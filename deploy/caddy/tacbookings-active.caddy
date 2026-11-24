@@ -1,0 +1,19 @@
+reverse_proxy {
+  lb_policy first
+  lb_try_duration 10s
+  fail_duration 30s
+  max_fails 3
+  health_uri /api/health/ready
+  health_interval 10s
+  health_timeout 5s
+  # The app reads the LAST X-Forwarded-For value as the visitor (getClientIp,
+  # src/lib/rate-limit.ts). Set it to Caddy's resolved client IP rather than
+  # appending Caddy's peer: behind a TLS-terminating proxy (CADDY_TLS_MODE=local,
+  # deploy/caddy/tls-local.caddy) the peer is the proxy, and every visitor would
+  # share one rate-limit bucket. With Caddy at the edge the two are the same.
+  header_up X-Forwarded-For {client_ip}
+  transport http {
+    keepalive 30s
+  }
+  to app_blue:3000 app:3000
+}

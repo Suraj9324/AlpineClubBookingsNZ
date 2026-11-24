@@ -1,0 +1,472 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as OTPAuth from "otpauth";
+
+// two-factor.ts reads DB-first identity via the server-only sync accessor (E3
+// #1929); neutralise the boundary guard and stub the accessor.
+vi.mock("server-only", () => ({}));
+vi.mock("@/lib/club-identity-settings", () => ({
+  getClubIdentitySync: () => ({
+    name: "Test Club",
+    bookingsName: "Test Club - Bookings",
+  }),
+}));
+
+const mockPrisma = vi.hoisted(() => ({
+  // Both shapes: an array of operations, and (#3454, enrolment) an interactive
+  // callback, which is handed this same double as its transaction client.
+  $executeRaw: vi.fn().mockResolvedValue(0),
+  $transaction: vi.fn(
+    async (operations: Array<Promise<unknown>> | ((tx: unknown) => Promise<unknown>)) =>
+      typeof operations === "function"
+        ? operations(mockPrisma)
+        : Promise.all(operations),
+  ),
+  auditLog: {
+    create: vi.fn().mockResolvedValue({ id: "audit-1" }),
+  },
+  twoFactorEmailCode: {
+    deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    create: vi.fn().mockResolvedValue({ id: "email-code-1" }),
+    findFirst: vi.fn(),
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+  },
+  twoFactorRecoveryCode: {
+    deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    createMany: vi.fn().mockResolvedValue({ count: 10 }),
+    findFirst: vi.fn(),
+    updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    // #4456 review: stored data under a ring key, asked before a legacy write.
+    count: vi.fn().mockResolvedValue(0),
+  },
+  integrationCredential: {
+    count: vi.fn().mockResolvedValue(0),
+  },
+  twoFactorSessionChallenge: {
+    deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    create: vi.fn().mockResolvedValue({ id: "session-challenge-1" }),
+  },
+  member: {
+    findUnique: vi.fn(),
+    update: vi.fn().mockResolvedValue({ id: "member-1" }),
+    count: vi.fn().mockResolvedValue(0),
+  },
+}));
+
+vi.mock("@/lib/prisma", () => ({ prisma: mockPrisma }));
+
+import {
+  consumeRecoveryCode,
+  consumeTwoFactorSessionChallenge,
+  createTwoFactorEmailCode,
+  createTwoFactorSessionChallenge,
+  decryptTwoFactorSecret,
+  encryptTwoFactorSecret,
+  enrollTwoFactor,
+  replaceRecoveryCodes,
+  generateTotpEnrollment,
+  hashEmailOtpCode,
+  hashRecoveryCode,
+  hashTwoFactorCode,
+  recordTwoFactorFailure,
+  twoFactorChallengeProofKind,
+  verifyTotpCode,
+  verifyTwoFactorEmailCode,
+  TWO_FACTOR_MAX_FAILED_ATTEMPTS,
+} from "@/lib/two-factor";
+import { DataKeyRingMissingError } from "@/lib/data-encryption-legacy-write-guard";
+
+describe("two-factor helpers", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv("AUTH_SECRET", "test-auth-secret-for-two-factor");
+  });
+
+  it("encrypts TOTP secrets at rest", () => {
+    const encrypted = encryptTwoFactorSecret("BASE32SECRET");
+
+    expect(encrypted).not.toContain("BASE32SECRET");
+    expect(decryptTwoFactorSecret(encrypted)).toBe("BASE32SECRET");
+  });
+
+  it("verifies TOTP codes with a small skew window", () => {
+    const setup = generateTotpEnrollment("member@example.test");
+    const totp = new OTPAuth.TOTP({
+      issuer: setup.issuer,
+      label: setup.label,
+      secret: OTPAuth.Secret.fromBase32(setup.secret),
+    });
+
+    expect(verifyTotpCode(setup.secret, totp.generate())).toBe(true);
+    expect(verifyTotpCode(setup.secret, "123")).toBe(false);
+  });
+
+  it("stores and verifies email OTP codes by HMAC hash", async () => {
+    const issued = await createTwoFactorEmailCode("member-1");
+    const createCall = mockPrisma.twoFactorEmailCode.create.mock.calls[0]?.[0];
+    expect(createCall.data.codeHash).toBe(hashEmailOtpCode(issued.code));
+    expect(createCall.data.codeHash).not.toBe(issued.code);
+
+    mockPrisma.twoFactorEmailCode.findFirst.mockResolvedValue({
+      id: "email-code-1",
+      memberId: "member-1",
+      used: false,
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+
+    await expect(
+      verifyTwoFactorEmailCode("member-1", issued.code),
+    ).resolves.toBe(true);
+    expect(mockPrisma.twoFactorEmailCode.updateMany).toHaveBeenCalledWith({
+      where: { id: "email-code-1", used: false },
+      data: { used: true },
+    });
+  });
+
+  it("rejects expired email OTP codes", async () => {
+    mockPrisma.twoFactorEmailCode.findFirst.mockResolvedValue({
+      id: "email-code-1",
+      memberId: "member-1",
+      used: false,
+      expiresAt: new Date(Date.now() - 1),
+    });
+
+    await expect(
+      verifyTwoFactorEmailCode("member-1", "123456"),
+    ).resolves.toBe(false);
+  });
+
+  it("consumes recovery codes once", async () => {
+    const code = "ABCD-EFGH-IJKL";
+    mockPrisma.twoFactorRecoveryCode.findFirst.mockResolvedValue({
+      id: "recovery-1",
+      memberId: "member-1",
+      codeHash: hashRecoveryCode(code),
+      usedAt: null,
+    });
+
+    await expect(consumeRecoveryCode("member-1", code)).resolves.toBe(true);
+    expect(mockPrisma.twoFactorRecoveryCode.updateMany).toHaveBeenCalledWith({
+      // Claimed on the hash it matched, too (#4456 review C2).
+      where: { id: "recovery-1", codeHash: hashRecoveryCode(code), usedAt: null },
+      data: { usedAt: expect.any(Date) },
+    });
+
+    mockPrisma.twoFactorRecoveryCode.findFirst.mockResolvedValue({
+      id: "recovery-1",
+      memberId: "member-1",
+      usedAt: new Date(),
+    });
+    await expect(consumeRecoveryCode("member-1", code)).resolves.toBe(false);
+  });
+
+  it("enrolls TOTP with encrypted secret and replacement recovery codes", async () => {
+    const recoveryCodes = await enrollTwoFactor({
+      memberId: "member-1",
+      method: "TOTP",
+      totpSecret: "BASE32SECRET",
+      actor: { kind: "member", memberId: "member-1" },
+    });
+
+    expect(recoveryCodes).toHaveLength(10);
+    // #3454: the enrolment records itself, on the same transaction client,
+    // and the row holds no trace of the secret.
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledTimes(1);
+    const audit = mockPrisma.auditLog.create.mock.calls[0]?.[0];
+    expect(audit.data).toMatchObject({
+      action: "security.two_factor.enrolled",
+      category: "security",
+      actorMemberId: "member-1",
+      subjectMemberId: "member-1",
+    });
+    expect(JSON.stringify(audit)).not.toContain("BASE32SECRET");
+    const updateCall = mockPrisma.member.update.mock.calls[0]?.[0];
+    expect(updateCall.data.twoFactorEnabled).toBe(true);
+    expect(updateCall.data.twoFactorMethod).toBe("TOTP");
+    expect(updateCall.data.totpSecret).not.toBe("BASE32SECRET");
+    expect(decryptTwoFactorSecret(updateCall.data.totpSecret)).toBe(
+      "BASE32SECRET",
+    );
+    expect(mockPrisma.twoFactorRecoveryCode.createMany).toHaveBeenCalledWith({
+      data: expect.arrayContaining([
+        expect.objectContaining({
+          memberId: "member-1",
+          codeHash: expect.any(String),
+        }),
+      ]),
+    });
+  });
+
+  it("refuses a MEMBER actor who is not the member being enrolled, and writes nothing (#3454 review)", async () => {
+    await expect(
+      enrollTwoFactor({
+        memberId: "member-1",
+        method: "EMAIL",
+        actor: { kind: "member", memberId: "member-2" },
+      }),
+    ).rejects.toThrow(/may change only their own second factor/);
+    expect(mockPrisma.member.update).not.toHaveBeenCalled();
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("replaces recovery codes and records it on the same transaction, with no code in the row (#3454)", async () => {
+    const codes = await replaceRecoveryCodes({
+      memberId: "member-1",
+      actor: { kind: "member", memberId: "member-1" },
+      request: { id: "req-r", ipAddress: "10.0.0.7", userAgent: "ua" },
+    });
+
+    expect(codes).toHaveLength(10);
+    expect(mockPrisma.twoFactorRecoveryCode.deleteMany).toHaveBeenCalledWith({
+      where: { memberId: "member-1" },
+    });
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledTimes(1);
+    const audit = mockPrisma.auditLog.create.mock.calls[0]?.[0];
+    expect(audit.data).toMatchObject({
+      action: "security.two_factor.recovery_codes_replaced",
+      category: "security",
+      actorMemberId: "member-1",
+      subjectMemberId: "member-1",
+      requestId: "req-r",
+      metadata: { actorKind: "member", recoveryCodesIssued: 10 },
+    });
+    const emitted = JSON.stringify(audit);
+    for (const code of codes) expect(emitted).not.toContain(code);
+  });
+
+  it("refuses to replace another member's recovery codes as a member (#3454)", async () => {
+    await expect(
+      replaceRecoveryCodes({
+        memberId: "member-1",
+        actor: { kind: "member", memberId: "member-2" },
+      }),
+    ).rejects.toThrow(/may change only their own second factor/);
+    expect(mockPrisma.twoFactorRecoveryCode.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses a job as the enrolling or replacing actor before any write (#4457)", async () => {
+    const job = { kind: "system", actor: "former-member-anonymisation" } as never;
+    await expect(
+      enrollTwoFactor({ memberId: "member-1", method: "EMAIL", actor: job }),
+    ).rejects.toThrow(/may only clear a second factor/);
+    await expect(replaceRecoveryCodes({ memberId: "member-1", actor: job })).rejects.toThrow(
+      /may only clear a second factor/,
+    );
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    expect(mockPrisma.member.update).not.toHaveBeenCalled();
+    expect(mockPrisma.twoFactorRecoveryCode.deleteMany).not.toHaveBeenCalled();
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an enrolment that names no actor, and writes nothing (#3454)", async () => {
+    await expect(
+      enrollTwoFactor({
+        memberId: "member-1",
+        method: "TOTP",
+        totpSecret: "BASE32SECRET",
+        actor: undefined as never,
+      }),
+    ).rejects.toThrow(/no usable actor/);
+    expect(mockPrisma.member.update).not.toHaveBeenCalled();
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("records an EMAIL enrolment as holding no authenticator-app secret (#3454)", async () => {
+    await enrollTwoFactor({
+      memberId: "member-1",
+      method: "EMAIL",
+      actor: { kind: "member", memberId: "member-1" },
+      request: { id: "req-9", ipAddress: "10.0.0.9", userAgent: "ua" },
+    });
+    const audit = mockPrisma.auditLog.create.mock.calls[0]?.[0];
+    expect(audit.data).toMatchObject({
+      action: "security.two_factor.enrolled",
+      requestId: "req-9",
+      ipAddress: "10.0.0.9",
+      metadata: { actorKind: "member", method: "EMAIL", authenticatorApp: false },
+    });
+  });
+
+  it("lets no sentinel TOTP secret reach the audit row or the actor error (#3454)", async () => {
+    const SENTINEL = "SENTINELTOTPSECRET3454ABCDEFGH";
+    const errors: unknown[] = [];
+    await enrollTwoFactor({
+      memberId: "member-1",
+      method: "TOTP",
+      totpSecret: SENTINEL,
+      actor: { kind: "member", memberId: "member-1" },
+    });
+    try {
+      await enrollTwoFactor({
+        memberId: "member-1",
+        method: "TOTP",
+        totpSecret: SENTINEL,
+        actor: { kind: "nobody" } as never,
+      });
+    } catch (error) {
+      errors.push(
+        error instanceof Error
+          ? { ...error, name: error.name, message: error.message, stack: error.stack }
+          : error,
+      );
+    }
+    expect(errors).toHaveLength(1);
+    const emitted = JSON.stringify([mockPrisma.auditLog.create.mock.calls, errors]);
+    expect(emitted).not.toContain(SENTINEL);
+    // The instrument is live: the encrypted secret did reach the member row.
+    expect(
+      decryptTwoFactorSecret(mockPrisma.member.update.mock.calls[0]?.[0].data.totpSecret),
+    ).toBe(SENTINEL);
+  });
+
+  it("stores session challenge tokens hashed with a short expiry", async () => {
+    const token = await createTwoFactorSessionChallenge("member-1", "TOTP");
+
+    const createCall =
+      mockPrisma.twoFactorSessionChallenge.create.mock.calls[0]?.[0];
+    expect(token).toMatch(/^TOTP\.[0-9a-f]{64}$/);
+    expect(twoFactorChallengeProofKind(token)).toBe("TOTP");
+    expect(createCall.data.memberId).toBe("member-1");
+    expect(createCall.data.tokenHash).toBe(hashTwoFactorCode(token));
+    expect(createCall.data.tokenHash).not.toBe(token);
+    const swapped = `EMAIL.${token.slice("TOTP.".length)}`;
+    expect(twoFactorChallengeProofKind(swapped)).toBe("EMAIL");
+    expect(hashTwoFactorCode(swapped)).not.toBe(createCall.data.tokenHash);
+    expect(twoFactorChallengeProofKind(token.slice("TOTP.".length))).toBeNull();
+    expect(createCall.data.expiresAt.getTime()).toBeGreaterThan(Date.now());
+    // Housekeeping removes only expired rows so live challenges cannot race.
+    expect(
+      mockPrisma.twoFactorSessionChallenge.deleteMany,
+    ).toHaveBeenCalledWith({
+      where: { memberId: "member-1", expiresAt: { lte: expect.any(Date) } },
+    });
+  });
+
+  it("consumes a session challenge token exactly once", async () => {
+    mockPrisma.twoFactorSessionChallenge.deleteMany.mockResolvedValueOnce({
+      count: 1,
+    });
+    await expect(
+      consumeTwoFactorSessionChallenge("member-1", "raw-token"),
+    ).resolves.toBe(true);
+    expect(
+      mockPrisma.twoFactorSessionChallenge.deleteMany,
+    ).toHaveBeenCalledWith({
+      where: {
+        tokenHash: { in: [hashTwoFactorCode("raw-token")] },
+        memberId: "member-1",
+        expiresAt: { gt: expect.any(Date) },
+      },
+    });
+
+    mockPrisma.twoFactorSessionChallenge.deleteMany.mockResolvedValueOnce({
+      count: 0,
+    });
+    await expect(
+      consumeTwoFactorSessionChallenge("member-1", "raw-token"),
+    ).resolves.toBe(false);
+  });
+
+  it("locks the member after repeated invalid two-factor attempts", async () => {
+    mockPrisma.member.findUnique.mockResolvedValue({
+      twoFactorFailedAttempts: TWO_FACTOR_MAX_FAILED_ATTEMPTS - 1,
+    });
+
+    const lockedUntil = await recordTwoFactorFailure("member-1");
+
+    expect(lockedUntil).toBeInstanceOf(Date);
+    expect(mockPrisma.member.update).toHaveBeenCalledWith({
+      where: { id: "member-1" },
+      data: {
+        twoFactorFailedAttempts: 0,
+        twoFactorLockedUntil: lockedUntil,
+      },
+    });
+  });
+});
+
+describe("no two-factor write under AUTH_SECRET while stored data names a ring key (#4456 review)", () => {
+  const MEMBER = { kind: "member", memberId: "member-1" } as const;
+  // A 32-byte ring key derived at run time, so no key literal sits in the source.
+  const RING_KEY = Buffer.from(
+    Array.from({ length: 32 }, (_, index) => (index * 37 + 11) % 256),
+  ).toString("base64");
+  const writers = {
+    "a TOTP enrolment": () =>
+      enrollTwoFactor({ memberId: "member-1", method: "TOTP", totpSecret: "BASE32SECRET", actor: MEMBER }),
+    "an email enrolment": () => enrollTwoFactor({ memberId: "member-1", method: "EMAIL", actor: MEMBER }),
+    "replacement recovery codes": () => replaceRecoveryCodes({ memberId: "member-1", actor: MEMBER }),
+  };
+  const wrote = () =>
+    mockPrisma.member.update.mock.calls.length +
+    mockPrisma.twoFactorRecoveryCode.createMany.mock.calls.length +
+    mockPrisma.auditLog.create.mock.calls.length;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv("AUTH_SECRET", "test-auth-secret-for-two-factor");
+    vi.stubEnv("DATA_ENCRYPTION_KEYS", "");
+  });
+
+  it.each(Object.entries(writers))("refuses %s, writing nothing, for each kind of ring-keyed row", async (_label, write) => {
+    for (const store of [
+      mockPrisma.integrationCredential.count,
+      mockPrisma.member.count,
+      mockPrisma.twoFactorRecoveryCode.count,
+    ]) {
+      store.mockResolvedValueOnce(1);
+      await expect(write()).rejects.toBeInstanceOf(DataKeyRingMissingError);
+      expect(wrote()).toBe(0);
+    }
+    expect(mockPrisma.member.count).toHaveBeenCalledWith({ where: { totpSecret: { startsWith: "v2:" } } });
+    // A `:` marks a ring hash, except on a code the re-encrypt retired (#4456 PR 2).
+    expect(mockPrisma.twoFactorRecoveryCode.count).toHaveBeenCalledWith({
+      where: {
+        AND: [
+          { codeHash: { contains: ":" } },
+          { NOT: { codeHash: { startsWith: "retired.legacy-auth-secret:" } } },
+        ],
+      },
+    });
+  });
+
+  it.each(Object.entries(writers))("writes %s under AUTH_SECRET as before when nothing names a ring key", async (_label, write) => {
+    await expect(write()).resolves.toBeDefined();
+    expect(wrote()).toBeGreaterThan(0);
+  });
+
+  it.each(Object.entries(writers))("never asks for %s when the write is under the ring", async (_label, write) => {
+    vi.stubEnv("DATA_ENCRYPTION_KEYS", `k1:${RING_KEY}`);
+    await expect(write()).resolves.toBeDefined();
+    expect(mockPrisma.integrationCredential.count).not.toHaveBeenCalled();
+    expect(mockPrisma.member.count).not.toHaveBeenCalled();
+  });
+
+  it("still mints the short-lived ones, an email code and a session challenge, without asking", async () => {
+    // Ring data in every store, and no ring: the durable writers above refuse.
+    for (const store of [
+      mockPrisma.integrationCredential.count,
+      mockPrisma.member.count,
+      mockPrisma.twoFactorRecoveryCode.count,
+    ]) {
+      store.mockResolvedValue(1);
+    }
+    try {
+      await expect(createTwoFactorEmailCode("member-1")).resolves.toMatchObject({ code: expect.stringMatching(/^\d{6}$/) });
+      expect(mockPrisma.twoFactorEmailCode.create).toHaveBeenCalledOnce();
+      await expect(createTwoFactorSessionChallenge("member-1", "EMAIL")).resolves.toMatch(
+        /^EMAIL\.[0-9a-f]{64}$/,
+      );
+      expect(mockPrisma.integrationCredential.count).not.toHaveBeenCalled();
+      expect(mockPrisma.member.count).not.toHaveBeenCalled();
+      expect(mockPrisma.twoFactorRecoveryCode.count).not.toHaveBeenCalled();
+    } finally {
+      for (const store of [
+        mockPrisma.integrationCredential.count,
+        mockPrisma.member.count,
+        mockPrisma.twoFactorRecoveryCode.count,
+      ]) {
+        store.mockResolvedValue(0);
+      }
+    }
+  });
+});

@@ -1,0 +1,553 @@
+"use client";
+
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Radio } from "@/components/ui/radio";
+import { promoChangeNotAppliedHeading } from "@/lib/promo-change-not-applied";
+import { formatCents } from "@/lib/utils";
+import {
+  EDIT_REFUND_CREDIT_CHOICE_LABEL,
+  combineEditRefundRoutes,
+  editRefundChoiceLabel,
+  editRefundRouteOf,
+  type EditRefundRoute,
+} from "@/lib/edit-refund-route";
+import { disputedRefundSentence, organiserBilledSentence } from "@/lib/booking-modified-email-copy";
+import { heldForDisputeSettlementCents } from "@/lib/edit-dispute-held-settlement";
+import type { PromoAction } from "@/components/edit-booking/hooks/use-promo-selection";
+import type { PromoInfo, QuoteResult, SettlementOptions } from "@/components/edit-booking/types";
+import { useClubFormat } from "@/components/club-format-provider";
+
+/**
+ * What this edit costs, and everything the club owes the member an explanation
+ * for before they press Save.
+ *
+ * Moved out of `edit-booking-panel.tsx` (#2690) as pure presentation, with every
+ * gate and every `role="status"` preserved exactly.
+ *
+ * THE CONVENTION FOR THIS CARD (#2390 review): every advisory that appears on
+ * its own when a quote comes back — not in response to a click — carries
+ * `role="status"`, so a screen-reader user hears it without hunting for it. That
+ * covers the minimum-stay notice, the subscription-rate notice, the
+ * group-discount note and both promo notices. The over-capacity block is
+ * deliberately excluded: it contains the confirm checkbox the member must
+ * operate, and announcing a form control as a live status reads as noise.
+ */
+export function PriceSummaryCard({
+  quote,
+  quoteLoading,
+  quoteError,
+  bookingFinalPriceCents,
+  promo,
+  promoAction,
+  overCapacityConfirmActive,
+  overCapacityNightList,
+  confirmOverCapacity,
+  showQuoteSummary,
+  ledgerAppliedCreditCents,
+  useCredit,
+  desiredElectionCents,
+  actingAsAdmin,
+  settlementMethod,
+  onConfirmOverCapacityChange,
+  onSettlementMethodChange,
+  linkedMoveRefundRoute = null,
+}: {
+  quote: QuoteResult | null;
+  quoteLoading: boolean;
+  quoteError: string;
+  bookingFinalPriceCents: number;
+  promo: PromoInfo | null;
+  promoAction: PromoAction;
+  overCapacityConfirmActive: boolean;
+  overCapacityNightList: { date: string; availableBeds: number }[];
+  confirmOverCapacity: boolean;
+  showQuoteSummary: boolean;
+  ledgerAppliedCreditCents: number;
+  useCredit: boolean;
+  desiredElectionCents: number;
+  actingAsAdmin: boolean;
+  settlementMethod: "card" | "credit" | null;
+  onConfirmOverCapacityChange: (checked: boolean) => void;
+  onSettlementMethodChange: (method: "card" | "credit") => void;
+  /**
+   * #5303 review: set while a linked move needing the card-or-credit choice is
+   * active. The panel then hides the linked "Return method" control, so this
+   * radio answers for every booking and is labelled by their combined route.
+   */
+  linkedMoveRefundRoute?: EditRefundRoute | null;
+}) {
+  const format = useClubFormat();
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <CardTitle headingLevel={2}>Price Summary</CardTitle>
+          {quoteLoading && quote && (
+            <span className="text-sm font-normal text-muted-foreground">Updating…</span>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent>
+        {quoteLoading && !quote && (
+          <p className="text-sm text-muted-foreground">Calculating price changes...</p>
+        )}
+
+        {quoteError && (
+          <div className="rounded-md bg-danger-3 p-3 text-sm text-danger-11">{quoteError}</div>
+        )}
+
+        {quote && !quote.capacityAvailable && !overCapacityConfirmActive && (
+          <div className="rounded-md bg-danger-3 p-3 text-sm text-danger-11">
+            <p className="font-medium">
+              {quote.partnerSharedReason ?? "Not enough beds available"}
+            </p>
+            {/*
+              #2930: the nights the server refused, exactly as it named them,
+              and NOTHING ELSE.
+
+              This list used to be built here from `nightDetails.filter(n =>
+              n.availableBeds < 0)` and printed "N bed(s) short" beside each
+              date. Both halves leaked the one distinction ADR-001 decision 6
+              says a member must never be able to draw. A whole-lodge-held night
+              is pinned to exactly 0 available beds and never negative
+              (`INV-CAP-021`), so it fell out of the filter and a hold-only
+              refusal drew an EMPTY list under the same sentence that a
+              genuinely full lodge drew an itemised one under. The shortfall
+              numbers then told them apart a second way, by arithmetic, because
+              a held night has no shortfall to state.
+
+              `capacityFullNights` is the server's own list from the single
+              helper (`getCapacityFullNights`), which counts a held night as a
+              full night and carries dates only.
+            */}
+            {quote.capacityFullNights && quote.capacityFullNights.length > 0 && (
+              <ul className="mt-1 list-disc pl-4">
+                {quote.capacityFullNights.map((date) => (
+                  <li key={date}>{date}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {/* #2124: advisory whole-stay minimum-stay warning — an early,
+            client-side heads-up that never gates Save. #2363: the hard
+            block is on the server. PUT /api/bookings/[id]/modify now
+            refuses a non-admin save that breaks the rule and returns the
+            frozen review, which handleSave surfaces in the save-error slot
+            below; an admin edit (including on-behalf) is not blocked. Save
+            stays enabled here on purpose — the server is authoritative, so
+            a stale or missing quote can never decide the outcome. */}
+        {quote && quote.minimumStayValid === false && (
+          <div
+            className="rounded-md bg-warning-3 p-3 text-sm text-warning-11"
+            role="status"
+          >
+            <p className="font-medium">
+              This change would leave your stay under a minimum-stay rule
+            </p>
+            <ul className="mt-1 list-disc pl-4">
+              {(quote.minimumStayViolations ?? []).map((violation, i) => (
+                <li key={i}>{violation.message}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* #2543 "tell them why": under the club's NON_MEMBER_PRICING mode a
+            member on this booking has an unpaid subscription, so their
+            nights are re-rated at non-member rates. Said here, above the
+            totals, because the New price below is the repriced figure and a
+            member who sees it move without explanation reads it as a bug.
+
+            The sentence is the SERVER's, rendered verbatim, and is read
+            straight off `quote` rather than copied into its own state — so a
+            later quote that returns null (the subscription was paid, or the
+            repriced guest was removed from the edit) drops the notice with
+            the quote it came from, and a refused or failed quote clears it
+            along with everything else via `setQuote(null)`. Gated only on
+            `quote`, like the minimum-stay warning beside it, so it survives a
+            render where capacity hides the money summary. */}
+        {quote?.subscriptionMemberRateNotice ? (
+          <div
+            className="rounded-md bg-warning-3 p-3 text-sm text-warning-11"
+            role="status"
+            data-testid="subscription-member-rate-notice"
+          >
+            {quote.subscriptionMemberRateNotice}
+          </div>
+        ) : null}
+
+        {/* #3179 (epic #2797) — this edit will save WITHOUT the promo-code
+            change the member just made. In warning colours rather than the
+            info colours beside it, and with a heading: the owner accepted the
+            cost of a partial save on
+            the condition that the wording is impossible to skim past, and a
+            member who reads nothing here walks away believing they applied a
+            discount they did not. Rendered VERBATIM from the server, and read
+            straight off `quote` like its neighbours, so it dies with the quote
+            it came from. */}
+        {quote?.promoChangeNotApplied ? (
+          <div
+            className="rounded-md bg-warning-3 p-3 text-sm text-warning-11"
+            role="status"
+            data-testid="promo-change-not-applied-notice"
+          >
+            <p className="font-medium">
+              {promoChangeNotAppliedHeading("preview")}
+            </p>
+            <p className="mt-1">{quote.promoChangeNotApplied.message}</p>
+          </div>
+        ) : null}
+
+        {/* #2770 D2 — "tell them why" for the edit-time group discount
+            switch, in the same slot and with the same lifecycle as the
+            subscription notice above: gated on `quote` alone so it survives
+            a render where capacity hides the money summary, and dropped
+            whenever the quote it came from is replaced or cleared. Rendered
+            as a plain note rather than a warning, because nothing is wrong
+            — it is the club's policy, stated where the officer is reading
+            the number it explains. */}
+        {quote?.groupDiscountEditNotice ? (
+          <div
+            className="rounded-md bg-muted p-3 text-sm text-muted-foreground"
+            role="status"
+            data-testid="group-discount-edit-notice"
+          >
+            {quote.groupDiscountEditNotice}
+          </div>
+        ) : null}
+
+        {overCapacityConfirmActive && (
+          <div className="space-y-2 rounded-md bg-warning-3 p-3 text-sm text-warning-11">
+            <p className="font-medium">
+              These nights are over lodge capacity
+            </p>
+            {overCapacityNightList.length > 0 && (
+              <ul className="list-disc pl-4">
+                {overCapacityNightList.map((night) => (
+                  <li key={night.date}>
+                    {night.date}: {Math.abs(night.availableBeds)} bed(s) over
+                  </li>
+                ))}
+              </ul>
+            )}
+            <label className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                checked={confirmOverCapacity}
+                onChange={(e) => onConfirmOverCapacityChange(e.target.checked)}
+                className="mt-1 h-4 w-4"
+              />
+              <span>
+                Book over capacity anyway — I understand this overbooks the
+                lodge.
+              </span>
+            </label>
+          </div>
+        )}
+
+        {showQuoteSummary && quote && (
+          <div className="space-y-3">
+            {/* Itemized changes */}
+            <div className="space-y-1">
+              {quote.itemizedChanges.map((item, i) => (
+                <div key={i} className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">{item.label}</span>
+                  <span
+                    className={`font-medium ${
+                      item.amountCents > 0
+                        ? "text-danger-11"
+                        : item.amountCents < 0
+                          ? "text-success-11"
+                          : ""
+                    }`}
+                  >
+                    {item.amountCents > 0 ? "+" : ""}
+                    {formatCents(item.amountCents, format)}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {/* Totals */}
+            <div className="border-t pt-2 space-y-1">
+              <div className="flex justify-between text-sm">
+                <span>Current price</span>
+                <span>{formatCents(bookingFinalPriceCents, format)}</span>
+              </div>
+              <div className="flex justify-between font-medium">
+                <span>New price</span>
+                <span>{formatCents(quote.newFinalPriceCents, format)}</span>
+              </div>
+              {/* #2266: the mockup's credit lines — what account credit
+                  already covers, what the saved election will cover at
+                  confirmation, and what is then left to pay.
+
+                  MED-5 honesty: when this edit reprices the booking below
+                  the credit already applied, the server clamps the applied
+                  slice to the new price and refunds the excess to the
+                  member's balance (F20, #1887) — so the panel shows the
+                  CLAMPED figure and says where the excess goes, instead of
+                  advertising a credit line the save will not keep.
+
+                  LOW-6: the late-notice change fee rides the invoice /
+                  additional charge, so "Remaining to pay" includes it —
+                  with its own line so the sum is transparent. */}
+              {(ledgerAppliedCreditCents > 0 ||
+                (useCredit && desiredElectionCents > 0)) &&
+                (() => {
+                  const displayedAppliedCreditCents = Math.min(
+                    ledgerAppliedCreditCents,
+                    quote.newFinalPriceCents,
+                  );
+                  const creditReturnedCents =
+                    ledgerAppliedCreditCents - displayedAppliedCreditCents;
+                  return (
+                    <>
+                      {ledgerAppliedCreditCents > 0 && (
+                        <div className="flex justify-between text-sm text-success-11">
+                          <span>Account credit applied</span>
+                          <span>
+                            -{formatCents(displayedAppliedCreditCents, format)}
+                          </span>
+                        </div>
+                      )}
+                      {creditReturnedCents > 0 && (
+                        <div className="flex justify-between text-sm text-success-11">
+                          <span>
+                            {actingAsAdmin
+                              ? `${formatCents(creditReturnedCents, format)} returns to the member's account credit`
+                              : `${formatCents(creditReturnedCents, format)} returns to your account credit`}
+                          </span>
+                          <span />
+                        </div>
+                      )}
+                      {useCredit && desiredElectionCents > 0 && (
+                        <div className="flex justify-between text-sm text-success-11">
+                          <span>Account credit (when you confirm)</span>
+                          <span>-{formatCents(desiredElectionCents, format)}</span>
+                        </div>
+                      )}
+                      {quote.changeFeeCents > 0 && (
+                        <div className="flex justify-between text-sm">
+                          <span>Late-notice change fee</span>
+                          <span>+{formatCents(quote.changeFeeCents, format)}</span>
+                        </div>
+                      )}
+                      <div className="flex justify-between font-medium" data-testid="remaining-to-pay">
+                        <span>Remaining to pay</span>
+                        <span>
+                          {formatCents(
+                            // #4299: the group organiser is billed for this place, never this member.
+                            quote.billedToOrganiser
+                              ? 0
+                              : Math.max(
+                                  0,
+                                  quote.newFinalPriceCents -
+                                    displayedAppliedCreditCents -
+                                    (useCredit ? desiredElectionCents : 0),
+                                ) + quote.changeFeeCents,
+                            format,
+                          )}
+                        </span>
+                      </div>
+                    </>
+                  );
+                })()}
+            </div>
+
+            {/* Net charge/refund. #4299: an increase on a place the organiser is billed for
+                is never shown to the joiner as their "Additional charge"; where the save
+                refuses it, the refusal below is the whole message. */}
+            {quote.netChargeCents !== 0 &&
+              !(quote.netChargeCents > 0 && quote.billedToOrganiser && (quote.chargeRefusal || quote.priceChangeRefusal)) && (
+              <div
+                className={`rounded-md p-3 text-sm ${
+                  quote.netChargeCents > 0
+                    ? "bg-danger-3 text-danger-11"
+                    : "bg-success-3 text-success-11"
+                }`}
+              >
+                {quote.netChargeCents > 0 && quote.billedToOrganiser ? (
+                  // #4299 N4: the organiser is invoiced for it on save; nothing is charged here. Never promised where the save refuses it (hidden above).
+                  <p className="font-medium" data-testid="organiser-billed-notice">
+                    {organiserBilledSentence(formatCents(quote.netChargeCents, format), "quote")}
+                  </p>
+                ) : quote.netChargeCents > 0 ? (
+                  <p className="font-medium">
+                    Additional charge: {formatCents(quote.netChargeCents, format)}
+                  </p>
+                ) : (
+                  <p className="font-medium">
+                    Booking reduction: {formatCents(Math.abs(quote.netChargeCents), format)}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {(quote.chargeRefusal || quote.priceChangeRefusal) && (
+              // #3653: the organiser paid by card; the save refuses this charge. #3949: or the organiser paid by
+              // Internet Banking and is part-way through cancelling the group; the save refuses any price change.
+              <p
+                role="alert"
+                data-testid={quote.priceChangeRefusal ? "organiser-price-change-refusal" : "organiser-charge-refusal"}
+                className="rounded-md border border-danger-6 bg-danger-3 p-3 text-sm text-danger-11"
+              >
+                {quote.priceChangeRefusal ?? quote.chargeRefusal}
+              </p>
+            )}
+
+            {/* #3954: a reduction first comes off the additional payment the
+                member has not paid yet; only the rest is refunded or credited. */}
+            {quote.netChargeCents < 0 && (quote.unpaidAskOffsetCents ?? 0) > 0 && (
+              <p className="rounded-md border p-3 text-sm" data-testid="unpaid-ask-offset">
+                Comes off your unpaid additional payment:{" "}
+                <span className="font-medium">{formatCents(quote.unpaidAskOffsetCents ?? 0, format)}</span>
+                {/* Round 6: said only when the quote states what is left - an
+                    absent figure is not "nothing left to pay". */}
+                {quote.askLeftCents === undefined
+                  ? null
+                  : quote.askLeftCents > 0
+                    ? ` (you will then owe ${formatCents(quote.askLeftCents, format)})`
+                    : " (nothing left to pay)"}
+              </p>
+            )}
+
+            {quote.netChargeCents < 0 && quote.settlementOptions && !quote.priceChangeRefusal && (
+              <div className="space-y-2 rounded-md border p-3 text-sm">
+                <div className="flex items-center justify-between">
+                  <p className="font-medium">Return method</p>
+                  {/* #2266: direction tag pairing with the credit card's
+                      "Credit → booking" — this section is money coming
+                      back to the member. */}
+                  <span className="rounded-full bg-info-3 px-2 py-0.5 text-xs font-medium text-info-11">
+                    Booking → you
+                  </span>
+                </div>
+                {quote.settlementOptions.returnsToOrganiser ? (
+                  // #3653: the organiser paid, so the organiser is refunded.
+                  <p data-testid="organiser-refund-notice">
+                    {quote.settlementOptions.cardRefundAmountCents > 0
+                      ? `${quote.settlementOptions.organiserRefundByBankTransfer ? "To be refunded to the group organiser by bank transfer" : "Refunded to the group organiser's card"}: ${formatCents(quote.settlementOptions.cardRefundAmountCents, format)} (${quote.settlementOptions.cardRefundPercentage}%). The organiser paid for this booking, so the refund goes back to them.`
+                      : "No refund is available for this reduction under the current policy."}
+                  </p>
+                ) : quote.settlementOptions.refundHeldForDispute ? (
+                  // #5061 follow-up (`INV-PAY-154`): the save's own held amount, in the email's words.
+                  <p data-testid="disputed-refund-notice">
+                    {disputedRefundSentence(
+                      formatCents(heldForDisputeSettlementCents(quote.settlementOptions), format),
+                      actingAsAdmin ? "the member's" : "your",
+                    )}
+                  </p>
+                ) : quote.settlementOptions.requiresSettlementMethod ? (
+                  <SettlementChoiceRadios
+                    options={quote.settlementOptions}
+                    linkedMoveRefundRoute={linkedMoveRefundRoute}
+                    settlementMethod={settlementMethod}
+                    onSettlementMethodChange={onSettlementMethodChange}
+                  />
+                ) : (
+                  <p className="text-muted-foreground">
+                    No refund or account credit is available for this reduction under the current policy.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* #3809: the booking's applied credit coming back, beside (or
+                instead of) a card refund - no choice to make, there is no card. */}
+            {quote.netChargeCents < 0 && (quote.appliedCreditGiveBackCents ?? 0) > 0 && (
+              <p className="rounded-md border p-3 text-sm" data-testid="applied-credit-give-back">
+                Returned as account credit:{" "}
+                <span className="font-medium">{formatCents(quote.appliedCreditGiveBackCents ?? 0, format)}</span>
+              </p>
+            )}
+
+            {!quote.promoStillValid && promoAction.type === "keep" && promo && (
+              <div
+                className="rounded-md bg-warning-3 p-3 text-sm text-warning-11"
+                role="status"
+              >
+                Your promo code &apos;{promo.code}&apos; is no longer valid and will be removed.
+              </div>
+            )}
+
+            {/* #2390: the promotion is keeping everyone who already had it
+                and simply not reaching the people this edit adds. Said
+                here, before Save, because a member who adds two guests and
+                silently gets a different rate for one of them reads that as
+                a bug. The totals above already include it. */}
+            {quote.promoCoverage && promoAction.type === "keep" && (
+              <div
+                className="rounded-md bg-warning-3 p-3 text-sm text-warning-11"
+                role="status"
+                data-testid="promo-coverage-notice"
+              >
+                {quote.promoCoverage.message}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * The member's card-or-credit choice for a reduction. The refund option names
+ * the route the save takes (#5303): this booking's own, combined with a linked
+ * move's while one needing the choice is active, because this one radio then
+ * answers for every booking.
+ */
+function SettlementChoiceRadios({
+  options,
+  linkedMoveRefundRoute,
+  settlementMethod,
+  onSettlementMethodChange,
+}: {
+  options: SettlementOptions;
+  linkedMoveRefundRoute: EditRefundRoute | null;
+  settlementMethod: "card" | "credit" | null;
+  onSettlementMethodChange: (method: "card" | "credit") => void;
+}) {
+  const format = useClubFormat();
+  const refundRoute = combineEditRefundRoutes([
+    editRefundRouteOf([options.refundByBankTransfer ?? false]),
+    ...(linkedMoveRefundRoute ? [linkedMoveRefundRoute] : []),
+  ]);
+  const choices = [
+    {
+      method: "card" as const,
+      label: editRefundChoiceLabel(refundRoute),
+      cents: options.cardRefundAmountCents,
+      percentage: options.cardRefundPercentage,
+    },
+    {
+      method: "credit" as const,
+      label: EDIT_REFUND_CREDIT_CHOICE_LABEL,
+      cents: options.accountCreditAmountCents,
+      percentage: options.accountCreditPercentage,
+    },
+  ];
+  return (
+    <div className="space-y-2">
+      {choices.map((choice) => (
+        <label key={choice.method} className="flex cursor-pointer items-start gap-2">
+          <Radio
+            name="settlementMethod"
+            value={choice.method}
+            checked={settlementMethod === choice.method}
+            onChange={() => onSettlementMethodChange(choice.method)}
+            className="mt-1"
+          />
+          <span>
+            {choice.label}:{" "}
+            <span className="font-medium">{formatCents(choice.cents, format)}</span>{" "}
+            <span className="text-muted-foreground">({choice.percentage}%)</span>
+          </span>
+        </label>
+      ))}
+    </div>
+  );
+}

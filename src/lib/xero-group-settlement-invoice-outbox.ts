@@ -1,0 +1,315 @@
+/**
+ * #3642 (`INV-PAY-105`): the combined group-settlement invoice's outbox
+ * identity — the one home for the keys its CREATE attempts and VOIDs carry, the
+ * object link it is recorded under, and the CREATE enqueue.
+ *
+ * AN ATTEMPT is one invoice the settlement asked for. The first is attempt 0,
+ * whose key is the pre-#3642 constant, so a row queued before this shipped is
+ * the same attempt after it. A settlement that abandons its invoice (the reaper
+ * released it, or the organiser's group changed and the invoice was replaced)
+ * asks for the next attempt under a new key: the outbox never folds it onto the
+ * old attempt's row, and Xero never answers it with a replay of the old
+ * invoice. A retry of the SAME attempt keeps its key, so Xero still
+ * deduplicates a create that timed out after it was accepted.
+ *
+ * The attempt is read back from the row's correlation key, which is written
+ * once at enqueue: the create worker overwrites the row's request payload with
+ * the invoice it sends, so the payload cannot carry it.
+ */
+import type { Prisma } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
+import {
+  buildXeroIdempotencyKey,
+  startXeroSyncOperation,
+  type XeroObjectLinkInput,
+  type XeroSyncOperationCompletion,
+} from "@/lib/xero-sync";
+import { buildXeroInvoiceUrl } from "@/lib/xero-links";
+import { XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_TYPE } from "@/lib/xero-operation-outbox-payload";
+import { GROUP_SETTLEMENT_INVOICE_ROLE } from "@/lib/group-settlement-invoice-binding";
+import { GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED_CODE } from "@/lib/xero-operation-error-codes";
+import { asRecord } from "@/lib/xero-json";
+import { scanSpacesWaitCode } from "@/lib/xero-operation-wait-spacing";
+
+type Db = Prisma.TransactionClient | typeof prisma;
+
+/** The Xero idempotency and outbox correlation key of one CREATE attempt. */
+export function groupSettlementInvoiceCreateKey(
+  settlementId: string,
+  attempt: number
+): string {
+  return attempt === 0
+    ? buildXeroIdempotencyKey("group-settlement", settlementId, "invoice", "v1")
+    : buildXeroIdempotencyKey(
+        "group-settlement",
+        settlementId,
+        "invoice",
+        `attempt-${attempt}`,
+        "v1"
+      );
+}
+
+/** The attempt a CREATE row's correlation key names, or null for any other key. */
+export function parseGroupSettlementInvoiceAttempt(
+  settlementId: string,
+  correlationKey: string | null | undefined
+): number | null {
+  if (!correlationKey) return null;
+  if (correlationKey === groupSettlementInvoiceCreateKey(settlementId, 0)) return 0;
+  const prefix = `group-settlement:${settlementId}:invoice:attempt-`;
+  if (!correlationKey.startsWith(prefix) || !correlationKey.endsWith(":v1")) {
+    return null;
+  }
+  const digits = correlationKey.slice(prefix.length, -":v1".length);
+  return /^[1-9]\d*$/.test(digits) ? Number(digits) : null;
+}
+
+/**
+ * #4525 (ALP-437): the flag a finished VOID's response payload carries when the
+ * invoice ended in Xero, and how: voided by the run (after a cancel or an
+ * abandon), found void already, or not in Xero at all. The VOID handlers write
+ * these flags; a combined invoice's export manifest recorded after the void's
+ * own coverage release reads them back (`releaseIfVoidFinished`). A payload
+ * with none (the invoice carries money, or is still bound) ended nothing.
+ */
+const GROUP_SETTLEMENT_INVOICE_VOID_ENDED = {
+  cancelledAfterInvoiceCreation: "VOIDED",
+  abandonedBySettlement: "VOIDED",
+  invoiceAlreadyVoid: "VOIDED",
+  invoiceNotFoundInXero: "NOT_FOUND",
+} as const;
+
+/** The response-payload flag a VOID handler writes when the invoice ended. */
+type GroupSettlementInvoiceVoidEndedFlag = keyof typeof GROUP_SETTLEMENT_INVOICE_VOID_ENDED;
+
+/** Every flag that says a VOID ended its invoice: what the cover sweep's statement filters on. */
+export const GROUP_SETTLEMENT_INVOICE_VOID_ENDED_FLAGS = Object.keys(
+  GROUP_SETTLEMENT_INVOICE_VOID_ENDED
+) as GroupSettlementInvoiceVoidEndedFlag[];
+
+/**
+ * The payload entry a VOID handler spreads into its completion for how the
+ * invoice ended: the one place the flag names are declared, so a writer can
+ * only write a flag `groupSettlementInvoiceVoidEnded` reads.
+ */
+export function groupSettlementInvoiceVoidEndedPayload<Flag extends GroupSettlementInvoiceVoidEndedFlag>(
+  flag: Flag
+): Record<Flag, true> {
+  return { [flag]: true } as Record<Flag, true>;
+}
+
+/** How a finished VOID's response payload says the invoice ended, or null when it did not. */
+export function groupSettlementInvoiceVoidEnded(responsePayload: unknown): "VOIDED" | "NOT_FOUND" | null {
+  const payload = asRecord(responsePayload);
+  if (!payload) return null;
+  for (const [flag, reason] of Object.entries(GROUP_SETTLEMENT_INVOICE_VOID_ENDED)) {
+    if (payload[flag] === true) return reason;
+  }
+  return null;
+}
+
+/**
+ * The Xero idempotency and outbox correlation key of a VOID: after the group
+ * was cancelled (`INV-PAY-035`), or after the settlement abandoned the invoice
+ * (`INV-PAY-105`). Invoice-specific, so every observer of one invoice converges
+ * on one row and one provider call.
+ */
+export function groupSettlementInvoiceVoidKey(
+  settlementId: string,
+  invoiceId: string,
+  after: "cancel" | "abandon"
+): string {
+  return buildXeroIdempotencyKey(
+    "group-settlement",
+    settlementId,
+    after === "cancel" ? "invoice-void-after-cancel" : "invoice-void-after-abandon",
+    invoiceId,
+    "v1"
+  );
+}
+
+/** The object link a combined settlement invoice is recorded under. */
+export function groupSettlementInvoiceLink(
+  settlementId: string,
+  invoice: { id: string; number?: string | null },
+  options?: { active?: boolean }
+): XeroObjectLinkInput {
+  return {
+    localModel: "GroupBookingSettlement",
+    localId: settlementId,
+    xeroObjectType: "INVOICE",
+    xeroObjectId: invoice.id,
+    xeroObjectNumber: invoice.number ?? null,
+    xeroObjectUrl: buildXeroInvoiceUrl(invoice.id),
+    role: GROUP_SETTLEMENT_INVOICE_ROLE,
+    ...(options?.active === undefined ? {} : { active: options.active }),
+  };
+}
+
+/**
+ * #4710 (PR #4708): the outcome of a claimed CREATE that finds its settlement
+ * already pointing at an invoice - a Retry queued after a stalled run bound it.
+ * Nothing is raised or emailed again; the row closes SUCCEEDED on the bound
+ * invoice, as the booking invoice's #2262 H3 path does, never left RUNNING for
+ * the stale reset to loop on. No link is written: the bound one stands, and
+ * re-writing it could re-activate a retired invoice's link (#3642).
+ */
+export function boundGroupSettlementInvoiceCompletion(invoice: { id: string; number: string | null }): XeroSyncOperationCompletion {
+  return {
+    status: "SUCCEEDED",
+    responsePayload: { skipped: true, reason: "Invoice already raised for this settlement; nothing was sent again." },
+    xeroObjectType: "INVOICE",
+    xeroObjectId: invoice.id,
+    xeroObjectNumber: invoice.number,
+    xeroObjectUrl: buildXeroInvoiceUrl(invoice.id),
+  };
+}
+
+/** The settlement's CREATE rows, every attempt. */
+function createRowsOf(settlementId: string) {
+  return {
+    direction: "OUTBOUND",
+    entityType: "INVOICE",
+    operationType: "CREATE",
+    localModel: "GroupBookingSettlement",
+    localId: settlementId,
+  } as const;
+}
+
+/**
+ * The settlement's current attempt: the highest one any CREATE row names, or
+ * null before the first. Read under `lock(1)` by every writer that enqueues,
+ * and by the create worker to learn whether a later attempt superseded it.
+ */
+export async function currentGroupSettlementInvoiceAttempt(
+  db: Db,
+  settlementId: string
+): Promise<number | null> {
+  const rows = await db.xeroSyncOperation.findMany({
+    where: createRowsOf(settlementId),
+    select: { correlationKey: true },
+  });
+  let current: number | null = null;
+  for (const row of rows) {
+    const attempt = parseGroupSettlementInvoiceAttempt(settlementId, row.correlationKey);
+    if (attempt !== null && (current === null || attempt > current)) current = attempt;
+  }
+  return current;
+}
+
+/**
+ * Queue the combined invoice's CREATE, inside the settle transaction under
+ * `lock(1)`.
+ *
+ * - `newAttempt: false`: the settlement still wants the invoice it already asked
+ *   for. The settlement's pointer is the one authority on "already raised";
+ *   otherwise an active row of the current attempt is returned, and a failed
+ *   one is re-driven under the SAME key.
+ * - `newAttempt: true`: the settlement abandoned its invoice, or never had one.
+ *   The next attempt is queued under its own key whatever the old attempt's row
+ *   is doing; that row finds itself superseded and raises nothing, or abandons
+ *   what it raised.
+ */
+export async function enqueueXeroGroupSettlementInvoiceOperation(
+  settlementId: string,
+  options: {
+    newAttempt: boolean;
+    createdByMemberId?: string;
+    store?: Prisma.TransactionClient;
+  }
+) {
+  const db = options.store ?? prisma;
+  const settlement = await db.groupBookingSettlement.findUnique({
+    where: { id: settlementId },
+    select: { id: true, xeroInvoiceId: true },
+  });
+  if (!settlement) {
+    throw new Error(`Group settlement not found: ${settlementId}`);
+  }
+  if (settlement.xeroInvoiceId && !options.newAttempt) {
+    return {
+      queueOperationId: null,
+      message: "Xero settlement invoice already linked for this group.",
+    };
+  }
+
+  const current = await currentGroupSettlementInvoiceAttempt(db, settlementId);
+  const attempt = options.newAttempt
+    ? current === null
+      ? 0
+      : current + 1
+    : (current ?? 0);
+  const correlationKey = groupSettlementInvoiceCreateKey(settlementId, attempt);
+
+  if (!options.newAttempt) {
+    const active = await db.xeroSyncOperation.findFirst({
+      where: {
+        ...createRowsOf(settlementId),
+        correlationKey,
+        status: { in: ["PENDING", "RUNNING"] },
+      },
+      orderBy: { createdAt: "desc" },
+      select: { id: true },
+    });
+    if (active) {
+      return {
+        queueOperationId: active.id,
+        message: "Xero settlement invoice is already queued for background processing.",
+      };
+    }
+  }
+
+  const queuedOperation = await startXeroSyncOperation({
+    ...createRowsOf(settlementId),
+    status: "PENDING",
+    idempotencyKey: correlationKey,
+    correlationKey,
+    requestPayload: {
+      queueType: XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_TYPE,
+      settlementId,
+    },
+    createdByMemberId: options.createdByMemberId ?? null,
+    store: options.store,
+  });
+  return {
+    queueOperationId: queuedOperation.id,
+    message: "Xero settlement invoice queued for background processing.",
+  };
+}
+
+/**
+ * #4919: the marker a CREATE row carries while its invoice's email is owed. It
+ * is written to `responsePayload`, which a claim keeps, so the re-driven run
+ * finds it; the invoice body is kept for the row's final record. No key has
+ * "email" in it: `sanitizeForJson` redacts any such key, marker and all.
+ */
+export const GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED_CAUSE = "INVOICE_EMAIL_DEFERRED";
+
+/** How long a row with an owed email waits before the outbox asks again. */
+export const GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED_RECHECK_MS = 60 * 1000;
+
+/** The owed-email marker's payload, from the row a deferral returns to PENDING. */
+export function deferredGroupInvoiceEmailPayload(invoice: unknown, error: unknown) {
+  return {
+    invoice,
+    deferredInvoiceSend: GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED_CAUSE,
+    deferredReason: error instanceof Error ? error.message : String(error),
+  };
+}
+
+/** The stored invoice body when the row's email is owed, otherwise null. */
+export function readDeferredGroupInvoiceEmail(payload: unknown): { invoice: unknown } | null {
+  const record = asRecord(payload);
+  return record?.deferredInvoiceSend === GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED_CAUSE
+    ? { invoice: record.invoice ?? null }
+    : null;
+}
+
+/** Leave a row whose email is owed out of the scan until its recheck is due. */
+export function scanSpacesGroupInvoiceEmailsDeferred(now: Date) {
+  return scanSpacesWaitCode(
+    GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED_CODE,
+    GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED_RECHECK_MS,
+    now,
+  );
+}

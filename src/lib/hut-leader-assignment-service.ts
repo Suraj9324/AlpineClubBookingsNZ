@@ -1,0 +1,404 @@
+import {
+  CustodianOverlapsWholeLodgeHoldError,
+  findWholeLodgeHoldAmendments,
+  recordWholeLodgeHoldAmendment,
+  validateCustodianBedHold,
+  wholeLodgeHoldAmendmentNights,
+  type WholeLodgeHoldAmendment,
+} from "@/lib/custodian-assignment";
+import { HutLeaderAssignmentSource } from "@prisma/client";
+import { MODULE_DISABLED_ERROR_CODE } from "@/lib/api-error-message";
+import { acquireLodgeCapacityLock } from "@/lib/capacity";
+import { isCustodianOccupancy } from "@/lib/custodian-occupancy";
+import { findHutLeaderOverlapRefusal } from "@/lib/hut-leader-overlap-guard";
+import { recordHutLeaderAssignmentAudit } from "@/lib/hut-leader-assignment-audit";
+import { prisma } from "@/lib/prisma";
+import {
+  findHutLeaderStayRefusal,
+  hutLeaderStayRefusalBody,
+  isHutLeaderStayCheckExempt,
+} from "@/lib/hut-leader-stayed-nights";
+import { LOCK1_HOLDER_TRANSACTION_BUDGET } from "@/lib/db-transaction";
+
+/**
+ * The two hut-leader assignment writes that decide something under a lock: the
+ * officer EDIT and the officer DELETE.
+ *
+ * They live here rather than inline in `[id]/route.ts` because a Next.js route
+ * module may export only route handlers, so the file cannot be split any other
+ * way — and both of these are lock topology plus its explanation, which is the
+ * part of the change a future reader most needs and most easily undoes. The
+ * route keeps what a route is for: authorisation, parsing, deriving the update
+ * from the request, and turning a refusal into a response.
+ *
+ * The CREATE stays in `route.ts`. It is one transaction that also mints a kiosk
+ * PIN and sends an email after commit, so pulling only its middle out would
+ * split one flow across two files without shortening either meaningfully.
+ *
+ * ## The lock rules both functions implement
+ *
+ * - Every edit — bed-holding or not — runs under the target lodge's capacity
+ *   key (#2887). #2286 locked only the bed path, reasoning that clearing a bed
+ *   moves no capacity; true of capacity, false of the OVERLAP predicate, which
+ *   a bedless edit breaks by MOVING DATES.
+ * - Everything the locked decision rests on is re-read UNDER the key (#2887
+ *   review). The caller's pre-lock read supplies the cheap 404 and the lock key
+ *   and nothing else.
+ * - The DELETE holds the same key since #2698, because removing a custodian bed
+ *   hold WIDENS the represented bed set of every overlapping whole-lodge hold
+ *   (`INV-CAP-038`) — a capacity move that ran on the base client outside any
+ *   transaction until then. It creates no overlap, so it still runs no overlap
+ *   read.
+ * - The #2698 AMEND path, and only that path, additionally takes the global
+ *   cohort key `pg_advisory_xact_lock(1)` FIRST (`INV-LOCK-002`): the hold
+ *   release path is booking cancel's `RELEASE_WHOLE_LODGE_HOLD_UPDATE`, which
+ *   serialises on the club-wide key and never on this lodge's. Whether it is
+ *   taken is decided by the CALLER, from the request, before this function
+ *   opens a transaction — so the order can never invert.
+ */
+export interface HutLeaderAssignmentRefusal {
+  status: number;
+  error: string;
+  /**
+   * #3817: the extra fields a stay refusal carries (`code`,
+   * `firstNightNotStayed`, `lastNightStayed`), rendered into the response body
+   * beside `error` so the form can offer the corrected last night.
+   */
+  details?:
+    | Omit<ReturnType<typeof hutLeaderStayRefusalBody>, "error">
+    | { code: typeof MODULE_DISABLED_ERROR_CODE };
+}
+
+/** Request provenance for the audit rows; absent when it cannot be read. */
+export interface HutLeaderAuditRequest {
+  id?: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+}
+
+/**
+ * Apply an officer's edit under the lodge capacity key, re-reading the row,
+ * the overlap set and the whole-lodge holds beneath it.
+ *
+ * Returns a refusal to be rendered as a response, or `null` on success. Hard
+ * custodian refusals and the #2698 ordering case are THROWN, not returned, so
+ * the transaction rolls back and the route maps them through
+ * `custodianBedHoldErrorResponse` exactly as it did before this moved.
+ */
+export async function applyHutLeaderAssignmentEditUnderLocks(input: {
+  assignmentId: string;
+  /** The lock key, derived by the caller from its pre-lock read. */
+  intendedLodgeId: string;
+  updateData: {
+    startDate?: Date;
+    endDate?: Date;
+    lodgeId?: string;
+    bedId?: string | null;
+    isCustodian?: boolean;
+  };
+  /** Was `bedId` present in the request at all? Absent means "leave the bed". */
+  bedIdProvided: boolean;
+  /** The requested bed when `bedIdProvided`: a string sets it, null clears it. */
+  requestedBedId: string | null | undefined;
+  confirmOverCapacity?: boolean;
+  /** #2698: the officer has explicitly accepted narrowing an existing hold. */
+  amendAccepted: boolean;
+  /**
+   * Is the `bedAllocation` module on? Only read by the caller when the edit
+   * moves nights or lodge; `true` otherwise, since nothing here then asks.
+   */
+  bedAllocationEnabled: boolean;
+  actorMemberId: string;
+  auditRequest?: HutLeaderAuditRequest | null;
+}): Promise<HutLeaderAssignmentRefusal | null> {
+  const { assignmentId: id, updateData } = input;
+
+  return prisma.$transaction(async (tx) => {
+    if (input.amendAccepted) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+    }
+    await acquireLodgeCapacityLock(tx, input.intendedLodgeId);
+
+    // The authoritative row. Every fact the decision rests on comes from HERE.
+    const locked = await tx.hutLeaderAssignment.findUnique({ where: { id } });
+    if (!locked) return { status: 404, error: "Assignment not found" };
+
+    const finalLodgeId = updateData.lodgeId ?? locked.lodgeId;
+    if (finalLodgeId !== input.intendedLodgeId) {
+      // The row moved lodges between the two reads, so the key we hold is not
+      // the key that governs it. Refuse rather than validate one lodge's roster
+      // and write to another's.
+      return {
+        status: 409,
+        error:
+          "This assignment moved to a different lodge while you were editing it. Reload and try again.",
+      };
+    }
+    const finalStart = updateData.startDate ?? locked.startDate;
+    const finalEnd = updateData.endDate ?? locked.endDate;
+    if (finalStart > finalEnd) {
+      return { status: 400, error: "startDate must be before or equal to endDate" };
+    }
+    // #3821: a school teacher is never the lodge custodian. The teacher row is
+    // the school booking's, and its kind is "a teacher on the booking"; ticking
+    // it would make it present every night with no school group there, and
+    // count as the custodian kind too. The page hides the control on these rows.
+    if (updateData.isCustodian === true && locked.source === HutLeaderAssignmentSource.SCHOOL_BOOKING) {
+      return {
+        status: 400,
+        error:
+          "A school teacher's assignment cannot be marked Custodian (lives on site). Add the custodian as their own assignment instead.",
+      };
+    }
+    const nextBedId = input.bedIdProvided ? input.requestedBedId : locked.bedId;
+    // #3821: nor can a teacher row hold a bed. A held bed is a custodian
+    // occupancy (`isCustodianOccupancy`, `INV-LIFE-062`), so it would make the
+    // row the custodian by the back door. Judged on the row AS IT WILL BE, so
+    // an edit that keeps a bed an older teacher row already holds is refused
+    // too, and releasing that bed (null) is the way out. The page hides
+    // "Hold a bed" on these rows.
+    if (nextBedId && locked.source === HutLeaderAssignmentSource.SCHOOL_BOOKING) {
+      return {
+        status: 400,
+        error:
+          "A school teacher's assignment cannot hold a bed: a held bed makes the assignment the lodge custodian. Release the bed, or add the custodian as their own assignment instead.",
+      };
+    }
+    const nightsOrLodgeMove =
+      finalStart.getTime() !== locked.startDate.getTime() ||
+      finalEnd.getTime() !== locked.endDate.getTime() ||
+      finalLodgeId !== locked.lodgeId;
+
+    // #3817: with bed allocation off an officer cannot pick or see beds, so a
+    // held bed may not be carried onto other nights or another lodge either —
+    // that would be a new hold the module-off create refuses. Releasing the
+    // bed (in this request or before it) and the custodian tick still work,
+    // so nothing is stranded. Judged against the LOCKED row's bed.
+    if (!input.bedAllocationEnabled && nextBedId && nightsOrLodgeMove) {
+      return {
+        status: 400,
+        error:
+          "Bed allocation is turned off for this club, so this assignment's held bed cannot move to other nights or another lodge. Release the bed first, or turn bed allocation on.",
+        details: { code: MODULE_DISABLED_ERROR_CODE },
+      };
+    }
+
+    const overlap = await findHutLeaderOverlapRefusal(tx, {
+      lodgeId: finalLodgeId,
+      startDate: finalStart,
+      endDate: finalEnd,
+      excludeAssignmentId: id,
+      // #2926: a DELIBERATE officer action, so the teacher carve-out applies.
+      allowOverlappingSchoolRows: true,
+      // #3821: the row as it will be, so a custodian is judged on the school
+      // nights it covers.
+      candidate: {
+        memberId: locked.memberId,
+        bedId: nextBedId ?? null,
+        isCustodian: updateData.isCustodian ?? locked.isCustodian,
+        source: locked.source,
+      },
+    });
+    if (overlap) return { status: 409, error: overlap.error };
+
+    // #3817 (owner decision "Block it outright"): an edit that moves the nights
+    // or the lodge, or takes away what made the row present without a stay —
+    // the custodian tick OR the held bed (Release bed) — may not leave a
+    // role-only, non-custodian row claiming a night the member is not staying
+    // there. Asked only when the claim moves, so changing one bed for another
+    // keeps working on any row. Not asked of a row that stays exempt
+    // (`isHutLeaderStayCheckExempt`: a custodian occupancy, or a school
+    // teacher's row). The refusal's way out is worded for what the edit took
+    // away: the tick (keep them Custodian) or the bed (mark them first).
+    const finalIsCustodian = updateData.isCustodian ?? locked.isCustodian;
+    const finalRow = { bedId: nextBedId, isCustodian: finalIsCustodian, source: locked.source };
+    const lostExemption = isHutLeaderStayCheckExempt(locked);
+    if ((nightsOrLodgeMove || lostExemption) && !isHutLeaderStayCheckExempt(finalRow)) {
+      const stayRefusal = await findHutLeaderStayRefusal(tx, {
+        memberId: locked.memberId,
+        lodgeId: finalLodgeId,
+        startDate: finalStart,
+        endDate: finalEnd,
+        exemptionRemoved: !lostExemption
+          ? undefined
+          : locked.isCustodian && !finalIsCustodian
+            ? "custodian"
+            : "bed",
+      });
+      if (stayRefusal) {
+        const { error, ...details } = hutLeaderStayRefusalBody(stayRefusal);
+        return { status: 409, error, details };
+      }
+    }
+
+    // A held bed or the custodian tick takes a space off capacity (#3817), so
+    // either brings the capacity re-check under this lodge key.
+    let amendments: WholeLodgeHoldAmendment[] = [];
+    if (isCustodianOccupancy(finalRow)) {
+      const previouslyCounted = isCustodianOccupancy(locked)
+        ? { startDate: locked.startDate, endDate: locked.endDate }
+        : null;
+      amendments = await validateCustodianBedHoldAndHoldAmendment(tx, {
+        bedId: nextBedId ?? null,
+        isCustodian: finalIsCustodian,
+        memberId: locked.memberId,
+        previouslyCounted: locked.lodgeId === finalLodgeId ? previouslyCounted : null,
+        lodgeId: finalLodgeId,
+        startDate: finalStart,
+        endDate: finalEnd,
+        assignmentId: id,
+        confirmOverCapacity: input.confirmOverCapacity,
+        amendAccepted: input.amendAccepted,
+      });
+    }
+    await tx.hutLeaderAssignment.update({ where: { id }, data: updateData });
+
+    await recordHutLeaderAssignmentAudit(tx, {
+      event: "updated",
+      actorMemberId: input.actorMemberId,
+      subjectMemberId: locked.memberId,
+      assignmentId: id,
+      lodgeId: finalLodgeId,
+      startDate: finalStart,
+      endDate: finalEnd,
+      bedId: nextBedId ?? null,
+      isCustodian: finalIsCustodian,
+      previous: {
+        lodgeId: locked.lodgeId,
+        startDate: locked.startDate,
+        endDate: locked.endDate,
+        bedId: locked.bedId,
+        isCustodian: locked.isCustodian,
+      },
+      requestId: input.auditRequest?.id,
+      ipAddress: input.auditRequest?.ipAddress,
+      userAgent: input.auditRequest?.userAgent,
+    });
+
+    if (amendments.length > 0) {
+      // Same transaction as the edit: accept writes both facts or neither.
+      await recordWholeLodgeHoldAmendment(tx, {
+        actorMemberId: input.actorMemberId,
+        assignmentId: id,
+        lodgeId: finalLodgeId,
+        bedId: nextBedId ?? null,
+        amendments,
+        requestId: input.auditRequest?.id,
+        ipAddress: input.auditRequest?.ipAddress,
+        userAgent: input.auditRequest?.userAgent,
+      });
+    }
+    return null;
+  }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+}
+
+/**
+ * Delete an assignment under the lodge capacity key (#2698).
+ *
+ * Returns a refusal or `null`. The caller's pre-lock read supplies the 404 and
+ * the key; the row is re-read here, and a row that moved lodges in between is
+ * refused rather than deleted under a key that does not govern it.
+ */
+export async function deleteHutLeaderAssignmentUnderLodgeLock(input: {
+  assignmentId: string;
+  /** The lock key, from the caller's pre-lock read. */
+  lodgeId: string;
+  actorMemberId: string;
+  auditRequest?: HutLeaderAuditRequest | null;
+}): Promise<HutLeaderAssignmentRefusal | null> {
+  const { assignmentId: id } = input;
+
+  return prisma.$transaction(async (tx) => {
+    await acquireLodgeCapacityLock(tx, input.lodgeId);
+    const locked = await tx.hutLeaderAssignment.findUnique({ where: { id } });
+    if (!locked) return { status: 404, error: "Assignment not found" };
+    if (locked.lodgeId !== input.lodgeId) {
+      return {
+        status: 409,
+        error:
+          "This assignment moved to a different lodge while you were deleting it. Reload and try again.",
+      };
+    }
+
+    await tx.hutLeaderAssignment.delete({ where: { id } });
+    await recordHutLeaderAssignmentAudit(tx, {
+      event: "deleted",
+      actorMemberId: input.actorMemberId,
+      subjectMemberId: locked.memberId,
+      assignmentId: id,
+      lodgeId: locked.lodgeId,
+      startDate: locked.startDate,
+      endDate: locked.endDate,
+      bedId: locked.bedId,
+      isCustodian: locked.isCustodian,
+      requestId: input.auditRequest?.id,
+      ipAddress: input.auditRequest?.ipAddress,
+      userAgent: input.auditRequest?.userAgent,
+    });
+    return null;
+  });
+}
+
+/**
+ * The bed-hold half of a create or an edit, in the order it has to happen:
+ * every HARD refusal first, then the #2698 ordering question.
+ *
+ * Shared by the create route and the edit above so the two cannot drift on the
+ * one thing that matters here — that a hold which is going to be refused
+ * outright never raises an amendment question the officer would then have to
+ * un-answer, and that a declined amendment throws rather than returns, so the
+ * caller's transaction rolls back and NOTHING is written on either side.
+ *
+ * Returns the amendments the caller must record after its own write. An empty
+ * array is the ordinary case.
+ */
+export async function validateCustodianBedHoldAndHoldAmendment(
+  tx: Parameters<typeof findWholeLodgeHoldAmendments>[0]["db"],
+  input: {
+    /** The held bed, or null for a ticked custodian with no bed (#3817). */
+    bedId: string | null;
+    /** The custodian tick; with no bed, it alone brings the capacity checks. */
+    isCustodian?: boolean;
+    /** The custodian, matched to their own guest rows (#3817, one space). */
+    memberId: string;
+    /** Editing a bedless custodian: the range it already counted before. */
+    previouslyCounted?: { startDate: Date; endDate: Date } | null;
+    lodgeId: string;
+    startDate: Date;
+    endDate: Date;
+    /** Present when editing, so the assignment does not re-prompt on its own nights. */
+    assignmentId?: string;
+    confirmOverCapacity?: boolean;
+    amendAccepted: boolean;
+  },
+): Promise<WholeLodgeHoldAmendment[]> {
+  await validateCustodianBedHold({
+    bedId: input.bedId,
+    lodgeId: input.lodgeId,
+    startDate: input.startDate,
+    endDate: input.endDate,
+    assignmentId: input.assignmentId,
+    confirmOverCapacity: input.confirmOverCapacity,
+    isCustodian: input.isCustodian,
+    memberId: input.memberId,
+    db: tx,
+  });
+
+  const amendments = await findWholeLodgeHoldAmendments({
+    bedId: input.bedId,
+    lodgeId: input.lodgeId,
+    startDate: input.startDate,
+    endDate: input.endDate,
+    assignmentId: input.assignmentId,
+    previouslyCounted: input.previouslyCounted,
+    memberId: input.memberId,
+    db: tx,
+  });
+  if (amendments.length > 0 && !input.amendAccepted) {
+    throw new CustodianOverlapsWholeLodgeHoldError(
+      amendments,
+      wholeLodgeHoldAmendmentNights(amendments),
+    );
+  }
+  return amendments;
+}

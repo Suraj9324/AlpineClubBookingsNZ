@@ -1,0 +1,783 @@
+import { isDeepStrictEqual } from "node:util";
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
+
+const mocks = vi.hoisted(() => ({
+  readSupersededCaptureHeldBack: vi.fn().mockResolvedValue({ byTransaction: new Map(), totalCents: 0 }),
+  auth: vi.fn(),
+  requireActiveSessionUser: vi.fn(),
+  refundRequestFindMany: vi.fn(),
+  refundRequestCount: vi.fn(),
+  // #4117: the approved appeals' payments, read for what their card refund still owes.
+  paymentFindMany: vi.fn(async () => []),
+  manualRefundTaskFindMany: vi.fn(async () => []),
+  bookingFindMany: vi.fn(),
+  bookingCount: vi.fn(),
+  memberApplicationFindMany: vi.fn(),
+  memberApplicationCount: vi.fn(),
+  nominationTokenFindMany: vi.fn(),
+  memberFindMany: vi.fn(),
+  deletionRequestFindMany: vi.fn(),
+  deletionRequestCount: vi.fn(),
+  auditLogFindMany: vi.fn(),
+  auditLogCount: vi.fn(),
+  emailLogFindMany: vi.fn(),
+  maintenanceReportFindMany: vi.fn(async () => []),
+  maintenanceReportCount: vi.fn(async () => 0),
+  lodgeFindMany: vi.fn(async () => []),
+  parseApplicationAddress: vi.fn(),
+  parseApplicationFamilyMembers: vi.fn(),
+}));
+
+// #4872: the superseded-capture hold-back read; none unless a test says.
+vi.mock("@/lib/superseded-capture-hold-back", () => ({
+  readSupersededCaptureHeldBack: (...args: unknown[]) => mocks.readSupersededCaptureHeldBack(...args),
+}));
+
+vi.mock("@/lib/auth", () => ({
+  auth: mocks.auth,
+}));
+
+vi.mock("@/lib/session-guards", async () => ({
+  requireAdmin: (await import("./helpers/require-admin-mock"))
+    .evaluateRequireAdminMock,
+  requireActiveSessionUser: mocks.requireActiveSessionUser,
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    refundRequest: {
+      findMany: mocks.refundRequestFindMany,
+      count: mocks.refundRequestCount,
+    },
+    payment: { findMany: mocks.paymentFindMany },
+    manualRefundTask: { findMany: mocks.manualRefundTaskFindMany },
+    booking: {
+      findMany: mocks.bookingFindMany,
+      count: mocks.bookingCount,
+    },
+    memberApplication: {
+      findMany: mocks.memberApplicationFindMany,
+      count: mocks.memberApplicationCount,
+    },
+    nominationToken: {
+      findMany: mocks.nominationTokenFindMany,
+    },
+    member: {
+      findMany: mocks.memberFindMany,
+    },
+    deletionRequest: {
+      findMany: mocks.deletionRequestFindMany,
+      count: mocks.deletionRequestCount,
+    },
+    auditLog: {
+      findMany: mocks.auditLogFindMany,
+      count: mocks.auditLogCount,
+    },
+    emailLog: {
+      findMany: mocks.emailLogFindMany,
+    },
+    maintenanceReport: {
+      findMany: mocks.maintenanceReportFindMany,
+      count: mocks.maintenanceReportCount,
+    },
+    lodge: { findMany: mocks.lodgeFindMany },
+  },
+}));
+
+vi.mock("@/lib/member-application-fields", () => ({
+  parseApplicationAddress: mocks.parseApplicationAddress,
+  parseApplicationFamilyMembers: mocks.parseApplicationFamilyMembers,
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: { error: vi.fn() },
+}));
+
+import { GET as getRefundRequests } from "@/app/api/admin/refund-requests/route";
+import { GET as getWaitlist } from "@/app/api/admin/waitlist/route";
+import { GET as getMemberApplications } from "@/app/api/admin/member-applications/route";
+import { GET as getDeletionRequests } from "@/app/api/admin/deletion-requests/route";
+import { GET as getCommunicationHistory } from "@/app/api/admin/communications/history/route";
+import { GET as getMaintenanceReports } from "@/app/api/admin/maintenance-reports/route";
+
+function request(path: string) {
+  return new NextRequest(`http://localhost${path}`);
+}
+
+async function expectInvalidQuery(response: Response) {
+  expect(response.status).toBe(400);
+  await expect(response.json()).resolves.toMatchObject({
+    error: "Invalid query parameters",
+  });
+}
+
+function refundRequest(id: string, status = "PENDING") {
+  return {
+    id,
+    bookingId: `booking-${id}`,
+    memberId: `member-${id}`,
+    reason: "Weather closure",
+    requestedAmountCents: null,
+    status,
+    adminNotes: null,
+    approvedAmountCents: null,
+    reviewedAt: null,
+    createdAt: new Date("2026-05-01T00:00:00.000Z"),
+    booking: {
+      id: `booking-${id}`,
+      checkIn: new Date("2026-07-01T00:00:00.000Z"),
+      checkOut: new Date("2026-07-03T00:00:00.000Z"),
+      finalPriceCents: 12000,
+      status: "CANCELLED",
+      creditsFromCancellation: [],
+      payment: {
+        amountCents: 12000,
+        refundedAmountCents: 0,
+        stripePaymentIntentId: "pi_123",
+        recoveryOperations: [],
+        refunds: [],
+      },
+    },
+    member: {
+      id: `member-${id}`,
+      firstName: "Jane",
+      lastName: "Doe",
+      email: "jane@example.com",
+    },
+  };
+}
+
+function waitlistBooking(id: string) {
+  return {
+    id,
+    member: {
+      id: `member-${id}`,
+      firstName: "Jane",
+      lastName: "Doe",
+      email: "jane@example.com",
+    },
+    checkIn: new Date("2026-07-01T00:00:00.000Z"),
+    checkOut: new Date("2026-07-03T00:00:00.000Z"),
+    guests: [],
+    status: "WAITLISTED",
+    waitlistPosition: 1,
+    waitlistOfferedAt: null,
+    waitlistOfferExpiresAt: null,
+    finalPriceCents: 12000,
+    createdAt: new Date("2026-05-01T00:00:00.000Z"),
+  };
+}
+
+function memberApplication(id: string, status = "PENDING_ADMIN") {
+  return {
+    id,
+    applicantFirstName: "Jane",
+    applicantLastName: "Doe",
+    applicantEmail: "jane@example.com",
+    applicantDateOfBirth: null,
+    applicantPhone: null,
+    applicantAddress: { streetCity: "Auckland" },
+    familyMembers: [],
+    nominator1Email: "one@example.com",
+    nominator2Email: "two@example.com",
+    nominator1Id: null,
+    nominator2Id: null,
+    nominator1ConfirmedAt: null,
+    nominator2ConfirmedAt: null,
+    status,
+    adminNotes: null,
+    reviewedBy: null,
+    reviewedAt: null,
+    createdAt: new Date("2026-05-01T00:00:00.000Z"),
+    updatedAt: new Date("2026-05-02T00:00:00.000Z"),
+  };
+}
+
+function deletionRequest(id: string, status = "PENDING") {
+  return {
+    id,
+    status,
+    reason: "Moving away",
+    adminNote: null,
+    reviewedBy: null,
+    reviewedAt: null,
+    createdAt: new Date("2026-05-01T00:00:00.000Z"),
+    member: {
+      id: `member-${id}`,
+      firstName: "Jane",
+      lastName: "Doe",
+      email: "jane@example.com",
+      role: "MEMBER",
+      active: true,
+    },
+  };
+}
+
+function auditLogEntry(id: string) {
+  return {
+    id,
+    memberId: "admin-1",
+    details: JSON.stringify({
+      subject: "Lodge update",
+      recipientFilter: "all",
+      totalRecipients: 10,
+      eligibleRecipients: 8,
+      queued: 8,
+    }),
+    createdAt: new Date("2026-05-01T00:00:00.000Z"),
+  };
+}
+
+describe("admin query validation and pagination", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.auth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mocks.requireActiveSessionUser.mockResolvedValue(null);
+    mocks.refundRequestFindMany.mockResolvedValue([]);
+    mocks.refundRequestCount.mockResolvedValue(0);
+    mocks.bookingFindMany.mockResolvedValue([]);
+    mocks.bookingCount.mockResolvedValue(0);
+    mocks.memberApplicationFindMany.mockResolvedValue([]);
+    mocks.memberApplicationCount.mockResolvedValue(0);
+    mocks.nominationTokenFindMany.mockResolvedValue([]);
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.deletionRequestFindMany.mockResolvedValue([]);
+    mocks.deletionRequestCount.mockResolvedValue(0);
+    mocks.auditLogFindMany.mockResolvedValue([]);
+    mocks.auditLogCount.mockResolvedValue(0);
+    mocks.emailLogFindMany.mockResolvedValue([]);
+    mocks.parseApplicationAddress.mockImplementation((value) => value);
+    mocks.parseApplicationFamilyMembers.mockImplementation((value) => value);
+  });
+
+  describe("GET /api/admin/refund-requests", () => {
+    it("returns 400 for invalid status", async () => {
+      const response = await getRefundRequests(
+        request("/api/admin/refund-requests?status=NOT_AN_ENUM")
+      );
+
+      await expectInvalidQuery(response);
+      expect(mocks.refundRequestFindMany).not.toHaveBeenCalled();
+    });
+
+    it("defaults to bounded pagination without params", async () => {
+      mocks.refundRequestFindMany.mockResolvedValue(
+        Array.from({ length: 25 }, (_, index) => refundRequest(`refund-${index}`))
+      );
+      mocks.refundRequestCount.mockResolvedValue(30);
+
+      const response = await getRefundRequests(request("/api/admin/refund-requests"));
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.data).toHaveLength(25);
+      expect(body.data.length).toBeLessThanOrEqual(body.pageSize);
+      expect(body).toMatchObject({ page: 1, pageSize: 25, total: 30, totalPages: 2 });
+      expect(mocks.refundRequestFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: "PENDING" },
+          // INV-OPS-020: the pending queue reads oldest first.
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          take: 25,
+          skip: 0,
+        })
+      );
+    });
+
+    it("returns expected data for valid params", async () => {
+      mocks.refundRequestFindMany.mockResolvedValue([refundRequest("refund-1", "APPROVED")]);
+      mocks.refundRequestCount.mockResolvedValue(1);
+      // #4117: the approved appeal's approval audit, read for a card refund not queued.
+      mocks.auditLogFindMany.mockResolvedValue([]);
+
+      const response = await getRefundRequests(
+        request("/api/admin/refund-requests?status=APPROVED&page=2&pageSize=10")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.data[0].id).toBe("refund-1");
+      expect(body).toMatchObject({ page: 2, pageSize: 10, total: 1 });
+      expect(mocks.refundRequestFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: "APPROVED" },
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          take: 10,
+          skip: 10,
+        })
+      );
+    });
+  });
+
+  describe("GET /api/admin/waitlist", () => {
+    it("returns 400 for invalid date", async () => {
+      const response = await getWaitlist(request("/api/admin/waitlist?from=garbage"));
+
+      await expectInvalidQuery(response);
+      expect(mocks.bookingFindMany).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 for date windows over 366 days", async () => {
+      const response = await getWaitlist(
+        request("/api/admin/waitlist?from=2026-01-01&to=2027-01-02")
+      );
+
+      await expectInvalidQuery(response);
+      expect(mocks.bookingFindMany).not.toHaveBeenCalled();
+    });
+
+    it("defaults to bounded pagination without params", async () => {
+      mocks.bookingFindMany.mockResolvedValue(
+        Array.from({ length: 25 }, (_, index) => waitlistBooking(`booking-${index}`))
+      );
+      mocks.bookingCount.mockResolvedValue(30);
+
+      const response = await getWaitlist(request("/api/admin/waitlist"));
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.entries).toHaveLength(25);
+      expect(body.entries.length).toBeLessThanOrEqual(body.pageSize);
+      expect(body).toMatchObject({ page: 1, pageSize: 25, total: 30 });
+      expect(mocks.bookingFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          take: 25,
+          skip: 0,
+        })
+      );
+    });
+
+    it("returns expected data for valid params", async () => {
+      mocks.bookingFindMany.mockResolvedValue([waitlistBooking("booking-1")]);
+      mocks.bookingCount.mockResolvedValue(1);
+
+      const response = await getWaitlist(
+        request("/api/admin/waitlist?from=2026-07-01&to=2026-07-31&page=2&pageSize=10")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.entries[0]).toMatchObject({
+        id: "booking-1",
+        memberName: "Jane Doe",
+        checkIn: "2026-07-01",
+        checkOut: "2026-07-03",
+      });
+      expect(body).toMatchObject({ page: 2, pageSize: 10, total: 1 });
+      expect(mocks.bookingFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            checkIn: expect.objectContaining({
+              gte: new Date("2026-07-01"),
+            }),
+            checkOut: expect.objectContaining({
+              lte: new Date("2026-07-31"),
+            }),
+          }),
+          take: 10,
+          skip: 10,
+        })
+      );
+    });
+
+    it("shows each row's true place, read from the whole queue rather than this page (#5402)", async () => {
+      const queued = (id: string, day: string, extra: Record<string, unknown> = {}) => ({
+        ...waitlistBooking(id),
+        lodgeId: "lodge-a",
+        noEmails: false,
+        createdAt: new Date(`2026-05-${day}T00:00:00.000Z`),
+        ...extra,
+      });
+      // Page 2 of the board: one waiting entry, one silenced, one offered.
+      mocks.bookingFindMany
+        .mockResolvedValueOnce([
+          queued("booking-3", "03"),
+          queued("booking-4", "04", { noEmails: true }),
+          queued("booking-5", "05", { status: "WAITLIST_OFFERED" }),
+        ])
+        // The position read: the live queue, two older entries off this page.
+        .mockResolvedValueOnce(
+          ["booking-1", "booking-2", "booking-3"].map((id, index) => ({
+            id,
+            lodgeId: "lodge-a",
+            checkIn: new Date("2026-07-01T00:00:00.000Z"),
+            checkOut: new Date("2026-07-03T00:00:00.000Z"),
+            createdAt: new Date(`2026-05-0${index + 1}T00:00:00.000Z`),
+            waitlistAlternateLodges: [],
+          })),
+        );
+      mocks.bookingCount.mockResolvedValue(5);
+
+      const response = await getWaitlist(request("/api/admin/waitlist?page=2&pageSize=3"));
+      const body = await response.json();
+
+      expect(
+        body.entries.map((entry: { id: string; waitlistPosition: number | null }) => [
+          entry.id,
+          entry.waitlistPosition,
+        ]),
+      ).toEqual([
+        ["booking-3", 3],
+        ["booking-4", null],
+        ["booking-5", null],
+      ]);
+      // The board lists the queue in its own join order.
+      expect(mocks.bookingFindMany.mock.calls[0]![0]).toMatchObject({
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      });
+      // Only the shown entry is placed; the read is not limited to this page.
+      const queueRead = mocks.bookingFindMany.mock.calls[1]![0] as {
+        where: Record<string, unknown>;
+        take?: number;
+      };
+      expect(queueRead.take).toBeUndefined();
+      expect(queueRead.where).toMatchObject({ status: "WAITLISTED", noEmails: false });
+    });
+
+    it("decorates offered bookings with waitlist offer email recovery state", async () => {
+      mocks.bookingFindMany.mockResolvedValue([
+        {
+          ...waitlistBooking("booking-1"),
+          status: "WAITLIST_OFFERED",
+          waitlistOfferedAt: new Date("2026-06-01T09:00:00.000Z"),
+          waitlistOfferExpiresAt: new Date("2026-06-03T09:00:00.000Z"),
+        },
+      ]);
+      mocks.bookingCount.mockResolvedValue(1);
+      mocks.emailLogFindMany.mockResolvedValue([
+        {
+          id: "email-log-1",
+          to: "jane@example.com",
+          status: "FAILED",
+          attempts: 3,
+          lastAttemptAt: new Date("2026-06-01T09:30:00.000Z"),
+          errorMessage: "SMTP rejected recipient",
+          createdAt: new Date("2026-06-01T09:00:05.000Z"),
+          htmlBody: "<a href=\"/bookings/booking-1/waitlist-confirm\">Confirm</a>",
+        },
+      ]);
+
+      const response = await getWaitlist(request("/api/admin/waitlist"));
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.entries[0].offerEmailDelivery).toMatchObject({
+        status: "FAILED",
+        emailLogId: "email-log-1",
+        attempts: 3,
+        errorMessage: "SMTP rejected recipient",
+        retryState: "exhausted",
+        needsOperatorAction: true,
+      });
+      expect(mocks.emailLogFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            templateName: "waitlist-offer",
+            to: { in: ["jane@example.com"] },
+          }),
+        })
+      );
+    });
+  });
+
+  describe("GET /api/admin/member-applications", () => {
+    it("returns 400 for invalid status", async () => {
+      const response = await getMemberApplications(
+        request("/api/admin/member-applications?status=NOT_AN_ENUM")
+      );
+
+      await expectInvalidQuery(response);
+      expect(mocks.memberApplicationFindMany).not.toHaveBeenCalled();
+    });
+
+    it("defaults to bounded pagination without params", async () => {
+      mocks.memberApplicationFindMany.mockResolvedValue(
+        Array.from({ length: 25 }, (_, index) => memberApplication(`application-${index}`))
+      );
+      mocks.memberApplicationCount.mockResolvedValue(30);
+
+      const response = await getMemberApplications(
+        request("/api/admin/member-applications")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.applications).toHaveLength(25);
+      expect(body.applications.length).toBeLessThanOrEqual(body.pageSize);
+      expect(body).toMatchObject({ page: 1, pageSize: 25, total: 30, totalPages: 2 });
+      expect(mocks.memberApplicationFindMany).toHaveBeenCalledWith({
+        where: undefined,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: 25,
+        skip: 0,
+      });
+    });
+
+    it("returns expected data for valid params", async () => {
+      mocks.memberApplicationFindMany.mockResolvedValue([
+        memberApplication("application-1", "APPROVED"),
+      ]);
+      mocks.memberApplicationCount.mockResolvedValue(1);
+
+      const response = await getMemberApplications(
+        request("/api/admin/member-applications?status=APPROVED&page=2&pageSize=10")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.applications[0]).toMatchObject({
+        id: "application-1",
+        applicantEmail: "jane@example.com",
+        status: "APPROVED",
+      });
+      expect(body).toMatchObject({ page: 2, pageSize: 10, total: 1, totalPages: 1 });
+      expect(mocks.memberApplicationFindMany).toHaveBeenCalledWith({
+        where: { status: "APPROVED" },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: 10,
+        skip: 10,
+      });
+    });
+
+    it("reads the pending-admin queue oldest first (INV-OPS-020)", async () => {
+      await getMemberApplications(
+        request("/api/admin/member-applications?status=PENDING_ADMIN")
+      );
+
+      expect(mocks.memberApplicationFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: "PENDING_ADMIN" },
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        })
+      );
+    });
+  });
+
+  describe("GET /api/admin/deletion-requests", () => {
+    it("returns 400 for invalid status", async () => {
+      const response = await getDeletionRequests(
+        request("/api/admin/deletion-requests?status=NOT_AN_ENUM")
+      );
+
+      await expectInvalidQuery(response);
+      expect(mocks.deletionRequestFindMany).not.toHaveBeenCalled();
+    });
+
+    it("defaults to bounded pagination without params", async () => {
+      mocks.deletionRequestFindMany.mockResolvedValue(
+        Array.from({ length: 25 }, (_, index) => deletionRequest(`deletion-${index}`))
+      );
+      mocks.deletionRequestCount.mockResolvedValue(30);
+
+      const response = await getDeletionRequests(
+        request("/api/admin/deletion-requests")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.requests).toHaveLength(25);
+      expect(body.requests.length).toBeLessThanOrEqual(body.pageSize);
+      expect(body).toMatchObject({ page: 1, pageSize: 25, total: 30, totalPages: 2 });
+      // #2597: the "pending" queue is the needs-a-decision queue, so it also
+      // carries a request whose approval started and did not finish — an admin
+      // who cannot see it cannot resume it.
+      expect(mocks.deletionRequestFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: { in: ["PENDING", "APPROVAL_IN_PROGRESS"] } },
+          // INV-OPS-020: the pending queue reads oldest first.
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          take: 25,
+          skip: 0,
+        })
+      );
+    });
+
+    it("returns expected data for valid params", async () => {
+      mocks.deletionRequestFindMany.mockResolvedValue([
+        deletionRequest("deletion-1", "REJECTED"),
+      ]);
+      mocks.deletionRequestCount.mockResolvedValue(1);
+
+      const response = await getDeletionRequests(
+        request("/api/admin/deletion-requests?status=REJECTED&page=2&pageSize=10")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.requests[0]).toMatchObject({
+        id: "deletion-1",
+        status: "REJECTED",
+      });
+      expect(body).toMatchObject({ page: 2, pageSize: 10, total: 1 });
+      expect(mocks.deletionRequestFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: "REJECTED" },
+          // A decided filter stays newest first.
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          take: 10,
+          skip: 10,
+        })
+      );
+    });
+  });
+
+  describe("GET /api/admin/communications/history", () => {
+    it("returns 400 for invalid pagination", async () => {
+      const response = await getCommunicationHistory(
+        request("/api/admin/communications/history?page=0")
+      );
+
+      await expectInvalidQuery(response);
+      expect(mocks.auditLogFindMany).not.toHaveBeenCalled();
+    });
+
+    it("defaults to bounded pagination without params", async () => {
+      mocks.auditLogFindMany.mockResolvedValue(
+        Array.from({ length: 25 }, (_, index) => auditLogEntry(`audit-${index}`))
+      );
+      mocks.auditLogCount.mockResolvedValue(30);
+
+      const response = await getCommunicationHistory(
+        request("/api/admin/communications/history")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.history).toHaveLength(25);
+      expect(body.history.length).toBeLessThanOrEqual(body.pageSize);
+      expect(body).toMatchObject({ page: 1, pageSize: 25, total: 30 });
+      expect(mocks.auditLogFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { action: "BULK_COMMUNICATION_SENT" },
+          take: 25,
+          skip: 0,
+        })
+      );
+    });
+
+    it("returns expected data for valid params", async () => {
+      mocks.auditLogFindMany.mockResolvedValue([auditLogEntry("audit-1")]);
+      mocks.auditLogCount.mockResolvedValue(1);
+
+      const response = await getCommunicationHistory(
+        request("/api/admin/communications/history?page=2&pageSize=10")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.history[0]).toMatchObject({
+        id: "audit-1",
+        subject: "Lodge update",
+        recipientFilter: "all",
+        totalRecipients: 10,
+        eligibleRecipients: 8,
+      });
+      expect(body).toMatchObject({ page: 2, pageSize: 10, total: 1, totalPages: 1 });
+      expect(mocks.auditLogFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { action: "BULK_COMMUNICATION_SENT" },
+          // #5202: `id` breaks ties so a send never repeats or vanishes between pages.
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          take: 10,
+          skip: 10,
+        })
+      );
+    });
+
+    it("counts the total with the same filter the page is read with (#5361)", async () => {
+      mocks.auditLogFindMany.mockResolvedValue([auditLogEntry("audit-1")]);
+      mocks.auditLogCount.mockResolvedValue(30);
+
+      const response = await getCommunicationHistory(
+        request("/api/admin/communications/history?page=2")
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ page: 2, total: 30, totalPages: 2 });
+      const filter = { action: "BULK_COMMUNICATION_SENT" };
+      expect(mocks.auditLogFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: filter })
+      );
+      // The whole argument, so a count with no filter, or a wider one, fails.
+      expect(mocks.auditLogCount).toHaveBeenCalledTimes(1);
+      expect(mocks.auditLogCount).toHaveBeenCalledWith({ where: filter });
+    });
+  });
+
+  // #5202 / INV-OPS-020: the Open filter is the queue's pending work, so it
+  // reads oldest first; the others stay newest first. `id` breaks ties.
+  describe("GET /api/admin/maintenance-reports", () => {
+    it("reads the Open filter oldest first and answers through adminListPage", async () => {
+      mocks.maintenanceReportCount.mockResolvedValue(40);
+
+      const response = await getMaintenanceReports(
+        request("/api/admin/maintenance-reports?page=2")
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ page: 2, pageSize: 25, total: 40, totalPages: 2 });
+      expect(mocks.maintenanceReportFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: "OPEN" },
+          orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          take: 25,
+          skip: 25,
+        })
+      );
+    });
+
+    it.each(["IN_PROGRESS", "RESOLVED", "ALL"])("reads the %s filter newest first", async (status) => {
+      const response = await getMaintenanceReports(
+        request(`/api/admin/maintenance-reports?status=${status}`)
+      );
+
+      expect(response.status).toBe(200);
+      expect(mocks.maintenanceReportFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({ orderBy: [{ createdAt: "desc" }, { id: "desc" }] })
+      );
+    });
+
+    // #5361: the total line and the rows must come from one filter. The route
+    // counts twice, once under the page's filter for the total and once for
+    // the outstanding figure, so each count is answered by the filter it was
+    // asked with and a total read from the wrong one shows in the body.
+    it.each([
+      ["no filter chosen", "", { status: "OPEN" }],
+      ["every status", "?status=ALL", {}],
+      ["a lodge only", "?status=ALL&lodgeId=lodge-1", { lodgeId: "lodge-1" }],
+      [
+        "status, source and lodge all set",
+        "?status=IN_PROGRESS&source=LODGE_QR&lodgeId=lodge-1",
+        { status: "IN_PROGRESS", source: "LODGE_QR", lodgeId: "lodge-1" },
+      ],
+    ])("counts the total with the page's own filter: %s (#5361)", async (_label, query, filter) => {
+      const outstanding = { status: { not: "RESOLVED" } };
+      const answerByFilter = async (...args: unknown[]) =>
+        isDeepStrictEqual((args[0] as { where?: unknown })?.where, outstanding) ? 7 : 40;
+      mocks.maintenanceReportCount
+        .mockImplementationOnce(answerByFilter)
+        .mockImplementationOnce(answerByFilter);
+
+      const response = await getMaintenanceReports(
+        request(`/api/admin/maintenance-reports${query}`)
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        total: 40,
+        totalPages: 2,
+        outstandingCount: 7,
+      });
+      expect(mocks.maintenanceReportFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: filter })
+      );
+      // Whole arguments: exactly these two counts, neither wider than stated.
+      expect(mocks.maintenanceReportCount).toHaveBeenCalledTimes(2);
+      expect(mocks.maintenanceReportCount).toHaveBeenCalledWith({ where: filter });
+      expect(mocks.maintenanceReportCount).toHaveBeenCalledWith({ where: outstanding });
+    });
+  });
+});

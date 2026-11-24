@@ -1,0 +1,247 @@
+import { NextRequest, NextResponse } from "next/server";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { requireAdmin } from "@/lib/session-guards";
+import { transactionContendedResponse } from "@/lib/transaction-contended-response";
+import { isDateOnlyString, parseDateOnly } from "@/lib/date-only";
+import { prisma } from "@/lib/prisma";
+import { z } from "zod";
+import logger from "@/lib/logger";
+import { getAuditRequestContext } from "@/lib/audit";
+import {
+  applyHutLeaderAssignmentEditUnderLocks,
+  deleteHutLeaderAssignmentUnderLodgeLock,
+} from "@/lib/hut-leader-assignment-service";
+import { custodianBedHoldErrorResponse } from "@/lib/custodian-assignment-routes";
+import { isEffectiveModuleEnabled } from "@/lib/admin-modules";
+import { isCustodianOccupancy } from "@/lib/custodian-occupancy";
+import { readSavedHutLeaderSchoolNightsWarning } from "@/lib/hut-leader-school-nights-warning";
+import { dateOnlyStringSchema } from "@/lib/date-only-schema";
+
+const updateSchema = z.object({
+  startDate: dateOnlyStringSchema.optional(),
+  endDate: dateOnlyStringSchema.optional(),
+  lodgeId: z.string().min(1).optional(),
+  // Custodian bed hold (#2286), THREE-state and deliberately so:
+  //   absent          -> leave the bed exactly as it is
+  //   null            -> CLEAR the bed (back to role only; the bed is bookable
+  //                      again from the moment this commits)
+  //   a bed id string -> set/replace the bed
+  // `.nullable()` as well as `.optional()` is what makes "clear" expressible at
+  // all — without it there would be no way to undo a hold except deleting the
+  // whole assignment.
+  bedId: z.string().min(1).nullable().optional(),
+  isCustodian: z.boolean().optional(), // #3817 custodian tick; absent = unchanged
+  // #1668-style explicit override of the over-capacity warning.
+  confirmOverCapacity: z.boolean().optional(),
+  // #2698 ordering case: the officer's EXPLICIT acceptance that holding this
+  // bed narrows an existing whole-lodge hold's represented bed set. Absent is
+  // decline-by-default — 409 CUSTODIAN_OVERLAPS_WHOLE_LODGE_HOLD, nothing
+  // written on either side.
+  amendOverlappingHolds: z.boolean().optional(),
+});
+
+/**
+ * PUT /api/admin/hut-leaders/[id]
+ * Update a hut leader assignment.
+ */
+export async function PUT(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const guard = await requireAdmin({
+    permission: { area: "lodge", level: "edit" },
+  });
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+  const { id } = await params;
+
+  const jsonBody = await parseJsonRequestBody(req, { error: "Invalid JSON" });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = updateSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid input", details: parsed.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  const existing = await prisma.hutLeaderAssignment.findUnique({ where: { id } });
+  if (!existing) {
+    return NextResponse.json({ error: "Assignment not found" }, { status: 404 });
+  }
+
+  const updateData: {
+    startDate?: Date;
+    endDate?: Date;
+    lodgeId?: string;
+    bedId?: string | null;
+    isCustodian?: boolean;
+  } = {};
+  if (parsed.data.startDate) {
+    if (!isDateOnlyString(parsed.data.startDate)) {
+      return NextResponse.json({ error: "Invalid startDate" }, { status: 400 });
+    }
+    updateData.startDate = parseDateOnly(parsed.data.startDate);
+  }
+  if (parsed.data.endDate) {
+    if (!isDateOnlyString(parsed.data.endDate)) {
+      return NextResponse.json({ error: "Invalid endDate" }, { status: 400 });
+    }
+    updateData.endDate = parseDateOnly(parsed.data.endDate);
+  }
+  if (parsed.data.lodgeId) {
+    const lodge = await prisma.lodge.findUnique({
+      where: { id: parsed.data.lodgeId },
+      select: { id: true, active: true },
+    });
+    if (!lodge || !lodge.active) {
+      return NextResponse.json({ error: "Lodge not found or not active" }, { status: 400 });
+    }
+    updateData.lodgeId = lodge.id;
+  }
+
+  // Everything the locked decision rests on is re-derived from the row read
+  // UNDER the lock; the pre-lock `existing` supplies the cheap 404 and the lock
+  // KEY only (#2887 review; the three interleavings are named route tests).
+  // Validate start <= end against the pre-lock row, so an obviously inverted
+  // range is refused without paying for a lock. Re-checked under it.
+  if ((updateData.startDate ?? existing.startDate) > (updateData.endDate ?? existing.endDate)) {
+    return NextResponse.json(
+      { error: "startDate must be before or equal to endDate" },
+      { status: 400 }
+    );
+  }
+
+  // The lock KEY. A concurrent move can make this stale; the locked re-read
+  // below detects that and refuses rather than acting under the wrong key.
+  const intendedLodgeId = updateData.lodgeId ?? existing.lodgeId;
+
+  // Custodian bed hold (#2286), three-state: zod's undefined = key absent
+  // (leave the bed), null = release it, string = set it.
+  if (parsed.data.isCustodian !== undefined) updateData.isCustodian = parsed.data.isCustodian;
+  const bedIdProvided = parsed.data.bedId !== undefined;
+  if (bedIdProvided) {
+    updateData.bedId = parsed.data.bedId ?? null;
+  }
+  const requestedBedId = bedIdProvided ? parsed.data.bedId : existing.bedId;
+  // Module gate (#3817), read only when it matters: SETTING a bed is refused
+  // here; moving nights or lodge is refused under the lock if a bed would move
+  // with it. Ticking Custodian and Release bed always work.
+  const movesNightsOrLodge = Boolean(updateData.startDate || updateData.endDate || updateData.lodgeId);
+  const bedAllocationEnabled = parsed.data.bedId || movesNightsOrLodge
+    ? await isEffectiveModuleEnabled("bedAllocation")
+    : true;
+  if (parsed.data.bedId && !bedAllocationEnabled) {
+    return NextResponse.json(
+      {
+        error:
+          "Bed allocation is turned off for this club, so a bed cannot be held for a hut leader.",
+        code: "MODULE_DISABLED",
+      },
+      { status: 400 },
+    );
+  }
+
+  const auditRequest = getAuditRequestContext(req);
+  // #2698: decided BEFORE any lock, because it decides WHICH locks are taken
+  // (INV-LOCK-002: global then lodge, never the other order) — and only when a
+  // bed is involved (review A-3), because an edit ending with no bed held can
+  // narrow no hold and must not take the club-wide key that serialises cancel,
+  // capture, settle, refund and credit-restore. `requestedBedId` is the
+  // pre-lock view: a stale null costs the officer a retry and nothing more,
+  // because the locked ordering check then THROWS with nothing written.
+  // #3817: a ticked custodian is an occupant too, so it may stand in for a bed.
+  const amendRequested = parsed.data.amendOverlappingHolds === true &&
+    isCustodianOccupancy({
+      bedId: requestedBedId,
+      isCustodian: parsed.data.isCustodian ?? existing.isCustodian,
+    });
+
+  try {
+    // Everything from here runs under the lodge capacity key, and the #2698
+    // amend path additionally under the global cohort key ahead of it
+    // (INV-LOCK-002). Both the locks and the reads that decide the edit live in
+    // `hut-leader-assignment-service.ts`; see its module note for why.
+    const refusal = await applyHutLeaderAssignmentEditUnderLocks({
+      assignmentId: id,
+      intendedLodgeId,
+      updateData,
+      bedIdProvided,
+      requestedBedId: parsed.data.bedId,
+      confirmOverCapacity: parsed.data.confirmOverCapacity,
+      amendAccepted: amendRequested,
+      bedAllocationEnabled,
+      actorMemberId: session.user.id,
+      auditRequest,
+    });
+
+    if (refusal) {
+      return NextResponse.json(
+        { error: refusal.error, ...refusal.details },
+        { status: refusal.status },
+      );
+    }
+    // #3821: the create's school-nights advisory, of the row as saved.
+    const schoolNightsWarning = await readSavedHutLeaderSchoolNightsWarning(prisma, id);
+    return NextResponse.json({ success: true, schoolNightsWarning });
+  } catch (err) {
+    const custodianResponse = custodianBedHoldErrorResponse(err);
+    if (custodianResponse) return custodianResponse;
+    const contended = transactionContendedResponse(err, "Hut leader assignment edit contended for the lock(1) budget", {
+      context: { assignmentId: id },
+    });
+    if (contended) return contended;
+    logger.error({ err }, "Error updating hut leader assignment");
+    return NextResponse.json({ error: "Failed to update assignment" }, { status: 500 });
+  }
+}
+
+/**
+ * DELETE /api/admin/hut-leaders/[id]
+ * Delete a hut leader assignment.
+ *
+ * Under the lodge capacity key since #2698 — removing a custodian bed hold
+ * widens the represented bed set of every overlapping whole-lodge hold
+ * (`INV-CAP-038`), which is a capacity move. The key, the locked re-read and
+ * the audited delete live in `hut-leader-assignment-service.ts`; the response
+ * contract here is unchanged.
+ */
+export async function DELETE(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const guard = await requireAdmin({
+    permission: { area: "lodge", level: "edit" },
+  });
+  if (!guard.ok) return guard.response;
+  const { id } = await params;
+
+  // The cheap 404 and the lock KEY. Every fact the delete records comes from
+  // the re-read under the key (#2887's rule, applied here too).
+  const existing = await prisma.hutLeaderAssignment.findUnique({ where: { id } });
+  if (!existing) {
+    return NextResponse.json({ error: "Assignment not found" }, { status: 404 });
+  }
+
+  try {
+    const refusal = await deleteHutLeaderAssignmentUnderLodgeLock({
+      assignmentId: id,
+      lodgeId: existing.lodgeId,
+      actorMemberId: guard.session.user.id,
+      auditRequest: getAuditRequestContext(req),
+    });
+    if (refusal) {
+      return NextResponse.json(
+        { error: refusal.error },
+        { status: refusal.status },
+      );
+    }
+    logger.info({ assignmentId: id }, "Hut leader assignment deleted");
+    return NextResponse.json({ success: true });
+  } catch (err) {
+    logger.error({ err }, "Error deleting hut leader assignment");
+    return NextResponse.json({ error: "Failed to delete assignment" }, { status: 500 });
+  }
+}

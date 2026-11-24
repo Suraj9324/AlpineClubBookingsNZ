@@ -1,0 +1,863 @@
+import { NextRequest } from "next/server";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { hutLeaderStayGuestRow } from "@/lib/__tests__/helpers/hut-leader-stay";
+
+vi.setConfig({ testTimeout: 10_000 });
+
+// ---------------------------------------------------------------------------
+// Mock Prisma
+// ---------------------------------------------------------------------------
+
+const mockPrisma = {
+  hutLeaderAssignment: {
+    count: vi.fn(),
+    findMany: vi.fn(),
+    findFirst: vi.fn(),
+    create: vi.fn(),
+  },
+  booking: {
+    count: vi.fn(),
+    findMany: vi.fn(),
+  },
+  bookingGuest: {
+    findMany: vi.fn(),
+  },
+  member: {
+    count: vi.fn(),
+    findUnique: vi.fn(),
+  },
+  // Module flags are read via loadEffectiveModuleFlags; null normalizes to all
+  // modules on, so the hut-leader auto-assign runs.
+  clubModuleSettings: {
+    findUnique: vi.fn().mockResolvedValue(null),
+  },
+  lodgeSettings: {
+    findUnique: vi.fn().mockResolvedValue(null),
+  },
+  // #2698: the hut-leader write routes audit themselves now (category `lodge`),
+  // and the real `createAuditLog` runs against this double.
+  auditLog: { create: vi.fn(async () => ({ id: "audit-1" })) },
+  lodge: {
+    findFirst: vi.fn().mockResolvedValue({ id: "lodge-1" }),
+    // The auto-assign cron iterates active lodges (#2915); a single-lodge club
+    // is the shape these cases already assume.
+    findMany: vi.fn().mockResolvedValue([{ id: "lodge-1" }]),
+    // #2887: the hut-leader POST resolves its named lodge and checks it active.
+    findUnique: vi.fn().mockResolvedValue({ id: "lodge-1", active: true }),
+  },
+  /*
+    #2887: hut-leader creation is a LOCKED write now — the POST, the PUT and
+    the auto-assign cron all take the per-lodge capacity key and re-read under
+    it — so the double needs the interactive transaction and the advisory-lock
+    statement. It hands back this same object, so assertions keep observing the
+    same `hutLeaderAssignment` mocks whether a call arrived through `prisma` or
+    through `tx`.
+  */
+  $executeRaw: vi.fn(async () => 0),
+  $transaction: vi.fn(async (arg: unknown) =>
+    typeof arg === "function"
+      ? (arg as (tx: typeof mockPrisma) => unknown)(mockPrisma)
+      : arg,
+  ),
+};
+
+vi.mock("@/lib/prisma", () => ({ prisma: mockPrisma }));
+vi.mock("@/lib/logger", () => ({
+  default: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}));
+
+// ---------------------------------------------------------------------------
+// Mock auth
+// ---------------------------------------------------------------------------
+
+const mockAuth = vi.fn();
+vi.mock("@/lib/auth", () => ({
+  auth: () => mockAuth(),
+}));
+
+// ---------------------------------------------------------------------------
+// #25 Feature 1: Overlap Validation (Pure Function)
+// ---------------------------------------------------------------------------
+
+describe("#25: calculateOverlapDays", () => {
+  function d(str: string) {
+    return new Date(str + "T00:00:00.000Z");
+  }
+
+  it("returns 0 when ranges do not overlap", async () => {
+    const { calculateOverlapDays } = await import("@/lib/hut-leader-overlap");
+    expect(calculateOverlapDays(d("2026-04-01"), d("2026-04-05"), d("2026-04-10"), d("2026-04-15"))).toBe(0);
+  });
+
+  it("returns 1 for single-day handover overlap (A ends on B start)", async () => {
+    const { calculateOverlapDays } = await import("@/lib/hut-leader-overlap");
+    // A: Apr 7-10, B: Apr 10-12 → overlap on Apr 10 = 1 day
+    expect(calculateOverlapDays(d("2026-04-07"), d("2026-04-10"), d("2026-04-10"), d("2026-04-12"))).toBe(1);
+  });
+
+  it("returns 2 for 2-day overlap", async () => {
+    const { calculateOverlapDays } = await import("@/lib/hut-leader-overlap");
+    // A: Apr 7-10, B: Apr 9-12 → overlap on Apr 9-10 = 2 days
+    expect(calculateOverlapDays(d("2026-04-07"), d("2026-04-10"), d("2026-04-09"), d("2026-04-12"))).toBe(2);
+  });
+
+  it("returns full range when one contains the other", async () => {
+    const { calculateOverlapDays } = await import("@/lib/hut-leader-overlap");
+    expect(calculateOverlapDays(d("2026-04-05"), d("2026-04-15"), d("2026-04-08"), d("2026-04-10"))).toBe(3);
+  });
+
+  it("returns correct overlap for identical ranges", async () => {
+    const { calculateOverlapDays } = await import("@/lib/hut-leader-overlap");
+    expect(calculateOverlapDays(d("2026-04-05"), d("2026-04-10"), d("2026-04-05"), d("2026-04-10"))).toBe(6);
+  });
+
+  it("returns 0 when ranges are adjacent but not overlapping", async () => {
+    const { calculateOverlapDays } = await import("@/lib/hut-leader-overlap");
+    expect(calculateOverlapDays(d("2026-04-01"), d("2026-04-05"), d("2026-04-06"), d("2026-04-10"))).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #25 Feature 1: POST /api/admin/hut-leaders Overlap Enforcement
+// ---------------------------------------------------------------------------
+
+describe("#25: Hut Leader POST Overlap Enforcement", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockPrisma.lodge.findFirst.mockResolvedValue({ id: "lodge-1" });
+    mockPrisma.lodge.findUnique.mockResolvedValue({ id: "lodge-1", active: true });
+  });
+
+  function d(str: string) {
+    return new Date(str + "T00:00:00.000Z");
+  }
+
+  it("allows 1-day overlap (handover scenario) — returns 201", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.member.findUnique
+      .mockResolvedValueOnce({
+        id: "admin-1",
+        active: true,
+        forcePasswordChange: false,
+        accessRoles: [{ role: "ADMIN" }],
+      })
+      .mockResolvedValue({
+        id: "m1",
+        active: true,
+        role: "USER",
+        accessRoles: [{ role: "USER" }],
+      });
+    // Existing: Apr 7-10, New: Apr 10-12 → 1 day overlap = OK
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([
+      {
+        id: "e1",
+        startDate: d("2026-04-07"),
+        endDate: d("2026-04-10"),
+        member: { firstName: "Alice", lastName: "Smith" },
+      },
+    ]);
+    mockPrisma.hutLeaderAssignment.create.mockResolvedValue({ id: "new-1" });
+    // #3817: the member stays the nights 10-12 Apr, so the stay check passes.
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([
+      hutLeaderStayGuestRow("2026-04-10", "2026-04-13"),
+    ]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { POST } = await import("@/app/api/admin/hut-leaders/route");
+    const req = new Request("http://localhost/api/admin/hut-leaders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ memberId: "m1", startDate: "2026-04-10", endDate: "2026-04-12", lodgeId: "lodge-1" }),
+    });
+
+    const res = await POST(req as any);
+    expect(res.status).toBe(201);
+  });
+
+  it("rejects 2+ day overlap with clear error message — returns 409", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.member.findUnique
+      .mockResolvedValueOnce({
+        id: "admin-1",
+        active: true,
+        forcePasswordChange: false,
+        accessRoles: [{ role: "ADMIN" }],
+      })
+      .mockResolvedValue({
+        id: "m1",
+        active: true,
+        role: "USER",
+        accessRoles: [{ role: "USER" }],
+      });
+    // Existing: Apr 7-10, New: Apr 9-12 → 2 days overlap = rejected
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([
+      {
+        id: "e1",
+        startDate: d("2026-04-07"),
+        endDate: d("2026-04-10"),
+        member: { firstName: "Alice", lastName: "Smith" },
+      },
+    ]);
+
+    const { POST } = await import("@/app/api/admin/hut-leaders/route");
+    const req = new Request("http://localhost/api/admin/hut-leaders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ memberId: "m1", startDate: "2026-04-09", endDate: "2026-04-12", lodgeId: "lodge-1" }),
+    });
+
+    const res = await POST(req as any);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("Alice Smith");
+    expect(body.error).toContain("2 days");
+    expect(body.error).toContain("Maximum 1 day overlap");
+  });
+
+  it("allows creation when no overlapping assignments exist", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.member.findUnique
+      .mockResolvedValueOnce({
+        id: "admin-1",
+        active: true,
+        forcePasswordChange: false,
+        accessRoles: [{ role: "ADMIN" }],
+      })
+      .mockResolvedValue({
+        id: "m1",
+        active: true,
+        role: "USER",
+        accessRoles: [{ role: "USER" }],
+      });
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+    mockPrisma.hutLeaderAssignment.create.mockResolvedValue({ id: "new-1" });
+    // #3817: the member stays the nights 15-18 Apr, so the stay check passes.
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([
+      hutLeaderStayGuestRow("2026-04-15", "2026-04-19"),
+    ]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { POST } = await import("@/app/api/admin/hut-leaders/route");
+    const req = new Request("http://localhost/api/admin/hut-leaders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ memberId: "m1", startDate: "2026-04-15", endDate: "2026-04-18", lodgeId: "lodge-1" }),
+    });
+
+    const res = await POST(req as any);
+    expect(res.status).toBe(201);
+  });
+
+  it("returns 403 for non-admin", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "u1", role: "USER", accessRoles: [{ role: "USER" }] } });
+
+    const { POST } = await import("@/app/api/admin/hut-leaders/route");
+    const req = new Request("http://localhost/api/admin/hut-leaders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ memberId: "m1", startDate: "2026-04-10", endDate: "2026-04-12", lodgeId: "lodge-1" }),
+    });
+
+    const res = await POST(req as any);
+    expect(res.status).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #25 Feature 2: Eligible Members API
+// ---------------------------------------------------------------------------
+
+describe("#25: Eligible Members API", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockPrisma.member.findUnique.mockResolvedValue({
+      id: "admin-1",
+      active: true,
+      forcePasswordChange: false,
+      accessRoles: [{ role: "ADMIN" }],
+    });
+  });
+
+  function d(str: string) {
+    // Use date-only string → parsed as UTC midnight by JS
+    return new Date(str);
+  }
+
+  it("returns members with booking and suggested dates", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([
+      {
+        memberId: "m1",
+        member: { id: "m1", firstName: "Wayne", lastName: "Peterson", email: "wayne@test.com", active: true },
+        booking: { checkIn: d("2026-04-06"), checkOut: d("2026-04-08") },
+      },
+    ]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/eligible-members/route");
+    const { NextRequest } = await import("next/server");
+    const req = new NextRequest(
+      "http://localhost/api/admin/hut-leaders/eligible-members?startDate=2026-04-06&endDate=2026-04-08&lodgeId=lodge-1"
+    );
+
+    const res = await GET(req);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.members).toHaveLength(1);
+    expect(body.members[0].id).toBe("m1");
+    expect(body.members[0].firstName).toBe("Wayne");
+    // Verify booking-related fields exist (exact dates depend on tz)
+    expect(body.members[0]).toHaveProperty("bookingCheckIn");
+    expect(body.members[0]).toHaveProperty("bookingCheckOut");
+    expect(body.members[0]).toHaveProperty("suggestedStartDate");
+    expect(body.members[0]).toHaveProperty("suggestedEndDate");
+    expect(body.members[0].hutLeaderEligible).toBe(false);
+    expect(body.members[0].hutLeaderEligibleAt).toBeNull();
+  });
+
+  it("sorts hut-leader-qualified members first without excluding others", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([
+      {
+        memberId: "m-alpha",
+        member: {
+          id: "m-alpha",
+          firstName: "Amy",
+          lastName: "Alpha",
+          email: "amy@test.com",
+          active: true,
+          hutLeaderEligible: false,
+          hutLeaderEligibleAt: null,
+        },
+        booking: { checkIn: d("2026-04-06"), checkOut: d("2026-04-08") },
+      },
+      {
+        memberId: "m-zulu",
+        member: {
+          id: "m-zulu",
+          firstName: "Zed",
+          lastName: "Zulu",
+          email: "zed@test.com",
+          active: true,
+          hutLeaderEligible: true,
+          hutLeaderEligibleAt: d("2026-04-01"),
+        },
+        booking: { checkIn: d("2026-04-06"), checkOut: d("2026-04-08") },
+      },
+    ]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/eligible-members/route");
+    const { NextRequest } = await import("next/server");
+    const req = new NextRequest(
+      "http://localhost/api/admin/hut-leaders/eligible-members?startDate=2026-04-06&endDate=2026-04-08&lodgeId=lodge-1"
+    );
+
+    const res = await GET(req);
+    const body = await res.json();
+    expect(body.members.map((m: { id: string }) => m.id)).toEqual([
+      "m-zulu",
+      "m-alpha",
+    ]);
+    expect(body.members[0].hutLeaderEligible).toBe(true);
+    expect(body.members[0].hutLeaderEligibleAt).toBe("2026-04-01T00:00:00.000Z");
+    expect(body.members[1].hutLeaderEligible).toBe(false);
+  });
+
+  it("uses earliest checkIn and latest checkOut for multiple bookings", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([
+      {
+        memberId: "m1",
+        member: { id: "m1", firstName: "Jane", lastName: "Doe", email: "j@t.com", active: true },
+        booking: { checkIn: d("2026-04-10"), checkOut: d("2026-04-12") },
+      },
+      {
+        memberId: "m1",
+        member: { id: "m1", firstName: "Jane", lastName: "Doe", email: "j@t.com", active: true },
+        booking: { checkIn: d("2026-04-06"), checkOut: d("2026-04-08") },
+      },
+    ]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/eligible-members/route");
+    const { NextRequest } = await import("next/server");
+    const req = new NextRequest(
+      "http://localhost/api/admin/hut-leaders/eligible-members?startDate=2026-04-06&endDate=2026-04-14&lodgeId=lodge-1"
+    );
+
+    const res = await GET(req);
+    const body = await res.json();
+    expect(body.members).toHaveLength(1);
+    // Earliest checkIn is Apr 6, latest checkOut is Apr 12
+    // suggestedStartDate should match earliest checkIn, suggestedEndDate the latest checkOut
+    expect(body.members[0].suggestedStartDate).toBe(body.members[0].bookingCheckIn);
+    // bookingCheckIn should be from the Apr 6 booking (earlier)
+    expect(new Date(body.members[0].bookingCheckIn).getTime())
+      .toBeLessThanOrEqual(new Date(body.members[0].bookingCheckOut).getTime());
+  });
+
+  it("filters out inactive members", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([
+      {
+        memberId: "m1",
+        member: { id: "m1", firstName: "Inactive", lastName: "User", email: "i@t.com", active: false },
+        booking: { checkIn: d("2026-04-06"), checkOut: d("2026-04-08") },
+      },
+    ]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/eligible-members/route");
+    const { NextRequest } = await import("next/server");
+    const req = new NextRequest(
+      "http://localhost/api/admin/hut-leaders/eligible-members?startDate=2026-04-06&endDate=2026-04-08&lodgeId=lodge-1"
+    );
+
+    const res = await GET(req);
+    const body = await res.json();
+    expect(body.members).toHaveLength(0);
+  });
+
+  it("returns 400 for missing date parameters", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/eligible-members/route");
+    const { NextRequest } = await import("next/server");
+    const req = new NextRequest("http://localhost/api/admin/hut-leaders/eligible-members?lodgeId=lodge-1");
+
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
+  it.each([
+    ["startDate=2026-02-30&endDate=2026-03-02"],
+    ["startDate=2026-02-26&endDate=2026-02-30"],
+  ])("returns 400 for a date that is not a real calendar day (%s)", async (query) => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/eligible-members/route");
+    const { NextRequest } = await import("next/server");
+    const req = new NextRequest(`http://localhost/api/admin/hut-leaders/eligible-members?${query}&lodgeId=lodge-1`);
+
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({ error: "startDate and endDate are required (YYYY-MM-DD)" });
+    expect(mockPrisma.bookingGuest.findMany).not.toHaveBeenCalled();
+  });
+
+  it("returns 403 for non-admin", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "u1", role: "USER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.member.findUnique.mockResolvedValue({
+      id: "u1",
+      active: true,
+      forcePasswordChange: false,
+      accessRoles: [{ role: "USER" }],
+    });
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/eligible-members/route");
+    const { NextRequest } = await import("next/server");
+    const req = new NextRequest(
+      "http://localhost/api/admin/hut-leaders/eligible-members?startDate=2026-04-06&endDate=2026-04-08&lodgeId=lodge-1"
+    );
+
+    const res = await GET(req);
+    expect(res.status).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #25 Feature 3: Auto-Assign Cron
+// ---------------------------------------------------------------------------
+
+describe("#25: Auto-Assign Hut Leaders", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockPrisma.member.findUnique.mockResolvedValue({
+      id: "admin-1",
+      active: true,
+      forcePasswordChange: false,
+      accessRoles: [{ role: "ADMIN" }],
+    });
+    mockPrisma.lodgeSettings.findUnique.mockResolvedValue(null);
+    vi.useFakeTimers();
+    // Set to a time that resolves to the desired "today" in NZST after setHours(0,0,0,0)
+    vi.setSystemTime(new Date("2026-04-08T06:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Helper: a stored `@db.Date` calendar day (UTC midnight), which is what the
+  // cron's days and the booking columns are since #3817 — the night model
+  // refuses a local-midnight timestamp outright.
+  function localMidnight(str: string): Date {
+    return new Date(str + "T00:00:00.000Z");
+  }
+
+  it("auto-assigns when exactly 1 adult member has PAID booking", async () => {
+    mockPrisma.hutLeaderAssignment.findFirst.mockResolvedValue(null);
+    const checkIn = localMidnight("2026-04-08");
+    const checkOut = localMidnight("2026-04-10");
+    mockPrisma.booking.findMany.mockResolvedValue([
+      {
+        id: "b1",
+        checkIn,
+        checkOut,
+        guests: [
+          { memberId: "m1", member: { id: "m1", firstName: "John", lastName: "Doe", active: true } },
+        ],
+      },
+    ]);
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+    mockPrisma.hutLeaderAssignment.create.mockResolvedValue({ id: "new-assign" });
+
+    const { autoAssignHutLeaders } = await import("@/lib/cron-hut-leader-auto-assign");
+    const result = await autoAssignHutLeaders();
+    expect(result.assignedCount).toBeGreaterThan(0);
+    expect(result.assignedDates.length).toBeGreaterThan(0);
+    expect(mockPrisma.hutLeaderAssignment.create).toHaveBeenCalled();
+  });
+
+  it("skips when 0 adult members are booked", async () => {
+    mockPrisma.hutLeaderAssignment.findFirst.mockResolvedValue(null);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+
+    const { autoAssignHutLeaders } = await import("@/lib/cron-hut-leader-auto-assign");
+    const result = await autoAssignHutLeaders();
+    expect(result.assignedCount).toBe(0);
+    expect(mockPrisma.hutLeaderAssignment.create).not.toHaveBeenCalled();
+  });
+
+  it("skips when 2+ adult members are booked", async () => {
+    mockPrisma.hutLeaderAssignment.findFirst.mockResolvedValue(null);
+    const checkIn = localMidnight("2026-04-08");
+    const checkOut = localMidnight("2026-04-10");
+    mockPrisma.booking.findMany.mockResolvedValue([
+      {
+        id: "b1",
+        checkIn,
+        checkOut,
+        guests: [
+          { memberId: "m1", member: { id: "m1", firstName: "John", lastName: "Doe", active: true } },
+          { memberId: "m2", member: { id: "m2", firstName: "Jane", lastName: "Smith", active: true } },
+        ],
+      },
+    ]);
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+
+    const { autoAssignHutLeaders } = await import("@/lib/cron-hut-leader-auto-assign");
+    const result = await autoAssignHutLeaders();
+    expect(result.assignedCount).toBe(0);
+    expect(mockPrisma.hutLeaderAssignment.create).not.toHaveBeenCalled();
+  });
+
+  // #3818: "already covered" is the shared presence-aware answer — the row
+  // must claim the night AND its leader must be staying it.
+  const coveringLeaderRow = {
+    id: "exists",
+    memberId: "leader",
+    lodgeId: "lodge-1",
+    startDate: new Date("2026-04-01T00:00:00.000Z"),
+    endDate: new Date("2026-04-30T00:00:00.000Z"),
+    source: "MANUAL",
+    bedId: null,
+  };
+  const leaderStayingAllMonth = {
+    memberId: "leader",
+    stayStart: new Date("2026-04-01T00:00:00.000Z"),
+    stayEnd: new Date("2026-05-01T00:00:00.000Z"),
+    nights: [],
+    booking: {
+      lodgeId: "lodge-1",
+      checkIn: new Date("2026-04-01T00:00:00.000Z"),
+      checkOut: new Date("2026-05-01T00:00:00.000Z"),
+    },
+  };
+
+  it("skips days that already have a leader assigned and staying", async () => {
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([coveringLeaderRow]);
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([leaderStayingAllMonth]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { autoAssignHutLeaders } = await import("@/lib/cron-hut-leader-auto-assign");
+    const result = await autoAssignHutLeaders();
+    expect(result.assignedCount).toBe(0);
+    expect(mockPrisma.hutLeaderAssignment.create).not.toHaveBeenCalled();
+    // Skipped at the probe: no candidate search ran for a covered night. The
+    // only booking read is the cover's own school-booking read (#3819), which
+    // carries the school filter under AND.
+    const candidateSearches = mockPrisma.booking.findMany.mock.calls.filter(
+      (call: unknown[]) => !(call[0] as { where?: { AND?: unknown } } | undefined)?.where?.AND,
+    );
+    expect(candidateSearches).toHaveLength(0);
+  });
+
+  it("does NOT skip a night whose assigned leader is not staying (#3818)", async () => {
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([coveringLeaderRow]);
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { autoAssignHutLeaders } = await import("@/lib/cron-hut-leader-auto-assign");
+    await autoAssignHutLeaders();
+    // The probe found no valid cover, so the job looked for a sole adult.
+    expect(mockPrisma.booking.findMany).toHaveBeenCalled();
+  });
+
+  it("uses the configured hut-leader lookahead window", async () => {
+    mockPrisma.lodgeSettings.findUnique.mockResolvedValue({
+      capacity: null,
+      hutLeaderLookaheadDays: 2,
+    });
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([coveringLeaderRow]);
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([leaderStayingAllMonth]);
+
+    const { autoAssignHutLeaders } = await import("@/lib/cron-hut-leader-auto-assign");
+    await autoAssignHutLeaders();
+
+    // The cheap already-covered probe reads the lodge's whole window ONCE
+    // (#3818 review), today through today + the two-day lookahead.
+    expect(mockPrisma.hutLeaderAssignment.findMany).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.hutLeaderAssignment.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          startDate: { lte: new Date("2026-04-10T00:00:00.000Z") },
+          endDate: { gte: new Date("2026-04-08T00:00:00.000Z") },
+        }),
+      }),
+    );
+  });
+
+  describe("in a container running TZ=Pacific/Auckland (#3818)", () => {
+    // Production sets TZ=Pacific/Auckland (Dockerfile, docker-compose). date-fns
+    // `eachDayOfInterval` returns LOCAL midnights there, i.e. 11:00/12:00Z of the
+    // PREVIOUS day, so the job used to run one night early. CI runs in UTC, where
+    // that bug is invisible, so this pins the process zone for one case.
+    const originalTz = process.env.TZ;
+    afterEach(() => {
+      if (originalTz === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTz;
+    });
+
+    it("walks the stored lodge nights today .. today + lookahead, not the night before", async () => {
+      process.env.TZ = "Pacific/Auckland";
+      // Premise: the process zone really moved, or this case proves nothing.
+      expect(new Date("2026-04-08T00:00:00.000Z").getTimezoneOffset()).not.toBe(0);
+      mockPrisma.lodgeSettings.findUnique.mockResolvedValue({
+        capacity: null,
+        hutLeaderLookaheadDays: 2,
+      });
+      mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+      mockPrisma.booking.findMany.mockResolvedValue([]);
+
+      const { autoAssignHutLeaders } = await import("@/lib/cron-hut-leader-auto-assign");
+      await autoAssignHutLeaders();
+
+      // One sole-adult read per uncovered night, each on a UTC-midnight day.
+      // The cover's school-group read (#3819) is not one: it selects no
+      // guests, the job's candidate read does (#3821).
+      const nights = mockPrisma.booking.findMany.mock.calls
+        .filter((call: unknown[]) => Boolean((call[0] as { select: { guests?: unknown } }).select.guests))
+        .map((call: unknown[]) =>
+        (call[0] as { where: { checkIn: { lte: Date } } }).where.checkIn.lte.toISOString(),
+      );
+      expect(nights).toEqual([
+        "2026-04-08T00:00:00.000Z",
+        "2026-04-09T00:00:00.000Z",
+        "2026-04-10T00:00:00.000Z",
+      ]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #25 Feature 4: Unassigned Dates API
+// ---------------------------------------------------------------------------
+
+describe("#25: Unassigned Dates API", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockPrisma.member.findUnique.mockResolvedValue({
+      id: "admin-1",
+      active: true,
+      forcePasswordChange: false,
+      accessRoles: [{ role: "ADMIN" }],
+    });
+    mockPrisma.lodgeSettings.findUnique.mockResolvedValue(null);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-08T06:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function localMidnight(str: string): Date {
+    return new Date(str + "T00:00:00");
+  }
+
+  it("returns dates with bookings but no hut leader assigned", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+    // Booking covering a range within the configured lookahead
+    const checkIn = localMidnight("2026-04-10");
+    const checkOut = localMidnight("2026-04-12");
+    mockPrisma.booking.findMany.mockResolvedValue([
+      { checkIn, checkOut, _count: { guests: 3 } },
+    ]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/unassigned-dates/route");
+    // #2887: this route names its lodge like every other hut-leader read.
+    const res = await GET(
+      new NextRequest("http://localhost/api/admin/hut-leaders/unassigned-dates?lodgeId=lodge-1"),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Should have at least 1 unassigned date
+    expect(body.unassignedDates.length).toBeGreaterThan(0);
+    // All entries should have date, bookingCount, guestCount
+    for (const entry of body.unassignedDates) {
+      expect(entry).toHaveProperty("date");
+      expect(entry).toHaveProperty("bookingCount");
+      expect(entry).toHaveProperty("guestCount");
+      expect(entry.bookingCount).toBeGreaterThan(0);
+      expect(entry.guestCount).toBeGreaterThan(0);
+    }
+  });
+
+  it("returns empty when all dates are covered by assignments", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    // Assignment covers the entire configured window
+    // #3818: covered means assigned AND staying, so the leader's stay is
+    // supplied too (UTC-midnight stored days, as the columns hold them).
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([
+      {
+        id: "a1",
+        memberId: "leader",
+        // Real lodge ids on all three rows, so the lodge match is exercised
+        // rather than passing as undefined === undefined.
+        lodgeId: "lodge-1",
+        source: "MANUAL",
+        bedId: null,
+        startDate: localMidnight("2026-04-01"),
+        endDate: localMidnight("2026-04-30"),
+      },
+    ]);
+    mockPrisma.bookingGuest.findMany.mockResolvedValue([
+      {
+        memberId: "leader",
+        stayStart: new Date("2026-04-01T00:00:00.000Z"),
+        stayEnd: new Date("2026-05-01T00:00:00.000Z"),
+        nights: [],
+        booking: {
+          lodgeId: "lodge-1",
+          checkIn: new Date("2026-04-01T00:00:00.000Z"),
+          checkOut: new Date("2026-05-01T00:00:00.000Z"),
+        },
+      },
+    ]);
+    mockPrisma.booking.findMany.mockResolvedValue([
+      {
+        lodgeId: "lodge-1",
+        checkIn: localMidnight("2026-04-10"),
+        checkOut: localMidnight("2026-04-12"),
+        _count: { guests: 2 },
+      },
+    ]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/unassigned-dates/route");
+    // #2887: this route names its lodge like every other hut-leader read.
+    const res = await GET(
+      new NextRequest("http://localhost/api/admin/hut-leaders/unassigned-dates?lodgeId=lodge-1"),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.unassignedDates).toHaveLength(0);
+  });
+
+  it("returns empty when no bookings exist", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/unassigned-dates/route");
+    // #2887: this route names its lodge like every other hut-leader read.
+    const res = await GET(
+      new NextRequest("http://localhost/api/admin/hut-leaders/unassigned-dates?lodgeId=lodge-1"),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.unassignedDates).toHaveLength(0);
+  });
+
+  it("returns 403 for non-admin", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "u1", role: "USER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.member.findUnique.mockResolvedValue({
+      id: "u1",
+      active: true,
+      forcePasswordChange: false,
+      accessRoles: [{ role: "USER" }],
+    });
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/unassigned-dates/route");
+    // #2887: this route names its lodge like every other hut-leader read.
+    const res = await GET(
+      new NextRequest("http://localhost/api/admin/hut-leaders/unassigned-dates?lodgeId=lodge-1"),
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("includes correct guest count for each date", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+    const checkIn = localMidnight("2026-04-10");
+    const checkOut = localMidnight("2026-04-11");
+    mockPrisma.booking.findMany.mockResolvedValue([
+      { checkIn, checkOut, _count: { guests: 4 } },
+    ]);
+
+    const { GET } = await import("@/app/api/admin/hut-leaders/unassigned-dates/route");
+    // #2887: this route names its lodge like every other hut-leader read.
+    const res = await GET(
+      new NextRequest("http://localhost/api/admin/hut-leaders/unassigned-dates?lodgeId=lodge-1"),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const relevant = body.unassignedDates.filter((d: any) => d.guestCount === 4);
+    expect(relevant.length).toBeGreaterThan(0);
+    expect(relevant[0].bookingCount).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #25 Feature 4: Dashboard Notification (Server Component Logic)
+// ---------------------------------------------------------------------------
+
+describe("#25: Dashboard Hut Leader Warning", () => {
+  it("admin dashboard page imports and uses hut leader check logic", async () => {
+    // Verify the dashboard page file exists and imports the needed modules
+    const fs = await import("fs");
+    const path = await import("path");
+    const dashboardPath = path.resolve("src/app/(admin)/admin/dashboard/page.tsx");
+    const content = fs.readFileSync(dashboardPath, "utf-8");
+    // Should call the shared coverage helper rather than reimplementing the
+    // unassigned-date query in the page.
+    expect(content).toContain("getUnassignedHutLeaderDates");
+    expect(content).not.toContain("hutLeaderAssignment.findMany");
+    // Should have the warning UI, using the configurable hut-leader label
+    // (CLUB_HUT_LEADER_LABEL) rather than a hard-coded "Hut Leader" literal.
+    expect(content).toContain("CLUB_HUT_LEADER_LABEL");
+    expect(content).toContain("who counts"); // #3821: "Nights without a … who counts"
+    // Should link to hut leaders page
+    expect(content).toContain("/admin/hut-leaders");
+    // Should show unassigned dates count
+    expect(content).toContain("unassignedDatesWithBookings");
+  });
+});

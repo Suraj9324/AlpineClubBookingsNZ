@@ -1,0 +1,188 @@
+// @vitest-environment jsdom
+
+import { render, screen, waitFor } from "@/lib/__tests__/support/club-time-render";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+// The live checks of System Health; its server page adds the integration
+// readiness section below them (S1 #4796), covered in admin-setup-hubs.test.tsx.
+import { AdminHealthDashboard as AdminHealthPage } from "@/app/(admin)/admin/system/health/_components/health-dashboard";
+import BackgroundJobsPage from "@/app/(admin)/admin/system/background-jobs/page";
+
+const fetchMock = vi.fn();
+
+function healthResponse() {
+  return {
+    health: {
+      status: "healthy",
+      version: "0.1.0",
+      uptime: 1000,
+      checks: {
+        db: { status: "ok", latencyMs: 5 },
+      },
+    },
+    cronJobs: {
+      "finance-daily-sync": [
+        {
+          id: "cron-1",
+          jobName: "finance-daily-sync",
+          startedAt: "2026-05-14T22:15:00.000Z",
+          completedAt: "2026-05-14T22:16:00.000Z",
+          durationMs: 60000,
+          status: "SUCCESS",
+          resultSummary: null,
+          error: null,
+        },
+      ],
+    },
+    cronHealth: {
+      generatedAt: "2026-05-15T00:00:00.000Z",
+      cronEnabled: true,
+      defaultTimezone: "Pacific/Auckland",
+      jobs: [
+        {
+          jobName: "finance-daily-sync",
+          label: "Finance daily sync",
+          schedule: "15 10 * * *",
+          timezone: "Pacific/Auckland",
+          expectedLocalTime: "10:15 NZT/NZDT daily",
+          staleAfterMinutes: 2160,
+          enabled: true,
+          disabledReason: null,
+          recordsRuns: true,
+          note:
+            "Runs at 10:15 local New Zealand time in Pacific/Auckland; UTC dashboards show this as 22:15 on the previous day during NZST or 21:15 during NZDT.",
+          status: "current",
+          severity: "ok",
+          summary:
+            "Latest successful run is within the 36h freshness threshold.",
+          staleThreshold: "36h",
+          latestRunAt: "2026-05-14T22:16:00.000Z",
+          latestRunStatus: "SUCCESS",
+          latestSuccessAt: "2026-05-14T22:16:00.000Z",
+          latestFailureAt: null,
+        },
+      ],
+    },
+    webhookStats: {},
+    recentWebhooks: [],
+    emailDeliverability: {
+      summary: {
+        activeCount: 0,
+        bounceCount: 0,
+        complaintCount: 0,
+        eventsLast24h: 0,
+      },
+      suppressions: [],
+    },
+    emailFailures: {
+      summary: {
+        activeCount: 0,
+        reviewedCount: 0,
+        scannedCount: 0,
+        maxAttempts: 3,
+      },
+      failures: [],
+      recentlyReviewed: [],
+    },
+    adminAlertDelivery: {
+      summary: {
+        recentCount: 0,
+        lookbackDays: 7,
+      },
+      escalations: [],
+    },
+    tokenEmailRecovery: {
+      summary: {
+        activeCount: 0,
+        reissuedCount: 0,
+        scannedCount: 0,
+      },
+      failures: [],
+      recentlyReissued: [],
+    },
+    systemInfo: {
+      version: "0.1.0",
+      nodeVersion: "v20.0.0",
+      uptime: 1000,
+      memoryMb: { rss: 128, heapUsed: 64, heapTotal: 96 },
+      sentryConfigured: true,
+      sentryDashboardUrl: null,
+      sentryConfigWarning:
+        "SENTRY_PROJECT is not configured; admin health cannot link directly to Sentry.",
+    },
+  };
+}
+
+describe("AdminHealthPage", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    global.fetch = fetchMock as typeof fetch;
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => healthResponse(),
+    });
+  });
+
+  it("shows Sentry config warnings without rendering placeholder dashboard links", async () => {
+    render(<AdminHealthPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("System is healthy")).not.toBeNull()
+    );
+
+    expect(screen.queryByText(/SENTRY_PROJECT is not configured/)).not.toBeNull();
+    expect(
+      screen.queryByRole("link", { name: /Open Sentry Dashboard/i })
+    ).toBeNull();
+  });
+
+  it("renders the readiness section above the checks while loading and once loaded (S1 #4796)", async () => {
+    // `#integration-readiness` is scrolled to on first paint; the checks load
+    // after mount, so the section must already sit above where they appear.
+    let resolveFetch: (value: unknown) => void = () => {};
+    fetchMock.mockReturnValue(new Promise((resolve) => (resolveFetch = resolve)));
+    render(<AdminHealthPage readiness={<section id="integration-readiness">Readiness</section>} />);
+
+    const heading = screen.getByRole("heading", { level: 1, name: "System Health" });
+    const loading = document.getElementById("integration-readiness")!;
+    expect(loading).not.toBeNull();
+    expect(heading.compareDocumentPosition(loading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    resolveFetch({ ok: true, json: async () => healthResponse() });
+    const status = await screen.findByText("System is healthy");
+    const loaded = document.getElementById("integration-readiness")!;
+    expect(loaded.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("renders cron schedule, threshold, and local finance sync timing", async () => {
+    // Cron job rendering moved to the Background Jobs page when the System
+    // Health page was split into per-section routes.
+    render(<BackgroundJobsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Finance daily sync")).not.toBeNull()
+    );
+
+    expect(screen.queryByText("15 10 * * *")).not.toBeNull();
+    expect(screen.queryByText("10:15 NZT/NZDT daily")).not.toBeNull();
+    expect(screen.queryByText("36h")).not.toBeNull();
+    expect(
+      screen.queryByText(/10:15 local New Zealand time/)
+    ).not.toBeNull();
+  });
+
+  it("writes the compact stamp with a two-digit day on New Zealand defaults (#3566)", async () => {
+    // The `compactDateTime` house shape replaced a local formatter with
+    // `day: "2-digit"`. A day of the month from 1 to 9 is the only case where
+    // that differs from `numeric` ("03 May" vs "3 May"), so the byte-identity
+    // proof needs one: 2026-05-02T22:16Z is 3 May, 10:16 am in Auckland.
+    const response = healthResponse();
+    response.cronHealth.jobs[0].latestRunAt = "2026-05-02T22:16:00.000Z";
+    fetchMock.mockResolvedValue({ ok: true, json: async () => response });
+    render(<BackgroundJobsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Finance daily sync")).not.toBeNull()
+    );
+    expect(screen.queryByText("Latest run: 03 May, 10:16 am")).not.toBeNull();
+  });
+});

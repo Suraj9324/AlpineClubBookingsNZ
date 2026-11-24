@@ -1,0 +1,2064 @@
+/**
+ * Booking creation service.
+ *
+ * The POST /api/bookings route handler used to mix request parsing,
+ * auth gates, capacity locking, pricing, promo/credit, persistence,
+ * payment-flow decisions, audit, and Xero queueing in one file. This
+ * service owns the business orchestration: it takes already-validated
+ * inputs (member resolved, dates parsed, guests normalized), runs the
+ * appropriate transaction, and returns either a created booking or a
+ * structured outcome the route handler turns into an HTTP response.
+ *
+ * Conventions preserved:
+ *   - money values stay integer cents
+ *   - booking dates stay NZ date-only (Date with time set to 00:00)
+ *   - external network calls (email, Xero) stay outside long DB
+ *     transactions (fired-and-forget after commit)
+ *   - booking creation transactions serialise per lodge via
+ *     acquireLodgeCapacityLock so capacity checks stay safe without
+ *     cross-lodge contention
+ */
+import { bookingPromoRedemptions } from "@/lib/booking-promo-redemptions";
+import {
+  BookingEventType,
+  BookingStatus,
+  PaymentSource,
+  PaymentStatus,
+  type PrismaClient,
+} from "@prisma/client";
+import { bookingOwner } from "@/lib/booking-owner";
+import { createZeroPriceConfirmationPayment } from "@/lib/booking-zero-price-payment";
+import { assertMemberMayBookLodge } from "@/lib/lodge-access";
+import {
+  lodgeNullTolerantScope,
+  resolveOptionalActiveLodgeId,
+} from "@/lib/lodges";
+import { prisma } from "@/lib/prisma";
+import {
+  calculateBookingCreditApplication,
+  decideBookingSplit,
+  priceDeferredNonMemberPortion,
+  toGuestPricingInputs,
+  toSeasonRateData,
+} from "@/lib/policies/booking-route-decisions";
+import { nonMemberHoldEnd } from "@/lib/non-member-hold-end";
+import { priceBookingGuestsWithMembershipTypePolicy } from "@/lib/membership-type-policy";
+import { acquireLodgeCapacityLock, checkCapacityForGuestRanges } from "@/lib/capacity";
+import { postBindingCharge } from "@/lib/booking-ledger-pending-charge";
+import { postStoredBookingConfirmationLedgerLines } from "@/lib/booking-ledger-confirmation-sync";
+import {
+  OverCapacityConfirmationRequiredError,
+  overCapacityNights,
+  wholeLodgeBlockedNights,
+  WholeLodgeHoldBlockedError,
+} from "@/lib/over-capacity-confirmation";
+import { ApiError } from "@/lib/api-error";
+import { addDaysDateOnly } from "@/lib/date-only";
+import { clubToday, dateOnlyInstantOf } from "@/lib/club-time";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import { lockPromoCodeRowsForUpdate, redeemPromoCode } from "@/lib/promo";
+import { recordBookingNightAdjustments } from "@/lib/night-adjustment-write";
+import { getWaitlistPositionOf } from "@/lib/waitlist-queue";
+import { loadEffectiveModuleFlags } from "@/lib/module-settings";
+import {
+  sendAdminNewBookingAlert,
+  sendBookingConfirmedEmail,
+  sendBookingPendingEmail,
+  sendWaitlistConfirmationEmail,
+} from "@/lib/email";
+import { getProvisionalNonMemberChildSummary } from "@/lib/booking-split-summary";
+import {
+  enqueueXeroAppliedCreditAllocationOperation,
+  enqueueXeroBookingInvoiceOperation,
+  kickQueuedXeroOutboxOperationsIfConnected,
+} from "@/lib/xero-operation-outbox";
+import { xeroInvoiceEmailInstructionForNotifyChoice } from "@/lib/xero-invoice-email-instruction";
+import { applyCreditToBooking, getMemberCreditBalance } from "@/lib/member-credit";
+import {
+  buildInternetBankingPaymentReference,
+  DEFAULT_BOOKING_PAYMENT_METHOD,
+} from "@/lib/booking-payment-methods";
+import { recordInternetBankingPaymentTransaction } from "@/lib/payment-transactions";
+import { logAudit } from "@/lib/audit";
+import { recordBookingEvent } from "@/lib/booking-events";
+import logger from "@/lib/logger";
+import { assertNoBookingMemberNightConflicts } from "@/lib/booking-member-night-conflicts";
+import { reconcileBedAllocationsForBookingWithGlobalLockHeld } from "@/lib/bed-allocation-lifecycle";
+import { buildInternetBankingHoldUntil } from "@/lib/internet-banking-settings";
+import {
+  type BookingWithGuests,
+  type BookingGuestInput,
+  type DraftBookingInput,
+  type ConfirmedBookingInput,
+  type ConfirmedBookingOutcome,
+  type WaitlistedBookingInput,
+  type WaitlistedBookingResult,
+  BookingPromoError,
+  BookingReviewJustificationRequiredError,
+  BookingLodgeError,
+  GroupJoinConflictError,
+  DuplicateStayConflictError,
+  RETROACTIVE_BOOKING_MAX_LOOKBACK_DAYS,
+} from "./booking-create-types";
+import { DUPLICATE_STAY_BOOKING_STATUSES } from "./booking-status";
+import {
+  getPromoTargetBookingGuestIds,
+  promoCodeRequestsOf,
+  remapPromoIndexesToSubset,
+  resolveEffectivePromoSources,
+  resolvePromotionsInTransaction,
+} from "./booking-create-promo";
+import { getCapacityFullNights } from "@/lib/capacity-full-nights";
+import {
+  buildGuestCreateData,
+  getCapacityGuestRanges,
+  resolveAdminReviewFields,
+  resolveAdultMemberHostingDecision,
+  resolveBookingDateEnvelope,
+} from "./booking-create-guests";
+import { recordAdultMemberHostingReviewForNewBooking } from "@/lib/adult-member-hosting-review";
+import { settleHostingCoverageAfterCommit } from "@/lib/adult-member-hosting-coverage-drain";
+import {
+  LOCK1_HOLDER_TRANSACTION_BUDGET,
+  withOptionalTransaction,
+} from "@/lib/db-transaction";
+import { organiserPaysForJoinerInTx } from "@/lib/group-late-joiner";
+import { bookingFinalPriceCents } from "@/lib/booking-final-price";
+import { resolveBookingGuestDietary } from "@/lib/member-dietary-booking-writes";
+
+// The helper types, errors, and pure functions that used to live here now live
+// in three cohesive sibling modules (types <- promo, types <- guests). Re-export
+// the public surface so `@/lib/booking-create` keeps its exact set of exports
+// for existing callers.
+export {
+  BookingPromoError,
+  BookingReviewJustificationRequiredError,
+  BookingLodgeError,
+  GroupJoinConflictError,
+  DuplicateStayConflictError,
+  RETROACTIVE_BOOKING_MAX_LOOKBACK_DAYS,
+};
+export type {
+  BookingGuestInput,
+  DraftBookingInput,
+  ConfirmedBookingInput,
+  ConfirmedBookingOutcome,
+  WaitlistedBookingInput,
+  WaitlistedBookingResult,
+};
+export { buildGuestCreateData };
+
+type LodgeResolutionDb = Parameters<typeof resolveOptionalActiveLodgeId>[0] & {
+  lodgeRoom: {
+    findUnique: (args: {
+      where: { id: string };
+      select: { lodgeId: true };
+    }) => Promise<{ lodgeId: string | null } | null>;
+  };
+};
+
+/**
+ * Refuse unchecked JavaScript/`any` callers at the public service boundary.
+ * The type contract makes omissions a compile error; this runtime half keeps
+ * an alias, wrapper, or stale compiled caller from reaching the read-oriented
+ * resolver, where `undefined` deliberately means "use the default lodge".
+ */
+function requireBookingLodgeId(requestedLodgeId: unknown): string {
+  if (
+    typeof requestedLodgeId !== "string" ||
+    requestedLodgeId.trim().length === 0
+  ) {
+    throw new BookingLodgeError("lodgeId is required");
+  }
+  return requestedLodgeId;
+}
+
+/**
+ * Resolve the lodge a new booking belongs to and enforce the lodge-scoping
+ * contract: an explicit lodgeId must name an active lodge, and a requested
+ * room must belong to that lodge (rooms without a lodgeId — expand-release
+ * tolerance — pass). Throws BookingLodgeError; the routes turn it into 400.
+ */
+async function resolveBookingLodgeId(
+  db: LodgeResolutionDb,
+  requestedLodgeId: string,
+  requestedRoomId: string | undefined,
+): Promise<string> {
+  const lodgeId = await resolveOptionalActiveLodgeId(db, requestedLodgeId);
+  if (!lodgeId) {
+    throw new BookingLodgeError("Unknown or inactive lodgeId");
+  }
+  if (requestedRoomId) {
+    const room = await db.lodgeRoom.findUnique({
+      where: { id: requestedRoomId },
+      select: { lodgeId: true },
+    });
+    if (room?.lodgeId && room.lodgeId !== lodgeId) {
+      throw new BookingLodgeError(
+        "Requested room belongs to a different lodge",
+      );
+    }
+  }
+  return lodgeId;
+}
+
+/**
+ * Validate the cross-lodge waitlist opt-in list (ADR-004): every alternate
+ * must be an active lodge distinct from the primary, and the member must be
+ * eligible to book it (same rule as the primary lodge; admin on-behalf
+ * bypasses eligibility exactly as assertMemberMayBookLodge does). Throws
+ * BookingLodgeError / LodgeBookingEligibilityError; routes map them to
+ * 400 / 403. Exported for unit tests.
+ */
+export async function resolveWaitlistAlternateLodgeIds(
+  db: Pick<PrismaClient, "lodge" | "memberLodgeAccess">,
+  input: {
+    requestedAlternateLodgeIds: string[] | undefined;
+    primaryLodgeId: string;
+    memberId: string;
+    isOnBehalf: boolean;
+  },
+): Promise<string[]> {
+  const distinct = Array.from(new Set(input.requestedAlternateLodgeIds ?? []))
+    .filter((id) => id && id !== input.primaryLodgeId);
+  if (distinct.length === 0) return [];
+
+  const activeCount = await db.lodge.count({
+    where: { id: { in: distinct }, active: true },
+  });
+  if (activeCount !== distinct.length) {
+    throw new BookingLodgeError("Unknown or inactive alternate lodgeId");
+  }
+  for (const alternateLodgeId of distinct) {
+    await assertMemberMayBookLodge(db, {
+      memberId: input.memberId,
+      lodgeId: alternateLodgeId,
+      isOnBehalf: input.isOnBehalf,
+    });
+  }
+  return distinct;
+}
+
+/**
+ * Create a DRAFT booking. Skips capacity locking, payment, Xero, and
+ * email side effects — drafts only persist the booking + pricing + an
+ * audit entry. Throws BookingPromoError if the promo code fails
+ * validation.
+ */
+export async function createDraftBooking(input: DraftBookingInput): Promise<BookingWithGuests> {
+  const lodgeId = requireBookingLodgeId(input.lodgeId);
+  const {
+    effectiveMemberId,
+    isOnBehalf,
+    sessionUserId,
+    checkIn: inputCheckIn,
+    checkOut: inputCheckOut,
+    guests,
+    notes,
+    workPartyEventId,
+    expectedArrivalTime,
+    requestedRoomId,
+    cancelIfGuestsBumped,
+    applyCreditCents,
+    groupDiscount,
+    memberReviewJustification,
+    adultMemberHostingReason,
+  } = input;
+  // #2364: null for every member-created booking, so their hazard opens PENDING.
+  const adultMemberHostingDecision = resolveAdultMemberHostingDecision({
+    isOnBehalf,
+    sessionUserId,
+    adultMemberHostingReason,
+  });
+  // Auto-expand (issue #713): the persisted range covers every guest night,
+  // never shrinking below the member's stated range.
+  const { checkIn, checkOut } = resolveBookingDateEnvelope(
+    guests,
+    inputCheckIn,
+    inputCheckOut
+  );
+
+  const review = resolveAdminReviewFields({
+    guests,
+    isOnBehalf,
+    sessionUserId,
+    memberReviewJustification,
+  });
+
+  // Member-created drafts that trip the no-adult rule land directly in
+  // AWAITING_REVIEW: they hold capacity while the admin is deciding and
+  // bypass the 72-hour draft expiry (which would otherwise delete them
+  // mid-review). Admin-created drafts (auto-approved) stay as DRAFT.
+  const draftStatus = review.blockForReview ? BookingStatus.AWAITING_REVIEW : BookingStatus.DRAFT;
+
+  // #3123 — the CLUB's day, from its persisted `ClubTimeSettings.timeZone`
+  // (`INV-CONFIG-002`), read BEFORE the transaction opens. The promotion's
+  // validity window is judged against it inside `resolvePromoInTransaction`,
+  // which runs under `pg_advisory_xact_lock(1)`, the per-lodge capacity key and
+  // a `FOR UPDATE` lock on the promo row — `INV-LOCK-004` forbids a
+  // `clubTimeSettings` read there. The runtime reader, not `club-time/server`:
+  // this module is CLI-reachable through `e2e/setup/seed-second-lodge.ts`, and
+  // `server-only` is a bare throw outside the `react-server` condition.
+  const todayAtClub = clubToday(await readClubTimeZoneOutsideRequest());
+
+  // The wait for lock(1) counts against this budget (`INV-LOCK-006`); on the
+  // defaults any long holder of the key aborted the draft.
+  const newBooking = await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+    // The explicit lodge id is the immutable lock key.  Take the capacity lock
+    // before trusting active/access/room state so lodge deactivation cannot
+    // commit between validation and the booking write (INV-LOCK-002).
+    await acquireLodgeCapacityLock(tx, lodgeId);
+    const bookingLodgeId = await resolveBookingLodgeId(
+      tx,
+      lodgeId,
+      requestedRoomId,
+    );
+    await assertMemberMayBookLodge(tx, {
+      memberId: effectiveMemberId,
+      lodgeId: bookingLodgeId,
+      isOnBehalf,
+    });
+    // Duplicate member nights (upstream #80cbdf4c): a member cannot hold
+    // two bookings covering the same night, regardless of lodge.
+    await assertNoBookingMemberNightConflicts(tx, {
+      actorMemberId: sessionUserId,
+      actorRole: isOnBehalf ? "ADMIN" : "USER",
+      checkIn,
+      checkOut,
+      guests,
+      // The club day resolved above, before this transaction opened
+      // (`INV-LOCK-004`). The guard reaches `evaluateGuestSelfRemoval` with it,
+      // and the promo window below reads the same one — one day per create.
+      today: dateOnlyInstantOf(todayAtClub),
+    }, input.format);
+    const draftExpiresAt = review.blockForReview
+      ? null
+      : new Date(Date.now() + 72 * 60 * 60 * 1000);
+
+    const seasons = await tx.season.findMany({
+      where: {
+        active: true,
+        startDate: { lte: checkOut },
+        endDate: { gte: checkIn },
+        ...lodgeNullTolerantScope(bookingLodgeId),
+      },
+      include: { membershipTypeRates: true },
+    });
+    const seasonData = toSeasonRateData(seasons);
+    const guestInputs = toGuestPricingInputs(guests);
+    const price = await priceBookingGuestsWithMembershipTypePolicy(tx, {
+      ownerMemberId: effectiveMemberId,
+      checkIn,
+      checkOut,
+      guests: guestInputs,
+      seasons: seasonData,
+      groupDiscount,
+      // #2543 — the mode this request resolved, so the price cannot be computed
+      // under a different regime than the gate that let the booking through, and
+      // no settings read happens under the capacity lock.
+      subscriptionLockoutMode: input.subscriptionLockoutMode,
+      // Finding 2 (privacy re-review of MG3 #2308): an on-behalf create keeps the
+      // detailed membership-type refusal naming the blocked member.
+      skipAuthorization: isOnBehalf,
+    });
+
+    let discountCents = 0;
+
+    let promoAdjustmentCents = 0;
+
+    const promoSources = await resolveEffectivePromoSources(tx, {
+      promoCodes: promoCodeRequestsOf(input),
+      workPartyEventId,
+      checkIn,
+      checkOut,
+      lodgeId: bookingLodgeId,
+    });
+    const promotions = await resolvePromotionsInTransaction(tx, {
+      sources: promoSources,
+      lockRows: true,
+      effectiveMemberId,
+      checkIn,
+      guests,
+      totalPriceCents: price.totalPriceCents,
+      perNightCentsByGuest: price.guests.map((g) => g.perNightCents),
+      nightDatesByGuest: price.guests.map((g) => g.nightDates),
+      lodgeId: bookingLodgeId,
+      todayAtClub,
+    });
+    // The booking's headline pair, from the one resolution (INV-MONEY-031's
+    // paired-assignment shape): Σ over the codes, each its own integer cents.
+    discountCents = promotions.discountCents;
+    promoAdjustmentCents = promotions.promoAdjustmentCents;
+
+    const finalPriceCents = bookingFinalPriceCents({
+      totalPriceCents: price.totalPriceCents,
+      promoAdjustmentCents,
+    });
+    const hasNonMembers = guests.some((g) => !g.isMember);
+    // #3029 (`INV-MOD-059`): each new guest row's dietary/allergy snapshot, from
+    // the linked members' CURRENT profiles through this transaction's client.
+    const guestDietary = await resolveBookingGuestDietary(
+      tx,
+      input.guestDietarySeeding,
+      guests,
+    );
+
+    const createdBooking = await tx.booking.create({
+      data: {
+        memberId: effectiveMemberId,
+        lodgeId: bookingLodgeId,
+        checkIn,
+        checkOut,
+        status: draftStatus,
+        totalPriceCents: price.totalPriceCents,
+        discountCents,
+        promoAdjustmentCents,
+        finalPriceCents,
+        hasNonMembers,
+        nonMemberHoldUntil: null,
+        draftExpiresAt,
+        notes: notes || null,
+        expectedArrivalTime: expectedArrivalTime || null,
+        requestedRoomId: requestedRoomId || null,
+        cancelIfGuestsBumped: cancelIfGuestsBumped ?? false,
+        // Stored credit election (#2265). A draft consumes NO credit: the
+        // member's balance stays free until the booking is real, so all that is
+        // written here is the amount they asked for. The pay path clamps it to
+        // the live balance and price and applies it through the ordinary
+        // credit-application path once the booking reaches PAYMENT_PENDING.
+        // Omitted entirely (column defaults to NULL) when the member made no
+        // election, which is the "nothing outstanding" state every pre-#2265
+        // row is already in — so the create payload stays byte-identical for a
+        // member who never touched the credit control.
+        //
+        // A draft that lands directly in AWAITING_REVIEW keeps its election
+        // too: approval releases it to PAYMENT_PENDING and the pay path
+        // consumes it there exactly as it would for a plain draft. Credit must
+        // not be consumed while an admin is still deciding — the same rule
+        // createConfirmedBooking enforces via review.blockForReview.
+        ...(applyCreditCents != null
+          ? { creditElectionCents: applyCreditCents }
+          : {}),
+        createdById: isOnBehalf ? sessionUserId : null,
+        requiresAdminReview: review.requiresAdminReview,
+        adminReviewReason: review.adminReviewReason,
+        memberReviewJustification: review.memberReviewJustification,
+        adminReviewStatus: review.adminReviewStatus,
+        adminReviewNotes: review.adminReviewNotes,
+        adminReviewedById: review.adminReviewedById,
+        adminReviewedAt: review.adminReviewedAt,
+        guests: {
+          create: buildGuestCreateData(guests, price, checkIn, checkOut, guestDietary),
+        },
+      },
+      include: { guests: true },
+    });
+
+    // #3827: one redemption per applied code, each in the booker's order. The
+    // booking was created a statement above in this transaction, which is the
+    // precondition `redeemPromoCode`'s switch probe needs.
+    for (const redemption of promotions.redemptions) {
+      await redeemPromoCode(
+        tx,
+        redemption.promoCodeId,
+        createdBooking.id,
+        effectiveMemberId,
+        redemption.discountCents,
+        redemption.priceAdjustmentCents,
+        redemption.freeNightsUsed || undefined,
+        redemption.eligibleGuestCount || undefined,
+        redemption.allocations,
+        getPromoTargetBookingGuestIds(createdBooking.guests, redemption.selectedGuestIndexes),
+        bookingLodgeId,
+        redemption.applicationOrder,
+      );
+    }
+
+    // #3276: the build-up of every night this booking was just sold, after the
+    // last night write and the redemption write. With no promotion the targets
+    // are empty and RECORDED says exactly that: nothing was taken off.
+    await recordBookingNightAdjustments(tx, {
+      format: input.format,
+      bookingId: createdBooking.id,
+      guestIds: createdBooking.guests.map((guest) => guest.id),
+      targets: promotions.promoAdjustmentTargets,
+      writer: "booking creation",
+    });
+
+    await reconcileBedAllocationsForBookingWithGlobalLockHeld({
+      bookingId: createdBooking.id,
+      db: tx,
+    });
+
+    // #2364. Inside the transaction, and reading the rows just written rather
+    // than the submitted party, so the stored snapshot always references real
+    // BookingGuest ids and stays comparable with every later evaluation. `tx` is
+    // passed for the reason `validateMinimumStay`'s db parameter exists: this
+    // runs under the lodge capacity lock, and the module client would check out
+    // a second pool connection beneath it.
+    await recordAdultMemberHostingReviewForNewBooking(
+      createdBooking.id,
+      tx,
+      adultMemberHostingDecision,
+    );
+
+    return createdBooking;
+  }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+
+  logAudit({
+    action: "booking.created",
+    memberId: sessionUserId,
+    targetId: newBooking.id,
+    subjectMemberId: effectiveMemberId,
+    entityType: "Booking",
+    entityId: newBooking.id,
+    category: "booking",
+    outcome: "success",
+    summary: "Draft booking created",
+    details: "Draft booking created",
+    metadata: {
+      status: newBooking.status,
+      onBehalf: isOnBehalf,
+      checkIn: checkIn.toISOString(),
+      checkOut: checkOut.toISOString(),
+      guestCount: guests.length,
+      hasNonMembers: guests.some((guest) => !guest.isMember),
+      finalPriceCents: newBooking.finalPriceCents,
+    },
+  });
+
+  if (isOnBehalf) {
+    logAudit({
+      action: "booking.created_on_behalf",
+      memberId: sessionUserId,
+      targetId: newBooking.id,
+      subjectMemberId: effectiveMemberId,
+      entityType: "Booking",
+      entityId: newBooking.id,
+      category: "booking",
+      outcome: "success",
+      summary: "Draft booking created on behalf of member",
+      details: `Admin created draft booking on behalf of member ${effectiveMemberId}`,
+      metadata: {
+        status: newBooking.status,
+        checkIn: checkIn.toISOString(),
+        checkOut: checkOut.toISOString(),
+        guestCount: guests.length,
+        hasNonMembers: guests.some((guest) => !guest.isMember),
+      },
+    });
+  }
+
+  await recordBookingEvent({
+    bookingId: newBooking.id,
+    type: BookingEventType.CREATED,
+    actorMemberId: sessionUserId,
+    amountCents: newBooking.finalPriceCents,
+  });
+
+  // Drafts that land directly in AWAITING_REVIEW skip the usual draft
+  // flow — alert admins immediately so they can decide.
+  if (review.blockForReview) {
+    const draftMember = await prisma.member.findUnique({ where: { id: effectiveMemberId } });
+    if (draftMember) {
+      sendAdminNewBookingAlert({
+        memberName: `${draftMember.firstName} ${draftMember.lastName}`,
+        checkIn: newBooking.checkIn,
+        checkOut: newBooking.checkOut,
+        guestCount: newBooking.guests.length,
+        totalCents: newBooking.finalPriceCents,
+        status: newBooking.status,
+        reviewReason: newBooking.adminReviewReason,
+        memberJustification: newBooking.memberReviewJustification,
+      }, input.format).catch((err) => logger.error({ err }, "Failed to send admin alert for awaiting-review draft"));
+    }
+  }
+
+  return newBooking;
+}
+
+/**
+ * Create a CONFIRMED/PENDING/PAYMENT_PENDING/PAID booking with capacity
+ * locking, pricing, promo/credit, and post-commit side effects.
+ *
+ * Returns `{ type: "capacityExceeded", fullNights }` instead of throwing
+ * when the request would oversell — the route handler turns that into
+ * the 409 capacity-exceeded response and can offer the waitlist option.
+ */
+export async function createConfirmedBooking(input: ConfirmedBookingInput): Promise<ConfirmedBookingOutcome> {
+  const lodgeId = requireBookingLodgeId(input.lodgeId);
+  const {
+    effectiveMemberId,
+    isOnBehalf,
+    sessionUserId,
+    checkIn: inputCheckIn,
+    checkOut: inputCheckOut,
+    guests,
+    notes,
+    workPartyEventId,
+    expectedArrivalTime,
+    requestedRoomId,
+    cancelIfGuestsBumped,
+    applyCreditCents,
+    groupDiscount,
+    status,
+    shouldBePending,
+    holdDays,
+    paymentMethod = DEFAULT_BOOKING_PAYMENT_METHOD,
+    internetBankingSettings,
+    memberReviewJustification,
+    adultMemberHostingReason,
+    reviewedMemberProposal,
+    parentBookingId,
+    organiserSettled,
+    groupJoin,
+    duplicateStayGuard,
+  } = input;
+  // #2364: null for every member-created booking, so their hazard opens PENDING.
+  const adultMemberHostingDecision = resolveAdultMemberHostingDecision({
+    isOnBehalf,
+    sessionUserId,
+    adultMemberHostingReason,
+  });
+  // Auto-expand (issue #713): cover every guest night (members + non-members)
+  // so the member booking and any linked non-member child share one range.
+  const { checkIn, checkOut } = resolveBookingDateEnvelope(
+    guests,
+    inputCheckIn,
+    inputCheckOut
+  );
+
+  // Retroactive booking (#1695). Honoured only for on-behalf creates whose
+  // resolved envelope actually starts in the past; when unset, every code
+  // path below stays byte-identical to the member flow.
+  const allowPastDates = Boolean(input.allowPastDates) && isOnBehalf;
+  // CT-4 (#2870): the club's day, from the persisted `ClubTimeSettings` zone and
+  // not the container's `TZ` (`INV-CONFIG-002`, `INV-DATE-019`), encoded at UTC
+  // midnight so it shares a frame with the stored dates and `addDaysDateOnly`.
+  //
+  // ONE HALF OF A FRAME PAIR — `POST /api/bookings` runs the same two rules
+  // before calling this, and the block below re-runs them as defence in depth on
+  // the RESOLVED envelope. Two "today"s from two different authorities are not
+  // defence in depth, they are a straddle: with the route on the club's day and
+  // this on the container's, a deployment whose container sits ahead of the club
+  // admits `clubToday - 365` at the door and then throws "Retroactive bookings
+  // can go back at most 365 days" here, one day later. The route now passes the
+  // day it used, so the pair is one value rather than two agreeing readers.
+  //
+  // #3123 review — and the day now arrives from the CALLER rather than being
+  // read here. This function is transaction-AWARE (`withOptionalTransaction`
+  // below), so on the atomic approve-and-execute path the caller's transaction
+  // is ALREADY open by the time control reaches this line: a `clubTimeSettings`
+  // read here would take a second pooled connection under
+  // `pg_advisory_xact_lock(1)` and the per-lodge capacity key. There is no
+  // position in this function that is outside the transaction on every path.
+  // See `ConfirmedBookingInput.todayAtClub` (`INV-LOCK-004`).
+  //
+  // ONE day serves both halves of this create: the retroactive / past-date
+  // envelope below, and the promotion's validity window inside
+  // `resolvePromoInTransaction`, which additionally holds `FOR UPDATE` on the
+  // promo row by the time it needs the day.
+  const todayAtClub = input.todayAtClub;
+  const todayDateOnly = dateOnlyInstantOf(todayAtClub);
+  const retroactiveOverride = allowPastDates && checkIn < todayDateOnly;
+  // Over-capacity warn-and-confirm (#1668/#1695, widened by #1767): every
+  // on-behalf create may overbook behind an explicit admin confirmation —
+  // except when the caller opted into the waitlist fallback, which needs the
+  // capacityExceeded outcome to fall through. Member self-creates
+  // (isOnBehalf false) always keep the hard capacity block.
+  const overCapacityWarnAndConfirm =
+    retroactiveOverride || (isOnBehalf && input.waitlistIntent !== true);
+  // The member email is a per-create choice only for on-behalf bookings; a
+  // member booking for themselves is always emailed.
+  const notifyMember = !isOnBehalf || input.notifyMember !== false;
+  /*
+    #2929 — the same choice, carried to the invoice this create raises.
+
+    Recorded on the outbox operation rather than passed to the invoice code,
+    because the invoice is not raised by this request: the create enqueues an
+    operation and returns, a worker raises the invoice afterwards, and an
+    operator retry may raise it days later. Only the operation row is still
+    there by then.
+
+    Written for a member's own booking too, where it is always SEND: the value
+    then says "nothing was withheld here", which is the truth, and it keeps "the
+    officer chose to send" distinguishable from "nobody was asked" on a path
+    that never offers the choice at all.
+  */
+  const creationInvoiceEmailDelivery =
+    xeroInvoiceEmailInstructionForNotifyChoice(notifyMember);
+
+  // Defence in depth: the route already gates a past-dated on-behalf create,
+  // but the service re-checks the RESOLVED envelope (guest nights can expand
+  // it before the requested check-in, #713) so no caller can persist a past
+  // stay without either the admin override or the internal inherited-stay
+  // marker. `allowPastCheckIn` is set only by callers that join an existing,
+  // already-validated stay envelope — group join (whole-stay unit, #1387) and
+  // cross-lodge waitlist confirm, which legitimately reach a past check-in
+  // once the parent stay is in progress — and is never exposed via the API.
+  if (checkIn < todayDateOnly && !input.allowPastCheckIn) {
+    if (!allowPastDates) {
+      throw new ApiError("Cannot book in the past", 400);
+    }
+    if (
+      checkIn < addDaysDateOnly(todayDateOnly, -RETROACTIVE_BOOKING_MAX_LOOKBACK_DAYS)
+    ) {
+      throw new ApiError(
+        `Retroactive bookings can go back at most ${RETROACTIVE_BOOKING_MAX_LOOKBACK_DAYS} days.`,
+        400,
+      );
+    }
+  }
+
+  const review = resolveAdminReviewFields({
+    guests,
+    isOnBehalf,
+    sessionUserId,
+    memberReviewJustification,
+    // #2526: a policy-exception approval reviewed minimum stay / hosting, never
+    // adult supervision, so the supervision review keeps member semantics.
+    reviewedMemberProposal,
+  });
+
+  // Split-booking decision (#738). A mixed member/non-member party that is not
+  // flagged becomes two linked bookings: the member portion is charged up front
+  // and holds capacity (the parent), while the non-member portion is a
+  // provisional PENDING child that holds nothing (resolved at the hold window
+  // in R3). The flagged "only book if my guests can come" path stays a single
+  // provisional PENDING booking holding nothing, nothing charged up front.
+  // Pure parties stay a single booking. Bookings held for admin review are
+  // never split — the whole party waits in AWAITING_REVIEW until an admin
+  // decides.
+  // The split decision, and which rows hold capacity, are `decideBookingSplit`'s
+  // — one definition, shared with the create route's full-lodge pre-flight.
+  const { nonMemberGuests, flaggedProvisional, splitBooking, primaryGuests } =
+    decideBookingSplit(guests, {
+      shouldBePending,
+      cancelIfGuestsBumped,
+      blockForReview: review.blockForReview,
+    });
+  const effectiveCancelIfGuestsBumped = flaggedProvisional;
+  // Promo selection indexes are remapped onto the member subset of a split.
+  const primaryHasNonMembers = primaryGuests.some((g) => !g.isMember);
+  // #3827: each code's choice, remapped on its own.
+  const primaryPromoCodes = promoCodeRequestsOf(input).map((request) => ({
+    ...request,
+    promoGuestIndexes: splitBooking
+      ? remapPromoIndexesToSubset(request.promoGuestIndexes, guests, primaryGuests)
+      : request.promoGuestIndexes,
+  }));
+
+  // A member-created youth-only booking lands in AWAITING_REVIEW regardless
+  // of the caller's requested status — payment is intentionally blocked
+  // until an admin approves.
+  const internetBankingPaymentSelected =
+    paymentMethod === "internet_banking" && !review.blockForReview;
+  const internetBankingHoldSlots =
+    internetBankingPaymentSelected && internetBankingSettings?.holdBedSlots === true;
+  const internetBankingHoldUntil = internetBankingHoldSlots
+    ? buildInternetBankingHoldUntil(internetBankingSettings)
+    : null;
+  // Status of the primary booking. A split member booking is always charged up
+  // front (a pure-member booking never holds as PENDING). The flagged path is
+  // forced PENDING. Otherwise use the status the route computed for the party.
+  const requestedStatus = flaggedProvisional
+    ? BookingStatus.PENDING
+    : splitBooking
+      ? BookingStatus.PAYMENT_PENDING
+      : internetBankingPaymentSelected
+        ? internetBankingHoldSlots
+          ? BookingStatus.CONFIRMED
+          : BookingStatus.PAYMENT_PENDING
+        : status;
+  const creditApplicationStatus = internetBankingPaymentSelected
+    ? BookingStatus.PAYMENT_PENDING
+    : requestedStatus;
+  const effectiveStatus = review.blockForReview
+    ? BookingStatus.AWAITING_REVIEW
+    : requestedStatus;
+  // A split member booking holds capacity and is never a provisional hold; the
+  // flagged path is always a provisional hold.
+  const primaryShouldBePending = flaggedProvisional
+    ? true
+    : splitBooking
+      ? false
+      : shouldBePending;
+
+  let isZeroDollarConfirmed = false;
+  let capacityFullNights: string[] | null = null;
+  // Set inside the transaction when a retroactive booking is created over
+  // capacity with the admin's explicit confirmation (#1695); recorded in the
+  // audit metadata after commit.
+  let capacityOverridden = false;
+  // Captured inside the transaction so the split child's CREATED event can be
+  // written once, after commit (issue #740).
+  let splitChild: { id: string; finalPriceCents: number } | null = null;
+
+  let booking: BookingWithGuests;
+  try {
+    // #2525: run in the caller's transaction when one is supplied (atomic
+    // approve-and-execute) so the booking is created in the SAME transaction that
+    // released the policy-exception reservation and claimed the request; open a
+    // self-contained transaction otherwise (every existing caller — behaviour
+    // unchanged). The caller that supplies `tx` has ALREADY taken global lock(1)
+    // and the per-lodge capacity lock; the `acquireLodgeCapacityLock` below then
+    // re-enters that same per-lodge key (a no-op) so the lock order holds either
+    // way. The lock(1) budget applies only to the transaction opened here; a
+    // caller's `tx` keeps its opener's budget (`INV-LOCK-006`).
+    booking = await withOptionalTransaction(input.tx, async (tx) => {
+      if (!input.tx) {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+      }
+      // The caller-provided id is also the immutable capacity-lock key.  The
+      // authoritative active/access/requested-room reads belong after it.
+      await acquireLodgeCapacityLock(tx, lodgeId);
+      const bookingLodgeId = await resolveBookingLodgeId(
+        tx,
+        lodgeId,
+        requestedRoomId,
+      );
+      await assertMemberMayBookLodge(tx, {
+        memberId: effectiveMemberId,
+        lodgeId: bookingLodgeId,
+        isOnBehalf,
+      });
+
+      // Cross-lodge duplicate-stay guard, in-transaction layer (#1587 item 2).
+      // Only the cross-lodge waitlist confirm sets duplicateStayGuard; every
+      // other caller leaves it undefined and this block is skipped. The offered
+      // lodge's capacity lock is held (acquired above), so re-running the same
+      // duplicate-stay query the confirm ran in its pre-flight phase closes the
+      // window where two fully-concurrent confirms of one offer both pass the
+      // earlier, separately-committed guard: the second transaction serialises
+      // behind the first's commit, sees its committed booking here, and rolls
+      // back rather than creating a duplicate stay. Member, lodge, and dates
+      // come from this booking's own resolved values so the guard cannot
+      // disagree with the row about to be written; the confirm's own entry is
+      // excluded by id.
+      //
+      // Runs BEFORE the member-night guard on purpose: when a real concurrent
+      // stay exists, the friendlier DUPLICATE_STAY rejection should win over a
+      // generic member-night error. The member-night guard below excludes the
+      // same replaced entry (#1628/#1609), so the offer's own WAITLIST_OFFERED
+      // booking trips neither check. This guard is a strict no-op for a normal
+      // confirm and every non-cross-lodge caller: the only overlapping booking
+      // in those cases is the WAITLIST_OFFERED entry, and WAITLIST_OFFERED is
+      // not in DUPLICATE_STAY_BOOKING_STATUSES (ACTIVE + COMPLETED), so the
+      // query matches nothing and nothing throws until a real concurrent stay
+      // exists.
+      if (duplicateStayGuard) {
+        const duplicateStay = await tx.booking.findFirst({
+          where: {
+            memberId: effectiveMemberId,
+            lodgeId: bookingLodgeId,
+            id: { not: duplicateStayGuard.excludeBookingId },
+            deletedAt: null,
+            status: { in: [...DUPLICATE_STAY_BOOKING_STATUSES] },
+            // Date-only overlap, matching the pre-flight guard's predicate.
+            checkIn: { lt: checkOut },
+            checkOut: { gt: checkIn },
+          },
+          select: { id: true },
+        });
+        if (duplicateStay) {
+          throw new DuplicateStayConflictError();
+        }
+      }
+
+      // Duplicate member nights (upstream #80cbdf4c). The cross-lodge confirm
+      // replaces a still-live WAITLIST_OFFERED entry whose guest rows can carry
+      // the confirming member's own memberId; without an exclusion the guard
+      // trips on the very booking this create is replacing and every
+      // member-guest confirm fails (#1628/#1609). The replaced entry is the
+      // same booking the duplicate-stay guard excludes, so its id is reused
+      // here; undefined for every other caller — their behaviour is unchanged.
+      await assertNoBookingMemberNightConflicts(tx, {
+        actorMemberId: sessionUserId,
+        actorRole: isOnBehalf ? "ADMIN" : "USER",
+        checkIn,
+        checkOut,
+        guests,
+        excludeBookingId: duplicateStayGuard?.excludeBookingId,
+        // The same club day the retroactive envelope and the promo window use,
+        // resolved before this transaction opened (`INV-LOCK-004`).
+        today: todayDateOnly,
+      }, input.format);
+
+      const capacityGuestRanges = getCapacityGuestRanges(primaryGuests, checkIn, checkOut);
+      const capacityCheck = await checkCapacityForGuestRanges(
+        bookingLodgeId,
+        checkIn,
+        checkOut,
+        capacityGuestRanges,
+        undefined,
+        tx
+      );
+
+      const seasons = await tx.season.findMany({
+        where: {
+          active: true,
+          startDate: { lte: checkOut },
+          endDate: { gte: checkIn },
+          ...lodgeNullTolerantScope(bookingLodgeId),
+        },
+        include: { membershipTypeRates: true },
+      });
+      const seasonData = toSeasonRateData(seasons);
+      const guestInputs = toGuestPricingInputs(primaryGuests);
+      const price = await priceBookingGuestsWithMembershipTypePolicy(tx, {
+        ownerMemberId: effectiveMemberId,
+        checkIn,
+        checkOut,
+        guests: guestInputs,
+        seasons: seasonData,
+        groupDiscount,
+        // #2543 — see the draft path above.
+        subscriptionLockoutMode: input.subscriptionLockoutMode,
+        // Finding 2 (privacy re-review of MG3 #2308).
+        skipAuthorization: isOnBehalf,
+      });
+
+      let discountCents = 0;
+
+      let promoAdjustmentCents = 0;
+
+      const promoSources = await resolveEffectivePromoSources(tx, {
+        promoCodes: primaryPromoCodes,
+        workPartyEventId,
+        checkIn,
+        checkOut,
+        lodgeId: bookingLodgeId,
+      });
+      const promotions = await resolvePromotionsInTransaction(tx, {
+        sources: promoSources,
+        lockRows: true,
+        effectiveMemberId,
+        checkIn,
+        guests: primaryGuests,
+        totalPriceCents: price.totalPriceCents,
+        perNightCentsByGuest: price.guests.map((g) => g.perNightCents),
+        nightDatesByGuest: price.guests.map((g) => g.nightDates),
+        lodgeId: bookingLodgeId,
+        todayAtClub,
+      });
+      // The booking's headline pair, from the one resolution (INV-MONEY-031's
+      // paired-assignment shape): Σ over the codes, each its own integer cents.
+      discountCents = promotions.discountCents;
+      promoAdjustmentCents = promotions.promoAdjustmentCents;
+
+      const finalPriceCents = bookingFinalPriceCents({
+        totalPriceCents: price.totalPriceCents,
+        promoAdjustmentCents,
+      });
+      // Credit is only applied at payment time. For a booking heading to
+      // AWAITING_REVIEW, defer credit application until the admin approves
+      // and the member completes payment.
+      const creditBalance =
+        (applyCreditCents ?? 0) > 0 &&
+        creditApplicationStatus === BookingStatus.PAYMENT_PENDING &&
+        !review.blockForReview
+          ? await getMemberCreditBalance(effectiveMemberId, tx)
+          : 0;
+      const { creditAppliedCents, effectivePriceCents } = calculateBookingCreditApplication({
+        format: input.format,
+        requestedCreditCents: review.blockForReview ? 0 : (applyCreditCents ?? 0),
+        creditBalanceCents: creditBalance,
+        finalPriceCents,
+        status: creditApplicationStatus,
+      });
+
+      // AWAITING_REVIEW holds capacity, so capacity must be verified even
+      // when the booking would otherwise have skipped the check (zero-dollar
+      // member-paid path).
+      if (
+        !capacityCheck.available &&
+        (requestedStatus === BookingStatus.PENDING || effectivePriceCents > 0 || review.blockForReview)
+      ) {
+        if (overCapacityWarnAndConfirm) {
+          // The v1 PENDING carve-out (#1767) is retired by #1771: the persisted
+          // capacity override is now stamped on the booking below and honoured
+          // by cron-confirm-pending's hold-window re-check, so a hold-eligible
+          // PENDING on-behalf overbook no longer silently self-destructs (bump
+          // email included). Members never overbook — overCapacityWarnAndConfirm
+          // is already false for member self-creates — so the members-never-
+          // overbook block is untouched.
+          // On-behalf over-capacity is warn-and-confirm (#1695/#1767): the
+          // lodge capacity lock is still held, only the availability decision
+          // defers to the admin's explicit confirmation.
+          if (input.confirmOverCapacity !== true) {
+            // Unconfirmed: member-parity path. A held night is unavailable
+            // exactly like a full lodge (decision 6); it never appears in the
+            // confirmable night list, so the admin sees the ordinary confirm
+            // prompt, never an exclusive-specific signal.
+            throw new OverCapacityConfirmationRequiredError(
+              overCapacityNights(capacityCheck),
+            );
+          }
+          // Confirmed override: an exclusive hold is NOT bypassable (decision
+          // 5). Refuse before stamping capacityOverridden so no guest is ever
+          // admitted onto a held night.
+          const blocked = wholeLodgeBlockedNights(capacityCheck);
+          if (blocked.length > 0) {
+            throw new WholeLodgeHoldBlockedError(blocked);
+          }
+          capacityOverridden = true;
+        } else {
+          capacityFullNights = getCapacityFullNights(capacityCheck.nightDetails);
+          throw new Error("CAPACITY_EXCEEDED_SENTINEL");
+        }
+      }
+
+      // #3672 (`INV-PAY-109`): a group join's payer is re-decided here, under
+      // `lock(1)`. A settlement paid since the join read the group makes this
+      // an ordinary member-pays booking, never one the paid bill left out.
+      // Only ever downgrades: the join forced the card method for an
+      // organiser-pays joiner, which is also what a member-pays one may use.
+      const organiserSettledInLock =
+        Boolean(organiserSettled) &&
+        (!groupJoin ||
+          (await organiserPaysForJoinerInTx(tx, groupJoin.groupBookingId)));
+
+      const nonMemberHoldUntil = primaryShouldBePending && !internetBankingPaymentSelected
+        ? nonMemberHoldEnd(checkIn, holdDays)
+        : null;
+
+      const newBooking = await tx.booking.create({
+        data: {
+          memberId: effectiveMemberId,
+          lodgeId: bookingLodgeId,
+          checkIn,
+          checkOut,
+          status: effectiveStatus,
+          totalPriceCents: price.totalPriceCents,
+          discountCents,
+          promoAdjustmentCents,
+          finalPriceCents,
+          hasNonMembers: primaryHasNonMembers,
+          nonMemberHoldUntil,
+          // Group join: link this joiner's booking to the organiser's booking.
+          // Included only when supplied (the group-join path forbids mixed
+          // guests). A normal or split party omits the key entirely so the
+          // column defaults to null, matching the create-payload assertions in
+          // booking-split.test.ts.
+          ...(parentBookingId != null ? { parentBookingId } : {}),
+          // ORGANISER_PAYS joins flag the booking so the joiner is never billed
+          // and the organiser settles it. Omitted entirely otherwise so the
+          // column defaults to false and the create-payload assertions in
+          // booking-split.test.ts stay unchanged.
+          ...(organiserSettledInLock ? { organiserSettled: true } : {}),
+          notes: notes || null,
+          expectedArrivalTime: expectedArrivalTime || null,
+          requestedRoomId: requestedRoomId || null,
+          cancelIfGuestsBumped: effectiveCancelIfGuestsBumped,
+          // Stored credit election (#2265) on the review rail. A booking held
+          // for admin review consumes no credit — `blockForReview` forces the
+          // applied amount to 0 above, because a member's balance must not be
+          // tied up while an admin is still deciding. Discarding what they
+          // asked for is a different thing entirely, and that is what used to
+          // happen: the member ticked "use my credit", the booking was parked
+          // in AWAITING_REVIEW, and the election was gone by the time the admin
+          // released it. Remember it here instead, exactly as a saved draft
+          // does, so the release -> pay path consumes it like any other
+          // PAYMENT_PENDING booking. Omitted entirely (column defaults to NULL)
+          // when the member made no election, so the create payload is
+          // unchanged for every other booking.
+          ...(review.blockForReview && applyCreditCents != null
+            ? { creditElectionCents: applyCreditCents }
+            : {}),
+          createdById: isOnBehalf ? sessionUserId : null,
+          // Persisted capacity override (#1771): stamp the admitting admin when
+          // this create deliberately overbooked (pre-create branch). Omitted
+          // entirely on the in-capacity path so the columns default to null.
+          ...(capacityOverridden
+            ? {
+                capacityOverriddenAt: new Date(),
+                capacityOverriddenByMemberId: sessionUserId,
+              }
+            : {}),
+          requiresAdminReview: review.requiresAdminReview,
+          adminReviewReason: review.adminReviewReason,
+          memberReviewJustification: review.memberReviewJustification,
+          adminReviewStatus: review.adminReviewStatus,
+          adminReviewNotes: review.adminReviewNotes,
+          adminReviewedById: review.adminReviewedById,
+          adminReviewedAt: review.adminReviewedAt,
+          guests: {
+            create: buildGuestCreateData(
+              primaryGuests,
+              price,
+              checkIn,
+              checkOut,
+              // #3029 (`INV-MOD-059`): carried values (the cross-lodge offer) as
+              // they are; linked members seeded from their current profiles.
+              await resolveBookingGuestDietary(
+                tx,
+                input.guestDietarySeeding,
+                primaryGuests,
+              ),
+            ),
+          },
+        },
+        include: { guests: true },
+      });
+
+      // #3827: one redemption per applied code, in the booker's order, on the
+      // booking created above in this transaction (the switch probe's
+      // precondition).
+      for (const redemption of promotions.redemptions) {
+        await redeemPromoCode(
+          tx,
+          redemption.promoCodeId,
+          newBooking.id,
+          effectiveMemberId,
+          redemption.discountCents,
+          redemption.priceAdjustmentCents,
+          redemption.freeNightsUsed || undefined,
+          redemption.eligibleGuestCount || undefined,
+          redemption.allocations,
+          getPromoTargetBookingGuestIds(newBooking.guests, redemption.selectedGuestIndexes),
+          bookingLodgeId,
+          redemption.applicationOrder,
+        );
+      }
+
+      // #3276: the build-up of every night this booking was just sold, after the
+      // last night write and the redemption write. With no promotion the targets
+      // are empty and RECORDED says exactly that: nothing was taken off.
+      await recordBookingNightAdjustments(tx, {
+        format: input.format,
+        bookingId: newBooking.id,
+        guestIds: newBooking.guests.map((guest) => guest.id),
+        targets: promotions.promoAdjustmentTargets,
+        writer: "booking creation",
+      });
+
+      if (creditAppliedCents > 0) {
+        await applyCreditToBooking(effectiveMemberId, creditAppliedCents, newBooking.id, tx, input.format);
+      }
+
+      // Zero-dollar (or fully credit-covered) PAYMENT_PENDING booking:
+      // final-claim capacity, create $0 SUCCEEDED Payment, set PAID.
+      // Skipped when the booking is held in AWAITING_REVIEW — payment
+      // (including the zero-dollar auto-PAID path) must wait for admin.
+      if (
+        effectivePriceCents === 0 &&
+        creditApplicationStatus === BookingStatus.PAYMENT_PENDING &&
+        !review.blockForReview
+      ) {
+        const finalCapacityCheck = await checkCapacityForGuestRanges(
+          bookingLodgeId,
+          checkIn,
+          checkOut,
+          capacityGuestRanges,
+          newBooking.id,
+          tx
+        );
+        if (!finalCapacityCheck.available) {
+          if (overCapacityWarnAndConfirm) {
+            // On-behalf $0 booking over capacity: warn-and-confirm
+            // (#1695/#1767).
+            if (input.confirmOverCapacity !== true) {
+              throw new OverCapacityConfirmationRequiredError(
+                overCapacityNights(finalCapacityCheck),
+              );
+            }
+            // Confirmed override cannot punch into an exclusive hold (decision 5).
+            const blocked = wholeLodgeBlockedNights(finalCapacityCheck);
+            if (blocked.length > 0) {
+              throw new WholeLodgeHoldBlockedError(blocked);
+            }
+            capacityOverridden = true;
+          } else {
+            // Since #737/#738 a PENDING booking holds no capacity, so there is
+            // no synchronous bump to fall back on: a $0 all-member booking that
+            // does not fit against committed bookings is rejected with the
+            // capacity-exceeded response, never bumped into a full lodge
+            // (issue #738, carried over from R1).
+            capacityFullNights = getCapacityFullNights(finalCapacityCheck.nightDetails);
+            throw new Error("CAPACITY_EXCEEDED_SENTINEL");
+          }
+        }
+
+        isZeroDollarConfirmed = true;
+        // The $0 Payment row, shared with the import's free stay (#5167).
+        await createZeroPriceConfirmationPayment(tx, { bookingId: newBooking.id, creditAppliedCents });
+        await tx.booking.update({
+          where: { id: newBooking.id },
+          data: {
+            status: BookingStatus.PAID,
+            // Persisted capacity override (#1771): the $0/credit-covered branch
+            // decides the overbook AFTER the create, so stamp the admitting
+            // admin on this settling update. Guarded — never set in-capacity.
+            ...(capacityOverridden
+              ? {
+                  capacityOverriddenAt: new Date(),
+                  capacityOverriddenByMemberId: sessionUserId,
+                }
+              : {}),
+          },
+        });
+        newBooking.status = BookingStatus.PAID;
+        // #4660: this PAID is the booking's confirmation, so its lines and R01
+        // post here, under this transaction's lock(1) and lodge key, after the
+        // promotion targets and the $0 payment are written. A retry posts nothing twice.
+        await postStoredBookingConfirmationLedgerLines(tx, newBooking.id, input.journal);
+      } else if (
+        internetBankingPaymentSelected &&
+        effectivePriceCents > 0
+      ) {
+        const reference = buildInternetBankingPaymentReference(newBooking.id);
+        const payment = await tx.payment.create({
+          data: {
+            bookingId: newBooking.id,
+            amountCents: effectivePriceCents,
+            creditAppliedCents,
+            source: PaymentSource.INTERNET_BANKING,
+            reference,
+            status: PaymentStatus.PENDING,
+            internetBankingHoldSlots,
+            internetBankingHoldUntil,
+            internetBankingHoldReleasedAt: null,
+          },
+        });
+
+        await recordInternetBankingPaymentTransaction({
+          paymentId: payment.id,
+          amountCents: effectivePriceCents,
+          status: PaymentStatus.PENDING,
+          reference,
+          reason: "internet_banking_booking_payment",
+          store: tx,
+        });
+        // #4628 (M3c, R01): the invoice binds the charge now, planned as the later confirmation plans its
+        // lines, under this transaction's lock(1) and lodge key; the context came in resolved (`INV-LOCK-004`).
+        await postBindingCharge(tx, input.journal, newBooking.id, bookingLodgeId);
+      }
+
+      await reconcileBedAllocationsForBookingWithGlobalLockHeld({
+        bookingId: newBooking.id,
+        db: tx,
+      });
+
+      if (groupJoin) {
+        // Roster write is atomic with the child booking (#1039 item 2). The
+        // advisory lock above serialises booking creation, so this
+        // check-then-write cannot race; the (groupBookingId, joinerMemberId)
+        // unique pair backs it at the database as well.
+        //
+        // #3038 — AND IT RUNS BEFORE THE SPLIT CHILD IS CREATED, WHICH IS
+        // LOAD-BEARING RATHER THAN TIDY. This row IS the booking's Group Trip
+        // identity (`INV-HOST-043`), and the split child below is reconciled
+        // against the hosting rule the moment it is written. While this write
+        // came last, that reconciliation ran with no roster row in existence:
+        // the parent belonged to no Group Trip yet, so the child — the half
+        // carrying the party's NON-MEMBER guests, the rows the rule exists to
+        // judge — inherited nothing and was recorded as uncovered. Every later
+        // evaluation of the same booking, the join preflight included, found
+        // the cover and disagreed with it. `verifyAndCreateNonMemberJoin` claims
+        // its roster row before reconciling for exactly this reason; the member
+        // join now matches it.
+        //
+        // Both writes are in ONE transaction, so nothing outside it can see the
+        // intermediate state, and a hosting refusal below still rolls this
+        // claim back with the booking.
+        const existingJoin = await tx.groupBookingJoin.findUnique({
+          where: {
+            groupBookingId_joinerMemberId: {
+              groupBookingId: groupJoin.groupBookingId,
+              joinerMemberId: groupJoin.joinerMemberId,
+            },
+          },
+          include: {
+            booking: { select: { status: true, deletedAt: true } },
+          },
+        });
+        const existingJoinIsLive =
+          existingJoin?.booking &&
+          !existingJoin.booking.deletedAt &&
+          existingJoin.booking.status !== BookingStatus.CANCELLED &&
+          existingJoin.booking.status !== BookingStatus.BUMPED;
+        if (existingJoinIsLive) {
+          throw new GroupJoinConflictError();
+        }
+        if (existingJoin) {
+          await tx.groupBookingJoin.update({
+            where: { id: existingJoin.id },
+            data: {
+              bookingId: newBooking.id,
+              isMember: true,
+              verifiedAt: new Date(),
+            },
+          });
+        } else {
+          await tx.groupBookingJoin.create({
+            data: {
+              groupBookingId: groupJoin.groupBookingId,
+              bookingId: newBooking.id,
+              joinerMemberId: groupJoin.joinerMemberId,
+              isMember: true,
+              verifiedAt: new Date(),
+            },
+          });
+        }
+      }
+
+      // Split booking (#738): create the linked provisional non-member booking
+      // in the same transaction. It is PENDING and holds no capacity (it does
+      // not run the capacity check or take payment in R2 — confirmed/charged or
+      // bumped at the hold window in R3). It carries no promo/credit; those stay
+      // with the member booking that is charged up front.
+      if (splitBooking) {
+        // The provisional child is charged the non-member SUBSET priced on its
+        // own (group discount qualifies only when the subset itself meets
+        // minGroupSize). This is the charge authority; the booking quote calls
+        // the SAME `priceDeferredNonMemberPortion` so the review banner's
+        // "about $X" equals what is charged here (#2003). splitBooking implies
+        // non-member guests, so the portion is always priced (never null).
+        const childPrice = await priceDeferredNonMemberPortion(tx, {
+          checkIn,
+          checkOut,
+          guests,
+          seasons: seasonData,
+          groupDiscount,
+        });
+        if (!childPrice) {
+          throw new Error(
+            "Split booking child pricing requires non-member guests",
+          );
+        }
+        const childHoldUntil = nonMemberHoldEnd(checkIn, holdDays);
+        const childBooking = await tx.booking.create({
+          data: {
+            memberId: effectiveMemberId,
+            // The child of a split booking always stays at the same lodge as
+            // its parent (one booking = one lodge, ADR-001).
+            lodgeId: newBooking.lodgeId,
+            checkIn,
+            checkOut,
+            status: BookingStatus.PENDING,
+            totalPriceCents: childPrice.totalPriceCents,
+            discountCents: 0,
+            promoAdjustmentCents: 0,
+            finalPriceCents: childPrice.totalPriceCents,
+            hasNonMembers: true,
+            nonMemberHoldUntil: childHoldUntil,
+            parentBookingId: newBooking.id,
+            notes: notes || null,
+            expectedArrivalTime: expectedArrivalTime || null,
+            requestedRoomId: requestedRoomId || null,
+            cancelIfGuestsBumped: false,
+            createdById: isOnBehalf ? sessionUserId : null,
+            // Persisted capacity override (#1771): a mixed-party overbook admits
+            // the WHOLE party over the ceiling behind the admin's confirm, so the
+            // provisional non-member child inherits the same override as its
+            // parent. Without this the parent (stamped) survives payment while the
+            // hold cron bumps the unstamped child days later — the exact silent
+            // partial-drop this feature exists to prevent. capacityOverridden is
+            // true here only when the member guests alone overflowed (the split
+            // gate checks member guests); if only the non-members overflow it stays
+            // false and the child keeps ordinary #738 hold-window behaviour.
+            ...(capacityOverridden
+              ? {
+                  capacityOverriddenAt: new Date(),
+                  capacityOverriddenByMemberId: sessionUserId,
+                }
+              : {}),
+            guests: {
+              create: buildGuestCreateData(
+                nonMemberGuests,
+                childPrice,
+                checkIn,
+                checkOut,
+                // #3029: non-members, so nothing is seeded; a carried value
+                // (cross-lodge offer) is kept.
+                await resolveBookingGuestDietary(
+                  tx,
+                  input.guestDietarySeeding,
+                  nonMemberGuests,
+                ),
+              ),
+            },
+          },
+          include: { guests: true },
+        });
+        // #3276: the split child carries no promotion (one redemption per party,
+        // on the member booking), so its nights record that nothing came off.
+        await recordBookingNightAdjustments(tx, {
+          format: input.format,
+          bookingId: childBooking.id,
+          guestIds: childBooking.guests.map((guest) => guest.id),
+          targets: [],
+          writer: "booking creation (split child)",
+        });
+        await reconcileBedAllocationsForBookingWithGlobalLockHeld({
+          bookingId: childBooking.id,
+          db: tx,
+        });
+        // #2364. The split child carries the party's NON-MEMBER guests, so it is
+        // the row that can trip the hosting rule; the reconciler borrows the
+        // member booking's adults as host-only participants, which is why the
+        // parent has to exist first (it does — it is `newBooking` above).
+        await recordAdultMemberHostingReviewForNewBooking(
+          childBooking.id,
+          tx,
+          adultMemberHostingDecision,
+        );
+        splitChild = {
+          id: childBooking.id,
+          finalPriceCents: childBooking.finalPriceCents,
+        };
+      }
+
+      // #2364, last inside the transaction so every guest row, split child and
+      // group-join row it evaluates already exists.
+      await recordAdultMemberHostingReviewForNewBooking(
+        newBooking.id,
+        tx,
+        adultMemberHostingDecision,
+      );
+
+      return newBooking;
+    }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+  } catch (err) {
+    if (err instanceof Error && err.message === "CAPACITY_EXCEEDED_SENTINEL" && capacityFullNights) {
+      return { type: "capacityExceeded", fullNights: capacityFullNights };
+    }
+    throw err;
+  }
+
+  // #2525: post-commit provider work (audit, booking events, member emails,
+  // Xero invoice/credit queueing, admin alert). In standalone mode it runs
+  // immediately below, exactly as before. In tx-mode the caller owns the
+  // commit, so it is handed back as `deferredPostCommit` to run AFTER that
+  // commit — no provider call ever fires inside the still-open transaction.
+  const runPostCommit = async (): Promise<void> => {
+    // A CONFIRMED/PAID create can restore cover to an existing same-owner
+    // booking. The fenced create transaction recorded that obligation; settle
+    // it only now, after either our transaction or the caller-owned transaction
+    // has committed, so the drain re-reads authoritative rows and keeps all
+    // notification providers outside the booking transaction.
+    await settleHostingCoverageAfterCommit({ bookingId: booking.id });
+
+    logAudit({
+      action: "booking.created",
+      memberId: sessionUserId,
+      targetId: booking.id,
+      subjectMemberId: effectiveMemberId,
+      entityType: "Booking",
+      entityId: booking.id,
+      category: "booking",
+      outcome: "success",
+      summary: "Booking created",
+      details: `Booking created with status ${booking.status}`,
+      metadata: {
+        status: booking.status,
+        onBehalf: isOnBehalf,
+        checkIn: checkIn.toISOString(),
+        checkOut: checkOut.toISOString(),
+        guestCount: primaryGuests.length,
+        hasNonMembers: primaryHasNonMembers,
+        finalPriceCents: booking.finalPriceCents,
+        zeroDollarConfirmed: isZeroDollarConfirmed,
+        paymentMethod,
+        split: splitBooking,
+        // Override audit fields (#1695/#1767), only when an override was in
+        // play — a normal create records nothing new. allowPastDates stays
+        // true exactly for the retroactive shape, so #1695 audits are
+        // byte-identical.
+        ...(retroactiveOverride || capacityOverridden
+          ? {
+              allowPastDates: retroactiveOverride,
+              confirmOverCapacity: input.confirmOverCapacity === true,
+              capacityOverridden,
+            }
+          : {}),
+      },
+    });
+
+    if (isOnBehalf) {
+      logAudit({
+        action: "booking.created_on_behalf",
+        memberId: sessionUserId,
+        targetId: booking.id,
+        subjectMemberId: effectiveMemberId,
+        entityType: "Booking",
+        entityId: booking.id,
+        category: "booking",
+        outcome: "success",
+        summary: "Booking created on behalf of member",
+        details: `Admin created booking on behalf of member ${effectiveMemberId}`,
+        metadata: {
+          status: booking.status,
+          checkIn: checkIn.toISOString(),
+          checkOut: checkOut.toISOString(),
+          guestCount: primaryGuests.length,
+          hasNonMembers: primaryHasNonMembers,
+          finalPriceCents: booking.finalPriceCents,
+          paymentMethod,
+          split: splitBooking,
+          // The admin's email choice is recorded on every on-behalf create.
+          notifyMember,
+          ...(retroactiveOverride || capacityOverridden
+            ? {
+                allowPastDates: retroactiveOverride,
+                confirmOverCapacity: input.confirmOverCapacity === true,
+                capacityOverridden,
+              }
+            : {}),
+        },
+      });
+    }
+
+    // Durable lifecycle events (issue #740): the booking was created, and the
+    // split non-member child (if any) was created in the same transaction.
+    await recordBookingEvent({
+      bookingId: booking.id,
+      type: BookingEventType.CREATED,
+      actorMemberId: sessionUserId,
+      amountCents: booking.finalPriceCents,
+    });
+    // `splitChild` is only assigned inside the transaction closure, which TS
+    // control-flow narrows away in this outer scope; cast back to its type.
+    const createdSplitChild = splitChild as
+      | { id: string; finalPriceCents: number }
+      | null;
+    if (createdSplitChild) {
+      await recordBookingEvent({
+        bookingId: createdSplitChild.id,
+        type: BookingEventType.CREATED,
+        actorMemberId: sessionUserId,
+        amountCents: createdSplitChild.finalPriceCents,
+      });
+    }
+    // A fully credit-covered or genuinely free booking is paid up front at $0.
+    if (isZeroDollarConfirmed) {
+      await recordBookingEvent({
+        bookingId: booking.id,
+        type: BookingEventType.MEMBER_PAID,
+        actorMemberId: sessionUserId,
+        amountCents: 0,
+      });
+    }
+
+    if (isZeroDollarConfirmed) {
+      try {
+        const fullBooking = await prisma.booking.findUnique({
+          where: { id: booking.id },
+          include: {
+            member: true,
+            // #3369: the owner may be an Organisation; bookingOwner() reads both.
+            organisation: { select: { name: true, email: true } },
+            guests: true,
+            promoRedemptions: {
+              include: {
+                promoCode: { include: { workPartyEvent: { select: { name: true } } } },
+              },
+            },
+          },
+        });
+        if (fullBooking) {
+          // Internal work-party promo codes are meaningless to members; label
+          // the discount with the event name instead. #3826: every code the
+          // booking carries, in application order — the one label it always
+          // was for a single-code booking.
+          const createdPromoLabel = bookingPromoRedemptions(fullBooking)
+            .map(
+              (redemption) =>
+                redemption.promoCode.workPartyEvent?.name ?? redemption.promoCode.code,
+            )
+            .join(", ");
+          // The member confirmation email is suppressed when an admin on-behalf
+          // create opts out (#1695); the Xero invoice below is still queued.
+          if (notifyMember) {
+            // Split-booking parent (#738/#1942): a zero-dollar/credit-covered
+            // parent can still carry a provisional non-member child. Describe it
+            // so the confirmation explains the separate later charge. Read-only;
+            // null on non-split bookings. (Only the email call site is touched
+            // here — the split engine above is untouched.)
+            const provisionalGuests = await getProvisionalNonMemberChildSummary({
+              id: fullBooking.id,
+              memberId: bookingOwner(fullBooking).memberId,
+            });
+            sendBookingConfirmedEmail(
+              {
+                bookingId: fullBooking.id,
+                recipientMemberId: bookingOwner(fullBooking).memberId,
+              },
+              bookingOwner(fullBooking).member.email,
+              bookingOwner(fullBooking).member.firstName,
+              fullBooking.checkIn,
+              fullBooking.checkOut,
+              fullBooking.guests.length,
+              fullBooking.finalPriceCents,
+              input.format,
+              {
+                lodgeId: fullBooking.lodgeId,
+                ...(provisionalGuests ? { provisionalGuests } : {}),
+                ...(createdPromoLabel
+                  ? {
+                      discountCents: fullBooking.discountCents,
+                      promoAdjustmentCents: fullBooking.promoAdjustmentCents,
+                      promoCode: createdPromoLabel,
+                    }
+                  : {}),
+              },
+            ).catch((err) => logger.error({ err, bookingId: booking.id }, "Failed to send confirmation email for $0 booking"));
+          }
+
+          const effectiveModules = await loadEffectiveModuleFlags();
+          if (effectiveModules.xeroIntegration) {
+            void enqueueXeroBookingInvoiceOperation(booking.id, {
+              createdByMemberId: sessionUserId,
+              invoiceEmailDelivery: creationInvoiceEmailDelivery,
+            })
+              .then(async (queuedInvoice) => {
+                if (!queuedInvoice.queueOperationId) return;
+                await kickQueuedXeroOutboxOperationsIfConnected({ limit: 1 });
+              })
+              .catch((err) =>
+                logger.error({ err, bookingId: booking.id }, "Failed to queue Xero invoice for $0 booking"),
+              );
+          }
+        }
+      } catch (err) {
+        logger.error({ err, bookingId: booking.id }, "Error in post-creation handling for $0 booking");
+      }
+    }
+
+    if (
+      paymentMethod === "internet_banking" &&
+      booking.status === BookingStatus.PAYMENT_PENDING &&
+      !isZeroDollarConfirmed
+    ) {
+      try {
+        const queuedInvoice = await enqueueXeroBookingInvoiceOperation(booking.id, {
+          createdByMemberId: sessionUserId,
+          invoiceEmailDelivery: creationInvoiceEmailDelivery,
+        });
+        // #1620 — allocate the member's existing floating credit notes against this
+        // invoice so they pay the effective (credit-reduced) amount. Enqueued after
+        // the invoice op (older createdAt → processed first). Skips itself when no
+        // credit was applied.
+        const queuedAllocation = await enqueueXeroAppliedCreditAllocationOperation(
+          booking.id,
+          { createdByMemberId: sessionUserId },
+        );
+        if (queuedInvoice.queueOperationId || queuedAllocation.queueOperationId) {
+          await kickQueuedXeroOutboxOperationsIfConnected({ limit: 2 });
+        }
+      } catch (err) {
+        logger.error(
+          { err, bookingId: booking.id },
+          "Failed to queue Xero invoice for Internet Banking booking"
+        );
+      }
+    }
+
+    if (booking.status === BookingStatus.PENDING && booking.nonMemberHoldUntil) {
+      const member = await prisma.member.findUnique({ where: { id: effectiveMemberId } });
+      // Suppressed when an admin on-behalf create opts out of member email (#1695).
+      if (member && notifyMember) {
+        sendBookingPendingEmail(
+          { bookingId: booking.id, recipientMemberId: effectiveMemberId },
+          member.email,
+          member.firstName,
+          booking.checkIn,
+          booking.checkOut,
+          booking.guests.length,
+          booking.nonMemberHoldUntil,
+          booking.lodgeId,
+        ).catch((err) => logger.error({ err }, "Failed to send pending booking email"));
+      }
+    }
+
+    const bookingMember = await prisma.member.findUnique({ where: { id: effectiveMemberId } });
+    if (bookingMember) {
+      sendAdminNewBookingAlert({
+        memberName: `${bookingMember.firstName} ${bookingMember.lastName}`,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        guestCount: booking.guests.length,
+        totalCents: booking.finalPriceCents,
+        status: booking.status,
+        reviewReason: booking.adminReviewReason,
+        memberJustification: booking.memberReviewJustification,
+      }, input.format).catch((err) => logger.error({ err }, "Failed to send admin new booking alert"));
+    }
+
+  };
+
+  if (input.tx) {
+    return {
+      type: "created",
+      booking,
+      bumpedBookingIds: [],
+      isZeroDollarConfirmed,
+      deferredPostCommit: runPostCommit,
+    };
+  }
+
+  await runPostCommit();
+  return { type: "created", booking, bumpedBookingIds: [], isZeroDollarConfirmed };
+}
+
+/**
+ * Create a WAITLISTED booking when capacity is full and the user has
+ * opted in. Pricing is locked in at waitlist time. Position is set
+ * inside the transaction so it remains stable until the booking is
+ * promoted off the waitlist.
+ */
+export async function createWaitlistedBooking(input: WaitlistedBookingInput): Promise<WaitlistedBookingResult> {
+  const lodgeId = requireBookingLodgeId(input.lodgeId);
+  const {
+    effectiveMemberId,
+    isOnBehalf,
+    sessionUserId,
+    checkIn: inputCheckIn,
+    checkOut: inputCheckOut,
+    guests,
+    notes,
+    workPartyEventId,
+    expectedArrivalTime,
+    requestedRoomId,
+    cancelIfGuestsBumped,
+    groupDiscount,
+    memberReviewJustification,
+    adultMemberHostingReason,
+  } = input;
+  // #2364: null for every member-created booking, so their hazard opens PENDING.
+  const adultMemberHostingDecision = resolveAdultMemberHostingDecision({
+    isOnBehalf,
+    sessionUserId,
+    adultMemberHostingReason,
+  });
+  // Auto-expand (issue #713): the persisted range covers every guest night,
+  // never shrinking below the member's stated range.
+  const { checkIn, checkOut } = resolveBookingDateEnvelope(
+    guests,
+    inputCheckIn,
+    inputCheckOut
+  );
+
+  // Throws BookingReviewJustificationRequiredError if the rule trips on a
+  // member-created booking with no justification supplied. WAITLISTED is
+  // kept as the persisted status (waitlist doesn't hold capacity), but
+  // adminReviewStatus = PENDING so the review queue and force-confirm path
+  // know it needs a decision before it can progress.
+  const review = resolveAdminReviewFields({
+    guests,
+    isOnBehalf,
+    sessionUserId,
+    memberReviewJustification,
+  });
+
+  // #3123 — the CLUB's day, from its persisted `ClubTimeSettings.timeZone`
+  // (`INV-CONFIG-002`), resolved ONCE here and read by both of this waitlist
+  // create's day-dependent decisions: the promotion's validity window in
+  // `validateAndCalculatePromoDiscount`, and the person-night guard's
+  // self-removal window inside the transaction below. Two reads would be two
+  // answers across club midnight.
+  //
+  // Read BEFORE the transaction below opens, because everything inside it holds
+  // the per-lodge capacity key and a `clubTimeSettings` query there would need a
+  // second pooled connection while that lock is held (`INV-LOCK-004`). The
+  // runtime reader rather than `club-time/server`: this module is CLI-reachable
+  // through `e2e/setup/seed-second-lodge.ts`, where `server-only` is a bare
+  // throw at import.
+  //
+  // The SPELLING matters here, not only the placement.
+  // `cross-lodge-waitlist-create.test.ts` finds this function's transaction by
+  // scanning for the interactive-transaction call as literal text, so naming
+  // that call in a comment ahead of the real one moves the scanner's idea of
+  // where the transaction starts and silently breaks an unrelated ordering
+  // contract. Say "the transaction below".
+  const todayAtClub = clubToday(await readClubTimeZoneOutsideRequest());
+
+  const waitlistLodgeId = await resolveBookingLodgeId(
+    prisma,
+    lodgeId,
+    requestedRoomId,
+  );
+  await assertMemberMayBookLodge(prisma, {
+    memberId: effectiveMemberId,
+    lodgeId: waitlistLodgeId,
+    isOnBehalf,
+  });
+  const alternateLodgeIds = await resolveWaitlistAlternateLodgeIds(prisma, {
+    requestedAlternateLodgeIds: input.alternateLodgeIds,
+    primaryLodgeId: waitlistLodgeId,
+    memberId: effectiveMemberId,
+    isOnBehalf,
+  });
+  const seasons = await prisma.season.findMany({
+    where: {
+      active: true,
+      startDate: { lte: checkOut },
+      endDate: { gte: checkIn },
+      ...lodgeNullTolerantScope(waitlistLodgeId),
+    },
+    include: { membershipTypeRates: true },
+  });
+  const seasonData = toSeasonRateData(seasons);
+  const guestInputs = toGuestPricingInputs(guests);
+  const price = await priceBookingGuestsWithMembershipTypePolicy(prisma, {
+    ownerMemberId: effectiveMemberId,
+    checkIn,
+    checkOut,
+    guests: guestInputs,
+    seasons: seasonData,
+    groupDiscount,
+    // #2543 — see the draft path above.
+    subscriptionLockoutMode: input.subscriptionLockoutMode,
+    // Finding 2 (privacy re-review of MG3 #2308).
+    skipAuthorization: isOnBehalf,
+  });
+
+  // Priced BEFORE the transaction, unlocked, as the waitlisted create always
+  // has: a waitlisted booking consumes no use until it is offered, and the
+  // offer re-prices every code under its locks (`recalculateBookingPromo`).
+  let discountCents = 0;
+  let promoAdjustmentCents = 0;
+  const promoSources = await resolveEffectivePromoSources(prisma, {
+    promoCodes: promoCodeRequestsOf(input),
+    workPartyEventId,
+    checkIn,
+    checkOut,
+    lodgeId: waitlistLodgeId,
+  });
+  // Each guest's own priced row, read once. The breakdown was built for
+  // exactly this party, so a guest with no row would be a promo evaluated
+  // against nothing — refused rather than discounted on a guess (#2800).
+  const pricedPerGuest = guests.map((_, index) => {
+    const priced = price.guests[index];
+    if (priced === undefined) {
+      throw new Error(
+        `Promo evaluation has no priced guest at breakdown position ${index} of ${price.guests.length} (#3167).`,
+      );
+    }
+    return priced;
+  });
+  const promotions = await resolvePromotionsInTransaction(prisma, {
+    sources: promoSources,
+    lockRows: false,
+    effectiveMemberId,
+    checkIn,
+    guests,
+    totalPriceCents: price.totalPriceCents,
+    perNightCentsByGuest: pricedPerGuest.map((priced) => priced.perNightCents),
+    nightDatesByGuest: pricedPerGuest.map((priced) => priced.nightDates),
+    lodgeId: waitlistLodgeId,
+    todayAtClub,
+  });
+  // The booking's headline pair, from the one resolution (INV-MONEY-031's
+  // paired-assignment shape): Σ over the codes, each its own integer cents.
+  discountCents = promotions.discountCents;
+  promoAdjustmentCents = promotions.promoAdjustmentCents;
+
+  const finalPriceCents = bookingFinalPriceCents({
+    totalPriceCents: price.totalPriceCents,
+    promoAdjustmentCents,
+  });
+  const hasNonMembers = guests.some((g) => !g.isMember);
+
+  const { newBooking, position } = await prisma.$transaction(async (tx) => {
+    await acquireLodgeCapacityLock(tx, lodgeId);
+    // The preflight above is only for pricing/error quality.  Re-establish the
+    // authoritative scope after the lock immediately before persisting.
+    const lockedLodgeId = await resolveBookingLodgeId(
+      tx,
+      lodgeId,
+      requestedRoomId,
+    );
+    await assertMemberMayBookLodge(tx, {
+      memberId: effectiveMemberId,
+      lodgeId: lockedLodgeId,
+      isOnBehalf,
+    });
+    if (lockedLodgeId !== waitlistLodgeId) {
+      throw new BookingLodgeError("Booking lodge changed during creation");
+    }
+    // Duplicate member nights (upstream #80cbdf4c): waitlist entries also
+    // may not overlap the member's existing booked nights.
+    await assertNoBookingMemberNightConflicts(tx, {
+      actorMemberId: sessionUserId,
+      actorRole: isOnBehalf ? "ADMIN" : "USER",
+      checkIn,
+      checkOut,
+      guests,
+      // Resolved above, before this transaction opened (`INV-LOCK-004`), and
+      // shared with the promotion's validity window — one day per create.
+      today: dateOnlyInstantOf(todayAtClub),
+    }, input.format);
+    // #3029 (`INV-MOD-059`): the waitlisted guest rows are the rows a later
+    // promotion keeps, so they are seeded here, when they are first created.
+    const guestDietary = await resolveBookingGuestDietary(
+      tx,
+      input.guestDietarySeeding,
+      guests,
+    );
+
+    const createdBooking = await tx.booking.create({
+      data: {
+        memberId: effectiveMemberId,
+        lodgeId: waitlistLodgeId,
+        checkIn,
+        checkOut,
+        status: BookingStatus.WAITLISTED,
+        totalPriceCents: price.totalPriceCents,
+        discountCents,
+        promoAdjustmentCents,
+        finalPriceCents,
+        hasNonMembers,
+        nonMemberHoldUntil: null,
+        notes: notes || null,
+        expectedArrivalTime: expectedArrivalTime || null,
+        requestedRoomId: requestedRoomId || null,
+        cancelIfGuestsBumped: cancelIfGuestsBumped ?? false,
+        createdById: isOnBehalf ? sessionUserId : null,
+        requiresAdminReview: review.requiresAdminReview,
+        adminReviewReason: review.adminReviewReason,
+        memberReviewJustification: review.memberReviewJustification,
+        adminReviewStatus: review.adminReviewStatus,
+        adminReviewNotes: review.adminReviewNotes,
+        adminReviewedById: review.adminReviewedById,
+        adminReviewedAt: review.adminReviewedAt,
+        guests: {
+          create: buildGuestCreateData(guests, price, checkIn, checkOut, guestDietary),
+        },
+      },
+      include: { guests: true },
+    });
+
+    // #3827: one redemption per applied code, in the booker's order, on the
+    // booking created above in this transaction (the switch probe's
+    // precondition). Each redemption's counter write row-locks its code, and
+    // this path holds the lodge key but not lock(1), so two waitlisted creates
+    // naming the same codes in opposite orders would take those row locks in
+    // opposite orders and deadlock. Every code row is therefore locked first,
+    // in ONE sorted call, after the lodge key (INV-LOCK-002, INV-MONEY-023).
+    // No cap is re-read here, deliberately: a waitlisted booking consumes no use
+    // until it is offered, the offer re-prices every code under its own locks,
+    // and the counter write is an atomic increment rather than a read-then-write.
+    if (promotions.redemptions.length > 1) {
+      await lockPromoCodeRowsForUpdate(
+        tx,
+        promotions.redemptions.map((redemption) => redemption.promoCodeId),
+      );
+    }
+    for (const redemption of promotions.redemptions) {
+      await redeemPromoCode(
+        tx,
+        redemption.promoCodeId,
+        createdBooking.id,
+        effectiveMemberId,
+        redemption.discountCents,
+        redemption.priceAdjustmentCents,
+        redemption.freeNightsUsed || undefined,
+        redemption.eligibleGuestCount || undefined,
+        redemption.allocations,
+        getPromoTargetBookingGuestIds(createdBooking.guests, redemption.selectedGuestIndexes),
+        waitlistLodgeId,
+        redemption.applicationOrder,
+      );
+    }
+
+    // #3276: the build-up of every night this booking was just sold, after the
+    // last night write and the redemption write. With no promotion the targets
+    // are empty and RECORDED says exactly that: nothing was taken off.
+    await recordBookingNightAdjustments(tx, {
+      format: input.format,
+      bookingId: createdBooking.id,
+      guestIds: createdBooking.guests.map((guest) => guest.id),
+      targets: promotions.promoAdjustmentTargets,
+      writer: "waitlist booking creation",
+    });
+
+    if (alternateLodgeIds.length > 0) {
+      await tx.bookingWaitlistAlternateLodge.createMany({
+        data: alternateLodgeIds.map((alternateLodgeId) => ({
+          bookingId: createdBooking.id,
+          lodgeId: alternateLodgeId,
+        })),
+      });
+    }
+
+    // The place quoted in the confirmation email and the audit row, read from
+    // the live queue under this transaction's lodge key (#5402). Nothing
+    // stores it: every screen reads it again when it shows it
+    // (`INV-CAP-041`).
+    const position = await getWaitlistPositionOf(tx, createdBooking);
+
+    // #2364. A waitlisted booking holds no capacity, but it is still a party
+    // the club will have to admit if the offer is taken, so the hazard is
+    // recorded now rather than discovered at confirmation time. The confirm
+    // path re-reconciles, so a policy or membership change during the wait is
+    // still picked up.
+    await recordAdultMemberHostingReviewForNewBooking(
+      createdBooking.id,
+      tx,
+      adultMemberHostingDecision,
+    );
+
+    return { newBooking: createdBooking, position };
+  });
+
+  const member = await prisma.member.findUnique({ where: { id: effectiveMemberId } });
+  // The waitlist confirmation honours the on-behalf email choice too (#1695);
+  // a member joining the waitlist themselves is always emailed.
+  const notifyWaitlistedMember = !isOnBehalf || input.notifyMember !== false;
+  if (member && notifyWaitlistedMember) {
+    sendWaitlistConfirmationEmail(
+      { bookingId: newBooking.id, recipientMemberId: effectiveMemberId },
+      member.email,
+      member.firstName,
+      checkIn,
+      checkOut,
+      newBooking.guests.length,
+      position,
+      newBooking.lodgeId,
+    ).catch((err) => logger.error({ err }, "Failed to send waitlist confirmation email"));
+
+    sendAdminNewBookingAlert({
+      memberName: `${member.firstName} ${member.lastName}`,
+      checkIn: newBooking.checkIn,
+      checkOut: newBooking.checkOut,
+      guestCount: newBooking.guests.length,
+      totalCents: newBooking.finalPriceCents,
+      status: newBooking.status,
+      reviewReason: newBooking.adminReviewReason,
+      memberJustification: newBooking.memberReviewJustification,
+    }, input.format).catch((err) => logger.error({ err }, "Failed to send admin alert for waitlisted booking"));
+  }
+
+  logAudit({
+    action: "booking.waitlisted",
+    memberId: effectiveMemberId,
+    targetId: newBooking.id,
+    subjectMemberId: effectiveMemberId,
+    entityType: "Booking",
+    entityId: newBooking.id,
+    category: "booking",
+    outcome: "success",
+    summary: "Booking added to waitlist",
+    details: `Booking added to waitlist at position #${position}`,
+    metadata: {
+      checkIn: checkIn.toISOString(),
+      checkOut: checkOut.toISOString(),
+      guestCount: newBooking.guests.length,
+      position,
+      finalPriceCents: newBooking.finalPriceCents,
+      requiresAdminReview: newBooking.requiresAdminReview,
+      ...(alternateLodgeIds.length > 0 ? { alternateLodgeIds } : {}),
+    },
+  });
+
+  await recordBookingEvent({
+    bookingId: newBooking.id,
+    type: BookingEventType.CREATED,
+    actorMemberId: sessionUserId,
+    amountCents: newBooking.finalPriceCents,
+  });
+
+  return { booking: newBooking, position };
+}

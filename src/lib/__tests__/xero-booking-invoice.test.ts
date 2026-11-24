@@ -1,0 +1,4718 @@
+import { CHANGE_FEE_LINE_DESCRIPTION } from "@/lib/xero-modification-line-items";
+import { primaryInvoicePayloadHash } from "@/lib/member-money/internal/primary-invoice-plan";
+import { resolveXeroTaxRendering } from "@/lib/xero-tax-anchors";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => {
+  const tx = {
+    $executeRaw: vi.fn(),
+    member: {
+      findUnique: vi.fn(),
+      findFirst: vi.fn(),
+      update: vi.fn(),
+    },
+    // #3548: a new refund note is recorded (payment, link, row) in one
+    // transaction; the same fns as the global client's, so assertions hold.
+    // #3980 review C3: the link's write is guarded on it being unset, then the
+    // fee is read back under its lock.
+    payment: {
+      update: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findUniqueOrThrow: vi.fn().mockResolvedValue({ changeFeeCents: 0, bookingId: "booking_1", xeroInvoiceId: null }),
+    },
+    // #3955 round 4: the invoice link is saved with the fee figures it is
+    // checked against in one transaction. Its payload read is the
+    // transaction's own, so the global read of the email instruction below
+    // stays countable.
+    xeroSyncOperation: {
+      update: vi.fn(),
+      findUnique: vi.fn().mockResolvedValue({ requestPayload: {} }),
+      // #4426: a refund note's record claims its row; no row here is resolved by hand.
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    // #3980: and with the booking's worth, read after the link's own update.
+    // Review M1: the create's own read runs in a transaction too, so the
+    // booking read is shared with the global client's.
+    booking: { findUniqueOrThrow: vi.fn().mockResolvedValue({ finalPriceCents: 0 }), findUnique: vi.fn() },
+    bookingModification: { findMany: vi.fn().mockResolvedValue([]) },
+    // #3953: and the captures the payment's cash figure holds.
+    paymentTransaction: { findMany: vi.fn().mockResolvedValue([]) },
+    // #4525 (M13): the primary invoice's export manifest, written after its link.
+    memberMoneyExportManifest: { findUnique: vi.fn().mockResolvedValue(null), createMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    // #4525 (ALP-437): no released generation of any component, so each row is generation 0.
+    memberMoneyExportCoverage: { createMany: vi.fn().mockResolvedValue({ count: 1 }), findFirst: vi.fn().mockResolvedValue(null) },
+    // #5208: a GST mismatch Xero returned, recorded beside its audit row.
+    xeroTaxOverrideMismatch: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: "mismatch_1" }) },
+    auditLog: { create: vi.fn().mockResolvedValue({}) },
+  };
+
+  const prisma = {
+  environmentSafetySettings: { findUnique: vi.fn().mockResolvedValue(null) },
+  /*
+    #3036 (ENV-SAFETY 3, INV-CONFIG-005): on a confirmed copy the funnel proves
+    the invoice's contact can no longer reach a member BEFORE returning its id,
+    and a missing delegate here is a refusal — which is the point, so it is
+    declared rather than worked around.
+  */
+  xeroSandboxContactContainment: {
+    findUnique: vi.fn().mockResolvedValue(null),
+    upsert: vi.fn().mockResolvedValue({}),
+  },
+    $transaction: vi.fn(async (callback) => callback(tx)),
+    // #1355: contact resolution now reads the member on the GLOBAL client
+    // (phase 0/1) and re-reads via the tx client (phase 2). Alias the same
+    // mock fns so every existing fixture serves both phases.
+    member: tx.member,
+    booking: {
+      findUnique: tx.booking.findUnique,
+      findUniqueOrThrow: tx.booking.findUniqueOrThrow,
+    },
+    // #3530: a modification credit note reads its row's stored lines; none
+    // here, so every note in this suite renders its single line as before.
+    bookingModification: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      // #3750: fees a finished-stay correction added to the amount owed; none
+      // here, so every invoice in this suite is raised exactly as before.
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    manualRefundTask: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    // #2258: the withheld-send audit row written when the booking's
+    // "No emails" switch stops Xero emailing the invoice.
+    emailLog: {
+      create: vi.fn().mockResolvedValue({ id: "emaillog_1" }),
+    },
+    season: {
+      findFirst: vi.fn(),
+    },
+    payment: {
+      findUnique: vi.fn(),
+      update: tx.payment.update,
+      updateMany: tx.payment.updateMany,
+      findUniqueOrThrow: tx.payment.findUniqueOrThrow,
+    },
+    // #3955 round 5: the allocation engine's own figure for the applied credit
+    // still to allocate (`unallocatedAppliedCents`); none unless a test says.
+    memberCredit: {
+      groupBy: vi.fn().mockResolvedValue([]),
+    },
+    // #3635 round-3 R1: no refund row names a late capture unless a test says so.
+    paymentRefund: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    paymentTransaction: {
+      updateMany: vi.fn(),
+    },
+    // #4525 (M13): the booking's posted charge legs the manifest plans against; none unless a test says.
+    memberMoneyLine: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    // ALP-436: the primary invoice update reads the primary's manifest on the global client.
+    memberMoneyExportManifest: tx.memberMoneyExportManifest,
+    // #5208: the GST-override pause, read before the lines are planned; open unless a test says.
+    xeroTaxOverrideMismatch: tx.xeroTaxOverrideMismatch,
+    xeroObjectLink: {
+      findFirst: vi.fn(),
+      findMany: vi.fn(),
+    },
+    // #3806 R2: the token store reads the connection row and the
+    // credential-store token set; `mockXeroConnection` points both at a fixture.
+    xeroConnection: {
+      findUnique: vi.fn(),
+    },
+    // The previous release's lease, which a waiting refresh also honours.
+    xeroToken: {
+      findFirst: vi.fn(async () => null),
+    },
+    integrationCredential: {
+      findUnique: vi.fn(async () => null),
+    },
+    xeroAccountMapping: {
+      findUnique: vi.fn(),
+    },
+    xeroItemCodeMapping: {
+      findMany: vi.fn(),
+      findFirst: vi.fn(),
+    },
+    // #1930, E4: getHutFeeItemCodeMap resolves the FULL/NON_MEMBER ids for the
+    // per-guest item-code fallback.
+    membershipType: {
+      findMany: vi.fn().mockResolvedValue([
+        { id: "type-full", key: "FULL" },
+        { id: "type-nonmember", key: "NON_MEMBER" },
+      ]),
+    },
+    xeroSyncOperation: {
+      update: tx.xeroSyncOperation.update,
+      // #2929: the creation-time invoice-email instruction is read back off the
+      // operation row a dispatcher claimed. Defaults to "no instruction was
+      // recorded", which is every row this application has ever written before
+      // that issue and every row an enqueuer with no on-behalf choice writes.
+      findUnique: vi.fn().mockResolvedValue({ invoiceEmailDelivery: null }),
+      // #3635: no refund note was resolved by hand in Xero unless a test says so.
+      findMany: vi.fn().mockResolvedValue([]),
+      // #3809: no applied-credit deallocation is on its way for an edit's note to wait on.
+      findFirst: vi.fn().mockResolvedValue(null),
+    },
+  };
+  // #4656: a refund note's record asks, inside its transaction, that no other create row records the
+  // note - the same reads as the global client's, so a test's stubs reach them.
+  Object.assign(tx, { xeroObjectLink: prisma.xeroObjectLink });
+  Object.assign(tx.xeroSyncOperation, { findFirst: prisma.xeroSyncOperation.findFirst });
+
+  const xeroClientInstance = {
+    initialize: vi.fn().mockResolvedValue(undefined),
+    setTokenSet: vi.fn(),
+    refreshWithRefreshToken: vi.fn(),
+    accountingApi: {
+      createInvoices: vi.fn(),
+      getInvoice: vi.fn(),
+      updateInvoice: vi.fn(),
+      createPayment: vi.fn(),
+      createPayments: vi.fn(),
+      createCreditNoteAllocation: vi.fn(),
+      emailInvoice: vi.fn(),
+      createCreditNotes: vi.fn(),
+      createContacts: vi.fn(),
+      getContacts: vi.fn(),
+      // #3036: read the contact back, and contain it on a copy.
+      getContact: vi.fn(),
+      updateContact: vi.fn(),
+    },
+  };
+
+  return {
+    prisma,
+    tx,
+    xeroClientInstance,
+    XeroClient: vi.fn(function MockXeroClient() {
+      return xeroClientInstance;
+    }),
+    startXeroSyncOperation: vi.fn(),
+    completeXeroSyncOperation: vi.fn(),
+    failXeroSyncOperation: vi.fn(),
+    findCanonicalPaymentRefundCreditNote: vi.fn(),
+    upsertXeroObjectLink: vi.fn(),
+    resolveStripeCashRefundEvidence: vi.fn(),
+    retryXeroWriteWithContactRepair: vi.fn(),
+    recordXeroApiUsage: vi.fn(),
+    // #1641 — the card-path applied-credit allocation engine, dynamically imported
+    // by createXeroInvoiceForBooking. Mocked so we assert the gate + placement
+    // without re-driving the (separately unit-tested) engine.
+    allocateAppliedCreditForBooking: vi.fn(),
+    logger: {
+      error: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      debug: vi.fn(),
+    },
+  };
+});
+
+vi.mock("@/lib/xero-tax-anchors", () => import("./support/xero-tax-anchors-baseline"));
+vi.mock("xero-node", () => ({
+  XeroClient: mocks.XeroClient,
+  Contact: class {},
+  ContactGroup: class {},
+  Invoice: {
+    TypeEnum: { ACCREC: "ACCREC" },
+    StatusEnum: { AUTHORISED: "AUTHORISED" },
+  },
+  LineItem: class {},
+  LineAmountTypes: { Inclusive: "Inclusive" },
+  CreditNote: {
+    TypeEnum: { ACCRECCREDIT: "ACCRECCREDIT" },
+    StatusEnum: { AUTHORISED: "AUTHORISED" },
+  },
+  Payment: class {},
+  RequestEmpty: class {},
+  Phone: {
+    PhoneTypeEnum: { MOBILE: "MOBILE" },
+  },
+  Address: {
+    AddressTypeEnum: {
+      STREET: "STREET",
+      POBOX: "POBOX",
+    },
+  },
+}));
+
+// #3955 review X4: the gap check has its own suite; here, what it is handed
+// and when — the figures are saved with the link, in one transaction, and a
+// retry through the "invoice already exists" exit re-runs the check.
+const feeGap = vi.hoisted(() => ({
+  queuePrimaryInvoiceWorthGap: vi.fn(async () => ({
+    gapCents: 0,
+    queueOperationId: null as string | null,
+    alreadyQueued: false,
+    cashTakenCents: 0,
+  })),
+  recheckPrimaryInvoiceWorthGap: vi.fn(),
+}));
+const { queuePrimaryInvoiceWorthGap } = feeGap;
+vi.mock("@/lib/xero-primary-invoice-fee-gap", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/xero-primary-invoice-fee-gap")),
+  ...feeGap,
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: mocks.prisma,
+}));
+
+// #4525 (M13): the Stripe payment's capture receipt; its recorder has its own suite.
+const captureReceipts = vi.hoisted(() => ({ record: vi.fn() }));
+vi.mock("@/lib/member-money/doors", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/member-money/doors")),
+  recordCaptureReceiptManifest: captureReceipts.record,
+}));
+
+vi.mock("@/lib/email", () => ({
+  sendPasswordResetEmail: vi.fn(),
+}));
+
+vi.mock("@/lib/pricing", () => ({
+  getStayNights: vi.fn(() => [new Date("2026-07-31"), new Date("2026-08-01")]),
+}));
+
+vi.mock("@/lib/phone", () => ({
+  formatXeroPhone: vi.fn(),
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: mocks.logger,
+}));
+
+vi.mock("@/lib/xero-api-usage", () => ({
+  recordXeroApiUsage: mocks.recordXeroApiUsage,
+}));
+
+// #2902: delta-mode createXeroCreditNote recomputes its uncovered amount from
+// provider-backed cash evidence, never the refundedAmountCents mirror.
+// Resolution rules are unit-tested in stripe-cash-refund-evidence.test.ts;
+// the default (cash === mirror) keeps the pre-#2902 scenarios intact.
+vi.mock("@/lib/stripe-cash-refund-evidence", () => ({
+  resolveStripeCashRefundEvidence: mocks.resolveStripeCashRefundEvidence,
+}));
+
+vi.mock("@/lib/xero-links", () => ({
+  buildXeroContactUrl: vi.fn((contactId: string) => `https://go.xero.test/contact/${contactId}`),
+  buildXeroInvoiceUrl: vi.fn((invoiceId: string) => `https://go.xero.test/invoice/${invoiceId}`),
+}));
+
+vi.mock("@/lib/xero-sync", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/xero-sync");
+
+  return {
+    ...actual,
+    buildXeroIdempotencyKey: vi.fn((...parts: unknown[]) => parts.join(":")),
+    buildXeroPayloadHash: vi.fn(() => "payload-hash"),
+    completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+    failXeroSyncOperation: mocks.failXeroSyncOperation,
+    findCanonicalPaymentRefundCreditNote: mocks.findCanonicalPaymentRefundCreditNote,
+    startXeroSyncOperation: mocks.startXeroSyncOperation,
+    upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+  };
+});
+
+vi.mock("@/lib/xero-applied-credit-allocation", () => ({
+  allocateAppliedCreditForBooking: mocks.allocateAppliedCreditForBooking,
+}));
+
+vi.mock("@/lib/xero-contacts", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/xero-contacts");
+  return {
+    ...actual,
+    retryXeroWriteWithContactRepair: mocks.retryXeroWriteWithContactRepair,
+  };
+});
+
+// DB-only Xero resolution (#2079): supply the operational config and the
+// token-encryption key from a stub so the token round-trips below need no
+// integration-credential DB rows.
+vi.mock("@/lib/xero-config", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/xero-config");
+  return {
+    ...actual,
+    getOperationalXeroConfig: vi.fn().mockResolvedValue({
+      clientId: "test-client",
+      clientSecret: "test-secret",
+      redirectUris: ["https://example.com/api/admin/xero/callback"],
+      scopes: [...actual.XERO_REQUIRED_REPORT_OAUTH_SCOPES],
+      httpTimeout: 10_000,
+    }),
+  };
+});
+
+import { createXeroCreditNoteForModification } from "@/lib/xero-modification-credit-notes";
+import { createXeroCreditNote } from "@/lib/xero-credit-notes";
+import {
+  createXeroInvoiceForBooking,
+  updateXeroBookingInvoiceForBooking,
+} from "@/lib/xero-booking-invoices";
+import { resetXeroRateLimitStateForTests } from "@/lib/xero-api-client";
+import { frozenTestNow } from "@/lib/__tests__/helpers/clock";
+import {
+  connectedXeroFixture,
+  ensureStrongTestAuthSecret,
+  mockXeroConnection,
+} from "@/lib/__tests__/helpers/xero-connected-mock";
+import { expectClubTimeZonePremise } from "@/lib/__tests__/helpers/club-time-zone";
+import { declareEnvironmentRole } from "@/lib/__tests__/helpers/environment-role";
+import { toXeroSandboxContactEmail } from "@/lib/xero-sandbox-contact-email";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+import { xeroClaim } from "@/lib/__tests__/helpers/xero-claim";
+import { primaryInvoicePaymentKey } from "@/lib/capture-receipt-senders";
+
+// #3806 R2: a connected Xero is the connection row plus the credential-store
+// token set, encrypted under a strong test AUTH_SECRET set once for the suite.
+let restoreAuthSecret: () => void = () => {};
+
+type XeroBookingFixture = Record<string, unknown> & {
+  checkIn: Date | string;
+  checkOut: Date | string;
+  totalPriceCents?: number;
+  promoAdjustmentCents?: number;
+  guests: Array<
+    Record<string, unknown> & {
+      id?: string;
+      priceCents: number;
+      nights?: Array<
+        Record<string, unknown> & {
+          id?: string;
+          stayDate?: Date | string;
+          priceCents?: number | null;
+          priceSource?: "SOLD" | "OFFICER_PRICED" | "EVEN_SPLIT" | "UNKNOWN";
+        }
+      >;
+    }
+  >;
+  promoRedemption?: (Record<string, unknown> & { allocations?: unknown[] }) | null;
+  nightAdjustments?: unknown[];
+};
+
+/**
+ * The create-path mock ignores Prisma's select/include shape, so every booking
+ * it returns must still carry the complete Stage 3 projection Prisma would
+ * materialise. Keeping that repair in test code makes omitted relations a
+ * fixture defect instead of production compatibility behaviour.
+ */
+function withMoneyBuildUpProjection<T extends XeroBookingFixture>(booking: T) {
+  const checkIn = booking.checkIn instanceof Date ? booking.checkIn : new Date(booking.checkIn);
+  const checkOut = booking.checkOut instanceof Date ? booking.checkOut : new Date(booking.checkOut);
+  const guests = booking.guests.map((guest, guestIndex) => {
+    const suppliedNights = guest.nights ?? [];
+    const nights = (suppliedNights.length > 0
+      ? suppliedNights
+      : [{ stayDate: checkIn, priceCents: guest.priceCents, priceSource: "SOLD" as const }]
+    ).map((night, nightIndex) => ({
+      ...night,
+      id: night.id ?? `guest-${guestIndex + 1}-night-${nightIndex + 1}`,
+      stayDate:
+        night.stayDate instanceof Date
+          ? night.stayDate
+          : new Date(night.stayDate ?? checkIn),
+      priceCents: night.priceCents ?? guest.priceCents,
+      priceSource: night.priceSource ?? ("SOLD" as const),
+    }));
+    return {
+      ...guest,
+      id: guest.id ?? `guest-${guestIndex + 1}`,
+      stayStart: null,
+      stayEnd: null,
+      nights,
+    };
+  });
+  return {
+    ...booking,
+    checkIn,
+    checkOut,
+    totalPriceCents:
+      booking.totalPriceCents ?? guests.reduce((sum, guest) => sum + guest.priceCents, 0),
+    promoAdjustmentCents: booking.promoAdjustmentCents ?? 0,
+    guests,
+    // #3826: the fixture names its one redemption; the booking carries a list.
+    promoRedemptions: booking.promoRedemption
+      ? [
+          {
+            ...booking.promoRedemption,
+            allocations: booking.promoRedemption.allocations ?? [],
+          },
+        ]
+      : [],
+    nightAdjustments: booking.nightAdjustments ?? [],
+  };
+}
+
+beforeAll(() => {
+  restoreAuthSecret = ensureStrongTestAuthSecret();
+});
+
+afterAll(() => {
+  restoreAuthSecret();
+});
+
+/*
+  #3035 (ENV-SAFETY 2): asking Xero to email an invoice is a provider SEND, so it
+  now goes through the environment-safety boundary. Both halves of the role have
+  to be declared or it resolves UNKNOWN and no invoice is emailed — a missing
+  `environmentSafetySettings` delegate is an UNREADABLE override, not "no
+  override". See src/lib/__tests__/helpers/environment-role.ts.
+*/
+beforeEach(() => {
+  declareEnvironmentRole("production");
+});
+
+describe("createXeroInvoiceForBooking", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mocks.prisma.memberCredit.groupBy.mockResolvedValue([]);
+    resetXeroRateLimitStateForTests();
+    vi.stubEnv(
+      "XERO_ENCRYPTION_KEY",
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    vi.stubEnv("XERO_CLIENT_ID", "client-id");
+    vi.stubEnv("XERO_CLIENT_SECRET", "client-secret");
+    // #3036: on a copy the funnel reads the linked contact back and contains it
+    // before returning its id. On the club's live site none of this runs.
+    mocks.prisma.xeroSandboxContactContainment.findUnique.mockResolvedValue(null);
+    mocks.prisma.xeroSandboxContactContainment.upsert.mockResolvedValue({});
+    mocks.xeroClientInstance.accountingApi.getContact.mockResolvedValue({
+      body: {
+        contacts: [
+          { contactID: "contact_1", emailAddress: "member@example.com" },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateContact.mockResolvedValue({
+      body: {},
+    });
+
+    mocks.prisma.$transaction.mockImplementation(async (callback) => callback(mocks.tx));
+    mocks.tx.$executeRaw.mockResolvedValue(1);
+    mocks.tx.member.findUnique.mockResolvedValue({
+      id: "mem_1",
+      email: "member@example.com",
+      xeroContactId: "contact_1",
+    });
+
+    mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      // Booking.lodgeId is NOT NULL in the schema; the season read that picks
+      // the hut-fee item code is scoped to it.
+      lodgeId: "lodge_1",
+      checkIn: "2026-07-31T00:00:00.000Z",
+      checkOut: "2026-08-02T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 10000,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 0,
+        refundedAmountCents: 0,
+        stripePaymentIntentId: null,
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: "STRIPE",
+      },
+    }));
+    mocks.prisma.payment.findUnique.mockResolvedValue(null);
+    mocks.prisma.paymentTransaction.updateMany.mockResolvedValue({ count: 0 });
+    mocks.prisma.season.findFirst.mockResolvedValue({ type: "WINTER" });
+    mocks.prisma.payment.update.mockResolvedValue({ id: "pay_1" });
+    mocks.prisma.xeroObjectLink.findFirst.mockResolvedValue(null);
+    mockXeroConnection(
+      mocks.prisma,
+      connectedXeroFixture({
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      tenantId: "tenant_1",
+      }),
+    );
+    mocks.prisma.xeroAccountMapping.findUnique.mockResolvedValue(null);
+    mocks.prisma.xeroItemCodeMapping.findMany.mockResolvedValue([]);
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "op_1" });
+    mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            total: 0,
+            status: "PAID",
+          },
+        ],
+      },
+    });
+    mocks.retryXeroWriteWithContactRepair.mockImplementation(
+      async (options: {
+        currentContactId: string;
+        run: (input: {
+          contactId: string;
+          idempotencyKey?: string | null;
+        }) => Promise<unknown>;
+      }) =>
+        options.run({
+          contactId: options.currentContactId,
+          idempotencyKey: null,
+        }),
+    );
+  });
+
+  it("#3750 (#3955 X2): bills the change fee recorded on the payment in full — the figure the pay steps collect", async () => {
+    const fixture = await mocks.prisma.booking.findUnique();
+    mocks.prisma.booking.findUnique.mockResolvedValueOnce({
+      ...fixture,
+      // An ordinary edit's fee recorded while the booking was paid by hand,
+      // then the payment reversed: owed again, and on no Xero document yet.
+      payment: { ...fixture.payment, changeFeeCents: 5_320 },
+    });
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+    const [, payload] = mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls.at(-1) as [
+      string,
+      { invoices: Array<{ lineItems: Array<{ description: string; unitAmount: number }> }> },
+    ];
+    const feeLines = payload.invoices[0].lineItems.filter(
+      (line) => line.description === CHANGE_FEE_LINE_DESCRIPTION,
+    );
+    expect(feeLines).toEqual([expect.objectContaining({ unitAmount: 53.2, quantity: 1 })]);
+  });
+
+  describe("#4525 (M13): the primary invoice's export manifest", () => {
+    const stayLeg = (grossCents: number) => ({
+      account: "BOOKING_REVENUE", chargeIdentity: "booking:booking_1:charge", side: "CREDIT", amountCents: grossCents,
+      grossCents, netCents: grossCents, taxCents: 0, taxCode: "GST_INCLUSIVE_1500BP", bookingId: "booking_1", lodgeId: "lodge_1",
+    });
+    const manifestRows = () => mocks.tx.memberMoneyExportManifest.createMany.mock.calls.map(([arg]) => (arg as { data: unknown[] }).data[0]);
+
+    it("records a COVERED manifest and its one coverage row after the invoice link, from the lines it sent", async () => {
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([stayLeg(10000)]);
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(manifestRows()).toEqual([expect.objectContaining({
+        documentRole: "PRIMARY_BOOKING_INVOICE", bookingId: "booking_1", outcome: "COVERED", reason: null,
+        lineTotalCents: 10000, providerInvoiceId: "inv_1",
+      })]);
+      expect(mocks.tx.memberMoneyExportCoverage.createMany).toHaveBeenCalledWith({ data: [expect.objectContaining({
+        documentRole: "PRIMARY_BOOKING_INVOICE", account: "BOOKING_REVENUE", chargeIdentity: "booking:booking_1:charge", coveredCents: 10000,
+      })] });
+      expect(mocks.tx.memberMoneyExportManifest.createMany.mock.invocationCallOrder[0])
+        .toBeGreaterThan(mocks.tx.payment.updateMany.mock.invocationCallOrder[0]);
+      // #4525 review: the manifest hashes exactly the lines sent, so a composition drift fails here.
+      const [, sent] = mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls.at(-1) as [unknown, { invoices: [{ lineItems: never[] }] }];
+      expect(manifestRows()).toEqual([expect.objectContaining({ payloadHash: primaryInvoicePayloadHash(sent.invoices[0].lineItems) })]);
+    });
+
+    it("#4525 review: records a CONFLICT and no coverage when Xero returns an ORIGINAL invoice billing other lines", async () => {
+      // A replayed create under the same idempotency key returns the first run's invoice, built before an edit.
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValueOnce({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 0, status: "PAID",
+          lineItems: [{ description: "Jordan - (ADULT, Member) - 1 night", quantity: 1, unitAmount: 80 }] }] },
+      });
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([stayLeg(10000)]);
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(manifestRows()).toEqual([expect.objectContaining({ outcome: "CONFLICT", reason: "STAY_CENTS", providerInvoiceId: "inv_1" })]);
+      expect(mocks.tx.memberMoneyExportCoverage.createMany).not.toHaveBeenCalled();
+    });
+
+    it("still sends the invoice and completes the operation when its lines do not match the journal", async () => {
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([stayLeg(9999)]);
+      await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_1");
+      expect(mocks.xeroClientInstance.accountingApi.createInvoices).toHaveBeenCalledTimes(1);
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalled();
+      expect(mocks.failXeroSyncOperation).not.toHaveBeenCalled();
+      expect(manifestRows()).toEqual([expect.objectContaining({ outcome: "CONFLICT", reason: "STAY_CENTS", lineTotalCents: 10000 })]);
+      expect(mocks.tx.memberMoneyExportCoverage.createMany).not.toHaveBeenCalled();
+    });
+
+    it("on a replay, records the manifest from the operation's stored lines and raises nothing", async () => {
+      const fixture = await mocks.prisma.booking.findUnique();
+      mocks.prisma.booking.findUnique.mockResolvedValueOnce({ ...fixture, payment: { ...fixture.payment, xeroInvoiceId: "inv_9", xeroInvoiceNumber: "INV-9" } });
+      const stored = [{ description: "Stored guest line", quantity: 2, unitAmount: 50, taxType: "OUTPUT2", accountCode: "200" }];
+      mocks.prisma.xeroSyncOperation.findUnique.mockImplementation(async (args: { select?: Record<string, boolean> }) =>
+        (args?.select?.requestPayload ? { requestPayload: { invoices: [{ lineItems: stored }] } } : { invoiceEmailDelivery: null }));
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([stayLeg(10000)]);
+      try {
+        await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_9");
+      } finally {
+        mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValue({ invoiceEmailDelivery: null });
+      }
+      expect(mocks.xeroClientInstance.accountingApi.createInvoices).not.toHaveBeenCalled();
+      expect(manifestRows()).toEqual([expect.objectContaining({
+        outcome: "COVERED", lineTotalCents: 10000, providerInvoiceId: "inv_9",
+        payloadHash: primaryInvoicePayloadHash(stored as never), frozenMapping: expect.objectContaining({ source: "STORED_REQUEST" }),
+      })]);
+    });
+
+    it("on a replay whose operation stored no lines, records nothing", async () => {
+      const fixture = await mocks.prisma.booking.findUnique();
+      mocks.prisma.booking.findUnique.mockResolvedValueOnce({ ...fixture, payment: { ...fixture.payment, xeroInvoiceId: "inv_9", xeroInvoiceNumber: "INV-9" } });
+      await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_9");
+      expect(mocks.prisma.memberMoneyLine.findMany).not.toHaveBeenCalled();
+      expect(mocks.tx.memberMoneyExportManifest.createMany).not.toHaveBeenCalled();
+    });
+
+    it("sends and completes when the manifest cannot be written", async () => {
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([stayLeg(10000)]);
+      mocks.tx.memberMoneyExportManifest.createMany.mockRejectedValueOnce(new Error("manifest store down"));
+      await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_1");
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalled();
+      expect(mocks.logger.error).toHaveBeenCalledWith(expect.objectContaining({ bookingId: "booking_1" }), expect.stringContaining("export manifest"));
+    });
+  });
+
+  describe("#5208 (Option A): the journal's GST on each line, and the live safeguard", () => {
+    // The fixture's stay: 10000c at 15%, whose journal tax is 1304c.
+    const taxedStayLeg = (grossCents = 10000, taxCents = 1304) => ({
+      account: "BOOKING_REVENUE", chargeIdentity: "booking:booking_1:charge", side: "CREDIT", amountCents: grossCents - taxCents,
+      grossCents, netCents: grossCents - taxCents, taxCents, taxCode: "GST_INCLUSIVE_1500BP", bookingId: "booking_1", lodgeId: "lodge_1",
+    });
+    type SentLine = { description?: string; quantity?: number; unitAmount?: number; taxAmount?: number };
+    const sentLines = () => {
+      const [, sent] = mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls.at(-1) as [unknown, { invoices: [{ lineItems: SentLine[] }] }];
+      return sent.invoices[0].lineItems;
+    };
+    const sentRequest = () => JSON.stringify(mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls.at(-1));
+    /** Xero's reply to the create: the lines sent, with the tax Xero holds on each. */
+    const xeroReplies = (taxAmount: (line: SentLine) => number | undefined) =>
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockImplementationOnce(async (_tenant: string, body: { invoices: [{ lineItems: SentLine[] }] }) => ({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 0, status: "PAID",
+          lineItems: body.invoices[0].lineItems.map((line) => ({ ...line, taxAmount: taxAmount(line) })) }] },
+      }));
+    const manifestRows = () => mocks.tx.memberMoneyExportManifest.createMany.mock.calls.map(([arg]) => (arg as { data: Array<Record<string, unknown>> }).data[0]);
+    const pauseOpen = () => mocks.tx.xeroTaxOverrideMismatch.findFirst.mockResolvedValueOnce({ id: "mismatch_0" });
+
+    it("sends the journal's tax on the stay lines, and records no mismatch when Xero keeps it", async () => {
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([taxedStayLeg()]);
+      xeroReplies((line) => line.taxAmount);
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      const lines = sentLines();
+      expect(lines.reduce((sum, line) => sum + Math.round(line.taxAmount! * 100), 0)).toBe(1304);
+      expect(manifestRows()).toEqual([expect.objectContaining({ outcome: "COVERED",
+        frozenMapping: expect.objectContaining({ taxAllocation: { method: "JOURNAL_LARGEST_REMAINDER", lineTaxCents: lines.map((line) => Math.round(line.taxAmount! * 100)) } }) })]);
+      expect(mocks.tx.xeroTaxOverrideMismatch.create).not.toHaveBeenCalled();
+    });
+
+    it("pauses the overrides when Xero returns other tax, and still completes the operation", async () => {
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([taxedStayLeg()]);
+      xeroReplies((line) => Math.round(line.taxAmount! * 100 - 1) / 100);
+      await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_1");
+      expect(mocks.tx.xeroTaxOverrideMismatch.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+        xeroSyncOperationId: "op_1", bookingId: "booking_1", providerInvoiceId: "inv_1", invoiceNumber: "INV-1", documentKind: "CREATE",
+        lines: [{ index: 0, sentCents: 1304, xeroCents: 1303 }],
+      }) }));
+      expect(mocks.tx.auditLog.create).toHaveBeenCalledWith({ data: expect.objectContaining({ action: "XERO_TAX_OVERRIDES_PAUSED", category: "xero" }) });
+      expect(manifestRows()).toEqual([expect.objectContaining({ outcome: "CONFLICT", reason: "TAX_CENTS" })]);
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalled();
+      expect(mocks.failXeroSyncOperation).not.toHaveBeenCalled();
+    });
+
+    it("does not compare a replayed create's ORIGINAL invoice, which bills other lines", async () => {
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([taxedStayLeg()]);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValueOnce({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 0, status: "PAID",
+          lineItems: [{ description: "an earlier stay", quantity: 1, unitAmount: 80, taxAmount: 10.43 }] }] },
+      });
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.tx.xeroTaxOverrideMismatch.create).not.toHaveBeenCalled();
+      expect(manifestRows()).toEqual([expect.objectContaining({ outcome: "CONFLICT", reason: "STAY_CENTS" })]);
+    });
+
+    it("does not pause when a retry's earlier attempt sent other line tax, though Xero's reply bills the same amounts", async () => {
+      // The first attempt went out while paused (or from the release before): no taxAmount. Xero replays that invoice.
+      const earlier = [{ description: "Jordan Hartley-Smith - (ADULT, Member) - 2 nights", quantity: 2, unitAmount: 50, taxType: "OUTPUT2", accountCode: "200" }];
+      mocks.prisma.xeroSyncOperation.findMany.mockResolvedValueOnce([{ requestPayload: { invoices: [{ lineItems: earlier }] } }]);
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([taxedStayLeg()]);
+      xeroReplies(() => 13.03);
+      await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_1");
+      expect(mocks.prisma.xeroSyncOperation.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { idempotencyKey: "booking:booking_1:invoice:v1" } }));
+      expect(sentLines().every((line) => typeof line.taxAmount === "number")).toBe(true);
+      expect(mocks.tx.xeroTaxOverrideMismatch.create).not.toHaveBeenCalled();
+      // The manifest still says the journal and Xero differ.
+      expect(manifestRows()).toEqual([expect.objectContaining({ outcome: "CONFLICT", reason: "TAX_CENTS" })]);
+    });
+
+    it("sends the pre-change request byte for byte while paused or unregistered, then resumes once cleared", async () => {
+      // The request as it was before #5208: the same create with no journal to plan from.
+      await createXeroInvoiceForBooking("booking_1");
+      const before = sentRequest();
+      expect(sentLines().some((line) => "taxAmount" in line)).toBe(false);
+
+      pauseOpen();
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([taxedStayLeg()]);
+      await createXeroInvoiceForBooking("booking_1");
+      expect(sentRequest()).toBe(before);
+      expect(manifestRows().at(-1)).toEqual(expect.objectContaining({ outcome: "COVERED", frozenMapping: expect.objectContaining({ taxAllocation: "PAUSED" }) }));
+
+      vi.mocked(resolveXeroTaxRendering).mockResolvedValueOnce({ lineAmountTypes: "NoTax" as never });
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([{ ...taxedStayLeg(10000, 0), taxCode: null }]);
+      await createXeroInvoiceForBooking("booking_1");
+      expect(sentLines().some((line) => "taxAmount" in line)).toBe(false);
+      expect(manifestRows().at(-1)).toEqual(expect.objectContaining({ outcome: "COVERED" }));
+      expect(manifestRows().at(-1)!.frozenMapping).not.toHaveProperty("taxAllocation");
+
+      // Cleared: no open row, so the next run sends the journal's tax again.
+      mocks.prisma.memberMoneyLine.findMany.mockResolvedValueOnce([taxedStayLeg()]);
+      await createXeroInvoiceForBooking("booking_1");
+      expect(sentLines().every((line) => typeof line.taxAmount === "number")).toBe(true);
+    });
+
+    it("pauses the overrides when an update comes back with other tax than the stored tax it copied", async () => {
+      const fixture = await mocks.prisma.booking.findUnique();
+      mocks.prisma.booking.findUnique.mockResolvedValueOnce({ ...fixture, payment: { ...fixture.payment, xeroInvoiceId: "inv_1", xeroInvoiceNumber: "INV-1" } });
+      const stored = { lineItemID: "line_1", description: "Jordan Hartley-Smith - (ADULT, Member) - 2 nights", quantity: 2, unitAmount: 50, taxType: "OUTPUT2", taxAmount: 13.04, accountCode: "200" };
+      mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValueOnce({ body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", type: "ACCREC",
+        contact: { contactID: "contact_1" }, lineAmountTypes: "Inclusive", total: 100, lineItems: [stored] }] } });
+      mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValueOnce({ body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 100,
+        lineItems: [{ ...stored, taxAmount: 13.03 }] }] } });
+      await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      const [, , sent] = mocks.xeroClientInstance.accountingApi.updateInvoice.mock.calls.at(-1) as [unknown, unknown, { invoices: [{ lineItems: SentLine[] }] }];
+      expect(sent.invoices[0].lineItems[0]!.taxAmount).toBe(13.04);
+      expect(mocks.tx.xeroTaxOverrideMismatch.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+        xeroSyncOperationId: "op_1", documentKind: "UPDATE", lines: [{ index: 0, sentCents: 1304, xeroCents: 1303 }] }) }));
+      expect(mocks.failXeroSyncOperation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("#3980 review M1: reads the booking and its marked edits from one REPEATABLE READ snapshot", async () => {
+    mocks.tx.bookingModification.findMany.mockResolvedValueOnce([{ id: "mod_marked" }]);
+    mocks.tx.paymentTransaction.findMany.mockResolvedValueOnce([
+      { stripePaymentIntentId: "pi_primary", amountCents: 10_000, refundedAmountCents: 0 },
+      { stripePaymentIntentId: "pi_change", amountCents: 8_000, refundedAmountCents: 0 },
+    ]);
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+    const [, options] = mocks.prisma.$transaction.mock.calls[0] as unknown as [unknown, { isolationLevel?: string }];
+    expect(options).toEqual({ isolationLevel: "RepeatableRead" });
+    // The worth, the lines and the marked edits come from that one transaction.
+    expect(mocks.tx.booking.findUnique).toHaveBeenCalledTimes(1);
+    expect(mocks.tx.bookingModification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ bookingId: "booking_1" }), select: { id: true } }),
+    );
+    expect(mocks.prisma.$transaction.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.xeroClientInstance.accountingApi.createInvoices.mock.invocationCallOrder[0],
+    );
+    expect(mocks.prisma.xeroSyncOperation.update).toHaveBeenCalledWith({
+      where: { id: "op_1" },
+      data: {
+        requestPayload: expect.objectContaining({
+          primaryInvoiceBilledFee: expect.objectContaining({
+            worth: expect.objectContaining({ markedModificationIdsAtBuild: ["mod_marked"] }),
+            // #3953: of the captures this snapshot held, those the cash it recorded
+            // covers - none, since this fixture's payment recorded no cash.
+            paymentIntentIdsRecordedAtLink: [],
+          }),
+        }),
+      },
+    });
+  });
+
+  it("#3980 review C3: a second save of the same invoice keeps the first's figures and re-checks from them", async () => {
+    // The link is already this invoice's: a run reset from stale RUNNING, retried.
+    mocks.tx.payment.updateMany.mockResolvedValueOnce({ count: 0 });
+    mocks.tx.payment.findUniqueOrThrow.mockResolvedValueOnce({ xeroInvoiceId: "inv_1" });
+    feeGap.recheckPrimaryInvoiceWorthGap.mockResolvedValueOnce({
+      gapCents: 0,
+      queueOperationId: null,
+      alreadyQueued: false,
+      cashTakenCents: 0,
+      reviewOperationId: null,
+    });
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+    expect(queuePrimaryInvoiceWorthGap).not.toHaveBeenCalled();
+    expect(feeGap.recheckPrimaryInvoiceWorthGap).toHaveBeenCalledWith(
+      expect.objectContaining({ bookingId: "booking_1", xeroInvoiceId: "inv_1" }),
+    );
+    // Nothing re-measured, nothing overwritten.
+    expect(mocks.tx.booking.findUniqueOrThrow).not.toHaveBeenCalled();
+    expect(mocks.prisma.payment.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ xeroInvoiceId: "inv_1" }) }),
+    );
+  });
+
+  it("#3955 X4 (round 4): saves the link with what Xero's invoice billed and the fee recorded then, and checks the gap from those", async () => {
+    const returnedLines = [
+      { description: "Jordan - (ADULT, Member) - 2 nights", quantity: 1, unitAmount: 100 },
+      { description: CHANGE_FEE_LINE_DESCRIPTION, quantity: 1, unitAmount: 20 },
+    ];
+    mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValueOnce({
+      body: {
+        invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 0, status: "PAID", lineItems: returnedLines }],
+      },
+    });
+    // The create read a 100.00 booking with no fee and built one 100.00 line.
+    const fixture = await mocks.prisma.booking.findUnique();
+    mocks.prisma.booking.findUnique.mockResolvedValueOnce({ ...fixture, finalPriceCents: 10_000 });
+    // The link's own row update reads back the fee recorded at that instant,
+    // and (#3980) the booking's price after it.
+    mocks.prisma.payment.findUniqueOrThrow.mockResolvedValueOnce({ changeFeeCents: 3_000, bookingId: "booking_1" });
+    mocks.prisma.booking.findUniqueOrThrow.mockResolvedValueOnce({ finalPriceCents: 10_000 });
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+    const atLink = {
+      xeroInvoiceId: "inv_1",
+      billedChangeFeeCents: 2_000,
+      billedTotalCents: 12_000,
+      recordedChangeFeeCentsAtLink: 3_000,
+      // Nothing captured, so no cash on the invoice.
+      primaryInvoiceCashCents: 0,
+      primaryInvoiceAttemptedCashCents: 0,
+      worth: { atBuildCents: 10_000, builtTotalCents: 10_000, atLinkCents: 13_000, markedModificationIdsAtBuild: [] },
+      // #3953: no capture in the snapshot, so none recorded.
+      paymentIntentIdsRecordedAtLink: [],
+    };
+    expect(mocks.prisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: "pay_1", xeroInvoiceId: null },
+      data: { xeroInvoiceId: "inv_1", xeroInvoiceNumber: "INV-1" },
+    });
+    expect(mocks.prisma.xeroSyncOperation.update).toHaveBeenCalledWith({
+      where: { id: "op_1" },
+      data: { requestPayload: expect.objectContaining({ primaryInvoiceBilledFee: atLink }) },
+    });
+    expect(queuePrimaryInvoiceWorthGap).toHaveBeenCalledWith(
+      expect.objectContaining({ bookingId: "booking_1", atLink }),
+    );
+    expect(mocks.prisma.payment.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      queuePrimaryInvoiceWorthGap.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("#3955 round 3: a gap check that throws after the link is persisted is re-run by the retry", async () => {
+    queuePrimaryInvoiceWorthGap.mockRejectedValueOnce(new Error("connection reset"));
+    await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).rejects.toThrow(
+      "connection reset",
+    );
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalled();
+    expect(feeGap.recheckPrimaryInvoiceWorthGap).not.toHaveBeenCalled();
+
+    // Retry: the link was persisted, so the create takes its "invoice already
+    // exists" exit — which must re-run the check rather than lose the fee.
+    mocks.xeroClientInstance.accountingApi.createInvoices.mockClear();
+    const fixture = await mocks.prisma.booking.findUnique();
+    mocks.prisma.booking.findUnique.mockResolvedValueOnce({
+      ...fixture,
+      payment: { ...fixture.payment, xeroInvoiceId: "inv_1", xeroInvoiceNumber: "INV-1" },
+    });
+    await expect(
+      createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1"), createdByMemberId: "officer_1" }),
+    ).resolves.toBe("inv_1");
+    expect(mocks.xeroClientInstance.accountingApi.createInvoices).not.toHaveBeenCalled();
+    expect(feeGap.recheckPrimaryInvoiceWorthGap).toHaveBeenCalledWith({
+      bookingId: "booking_1",
+      xeroInvoiceId: "inv_1",
+      createdByMemberId: "officer_1",
+    });
+  });
+
+  it("resolves the item-code season from the booking's own lodge, not any lodge", async () => {
+    // Lodges may run different season windows (lodge-scoping-contract.md), so an
+    // unscoped read can match another lodge's season — and Season.type picks the
+    // hut-fee item code, and therefore the GL account the revenue posts to.
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(mocks.prisma.season.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ lodgeId: "lodge_1" }),
+      }),
+    );
+  });
+
+  describe("#1641 card applied-credit allocation", () => {
+    function cardPayment(overrides: Record<string, unknown> = {}) {
+      return {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        // effective (10000 finalPrice − 3000 applied credit)
+        amountCents: 7000,
+        refundedAmountCents: 0,
+        creditAppliedCents: 3000,
+        stripePaymentIntentId: "pi_1",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: "STRIPE",
+        ...overrides,
+      };
+    }
+
+    function cardCreditBooking(paymentOverrides: Record<string, unknown> = {}) {
+      return withMoneyBuildUpProjection({
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        totalPriceCents: 10000,
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+        createdAt: "2026-05-15T10:30:00.000Z",
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        guests: [
+          {
+            id: "guest_1",
+            firstName: "Jordan",
+            lastName: "Hartley-Smith",
+            ageTier: "ADULT",
+            isMember: true,
+            priceCents: 10000,
+            nights: [],
+          },
+        ],
+        payment: cardPayment(paymentOverrides),
+      });
+    }
+
+    beforeEach(() => {
+      mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({
+        body: { payments: [{ paymentID: "xpay_1" }] },
+      });
+      mocks.allocateAppliedCreditForBooking.mockResolvedValue(undefined);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: {
+          invoices: [
+            { invoiceID: "inv_1", invoiceNumber: "INV-1", total: 10000, status: "AUTHORISED" },
+          ],
+        },
+      });
+    });
+
+    it("allocates the applied credit against a freshly raised card invoice", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+      // Effective Stripe payment recorded, then the credit note allocated so the
+      // invoice reaches PAID via (effective cash + credit).
+      expect(mocks.xeroClientInstance.accountingApi.createPayment).toHaveBeenCalledTimes(1);
+      expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalledWith(
+        "booking_1",
+        expect.anything()
+      );
+    });
+
+    it("MUTATION #3955 round 4 (finding 3): an invoice billing less than cash plus credit records only the cash the credit leaves due", async () => {
+      // Built before a 5.00 fee was recorded: it bills 100.00, while the card
+      // took 85.00 and 20.00 of credit was applied. 80.00 of cash, so the
+      // 20.00 allocation fits; the 5.00 left is the gap invoice's.
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ amountCents: 8_500, creditAppliedCents: 2_000, changeFeeCents: 500 }),
+      );
+      mocks.prisma.memberCredit.groupBy.mockResolvedValue([{ appliedToBookingId: "booking_1", _sum: { amountCents: -2_000 } }]);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 100, amountDue: 100, status: "AUTHORISED" }] },
+      });
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.xeroClientInstance.accountingApi.createPayment).toHaveBeenCalledWith(
+        "tenant_1",
+        expect.objectContaining({ amount: 80 }),
+        expect.anything(),
+      );
+      expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalled();
+    });
+
+    it("MUTATION #3955 round 5 (finding 2): the cap allows for the credit the engine will allocate, from the ledger - not the payment's mirror", async () => {
+      // The mirror says 20.00, but 30.00 of BOOKING_APPLIED credit is still
+      // unallocated on the ledger, which is what the engine allocates. The
+      // cash must leave 30.00 due, or the allocation would not fit.
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ amountCents: 8_500, creditAppliedCents: 2_000 }),
+      );
+      mocks.prisma.memberCredit.groupBy.mockResolvedValue([{ appliedToBookingId: "booking_1", _sum: { amountCents: -3_000 } }]);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 100, amountDue: 100, status: "AUTHORISED" }] },
+      });
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.prisma.memberCredit.groupBy).toHaveBeenCalledWith({
+        by: ["appliedToBookingId"],
+        where: { appliedToBookingId: { in: ["booking_1"] }, type: "BOOKING_APPLIED", xeroCreditNoteId: null },
+        _sum: { amountCents: true },
+      });
+      expect(mocks.xeroClientInstance.accountingApi.createPayment).toHaveBeenCalledWith(
+        "tenant_1",
+        expect.objectContaining({ amount: 70 }),
+        expect.anything(),
+      );
+    });
+
+    it("MUTATION #3955 round 5 (finding 3): cash the cap leaves off the invoice, with no gap invoice taking it, is logged and recorded on the operation", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ amountCents: 8_500, creditAppliedCents: 2_000 }),
+      );
+      mocks.prisma.memberCredit.groupBy.mockResolvedValue([{ appliedToBookingId: "booking_1", _sum: { amountCents: -2_000 } }]);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 100, amountDue: 100, status: "AUTHORISED" }] },
+      });
+      mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({
+        body: { payments: [{ paymentID: "xpay_1", amount: 80 }] },
+      });
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      const shortfall = { netCapturedCents: 8_500, invoicePaymentCents: 8_000, gapInvoiceCashCents: 0, unrecordedCashCents: 500 };
+      expect(mocks.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ bookingId: "booking_1", ...shortfall }),
+        expect.stringContaining("no change-fee gap invoice takes the remainder"),
+      );
+      expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({ responsePayload: expect.objectContaining({ primaryInvoiceCashShortfall: shortfall }) }),
+      );
+
+      // A gap invoice that records the 5.00 as paid takes it: nothing to report.
+      mocks.logger.warn.mockClear();
+      queuePrimaryInvoiceWorthGap.mockResolvedValueOnce({
+        gapCents: 500,
+        queueOperationId: "op_gap",
+        alreadyQueued: false,
+        cashTakenCents: 500,
+      });
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.logger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining("no change-fee gap invoice takes the remainder"),
+      );
+      expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({ responsePayload: expect.objectContaining({ primaryInvoiceCashShortfall: null }) }),
+      );
+    });
+
+    it("MUTATION #3955 round 5 (finding 4): the cash the primary recorded is computed once and stored with the link", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ amountCents: 8_500, creditAppliedCents: 2_000 }),
+      );
+      mocks.prisma.memberCredit.groupBy.mockResolvedValue([{ appliedToBookingId: "booking_1", _sum: { amountCents: -2_000 } }]);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 100, amountDue: 100, status: "AUTHORISED" }] },
+      });
+      mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({
+        body: { payments: [{ paymentID: "xpay_1", amount: 80 }] },
+      });
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(queuePrimaryInvoiceWorthGap).toHaveBeenCalledWith(
+        expect.objectContaining({ atLink: expect.objectContaining({ primaryInvoiceCashCents: 8_000 }) }),
+      );
+      expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({
+          extraLinks: expect.arrayContaining([
+            expect.objectContaining({ role: "INVOICE_PAYMENT", xeroObjectId: "xpay_1" }),
+          ]),
+        }),
+      );
+    });
+
+    it("MUTATION #3955 round 5 (finding 4): a retry whose cap reaches zero records the payment the first run made, not a skip", async () => {
+      // Run 1 recorded 80.00 and died before saving the link. The retry's
+      // invoice shows it paid: 20.00 due, which the 20.00 of credit takes.
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ amountCents: 8_000, creditAppliedCents: 2_000 }),
+      );
+      mocks.prisma.memberCredit.groupBy.mockResolvedValue([{ appliedToBookingId: "booking_1", _sum: { amountCents: -2_000 } }]);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: {
+          invoices: [
+            {
+              invoiceID: "inv_1",
+              invoiceNumber: "INV-1",
+              total: 100,
+              amountDue: 20,
+              status: "AUTHORISED",
+              payments: [
+                { paymentID: "xpay_other", amount: 5, reference: "Stripe pi_other" },
+                { paymentID: "xpay_run1", amount: 80, reference: "Stripe pi_1" },
+              ],
+            },
+          ],
+        },
+      });
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+      expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({
+          responsePayload: expect.objectContaining({ paymentSkipped: false, primaryInvoiceCashShortfall: null }),
+          extraLinks: expect.arrayContaining([
+            expect.objectContaining({ role: "INVOICE_PAYMENT", xeroObjectId: "xpay_run1" }),
+          ]),
+        }),
+      );
+      expect(queuePrimaryInvoiceWorthGap).toHaveBeenCalledWith(
+        expect.objectContaining({ atLink: expect.objectContaining({ primaryInvoiceCashCents: 8_000 }) }),
+      );
+    });
+
+    // #4010 review: the repair records the payment this run TRIED to write,
+    // which the floor below must never raise to an earlier unmatched payment.
+    describe("#4525 (M13): the Stripe payment's capture receipt", () => {
+      it("records the payment Xero stored, under the key and with the cents it was sent, after the operation stored its link", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({ body: { payments: [{ paymentID: "xpay_1", amount: 70 }] } });
+
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        const [, sent, key] = mocks.xeroClientInstance.accountingApi.createPayment.mock.calls[0] as [string, { reference: string; account: { code: string }; amount: number }, string];
+        expect(captureReceipts.record).toHaveBeenCalledTimes(1);
+        expect(captureReceipts.record).toHaveBeenCalledWith({
+          bookingId: "booking_1", paymentIntentId: "pi_1", paymentKey: key, amountCents: sent.amount * 100,
+          providerPaymentId: "xpay_1", invoiceId: "inv_1", reference: sent.reference, bankCode: sent.account.code,
+        });
+        expect(captureReceipts.record.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.completeXeroSyncOperation.mock.invocationCallOrder.at(-1)!);
+      });
+
+      // The split saved with the link (`intentsRecordedByPrimaryCash`) names the captures the invoice's cash covers.
+      const cashSplitAtLink = (split: Record<string, unknown>) => mocks.prisma.xeroSyncOperation.findFirst.mockResolvedValue({ id: "op_create", requestPayload: {
+        primaryInvoiceBilledFee: { xeroInvoiceId: "inv_1", billedChangeFeeCents: 0, billedTotalCents: 10_000, recordedChangeFeeCentsAtLink: 0, primaryInvoiceCashCents: 7_000, ...split } } });
+
+      it("names the one capture the split saved with the link says its cash came from", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({ body: { payments: [{ paymentID: "xpay_1", amount: 70 }] } });
+        cashSplitAtLink({ paymentIntentIdsRecordedAtLink: ["pi_first"] });
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        } finally {
+          mocks.prisma.xeroSyncOperation.findFirst.mockResolvedValue(null);
+        }
+        expect(captureReceipts.record).toHaveBeenCalledWith(expect.objectContaining({ paymentIntentId: "pi_first", amountCents: 7000, providerPaymentId: "xpay_1" }));
+      });
+
+      it("names no capture, so records a conflict rather than coverage, when its cash came from several", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({ body: { payments: [{ paymentID: "xpay_1", amount: 70 }] } });
+        cashSplitAtLink({ paymentIntentIdsRecordedAtLink: ["pi_first"], partiallyRecordedCaptureAtLink: { paymentIntentId: "pi_1", cents: 2_000 } });
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        } finally {
+          mocks.prisma.xeroSyncOperation.findFirst.mockResolvedValue(null);
+        }
+        expect(captureReceipts.record).toHaveBeenCalledWith(expect.objectContaining({ paymentIntentId: null, amountCents: 7000, providerPaymentId: "xpay_1" }));
+      });
+
+      it("records nothing, and the invoice still stands, when that split cannot be read", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({ body: { payments: [{ paymentID: "xpay_1", amount: 70 }] } });
+        mocks.prisma.xeroSyncOperation.findFirst.mockRejectedValue(new Error("database unavailable"));
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        } finally {
+          mocks.prisma.xeroSyncOperation.findFirst.mockResolvedValue(null);
+        }
+        expect(captureReceipts.record).not.toHaveBeenCalled();
+        expect(mocks.failXeroSyncOperation).not.toHaveBeenCalled();
+      });
+
+      // #4525 review: a run that fails after Xero took the payment records its
+      // receipt before failing the row, and keeps the payment on that row too.
+      it("MUTATION #4525: a run failing after Xero took the payment records its receipt, then keeps that payment on the failed operation", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({ body: { payments: [{ paymentID: "xpay_1", amount: 70 }] } });
+        const failure = new Error("could not store the outcome");
+        mocks.completeXeroSyncOperation.mockRejectedValueOnce(failure);
+        await expect(createXeroInvoiceForBooking("booking_1")).rejects.toBe(failure);
+        expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(expect.anything(), failure, {
+          error: failure, payment: expect.objectContaining({ paymentID: "xpay_1" }),
+        });
+        expect(captureReceipts.record).toHaveBeenCalledTimes(1);
+        expect(captureReceipts.record).toHaveBeenCalledWith(expect.objectContaining({ paymentKey: primaryInvoicePaymentKey("pay_1"), amountCents: 7000, providerPaymentId: "xpay_1" }));
+        expect(captureReceipts.record.mock.invocationCallOrder[0]).toBeLessThan(mocks.failXeroSyncOperation.mock.invocationCallOrder[0]!);
+      });
+
+      /**
+       * #4525 review: the outbox path, which the test above does not reach. The
+       * outbox hands the handler its claim, then fails the same row again with no
+       * payload (`xero-operation-outbox.ts`, `failXeroSyncOperation(outcomeClaim,
+       * error, undefined, { keepCancelled: true })`), and the real failure write
+       * stores the error alone. The row below stands in for the database; both
+       * failure writes are the real `failXeroSyncOperation`.
+       */
+      async function failThroughTheOutbox(claimId: string) {
+        const { failXeroSyncOperation: realFail } = (await vi.importActual("@/lib/xero-sync")) as typeof import("@/lib/xero-sync");
+        const row: { id: string; status: string; startedAt: Date | null; responsePayload: unknown } = { id: claimId, status: "RUNNING", startedAt: xeroClaim(claimId).startedAt, responsePayload: null };
+        const store = mocks.prisma.xeroSyncOperation as unknown as Record<string, unknown>;
+        // The guard lets a FAILED land on this claim's own RUNNING or FAILED row (`ownClaimOutcomeRow`); this row is always one.
+        store.updateManyAndReturn = vi.fn(async ({ data }: { data: Record<string, unknown> }) => [Object.assign(row, data)]);
+        mocks.failXeroSyncOperation.mockImplementation(realFail);
+        const failure = new Error("could not store the outcome");
+        mocks.completeXeroSyncOperation.mockRejectedValueOnce(failure);
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim(claimId) })).rejects.toBe(failure);
+          await realFail(xeroClaim(claimId), failure, undefined, { keepCancelled: true }); // the outbox's catch
+        } finally {
+          delete store.updateManyAndReturn;
+          mocks.failXeroSyncOperation.mockReset();
+        }
+        return row;
+      }
+
+      it("MUTATION #4525: a queued run failing after Xero took the payment records the receipt once, though the outbox's failure write keeps only the error", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({ body: { payments: [{ paymentID: "xpay_1", amount: 70 }] } });
+        const row = await failThroughTheOutbox("op_queued");
+        expect(row.status).toBe("FAILED");
+        expect(row.responsePayload).not.toHaveProperty("payment");
+        expect(captureReceipts.record).toHaveBeenCalledTimes(1);
+
+        // The later retry finds the invoice linked and replays: it reads no payment, so records nothing more.
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ xeroInvoiceId: "inv_1", xeroInvoiceNumber: "INV-1" }));
+        mocks.prisma.xeroSyncOperation.findUnique.mockImplementation(async (args: { select?: Record<string, boolean> }) =>
+          (args?.select?.responsePayload ? { responsePayload: row.responsePayload } : { invoiceEmailDelivery: null }));
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_queued") })).resolves.toBe("inv_1");
+        } finally {
+          mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValue({ invoiceEmailDelivery: null });
+        }
+        expect(captureReceipts.record).toHaveBeenCalledTimes(1);
+        expect(captureReceipts.record).toHaveBeenCalledWith({
+          bookingId: "booking_1", paymentIntentId: "pi_1", paymentKey: primaryInvoicePaymentKey("pay_1"), amountCents: 7000,
+          providerPaymentId: "xpay_1", invoiceId: "inv_1", reference: expect.any(String), bankCode: expect.any(String),
+        });
+      });
+
+      it("records under one key whether the failure path or an officer's inline replay reaches the payment", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({ body: { payments: [{ paymentID: "xpay_1", amount: 70 }] } });
+        const failure = new Error("could not store the outcome");
+        mocks.completeXeroSyncOperation.mockRejectedValueOnce(failure);
+        await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_inline") })).rejects.toBe(failure);
+        // An inline retry refuses its own failure write, so the run's `{ error, payment }` stays for the replay.
+        const kept = mocks.failXeroSyncOperation.mock.calls[0]![2];
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ xeroInvoiceId: "inv_1", xeroInvoiceNumber: "INV-1" }));
+        mocks.prisma.xeroSyncOperation.findUnique.mockImplementation(async (args: { select?: Record<string, boolean> }) =>
+          (args?.select?.responsePayload ? { responsePayload: kept } : { invoiceEmailDelivery: null }));
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_inline") })).resolves.toBe("inv_1");
+        } finally {
+          mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValue({ invoiceEmailDelivery: null });
+        }
+        // Twice, under the same key, payment and cents: the recorder's first row stands (its real-database suite).
+        expect(captureReceipts.record).toHaveBeenCalledTimes(2);
+        const [atFailure, atReplay] = captureReceipts.record.mock.calls.map(([input]) => input as Record<string, unknown>);
+        for (const field of ["bookingId", "paymentIntentId", "paymentKey", "amountCents", "providerPaymentId", "invoiceId"]) {
+          expect(atReplay![field]).toEqual(atFailure![field]);
+        }
+        expect(atFailure).toMatchObject({ paymentKey: primaryInvoicePaymentKey("pay_1"), amountCents: 7000 });
+      });
+
+      it("MUTATION #4525: a replay that throws after reading the stored payment has already recorded its receipt", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ xeroInvoiceId: "inv_9", xeroInvoiceNumber: "INV-9" }));
+        const storedPayment = { paymentID: "xpay_9", amount: 70, reference: "Stripe pi_1", account: { code: "606" } };
+        mocks.prisma.xeroSyncOperation.findUnique.mockImplementation(async (args: { select?: Record<string, boolean> }) =>
+          (args?.select?.responsePayload ? { responsePayload: { payment: storedPayment } } : { invoiceEmailDelivery: null }));
+        const failure = new Error("gap recheck failed");
+        feeGap.recheckPrimaryInvoiceWorthGap.mockRejectedValueOnce(failure);
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).rejects.toBe(failure);
+        } finally {
+          mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValue({ invoiceEmailDelivery: null });
+        }
+        expect(mocks.completeXeroSyncOperation).not.toHaveBeenCalled();
+        expect(captureReceipts.record).toHaveBeenCalledTimes(1);
+        expect(captureReceipts.record).toHaveBeenCalledWith(expect.objectContaining({
+          paymentKey: primaryInvoicePaymentKey("pay_1"), amountCents: 7000, providerPaymentId: "xpay_9", invoiceId: "inv_9",
+        }));
+      });
+
+      it("fails a run that sent no payment with the error alone, as before", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ source: "INTERNET_BANKING" }));
+        const failure = new Error("could not store the outcome");
+        mocks.completeXeroSyncOperation.mockRejectedValueOnce(failure);
+        await expect(createXeroInvoiceForBooking("booking_1")).rejects.toBe(failure);
+        expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(expect.anything(), failure, undefined);
+      });
+
+      it("records nothing when Xero refuses the payment, and the invoice still stands", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+        mocks.xeroClientInstance.accountingApi.createPayment.mockRejectedValue(new Error("Xero rejected the payment"));
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        expect(captureReceipts.record).not.toHaveBeenCalled();
+      });
+
+      it("records nothing for an Internet Banking payment, which Xero reconciles itself", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ source: "INTERNET_BANKING" }));
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+        expect(captureReceipts.record).not.toHaveBeenCalled();
+      });
+
+      it("preserves the stored response when a replay cannot read its payment evidence", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ xeroInvoiceId: "inv_9", xeroInvoiceNumber: "INV-9" }));
+        mocks.prisma.xeroSyncOperation.findUnique.mockImplementation(async (args: { select?: Record<string, boolean> }) => {
+          if (args?.select?.responsePayload) throw new Error("payment evidence unavailable");
+          return { invoiceEmailDelivery: null };
+        });
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_9");
+        } finally {
+          mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValue({ invoiceEmailDelivery: null });
+        }
+        expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ responsePayload: undefined }));
+        expect(captureReceipts.record).not.toHaveBeenCalled();
+      });
+
+      it("on a replay, records the payment the raising run stored, from its operation's response, and sends nothing", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ xeroInvoiceId: "inv_9", xeroInvoiceNumber: "INV-9" }));
+        const storedPayment = { paymentID: "xpay_9", amount: 70, reference: "Stripe pi_1", account: { code: "606" } };
+        mocks.prisma.xeroSyncOperation.findUnique.mockImplementation(async (args: { select?: Record<string, boolean> }) =>
+          (args?.select?.responsePayload ? { responsePayload: { payment: storedPayment } } : { invoiceEmailDelivery: null }));
+        try {
+          await expect(createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") })).resolves.toBe("inv_9");
+        } finally {
+          mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValue({ invoiceEmailDelivery: null });
+        }
+        // #4525 review: recorded as soon as it is read, before anything else in the replay can throw.
+        expect(captureReceipts.record.mock.invocationCallOrder[0]).toBeLessThan(mocks.completeXeroSyncOperation.mock.invocationCallOrder.at(-1)!);
+        // The completion replaces the stored response, so the payment is read before it.
+        const storedRead = mocks.prisma.xeroSyncOperation.findUnique.mock.calls.findIndex(([args]) => (args as { select?: Record<string, boolean> })?.select?.responsePayload);
+        expect(mocks.prisma.xeroSyncOperation.findUnique.mock.invocationCallOrder[storedRead]).toBeLessThan(mocks.completeXeroSyncOperation.mock.invocationCallOrder.at(-1)!);
+        expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+          responsePayload: expect.objectContaining({ payment: storedPayment }),
+        }));
+        expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+        expect(captureReceipts.record).toHaveBeenCalledWith(expect.objectContaining({
+          paymentIntentId: "pi_1", amountCents: 7000, providerPaymentId: "xpay_9", invoiceId: "inv_9", reference: "Stripe pi_1", bankCode: "606",
+        }));
+      });
+    });
+
+    describe("#4010: the attempted payment is stored beside the floored cash", () => {
+      it.each([
+        { earlierPaidCents: 6_000, capturedCents: 8_000, attempted: 4_000, floored: 6_000 },
+        { earlierPaidCents: 3_000, capturedCents: 2_000, attempted: 2_000, floored: 3_000 },
+      ])(
+        "earlier unmatched $earlierPaidCents, cap $attempted: a failed write stores $attempted attempted, $floored cash",
+        async ({ earlierPaidCents, capturedCents, attempted, floored }) => {
+          mocks.prisma.booking.findUnique.mockResolvedValue(
+            cardCreditBooking({ amountCents: capturedCents, creditAppliedCents: 0 }),
+          );
+          mocks.prisma.memberCredit.groupBy.mockResolvedValue([]);
+          mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+            body: {
+              invoices: [
+                {
+                  invoiceID: "inv_1",
+                  invoiceNumber: "INV-1",
+                  total: 100,
+                  amountPaid: earlierPaidCents / 100,
+                  amountDue: (10_000 - earlierPaidCents) / 100,
+                  status: "AUTHORISED",
+                  payments: [{ paymentID: "xpay_other", amount: earlierPaidCents / 100, reference: "Stripe pi_other" }],
+                },
+              ],
+            },
+          });
+          mocks.xeroClientInstance.accountingApi.createPayment.mockRejectedValue(new Error("Xero rejected the payment"));
+
+          await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+          expect(mocks.xeroClientInstance.accountingApi.createPayment).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({ amount: attempted / 100 }),
+            expect.anything(),
+          );
+          expect(mocks.prisma.xeroSyncOperation.update).toHaveBeenCalledWith({
+            where: { id: "op_1" },
+            data: {
+              requestPayload: expect.objectContaining({
+                primaryInvoiceBilledFee: expect.objectContaining({
+                  primaryInvoiceCashCents: floored,
+                  primaryInvoiceAttemptedCashCents: attempted,
+                }),
+              }),
+            },
+          });
+          expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+            expect.objectContaining({ id: "op_1" }),
+            expect.objectContaining({ status: "PARTIAL" }),
+          );
+        },
+      );
+    });
+
+    describe("MUTATION #3955 round 6 (F1): the stored primary cash is floored at the invoice's own amountPaid", () => {
+      // Cap zero: 20.00 due, taken by the 20.00 of applied credit.
+      const retryInvoice = (extra: Record<string, unknown>) => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(
+          cardCreditBooking({ amountCents: 8_000, creditAppliedCents: 2_000 }),
+        );
+        mocks.prisma.memberCredit.groupBy.mockResolvedValue([{ appliedToBookingId: "booking_1", _sum: { amountCents: -2_000 } }]);
+        mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+          body: {
+            invoices: [
+              { invoiceID: "inv_1", invoiceNumber: "INV-1", total: 100, amountDue: 20, status: "AUTHORISED", ...extra },
+            ],
+          },
+        });
+      };
+
+      it("a missed reference lookup with amountPaid above zero stores that cash and says an earlier payment was not matched", async () => {
+        retryInvoice({
+          amountPaid: 80,
+          payments: [{ paymentID: "xpay_other", amount: 80, reference: "Stripe pi_other" }],
+        });
+
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+        expect(queuePrimaryInvoiceWorthGap).toHaveBeenCalledWith(
+          expect.objectContaining({ atLink: expect.objectContaining({ primaryInvoiceCashCents: 8_000 }) }),
+        );
+        expect(mocks.logger.warn).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.stringContaining("earlier payment is present on the invoice but not matched by reference"),
+        );
+        expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+          expect.objectContaining({ id: "op_1" }),
+          expect.objectContaining({
+            responsePayload: expect.objectContaining({
+              paymentSkipped: true,
+              paymentSkipReason: expect.stringContaining("not matched by reference"),
+            }),
+          }),
+        );
+      });
+
+      it("a found reference lookup records that payment's link and gives no unmatched reason", async () => {
+        retryInvoice({
+          amountPaid: 80,
+          payments: [{ paymentID: "xpay_run1", amount: 80, reference: "Stripe pi_1" }],
+        });
+
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        expect(queuePrimaryInvoiceWorthGap).toHaveBeenCalledWith(
+          expect.objectContaining({ atLink: expect.objectContaining({ primaryInvoiceCashCents: 8_000 }) }),
+        );
+        expect(mocks.logger.warn).not.toHaveBeenCalledWith(
+          expect.anything(),
+          expect.stringContaining("not matched by reference"),
+        );
+        expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+          expect.objectContaining({ id: "op_1" }),
+          expect.objectContaining({
+            responsePayload: expect.objectContaining({ paymentSkipped: false }),
+          }),
+        );
+      });
+
+      it("an amountPaid of zero stores zero and keeps the 'nothing is left due' reason", async () => {
+        retryInvoice({ amountPaid: 0, payments: [] });
+
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+        expect(queuePrimaryInvoiceWorthGap).toHaveBeenCalledWith(
+          expect.objectContaining({ atLink: expect.objectContaining({ primaryInvoiceCashCents: 0 }) }),
+        );
+        expect(mocks.logger.warn).not.toHaveBeenCalledWith(
+          expect.anything(),
+          expect.stringContaining("not matched by reference"),
+        );
+        expect(mocks.completeXeroSyncOperation).toHaveBeenLastCalledWith(
+          expect.objectContaining({ id: "op_1" }),
+          expect.objectContaining({
+            responsePayload: expect.objectContaining({
+              paymentSkipped: true,
+              paymentSkipReason: expect.stringContaining("Nothing is left due"),
+            }),
+          }),
+        );
+      });
+    });
+
+    it("#3955 round 4: records no cash when the applied credit leaves nothing due, and says why", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ amountCents: 500, creditAppliedCents: 10_000, changeFeeCents: 500 }),
+      );
+      mocks.prisma.memberCredit.groupBy.mockResolvedValue([{ appliedToBookingId: "booking_1", _sum: { amountCents: -10_000 } }]);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1", total: 100, amountDue: 100, status: "AUTHORISED" }] },
+      });
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({
+          responsePayload: expect.objectContaining({
+            paymentSkipped: true,
+            paymentSkipReason: expect.stringContaining("applied account credit"),
+          }),
+        }),
+      );
+      expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalled();
+    });
+
+    it("does NOT allocate for a legacy full-price card capture (creditAppliedCents = 0)", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ amountCents: 10000, creditAppliedCents: 0 })
+      );
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.allocateAppliedCreditForBooking).not.toHaveBeenCalled();
+    });
+
+    it("does NOT allocate for an Internet-Banking invoice (its own outbox op handles it)", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ source: "INTERNET_BANKING", status: "PENDING" })
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+      expect(mocks.allocateAppliedCreditForBooking).not.toHaveBeenCalled();
+    });
+
+    it("fails the op when allocation rejects, and the retry does not re-create the invoice", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+      mocks.allocateAppliedCreditForBooking.mockRejectedValueOnce(
+        new Error("Xero allocation rejected")
+      );
+
+      // First run: invoice raised + effective payment recorded, THEN allocation
+      // throws -> the op is failed and the function rejects (Q1: loud, not silent).
+      await expect(createXeroInvoiceForBooking("booking_1")).rejects.toThrow(
+        "Xero allocation rejected"
+      );
+      expect(mocks.failXeroSyncOperation).toHaveBeenCalled();
+      expect(mocks.xeroClientInstance.accountingApi.createInvoices).toHaveBeenCalledTimes(1);
+
+      // Retry: the invoice already exists (xeroInvoiceId persisted before the
+      // allocation call), so the early-return path re-drives the idempotent
+      // allocation WITHOUT creating a second invoice.
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockClear();
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        cardCreditBooking({ xeroInvoiceId: "inv_1", xeroInvoiceNumber: "INV-1" })
+      );
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+      expect(mocks.xeroClientInstance.accountingApi.createInvoices).not.toHaveBeenCalled();
+      expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalledTimes(2);
+    });
+
+    /*
+      #3502 (review, Xero lens): a credit-paid ($0) booking whose primary invoice
+      was not yet raised ($50, all credit) grows by +$50 with a $5 change fee.
+      The card ask ($55) is captured BEFORE the invoice exists, so no
+      supplementary invoice ever bills the fee. The invoice raised later must
+      bill it, or it totals $100 against $55 recorded cash and $50 of credit
+      (more than the $45 then due), and Xero refuses the
+      allocation on every replay. A card-plus-credit booking edited before its
+      invoice is the same class and takes the same line.
+    */
+    describe("#3502 a change fee taken by card before the primary invoice was raised", () => {
+      /** $100 stay now: $50 of credit, and the $55 card ask (the $50 rise plus the $5 fee). */
+      function grownCreditPaidBooking() {
+        return cardCreditBooking({
+          amountCents: 5_500,
+          creditAppliedCents: 5_000,
+          changeFeeCents: 500,
+        });
+      }
+      const feeLines = () =>
+        (mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls[0]![1].invoices[0]
+          .lineItems as Array<{ description?: string; unitAmount?: number }>)
+          .filter((line) => line.description === "Late notice booking change fee");
+
+      it("MUTATION: bills the fee on the primary invoice, so cash plus credit settles it", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(grownCreditPaidBooking());
+
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+        expect(feeLines()).toEqual([expect.objectContaining({ quantity: 1, unitAmount: 5 })]);
+        const lines = mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls[0]![1]
+          .invoices[0].lineItems as Array<{ quantity?: number; unitAmount?: number }>;
+        const invoiceCents = Math.round(
+          lines.reduce((sum, line) => sum + (line.quantity ?? 1) * (line.unitAmount ?? 0), 0) * 100,
+        );
+        // $100 of stay plus the $5 fee = the $55 card capture + the $50 credit.
+        expect(invoiceCents).toBe(10_500);
+        expect(invoiceCents).toBe(5_500 + 5_000);
+        expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalled();
+      });
+
+      it("adds no fee line for a booking with no fee", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking());
+
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+        expect(feeLines()).toEqual([]);
+      });
+    });
+
+    describe("#3836 a booking paid entirely by credit", () => {
+      const creditOnly = { amountCents: 0, creditAppliedCents: 10000, stripePaymentIntentId: null };
+
+      it("allocates the applied credit against the full-price invoice, recording no cash", async () => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking(creditOnly));
+
+        await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+        expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+        expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalledWith("booking_1", expect.anything());
+      });
+
+      it.each([
+        { shape: "replayed after the invoice exists", overrides: { xeroInvoiceId: "inv_1", xeroInvoiceNumber: "INV-1" } },
+        { shape: "flipped to FAILED by the never-captured cancel", overrides: { status: "FAILED" } },
+      ])("allocates when $shape", async ({ overrides }) => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking({ ...creditOnly, ...overrides }));
+
+        await createXeroInvoiceForBooking("booking_1");
+
+        expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        { shape: "a card refunded whole (net 0)", overrides: { status: "REFUNDED", amountCents: 7000, refundedAmountCents: 7000 } },
+        { shape: "a card capture not yet captured", overrides: { status: "PENDING" } },
+        { shape: "a $0 booking with no credit applied", overrides: { amountCents: 0, creditAppliedCents: 0 } },
+        { shape: "an Internet-Banking $0 row", overrides: { ...creditOnly, source: "INTERNET_BANKING" } },
+      ])("still does NOT allocate for $shape", async ({ overrides }) => {
+        mocks.prisma.booking.findUnique.mockResolvedValue(cardCreditBooking(overrides));
+
+        await createXeroInvoiceForBooking("booking_1");
+
+        expect(mocks.allocateAppliedCreditForBooking).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  it("skips Xero payment creation when the booking invoice total is zero", async () => {
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(mocks.xeroClientInstance.accountingApi.createInvoices).toHaveBeenCalledTimes(1);
+    expect(mocks.xeroClientInstance.accountingApi.createInvoices).toHaveBeenCalledWith(
+      "tenant_1",
+      {
+        invoices: [
+          expect.objectContaining({
+            date: "2026-07-31",
+            dueDate: "2026-05-15",
+          }),
+        ],
+      },
+      undefined,
+      undefined,
+      "booking:booking_1:invoice:v1"
+    );
+    expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+    expect(mocks.xeroClientInstance.accountingApi.emailInvoice).not.toHaveBeenCalled();
+    expect(mocks.prisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: "pay_1", xeroInvoiceId: null },
+      data: {
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    });
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        status: "SUCCEEDED",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+        responsePayload: expect.objectContaining({
+          payment: null,
+          paymentError: null,
+          paymentSkipped: true,
+          paymentSkipReason: "Zero-total invoice does not require Xero payment recording.",
+          invoiceEmailSkipped: true,
+        }),
+      })
+    );
+  });
+
+  it("does NOT let Xero email the invoice when the booking has No emails on, and records the withhold (#2258)", async () => {
+    mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1", email: "member@example.test" },
+      // The switch. The invoice itself is still raised in Xero — only the
+      // emailing is withheld.
+      noEmails: true,
+      checkIn: "2026-07-31T00:00:00.000Z",
+      checkOut: "2026-08-02T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "PENDING",
+        amountCents: 10000,
+        stripePaymentIntentId: null,
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: "INTERNET_BANKING",
+      },
+    }));
+
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(
+      mocks.xeroClientInstance.accountingApi.emailInvoice
+    ).not.toHaveBeenCalled();
+    expect(mocks.prisma.emailLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        bookingId: "booking_1",
+        templateName: "xero-booking-invoice-email",
+        status: "SKIPPED_NO_EMAILS",
+        to: "member@example.test",
+        htmlBody: null,
+      }),
+      select: { id: true },
+    });
+    // The invoice was still created and linked — only the email is withheld.
+    expect(
+      mocks.xeroClientInstance.accountingApi.createInvoices
+    ).toHaveBeenCalled();
+    // A DELIBERATE withhold is a complete, intended outcome: no error, and the
+    // flag distinguishes it from the ordinary "this source raises no emailed
+    // invoice" skip.
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        status: "SUCCEEDED",
+        responsePayload: expect.objectContaining({
+          invoiceEmailError: null,
+          invoiceEmailWithheldByNoEmails: true,
+        }),
+      })
+    );
+  });
+
+  // The corrected contract (#2258 review finding): an unreadable switch is a
+  // FAULT, not a deliberate withhold. Filing it as SKIPPED_NO_EMAILS would put a
+  // false "the admin asked for silence" line on a booking whose switch is OFF
+  // (#2259's banner), and reporting the sync operation SUCCEEDED would strand an
+  // unpaid internet-banking invoice the member was never told about, with no
+  // re-drive path — the exact #1705 harm.
+  it("reports an unreadable switch as a FAULT: PARTIAL sync op, no withheld row, no email (#2258)", async () => {
+    const bookingRow = {
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1", email: "member@example.test" },
+      checkIn: "2026-07-31T00:00:00.000Z",
+      checkOut: "2026-08-02T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "PENDING",
+        amountCents: 10000,
+        stripePaymentIntentId: null,
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: "INTERNET_BANKING",
+      },
+    };
+    // The invoice and Stage 3 evidence share the first coherent booking read;
+    // the pre-email re-read throws.
+    const projectedBookingRow = withMoneyBuildUpProjection(bookingRow);
+    mocks.prisma.booking.findUnique
+      .mockResolvedValueOnce(projectedBookingRow)
+      .mockRejectedValueOnce(new Error("connection reset"));
+
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(
+      mocks.xeroClientInstance.accountingApi.emailInvoice
+    ).not.toHaveBeenCalled();
+    // NOT filed as a deliberate withhold.
+    expect(mocks.prisma.emailLog.create).not.toHaveBeenCalled();
+    // Visible and re-drivable: the operation completes PARTIAL with a populated
+    // invoiceEmailError, exactly as a failed emailInvoice call would.
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        status: "PARTIAL",
+        responsePayload: expect.objectContaining({
+          invoiceEmailError: expect.any(Error),
+          invoiceEmailSkipped: true,
+          invoiceEmailWithheldByNoEmails: false,
+          // #3001: WHICH fault, recorded beside the error. The error value is
+          // not redacted and is never read back out of this payload, so without
+          // this key the booking's warning can only say "sending it failed" —
+          // and for THIS cause the obvious remedy, "send it from Xero
+          // yourself", may email a booking whose switch is on.
+          invoiceEmailFailureCause: "NO_EMAILS_UNREADABLE",
+        }),
+      })
+    );
+  });
+
+  /*
+    #3035 (ENV-SAFETY 2, INV-CONFIG-004). The invoice is still raised and its
+    ids still persisted; only the emailing is withheld, and the two non-allow
+    outcomes are reported differently because they need different remedies.
+  */
+  describe("the environment-safety boundary", () => {
+    function internetBankingBooking() {
+      return withMoneyBuildUpProjection({
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1", email: "member@example.test" },
+        lodgeId: "lodge_1",
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+        createdAt: "2026-05-15T10:30:00.000Z",
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        noEmails: false,
+        guests: [
+          {
+            firstName: "Jordan",
+            lastName: "Hartley-Smith",
+            ageTier: "ADULT",
+            isMember: true,
+            priceCents: 10000,
+          },
+        ],
+        payment: {
+          id: "pay_1",
+          status: "PENDING",
+          amountCents: 10000,
+          stripePaymentIntentId: null,
+          xeroInvoiceId: null,
+          xeroInvoiceNumber: null,
+          source: "INTERNET_BANKING",
+        },
+      });
+    }
+
+    it("raises the invoice but emails nobody on a confirmed copy, and stays SUCCEEDED", async () => {
+      declareEnvironmentRole("non-production");
+      mocks.prisma.booking.findUnique.mockResolvedValue(internetBankingBooking());
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe(
+        "inv_1"
+      );
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice
+      ).not.toHaveBeenCalled();
+      // NOT a withheld-email audit row: that row asserts an administrator turned
+      // the booking's "No emails" switch on, and nobody did.
+      expect(mocks.prisma.emailLog.create).not.toHaveBeenCalled();
+      // The invoice ids are still persisted, so the booking is not left thinking
+      // no invoice exists.
+      expect(mocks.prisma.payment.updateMany).toHaveBeenCalled();
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({
+          status: "SUCCEEDED",
+          responsePayload: expect.objectContaining({
+            invoiceEmailError: null,
+            invoiceEmailSkipped: true,
+            invoiceEmailWithheldByNoEmails: false,
+            invoiceEmailWithheldForEnvironment: true,
+          }),
+        })
+      );
+    });
+
+    it("contains the invoice's contact BEFORE the invoice exists, and keeps it AUTHORISED", async () => {
+      /*
+        #3036 (INV-CONFIG-005). The half #3035 could not cover: the invoice is
+        AUTHORISED and stays that way, and XERO emails its own reminders for an
+        outstanding authorised invoice with no API call from here. So the contact
+        this invoice is raised against has to lose its real address BEFORE the
+        invoice exists.
+      */
+      declareEnvironmentRole("non-production");
+      mocks.prisma.booking.findUnique.mockResolvedValue(internetBankingBooking());
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe(
+        "inv_1"
+      );
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.updateContact
+      ).toHaveBeenCalledWith(
+        "tenant_1",
+        "contact_1",
+        {
+          contacts: [
+            {
+              contactID: "contact_1",
+              emailAddress: toXeroSandboxContactEmail("member@example.com"),
+            },
+          ],
+        },
+        expect.any(String)
+      );
+      const [, invoicePayload] =
+        mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls[0];
+      expect(invoicePayload.invoices[0].status).toBe("AUTHORISED");
+    });
+
+    it("raises NO invoice at all when the contact cannot be contained", async () => {
+      // The point of putting the gate inside the funnel: an invoice writer that
+      // cannot prove its contact is safe raises nothing, without needing to know
+      // anything about containment itself.
+      declareEnvironmentRole("non-production");
+      mocks.prisma.booking.findUnique.mockResolvedValue(internetBankingBooking());
+      mocks.xeroClientInstance.accountingApi.updateContact.mockRejectedValue(
+        new Error("400 from Xero")
+      );
+
+      await expect(createXeroInvoiceForBooking("booking_1")).rejects.toThrow(
+        /still able to reach a member/
+      );
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.createInvoices
+      ).not.toHaveBeenCalled();
+    });
+
+    /*
+      REWRITTEN BY #3036, and the change is the point rather than a test fix.
+      Under #3035 alone an UNDECLARED installation raised the invoice and merely
+      declined to email it, reporting PARTIAL so an operator could see the
+      unemailed invoice. #3036 refuses EARLIER: the contact cannot be resolved at
+      all without knowing which installation this is, because the answer decides
+      what address may sit on that contact — so no invoice is raised, and there
+      is nothing to report PARTIAL about.
+
+      The PARTIAL / `invoiceEmailError` shape #3035 built is still asserted, in
+      `xero-invoice-email-boundary.test.ts` ("withholds as a FAULT when the
+      installation is undeclared"), and it is still reachable from these
+      workflows in the narrow window where the role is readable when the contact
+      is resolved and unreadable a moment later when the invoice is emailed.
+    */
+    it("raises no invoice at all when nobody has said what this installation is", async () => {
+      vi.stubEnv("APP_ENVIRONMENT_ROLE", "");
+      mocks.prisma.booking.findUnique.mockResolvedValue(internetBankingBooking());
+
+      await expect(createXeroInvoiceForBooking("booking_1")).rejects.toThrow(
+        /APP_ENVIRONMENT_ROLE/
+      );
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.createInvoices
+      ).not.toHaveBeenCalled();
+      expect(
+        mocks.xeroClientInstance.accountingApi.updateContact
+      ).not.toHaveBeenCalled();
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice
+      ).not.toHaveBeenCalled();
+      expect(mocks.prisma.emailLog.create).not.toHaveBeenCalled();
+    });
+  });
+
+  /*
+    #2929 — the administrator's creation-time "do not email the member" choice,
+    carried to the Xero invoice email that same creation raises.
+
+    Every test here drives the INTERNET BANKING path with `syncOperationId`,
+    because that is the whole point: the officer's choice is not a parameter to
+    this function, it is a value on the operation row a dispatcher claimed. The
+    request that made the choice ended long ago.
+  */
+  describe("the creation-time \"do not email the member\" choice", () => {
+    function internetBankingBooking(
+      overrides: Record<string, unknown> = {},
+    ) {
+      return {
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1", email: "member@example.test" },
+        lodgeId: "lodge_1",
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+        createdAt: "2026-05-15T10:30:00.000Z",
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        noEmails: false,
+        guests: [
+          {
+            firstName: "Jordan",
+            lastName: "Hartley-Smith",
+            ageTier: "ADULT",
+            isMember: true,
+            priceCents: 10000,
+          },
+        ],
+        payment: {
+          id: "pay_1",
+          status: "PENDING",
+          amountCents: 10000,
+          stripePaymentIntentId: null,
+          xeroInvoiceId: null,
+          xeroInvoiceNumber: null,
+          source: "INTERNET_BANKING",
+        },
+        ...overrides,
+      };
+    }
+
+    /** What the operation row a dispatcher claimed says about delivery. */
+    function operationSays(invoiceEmailDelivery: string | null) {
+      mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValue({
+        invoiceEmailDelivery,
+      });
+    }
+
+    function completionPayload() {
+      const call = mocks.completeXeroSyncOperation.mock.calls.at(-1);
+      return (call?.[1] as { responsePayload: Record<string, unknown> })
+        .responsePayload;
+    }
+
+    beforeEach(() => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        withMoneyBuildUpProjection(internetBankingBooking()),
+      );
+      mocks.xeroClientInstance.accountingApi.emailInvoice.mockResolvedValue({
+        body: {},
+      });
+    });
+
+    /*
+      THE NAMED TEST the issue's last acceptance criterion asks for.
+
+      THE MUTATION THAT FAILS IT: delete `!invoiceEmailWithheldByCreationChoice`
+      from the `invoiceEmailPolicy` conjunction in xero-booking-invoices.ts —
+      the gate that decides whether `sendXeroInvoiceEmail` is reached at all.
+      Xero is then asked to email the invoice the officer chose not to send and
+      the first assertion below fails.
+
+      NOT the mutation you might reach for first. Deleting the
+      `xeroInvoiceEmailIsWithheldAtCreation(...)` term from
+      `invoiceEmailWithheldByCreationChoice` itself leaves that flag ALWAYS
+      true, so the email is still withheld and this test still passes. (The
+      suite as a whole does discriminate — "emails the invoice exactly as before
+      when the officer chose to send" fails on that one — but the criterion asks
+      for a NAMED test, and a comment pointing the next reader at the wrong edit
+      is worse than no comment at all: they make it, see green, and conclude the
+      suppression is untested.)
+    */
+    it("withholds the Xero invoice email when the officer who created the booking chose not to email the member (#2929)", async () => {
+      operationSays("WITHHELD_AT_CREATION");
+
+      await expect(
+        createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") }),
+      ).resolves.toBe("inv_1");
+
+      // The email, and ONLY the email, is withheld.
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice,
+      ).not.toHaveBeenCalled();
+      // The invoice is still raised, and still AUTHORISED: the club is owed the
+      // money either way, and Xero is where that one invoice is sent from.
+      expect(
+        mocks.xeroClientInstance.accountingApi.createInvoices,
+      ).toHaveBeenCalled();
+      const [, invoicePayload] =
+        mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls[0];
+      expect(invoicePayload.invoices[0].status).toBe("AUTHORISED");
+      // Its ids are persisted, so no surface thinks the invoice is missing.
+      expect(mocks.prisma.payment.updateMany).toHaveBeenCalled();
+
+      // The withheld-email audit evidence, in the existing vocabulary, naming
+      // THIS reason rather than the switch.
+      expect(mocks.prisma.emailLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          bookingId: "booking_1",
+          templateName: "xero-booking-invoice-email",
+          status: "SKIPPED_NO_EMAILS",
+          to: "member@example.test",
+          htmlBody: null,
+          errorMessage: expect.stringContaining(
+            "chose not to email the member",
+          ),
+        }),
+        select: { id: true },
+      });
+
+      // A deliberate, complete outcome: SUCCEEDED, no error, and reported under
+      // its own key so no operator is told the persistent switch is on.
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({ status: "SUCCEEDED" }),
+      );
+      expect(completionPayload()).toMatchObject({
+        invoiceEmailError: null,
+        invoiceEmailSkipped: true,
+        invoiceEmailWithheldByCreationChoice: true,
+        invoiceEmailWithheldByNoEmails: false,
+        invoiceEmailWithheldForEnvironment: false,
+      });
+    });
+
+    it("emails the invoice exactly as before when the officer chose to send", async () => {
+      operationSays("SEND");
+
+      await expect(
+        createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") }),
+      ).resolves.toBe("inv_1");
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice,
+      ).toHaveBeenCalledWith(
+        "tenant_1",
+        "inv_1",
+        expect.any(Object),
+        "booking:booking_1:invoice-email:inv_1:v1",
+      );
+      expect(mocks.prisma.emailLog.create).not.toHaveBeenCalled();
+      expect(completionPayload()).toMatchObject({
+        invoiceEmailSkipped: false,
+        invoiceEmailWithheldByCreationChoice: false,
+      });
+    });
+
+    it("emails the invoice when the operation records no instruction at all — every row written before #2929", async () => {
+      operationSays(null);
+
+      await expect(
+        createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") }),
+      ).resolves.toBe("inv_1");
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice,
+      ).toHaveBeenCalled();
+      expect(completionPayload()).toMatchObject({
+        invoiceEmailWithheldByCreationChoice: false,
+      });
+    });
+
+    it("emails the invoice when the stored value is not one this application recognises", async () => {
+      // Fail-open is the RIGHT answer only here: an unrecognised value is not a
+      // withhold anybody asked for, and the member is owed the invoice they have
+      // to pay. A typo in a future enqueuer must not silently stop invoices
+      // reaching members.
+      operationSays("withheld_at_creation");
+
+      await expect(
+        createXeroInvoiceForBooking("booking_1", { syncOperation: xeroClaim("op_1") }),
+      ).resolves.toBe("inv_1");
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice,
+      ).toHaveBeenCalled();
+    });
+
+    it("reads nothing at all when no dispatcher claimed a row for this run", async () => {
+      // A self-minting run has no enqueuer and therefore no instruction; asking
+      // the row we are about to write would be asking ourselves.
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe(
+        "inv_1",
+      );
+
+      expect(
+        mocks.prisma.xeroSyncOperation.findUnique,
+      ).not.toHaveBeenCalled();
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice,
+      ).toHaveBeenCalled();
+    });
+
+    it("touches nothing persistent: not the switch, not the contact's address", async () => {
+      operationSays("WITHHELD_AT_CREATION");
+
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+
+      // `prisma.booking` in this file's double has no `update` delegate at all,
+      // so a write to Booking.noEmails here could not even be attempted — but
+      // state it, because the rule is what matters and the double may grow one.
+      expect(
+        (mocks.prisma.booking as Record<string, unknown>).update,
+      ).toBeUndefined();
+      // The club's live site never rewrites the contact; that is the copy-only
+      // containment path, and a withhold is not a reason to touch an address.
+      expect(
+        mocks.xeroClientInstance.accountingApi.updateContact,
+      ).not.toHaveBeenCalled();
+    });
+
+    it("survives the payload rewrite, so an operator retry hours later still withholds", async () => {
+      /*
+        THE DURABILITY PROPERTY, and the reason this is a column rather than a
+        `requestPayload` key. This function REWRITES requestPayload wholesale
+        with the Xero invoice request before its first provider call. If the
+        instruction lived there it would be destroyed by the run that then
+        failed, and the retry — which is the execution that actually needs it —
+        would find nothing and email the member.
+      */
+      operationSays("WITHHELD_AT_CREATION");
+
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+
+      // It is read from the column, by name.
+      expect(mocks.prisma.xeroSyncOperation.findUnique).toHaveBeenCalledWith({
+        where: { id: "op_1" },
+        select: { invoiceEmailDelivery: true },
+      });
+      // And nothing this run writes can disturb it: no update through the
+      // client, and no completion payload, names the column.
+      for (const [, args] of mocks.prisma.xeroSyncOperation.update.mock.calls.entries()) {
+        expect(JSON.stringify(args ?? {})).not.toContain("invoiceEmailDelivery");
+      }
+      for (const call of mocks.completeXeroSyncOperation.mock.calls) {
+        expect(Object.keys(call[1] as object)).not.toContain(
+          "invoiceEmailDelivery",
+        );
+      }
+    });
+
+    it("records the SWITCH, not this choice, when a silenced booking also carries one — one reason per event", async () => {
+      // `INV-CONFIG-004`: the four non-delivery outcomes stay distinguishable,
+      // and one event carries one reason. The persistent switch is the broader
+      // fact and is what the officer has to act on, so it is the one recorded.
+      operationSays("WITHHELD_AT_CREATION");
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        withMoneyBuildUpProjection(internetBankingBooking({ noEmails: true })),
+      );
+
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.emailInvoice,
+      ).not.toHaveBeenCalled();
+      expect(mocks.prisma.emailLog.create).toHaveBeenCalledTimes(1);
+      expect(completionPayload()).toMatchObject({
+        invoiceEmailWithheldByNoEmails: true,
+        invoiceEmailWithheldByCreationChoice: false,
+      });
+    });
+
+    /*
+      ONE SUBJECT PER TEMPLATE, whichever decision withheld it (#2929 fix
+      round).
+
+      The withheld-emails banner groups by TEMPLATE NAME and renders a single
+      representative subject for the group — whichever row is newest. Two
+      withhold sites spelling the wording out separately therefore makes one
+      kind of withheld email show two different subjects depending on which
+      happened last, which reads to an officer as two different messages. The
+      wording now lives in one constant above both sites; this is the guard that
+      keeps it there.
+    */
+    it("gives the same withheld subject whichever decision withheld it", async () => {
+      function subjectOfWithheldRow(index: number): string {
+        const call = mocks.prisma.emailLog.create.mock.calls[index] as [
+          { data: { subject: string } },
+        ];
+        return call[0].data.subject;
+      }
+
+      // The creation-time choice, on a booking whose switch was never used.
+      operationSays("WITHHELD_AT_CREATION");
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+
+      // The persistent switch, with no creation-time instruction at all.
+      operationSays(null);
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        withMoneyBuildUpProjection(internetBankingBooking({ noEmails: true })),
+      );
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+
+      expect(mocks.prisma.emailLog.create).toHaveBeenCalledTimes(2);
+      expect(subjectOfWithheldRow(1)).toBe(subjectOfWithheldRow(0));
+      expect(subjectOfWithheldRow(0)).toContain(
+        "for your Internet Banking booking payment",
+      );
+    });
+
+    /*
+      THE FOUR OUTCOMES, side by side (`INV-CONFIG-004`). Three of them send no
+      email, and telling them apart is the whole reason each has its own key: a
+      support call about "the member never got the invoice" is answered
+      differently depending on which of these it was, and three states that look
+      identical from outside are how the next one gets misdiagnosed.
+    */
+    it("keeps business suppression, environment-safety suppression, provider failure and an ordinary send distinguishable", async () => {
+      async function signature() {
+        const payload = completionPayload();
+        return {
+          emailed:
+            mocks.xeroClientInstance.accountingApi.emailInvoice.mock.calls
+              .length > 0,
+          withheldRow: mocks.prisma.emailLog.create.mock.calls.length > 0,
+          status: (
+            mocks.completeXeroSyncOperation.mock.calls.at(-1)?.[1] as {
+              status: string;
+            }
+          ).status,
+          byCreationChoice: payload.invoiceEmailWithheldByCreationChoice,
+          forEnvironment: payload.invoiceEmailWithheldForEnvironment,
+          failed: payload.invoiceEmailError !== null,
+          // #3001: three faults share one key, and they need three remedies.
+          cause: payload.invoiceEmailFailureCause ?? null,
+        };
+      }
+
+      // 1. This issue's business-rule suppression.
+      operationSays("WITHHELD_AT_CREATION");
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+      const businessRule = await signature();
+
+      // 2. The environment-safety suppression (#3035): NOT the club's decision,
+      //    so no withheld row is written at all.
+      vi.clearAllMocks();
+      declareEnvironmentRole("non-production");
+      operationSays("SEND");
+      mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection(internetBankingBooking()));
+      mocks.xeroClientInstance.accountingApi.getContact.mockResolvedValue({
+        body: {
+          contacts: [
+            { contactID: "contact_1", emailAddress: "member@example.com" },
+          ],
+        },
+      });
+      mocks.xeroClientInstance.accountingApi.updateContact.mockResolvedValue({
+        body: {},
+      });
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+      const environmentSafety = await signature();
+
+      // 3. An outright provider failure: nothing was decided, something broke.
+      vi.clearAllMocks();
+      declareEnvironmentRole("production");
+      operationSays("SEND");
+      mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection(internetBankingBooking()));
+      mocks.xeroClientInstance.accountingApi.emailInvoice.mockRejectedValue(
+        new Error("503 from Xero"),
+      );
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+      const providerFailure = await signature();
+
+      // 4. An ordinary send.
+      vi.clearAllMocks();
+      operationSays("SEND");
+      mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection(internetBankingBooking()));
+      mocks.xeroClientInstance.accountingApi.emailInvoice.mockResolvedValue({
+        body: {},
+      });
+      await createXeroInvoiceForBooking("booking_1", {
+        syncOperation: xeroClaim("op_1"),
+      });
+      const ordinarySend = await signature();
+
+      expect(businessRule).toEqual({
+        emailed: false,
+        withheldRow: true,
+        status: "SUCCEEDED",
+        byCreationChoice: true,
+        forEnvironment: false,
+        failed: false,
+        cause: null,
+      });
+      expect(environmentSafety).toEqual({
+        emailed: false,
+        withheldRow: false,
+        status: "SUCCEEDED",
+        byCreationChoice: false,
+        forEnvironment: true,
+        failed: false,
+        cause: null,
+      });
+      expect(providerFailure).toEqual({
+        emailed: true,
+        withheldRow: false,
+        status: "PARTIAL",
+        byCreationChoice: false,
+        forEnvironment: false,
+        failed: true,
+        cause: "PROVIDER",
+      });
+      expect(ordinarySend).toEqual({
+        emailed: true,
+        withheldRow: false,
+        status: "SUCCEEDED",
+        byCreationChoice: false,
+        forEnvironment: false,
+        failed: false,
+        cause: null,
+      });
+
+      // Belt and braces: no two of the four read the same from outside.
+      const seen = [
+        businessRule,
+        environmentSafety,
+        providerFailure,
+        ordinarySend,
+      ].map((s) => JSON.stringify(s));
+      expect(new Set(seen).size).toBe(4);
+    });
+  });
+
+  it("emails Internet Banking invoices and updates the Internet Banking transaction", async () => {
+    mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      // Booking.lodgeId is NOT NULL in the schema; the season read that picks
+      // the hut-fee item code is scoped to it.
+      lodgeId: "lodge_1",
+      checkIn: "2026-07-31T00:00:00.000Z",
+      checkOut: "2026-08-02T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "PENDING",
+        amountCents: 10000,
+        stripePaymentIntentId: null,
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: "INTERNET_BANKING",
+      },
+    }));
+    mocks.xeroClientInstance.accountingApi.emailInvoice.mockResolvedValue({
+      body: {},
+    });
+
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+    expect(mocks.xeroClientInstance.accountingApi.emailInvoice).toHaveBeenCalledWith(
+      "tenant_1",
+      "inv_1",
+      expect.any(Object),
+      "booking:booking_1:invoice-email:inv_1:v1"
+    );
+    expect(mocks.prisma.paymentTransaction.updateMany).toHaveBeenCalledWith({
+      where: {
+        paymentId: "pay_1",
+        source: "INTERNET_BANKING",
+        kind: "PRIMARY",
+      },
+      data: {
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    });
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        status: "SUCCEEDED",
+        responsePayload: expect.objectContaining({
+          invoiceEmail: {},
+          invoiceEmailSkipped: false,
+        }),
+      })
+    );
+  });
+
+  it("does not record settled Internet Banking invoices as Stripe Xero payments", async () => {
+    mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      // Booking.lodgeId is NOT NULL in the schema; the season read that picks
+      // the hut-fee item code is scoped to it.
+      lodgeId: "lodge_1",
+      checkIn: "2026-07-31T00:00:00.000Z",
+      checkOut: "2026-08-02T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 10000,
+        stripePaymentIntentId: null,
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: "INTERNET_BANKING",
+      },
+    }));
+    mocks.xeroClientInstance.accountingApi.emailInvoice.mockResolvedValue({
+      body: {},
+    });
+
+    await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(mocks.xeroClientInstance.accountingApi.createPayment).not.toHaveBeenCalled();
+    expect(mocks.xeroClientInstance.accountingApi.emailInvoice).toHaveBeenCalledWith(
+      "tenant_1",
+      "inv_1",
+      expect.any(Object),
+      "booking:booking_1:invoice-email:inv_1:v1"
+    );
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        status: "SUCCEEDED",
+        responsePayload: expect.objectContaining({
+          payment: null,
+          paymentError: null,
+          paymentSkipped: true,
+          paymentSkipReason:
+            "Internet Banking invoice payments are reconciled from Xero instead of recorded as Stripe bank payments.",
+          invoiceEmailSkipped: false,
+        }),
+      })
+    );
+  });
+
+  it("updates primary invoice dates and guest line narration without changing amounts", async () => {
+    mocks.prisma.booking.findUnique.mockResolvedValue({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      checkIn: "2026-08-03T00:00:00.000Z",
+      // A 2-night stay (checkIn + 2 days); getStayNights is mocked to length 2
+      // above, so checkOut must be 08-05 for the fixture to be internally
+      // consistent. The #1163 price-run splitter derives the line's end date from
+      // the night count, so an inconsistent checkOut would misdescribe the range.
+      checkOut: "2026-08-05T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 10000,
+        stripePaymentIntentId: "pi_1",
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            contact: { contactID: "contact_1" },
+            lineAmountTypes: "Inclusive",
+            reference: "Booking booking_",
+            lineItems: [
+              {
+                lineItemID: "line_1",
+                description:
+                  "Jordan Hartley-Smith - (ADULT, Member) - 1 night - 2026-07-31 - 2026-08-01",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+          },
+        ],
+      },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(mocks.xeroClientInstance.accountingApi.updateInvoice).toHaveBeenCalledWith(
+      "tenant_1",
+      "inv_1",
+      {
+        invoices: [
+          expect.objectContaining({
+            date: "2026-08-03",
+            dueDate: "2026-05-15",
+            lineItems: [
+              expect.objectContaining({
+                lineItemID: "line_1",
+                description:
+                  "Jordan Hartley-Smith - (ADULT, Member) - 2 nights - 2026-08-03 - 2026-08-05",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              }),
+            ],
+          }),
+        ],
+      },
+      undefined,
+      "booking:booking_1:invoice-update:inv_1:2026-08-03:2026-08-05:v1"
+    );
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+      })
+    );
+  });
+
+  it.each([
+    ["no primary manifest", null, null, 100, undefined, 10000],
+    ["a matching primary manifest", { id: "pm_1", outcome: "COVERED", lineTotalCents: 10000, providerInvoiceId: "inv_1" }, "COVERED", 100, undefined, 10000],
+    ["a primary manifest naming another invoice", { id: "pm_1", outcome: "COVERED", lineTotalCents: 10000, providerInvoiceId: "inv_0" }, "CONFLICT", 100, undefined, 10000],
+    ["a discounted provider invoice", { id: "pm_1", outcome: "COVERED", lineTotalCents: 10000, providerInvoiceId: "inv_1" }, "CONFLICT", 90, undefined, 9000],
+    ["a response with a changed total", { id: "pm_1", outcome: "COVERED", lineTotalCents: 10000, providerInvoiceId: "inv_1" }, "CONFLICT", 100, 115, 11500],
+    ["an unavailable provider total", { id: "pm_1", outcome: "COVERED", lineTotalCents: 10000, providerInvoiceId: "inv_1" }, null, undefined, undefined, undefined],
+  ] as const)("ALP-436: records the update's export manifest against %s, and sends and completes regardless", async (_label, primary, outcome, currentTotal, responseTotal, expectedTotalCents) => {
+    mocks.tx.memberMoneyExportManifest.findUnique.mockResolvedValueOnce(primary);
+    mocks.prisma.booking.findUnique.mockResolvedValue({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      checkIn: "2026-08-03T00:00:00.000Z",
+      // A 2-night stay (checkIn + 2 days); getStayNights is mocked to length 2
+      // above, so checkOut must be 08-05 for the fixture to be internally
+      // consistent. The #1163 price-run splitter derives the line's end date from
+      // the night count, so an inconsistent checkOut would misdescribe the range.
+      checkOut: "2026-08-05T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 10000,
+        stripePaymentIntentId: "pi_1",
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            contact: { contactID: "contact_1" },
+            lineAmountTypes: "Inclusive",
+            total: currentTotal,
+            reference: "Booking booking_",
+            lineItems: [
+              {
+                lineItemID: "line_1",
+                description:
+                  "Jordan Hartley-Smith - (ADULT, Member) - 1 night - 2026-07-31 - 2026-08-01",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            total: responseTotal,
+          },
+        ],
+      },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(mocks.xeroClientInstance.accountingApi.updateInvoice).toHaveBeenCalledWith(
+      "tenant_1",
+      "inv_1",
+      {
+        invoices: [
+          expect.objectContaining({
+            date: "2026-08-03",
+            dueDate: "2026-05-15",
+            lineItems: [
+              expect.objectContaining({
+                lineItemID: "line_1",
+                description:
+                  "Jordan Hartley-Smith - (ADULT, Member) - 2 nights - 2026-08-03 - 2026-08-05",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              }),
+            ],
+          }),
+        ],
+      },
+      undefined,
+      "booking:booking_1:invoice-update:inv_1:2026-08-03:2026-08-05:v1"
+    );
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+      })
+    );
+    const rows = mocks.tx.memberMoneyExportManifest.createMany.mock.calls.map(([arg]) => (arg as { data: unknown[] }).data[0]);
+    expect(rows).toEqual(outcome === null ? [] : [expect.objectContaining({
+      documentRole: "PRIMARY_BOOKING_INVOICE_UPDATE", bookingId: "booking_1", outcome, providerInvoiceId: "inv_1", lineTotalCents: expectedTotalCents,
+      legacyKey: "booking:booking_1:invoice-update:inv_1:2026-08-03:2026-08-05:v1",
+      ...(outcome === "CONFLICT" ? { reason: "PRIMARY_UNMATCHED" } : { reason: null }),
+    })]);
+    expect(mocks.tx.memberMoneyExportCoverage.createMany).not.toHaveBeenCalled();
+  });
+
+  it("#3955 X3: never relabels the change-fee line as a guest when the narration is rewritten", async () => {
+    // The invoice carries one guest and the change-fee line; the booking now
+    // has two guests. The second guest's narration must not land on the fee.
+    mocks.prisma.booking.findUnique.mockResolvedValue({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      checkIn: "2026-08-03T00:00:00.000Z",
+      checkOut: "2026-08-05T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      guests: [
+        { firstName: "Jordan", lastName: "Hartley-Smith", ageTier: "ADULT", isMember: true, priceCents: 10000 },
+        { firstName: "Sam", lastName: "Guest", ageTier: "ADULT", isMember: true, priceCents: 10000 },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 10000,
+        stripePaymentIntentId: "pi_1",
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    });
+    const feeLine = {
+      lineItemID: "line_fee",
+      description: CHANGE_FEE_LINE_DESCRIPTION,
+      quantity: 1,
+      unitAmount: 25,
+      taxType: "OUTPUT2",
+      accountCode: "200",
+    };
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            contact: { contactID: "contact_1" },
+            lineAmountTypes: "Inclusive",
+            reference: "Booking booking_",
+            lineItems: [
+              {
+                lineItemID: "line_1",
+                description: "Jordan Hartley-Smith - (ADULT, Member) - 1 night - 2026-07-31 - 2026-08-01",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+              feeLine,
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1" }] },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    const [, , body] = mocks.xeroClientInstance.accountingApi.updateInvoice.mock.calls.at(-1) as [
+      string,
+      string,
+      { invoices: Array<{ lineItems: Array<{ lineItemID?: string; description?: string }> }> },
+    ];
+    expect(body.invoices[0].lineItems.find((line) => line.lineItemID === "line_fee")).toEqual(
+      expect.objectContaining({ description: CHANGE_FEE_LINE_DESCRIPTION, unitAmount: 25 }),
+    );
+  });
+
+  it("keeps the due date an already-issued invoice was issued with (#2697)", async () => {
+    // #2697 corrected the due date to the club's calendar day. That correction
+    // must reach NEW invoices only — the owner decision is that already-issued
+    // Xero invoices are untouched, with no write-back.
+    //
+    // Before that fix, recomputing the due date on update was value-stable, so
+    // nobody had to think about it. Afterwards it is not: this booking was made
+    // at 00:00 on 15 May NZST, which is still 14 May in UTC, so the old
+    // derivation issued "2026-05-14" and the new one would produce "2026-05-15".
+    // Recomputing here would silently move a live AUTHORISED invoice's due date
+    // the next time an unrelated edit synced.
+    mocks.prisma.booking.findUnique.mockResolvedValue({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      checkIn: "2026-08-03T00:00:00.000Z",
+      checkOut: "2026-08-05T00:00:00.000Z",
+      createdAt: "2026-05-14T12:00:00.000Z",
+      discountCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 10000,
+        stripePaymentIntentId: "pi_1",
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            contact: { contactID: "contact_1" },
+            lineAmountTypes: "Inclusive",
+            reference: "Booking booking_",
+            // What Xero already holds: the pre-#2697 UTC-truncated day.
+            dueDate: "2026-05-14",
+            lineItems: [
+              {
+                lineItemID: "line_1",
+                description:
+                  "Jordan Hartley-Smith - (ADULT, Member) - 1 night - 2026-07-31 - 2026-08-01",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1" }] },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    expect(mocks.xeroClientInstance.accountingApi.updateInvoice).toHaveBeenCalledWith(
+      "tenant_1",
+      "inv_1",
+      {
+        invoices: [expect.objectContaining({ dueDate: "2026-05-14" })],
+      },
+      undefined,
+      "booking:booking_1:invoice-update:inv_1:2026-08-03:2026-08-05:v1"
+    );
+  });
+
+  /** The booking shape the update path needs: a payment carrying an invoice id. */
+  function bookingWithExistingInvoice() {
+    return {
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      checkIn: "2026-08-03T00:00:00.000Z",
+      checkOut: "2026-08-05T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 0,
+      guests: [
+        {
+          firstName: "Jordan",
+          lastName: "Hartley-Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          priceCents: 10000,
+        },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 10000,
+        stripePaymentIntentId: "pi_1",
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    };
+  }
+
+  /*
+    INV-CONFIG-005 (#3036 review P0-2). Re-pricing an invoice can RAISE its
+    amount due, and this path never goes through `findOrCreateXeroContact` — so
+    on a copy restored from the club's live database nothing here had ever looked
+    at what the invoice's contact holds, while Xero goes on emailing reminders
+    for an outstanding AUTHORISED invoice from its own servers.
+  */
+  it("contains the invoice's contact before re-pricing it on a copy", async () => {
+    declareEnvironmentRole("non-production");
+    mocks.prisma.booking.findUnique.mockResolvedValue(
+      bookingWithExistingInvoice()
+    );
+    mocks.prisma.member.findUnique.mockResolvedValue({
+      email: "member@example.com",
+      xeroContactId: "contact_1",
+    });
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            status: "AUTHORISED",
+            contact: { contactID: "contact_1" },
+            lineAmountTypes: "Inclusive",
+            reference: "Booking booking_",
+            lineItems: [
+              {
+                lineItemID: "line_1",
+                description: "old",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1" }] },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe(
+      "inv_1"
+    );
+
+    expect(
+      mocks.xeroClientInstance.accountingApi.updateContact
+    ).toHaveBeenCalledWith(
+      "tenant_1",
+      "contact_1",
+      {
+        contacts: [
+          {
+            contactID: "contact_1",
+            emailAddress: toXeroSandboxContactEmail("member@example.com"),
+          },
+        ],
+      },
+      expect.any(String)
+    );
+  });
+
+  it("contains the INVOICE's contact, not the member's link, when they differ", async () => {
+    /*
+      The permissive defect this replaced. The update re-sends
+      `currentInvoice.contact`, and after a member merge or an admin re-link that
+      is a DIFFERENT contact from `Member.xeroContactId`. The first version of
+      this check ran at the top of the function against the member's link, so it
+      proved containment of a contact this update never touches while raising the
+      amount due on one it does.
+    */
+    declareEnvironmentRole("non-production");
+    mocks.prisma.booking.findUnique.mockResolvedValue(
+      bookingWithExistingInvoice()
+    );
+    mocks.prisma.member.findUnique.mockResolvedValue({
+      email: "member@example.com",
+      xeroContactId: "contact_survivor",
+    });
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            status: "AUTHORISED",
+            contact: { contactID: "contact_loser" },
+            lineAmountTypes: "Inclusive",
+            reference: "Booking booking_",
+            lineItems: [
+              {
+                lineItemID: "line_1",
+                description: "old",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.getContact.mockResolvedValue({
+      body: {
+        contacts: [
+          { contactID: "contact_loser", emailAddress: "member@example.com" },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1" }] },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe(
+      "inv_1"
+    );
+
+    expect(
+      mocks.xeroClientInstance.accountingApi.getContact
+    ).toHaveBeenCalledWith("tenant_1", "contact_loser");
+    expect(
+      mocks.xeroClientInstance.accountingApi.updateContact
+    ).toHaveBeenCalledWith(
+      "tenant_1",
+      "contact_loser",
+      expect.objectContaining({
+        contacts: [
+          expect.objectContaining({ contactID: "contact_loser" }),
+        ],
+      }),
+      expect.any(String)
+    );
+  });
+
+  it("re-prices nothing on a copy that cannot prove the contact contained", async () => {
+    declareEnvironmentRole("non-production");
+    mocks.prisma.booking.findUnique.mockResolvedValue(
+      bookingWithExistingInvoice()
+    );
+    mocks.prisma.member.findUnique.mockResolvedValue({
+      email: "member@example.com",
+      xeroContactId: "contact_1",
+    });
+    mocks.xeroClientInstance.accountingApi.getContact.mockRejectedValue(
+      new Error("503 from Xero")
+    );
+
+    await expect(
+      updateXeroBookingInvoiceForBooking("booking_1")
+    ).rejects.toThrow(/cannot prove the contact is unable to reach a member/);
+    expect(
+      mocks.xeroClientInstance.accountingApi.updateInvoice
+    ).not.toHaveBeenCalled();
+  });
+
+  it("asks none of that on the club's live site", async () => {
+    declareEnvironmentRole("production");
+    mocks.prisma.booking.findUnique.mockResolvedValue(
+      bookingWithExistingInvoice()
+    );
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            status: "AUTHORISED",
+            contact: { contactID: "contact_1" },
+            lineAmountTypes: "Inclusive",
+            reference: "Booking booking_",
+            lineItems: [
+              {
+                lineItemID: "line_1",
+                description: "old",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1" }] },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe(
+      "inv_1"
+    );
+
+    expect(
+      mocks.xeroClientInstance.accountingApi.updateContact
+    ).not.toHaveBeenCalled();
+    expect(
+      mocks.prisma.xeroSandboxContactContainment.findUnique
+    ).not.toHaveBeenCalled();
+  });
+
+  // The Stripe payment recorded against a freshly raised invoice is
+  // bank-reconciliation input, and its date decides which GST period the cash
+  // falls in. It read the clock's UTC day, which is still yesterday for roughly
+  // the first half of every New Zealand day (#2834, INV-DATE-019). The instants
+  // below are chosen so a wrong zone fails them: the first is 00:00 NZST, which
+  // any zone shallower than UTC+12 gets wrong, and the second is 00:30 NZDT,
+  // which a fixed +12 zone with no daylight saving gets wrong.
+  describe.each([
+    {
+      label: "NZST (UTC+12), the first instant of a club day",
+      instant: new Date("2026-06-14T12:00:00.000Z"),
+      utcDay: "2026-06-14",
+      clubDay: "2026-06-15",
+    },
+    {
+      label: "NZDT (UTC+13), 00:30 on a club day",
+      instant: new Date("2026-01-14T11:30:00.000Z"),
+      utcDay: "2026-01-14",
+      clubDay: "2026-01-15",
+    },
+  ])("the recorded Stripe payment date — $label", ({ instant, utcDay, clubDay }) => {
+    beforeEach(() => {
+      // Say what actually happened before any date assertion can turn an
+      // environment problem into what looks like the product bug.
+      expectClubTimeZonePremise();
+      // A fixture that drifted out of the divergence window would pass vacuously.
+      expect(instant.toISOString().slice(0, 10)).toBe(utcDay);
+      // The root freeze pins midday NZ, where the two calendars agree — the one
+      // window this defect does not live in. Pin the divergent instant here.
+      vi.setSystemTime(instant);
+    });
+
+    afterEach(() => {
+      // Hand the clock back so the root `beforeEach` re-freezes the DEFAULT
+      // instant for every test declared after this block. Without this the pin
+      // leaks: `ensureFrozenTestClock()` returns early whenever anything is
+      // already mocking `Date`, so it would never overwrite — nor restore — a
+      // deliberate pin, and the rest of this file would silently run six months
+      // earlier than 1 July 2026 (docs/TESTING.md rule 4).
+      vi.useRealTimers();
+    });
+
+    it("is the club's calendar day, not the UTC one", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(withMoneyBuildUpProjection({
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        totalPriceCents: 10000,
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+        createdAt: "2026-05-15T10:30:00.000Z",
+        discountCents: 0,
+        guests: [
+          {
+            id: "guest_1",
+            firstName: "Jordan",
+            lastName: "Hartley-Smith",
+            ageTier: "ADULT",
+            isMember: true,
+            priceCents: 10000,
+            nights: [],
+          },
+        ],
+        payment: {
+          id: "pay_1",
+          status: "SUCCEEDED",
+          amountCents: 10000,
+          refundedAmountCents: 0,
+          creditAppliedCents: 0,
+          stripePaymentIntentId: "pi_1",
+          xeroInvoiceId: null,
+          xeroInvoiceNumber: null,
+          source: "STRIPE",
+        },
+      }));
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: {
+          invoices: [
+            {
+              invoiceID: "inv_1",
+              invoiceNumber: "INV-1",
+              total: 100,
+              status: "AUTHORISED",
+            },
+          ],
+        },
+      });
+      mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({
+        body: { payments: [{ paymentID: "xpay_1" }] },
+      });
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+      const [, payment] =
+        mocks.xeroClientInstance.accountingApi.createPayment.mock.calls[0];
+      expect(payment.date).toBe(clubDay);
+      expect(payment.date).not.toBe(utcDay);
+    });
+  });
+
+  // The restore proof for the block above. It is declared AFTER it, so it runs
+  // after it, and it fails the moment that `afterEach` stops handing the clock
+  // back — which is the only thing standing between a scoped pin and roughly
+  // 2,300 lines of later tests silently running on 14 January 2026 instead of
+  // 1 July 2026, flipping past and future for every `2026-07-31` fixture in this
+  // file. `frozenTestNow()` rather than the literal so the rollover canary's
+  // `TEST_CLOCK_ISO` / `TEST_CLOCK_OFFSET_DAYS` runs still agree with it.
+  it("hands the default frozen clock back to every test declared after the pinned block", () => {
+    expect(new Date().toISOString()).toBe(frozenTestNow().toISOString());
+  });
+
+  it("keeps every promotion line of a several-code invoice untouched and re-narrates only the guest lines (#3828)", async () => {
+    // The update path passes promotion lines through by description, one by
+    // one; a second promotion line must neither be dropped nor consume the
+    // guest line's narration slot.
+    mocks.prisma.booking.findUnique.mockResolvedValue({
+      id: "booking_1",
+      memberId: "mem_1",
+      member: { id: "mem_1" },
+      checkIn: "2026-08-03T00:00:00.000Z",
+      checkOut: "2026-08-05T00:00:00.000Z",
+      createdAt: "2026-05-15T10:30:00.000Z",
+      discountCents: 5000,
+      guests: [
+        { firstName: "Jordan", lastName: "Hartley-Smith", ageTier: "ADULT", isMember: true, priceCents: 10000 },
+      ],
+      payment: {
+        id: "pay_1",
+        status: "SUCCEEDED",
+        amountCents: 5000,
+        stripePaymentIntentId: "pi_1",
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-1",
+      },
+    });
+    const summer = {
+      lineItemID: "line_2",
+      description: "Promo adjustment - SUMMER25",
+      quantity: 1,
+      unitAmount: -30,
+      taxType: "OUTPUT2",
+      itemCode: "PROMO-DISC",
+    };
+    const guestFree = {
+      lineItemID: "line_3",
+      description: "Promo adjustment - GUESTFREE",
+      quantity: 1,
+      unitAmount: -20,
+      taxType: "OUTPUT2",
+      itemCode: "FREE-NIGHT",
+      accountCode: "205",
+    };
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: {
+        invoices: [
+          {
+            invoiceID: "inv_1",
+            invoiceNumber: "INV-1",
+            type: "ACCREC",
+            contact: { contactID: "contact_1" },
+            lineAmountTypes: "Inclusive",
+            reference: "Booking booking_",
+            lineItems: [
+              summer,
+              {
+                lineItemID: "line_1",
+                description:
+                  "Jordan Hartley-Smith - (ADULT, Member) - 1 night - 2026-07-31 - 2026-08-01",
+                quantity: 1,
+                unitAmount: 100,
+                taxType: "OUTPUT2",
+                accountCode: "200",
+              },
+              guestFree,
+            ],
+          },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateInvoice.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_1", invoiceNumber: "INV-1" }] },
+    });
+
+    await expect(updateXeroBookingInvoiceForBooking("booking_1")).resolves.toBe("inv_1");
+
+    const sent = mocks.xeroClientInstance.accountingApi.updateInvoice.mock.calls[0]![2]
+      .invoices[0].lineItems;
+    expect(sent).toEqual([
+      summer,
+      expect.objectContaining({
+        lineItemID: "line_1",
+        description:
+          "Jordan Hartley-Smith - (ADULT, Member) - 2 nights - 2026-08-03 - 2026-08-05",
+      }),
+      guestFree,
+    ]);
+  });
+
+  describe("promo code discount line coding", () => {
+    function bookingWithPromo(promo: {
+      code: string;
+      xeroItemCode: string | null;
+      xeroAccountCode: string | null;
+    } | null) {
+      return withMoneyBuildUpProjection({
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        totalPriceCents: 10000,
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+        createdAt: "2026-05-15T10:30:00.000Z",
+        discountCents: 5000,
+        promoAdjustmentCents: -5000,
+        guests: [
+          {
+            id: "guest_1",
+            firstName: "Jordan",
+            lastName: "Hartley-Smith",
+            ageTier: "ADULT",
+            isMember: true,
+            priceCents: 10000,
+            nights: [],
+          },
+        ],
+        payment: {
+          id: "pay_1",
+          status: "SUCCEEDED",
+          amountCents: 5000,
+          stripePaymentIntentId: "pi_1",
+          xeroInvoiceId: null,
+          xeroInvoiceNumber: null,
+        },
+        promoRedemption: promo
+          ? {
+              promoCode: promo,
+              priceAdjustmentCents: -5000,
+              allocations: [
+                { memberId: "mem_1", priceAdjustmentCents: -5000 },
+              ],
+            }
+          : null,
+        nightAdjustments: [
+          {
+            bookingGuestId: "guest_1",
+            beneficiaryMemberId: "mem_1",
+            amountCents: -5000,
+            bookingGuestNight: null,
+          },
+        ],
+      });
+    }
+
+    function getPromoAdjustmentLine() {
+      const call = mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls[0];
+      const lineItems = call[1].invoices[0].lineItems as Array<{
+        description?: string;
+        itemCode?: string;
+        accountCode?: string;
+        unitAmount?: number;
+      }>;
+      return lineItems.find((l) => l.description?.toLowerCase().startsWith("promo adjustment"));
+    }
+
+    it("posts the promo adjustment line to the promo's xeroItemCode when set", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        bookingWithPromo({ code: "SUMMER25", xeroItemCode: "PROMO-DISC", xeroAccountCode: null })
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      const discount = getPromoAdjustmentLine();
+      expect(discount).toBeDefined();
+      expect(discount?.description).toBe("Promo adjustment - SUMMER25");
+      expect(discount?.itemCode).toBe("PROMO-DISC");
+      expect(discount?.accountCode).toBeUndefined();
+      expect(discount?.unitAmount).toBe(-50);
+      expect(mocks.startXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestPayload: expect.objectContaining({
+            moneyBuildUp: expect.objectContaining({
+              moneyBuildUpOperation: "XERO_PROMO_LINE",
+              moneyBuildUpSource: "STORED",
+              moneyBuildUpStoredCents: -5000,
+              moneyBuildUpDerivedCents: -5000,
+            }),
+            moneyReconciliation: {
+              state: "UNRECONCILED",
+              reasons: ["FINAL_PRICE_RELATION_MISMATCH"],
+            },
+          }),
+        }),
+      );
+    });
+
+    it("preserves Stage 4 reconciliation evidence when contact repair rebuilds the request", async () => {
+      const booking = bookingWithPromo({
+        code: "EXPIRED",
+        xeroItemCode: null,
+        xeroAccountCode: null,
+      });
+      booking.promoAdjustmentCents = 0;
+      booking.discountCents = 0;
+      mocks.prisma.booking.findUnique.mockResolvedValue(booking);
+      let repairedPayload: unknown;
+      mocks.retryXeroWriteWithContactRepair.mockImplementationOnce(
+        async (options: {
+          buildRequestPayload: (contactId: string) => unknown;
+          run: (input: {
+            contactId: string;
+            idempotencyKey?: string | null;
+          }) => Promise<unknown>;
+        }) => {
+          repairedPayload = options.buildRequestPayload("contact_repaired");
+          return options.run({
+            contactId: "contact_repaired",
+            idempotencyKey: null,
+          });
+        },
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      expect(repairedPayload).toEqual(
+        expect.objectContaining({
+          moneyBuildUp: expect.objectContaining({
+            moneyBuildUpOperation: "XERO_PROMO_LINE",
+            moneyBuildUpSource: "DERIVED_COMPATIBILITY_FALLBACK",
+          }),
+          moneyReconciliation: {
+            state: "UNRECONCILED",
+            reasons: [
+              "PROMO_BUILD_UP_MISMATCH",
+              "FINAL_PRICE_RELATION_MISMATCH",
+            ],
+          },
+        }),
+      );
+    });
+
+    it("posts the promo adjustment line to the promo's xeroAccountCode when only an account code is set", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        bookingWithPromo({ code: "PROMO10", xeroItemCode: null, xeroAccountCode: "201" })
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      const discount = getPromoAdjustmentLine();
+      expect(discount).toBeDefined();
+      expect(discount?.itemCode).toBeUndefined();
+      expect(discount?.accountCode).toBe("201");
+    });
+
+    it("includes both itemCode and accountCode when both are set on the promo", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        bookingWithPromo({ code: "WINTER20", xeroItemCode: "PROMO-DISC", xeroAccountCode: "201" })
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      const discount = getPromoAdjustmentLine();
+      expect(discount?.itemCode).toBe("PROMO-DISC");
+      expect(discount?.accountCode).toBe("201");
+    });
+
+    it("falls back to hut-fee item code when the promo has no Xero codes set", async () => {
+      mocks.prisma.xeroAccountMapping.findUnique.mockImplementation(({ where }) => {
+        if (where.key === "hutFeeItem") return Promise.resolve({ code: null, itemCode: "HUT-FEE" });
+        return Promise.resolve(null);
+      });
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        bookingWithPromo({ code: "LEGACY", xeroItemCode: null, xeroAccountCode: null })
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      const discount = getPromoAdjustmentLine();
+      expect(discount?.description).toBe("Promo adjustment - LEGACY");
+      expect(discount?.itemCode).toBe("HUT-FEE");
+    });
+
+    it("uses the generic promo adjustment description when no promo redemption is linked", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(bookingWithPromo(null));
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      const discount = getPromoAdjustmentLine();
+      expect(discount?.description).toBe("Promo adjustment");
+    });
+
+    it("classifies stale recorded promo rows even when today's Xero headline is zero", async () => {
+      const booking = bookingWithPromo({
+        code: "EXPIRED",
+        xeroItemCode: null,
+        xeroAccountCode: null,
+      });
+      booking.promoAdjustmentCents = 0;
+      booking.discountCents = 0;
+      mocks.prisma.booking.findUnique.mockResolvedValue(booking);
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      expect(getPromoAdjustmentLine()).toBeUndefined();
+      expect(mocks.prisma.booking.findUnique).toHaveBeenCalledTimes(1);
+      expect(mocks.startXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestPayload: expect.objectContaining({
+            moneyBuildUp: expect.objectContaining({
+              moneyBuildUpSource: "DERIVED_COMPATIBILITY_FALLBACK",
+              moneyBuildUpFallbackClassification: "STORED_SIDE_DEFECT",
+              moneyBuildUpStoredCents: -5000,
+              moneyBuildUpDerivedCents: 0,
+            }),
+            moneyReconciliation: {
+              state: "UNRECONCILED",
+              reasons: [
+                "PROMO_BUILD_UP_MISMATCH",
+                "FINAL_PRICE_RELATION_MISMATCH",
+              ],
+            },
+          }),
+        }),
+      );
+    });
+  });
+
+  describe("several promo codes on one booking (#3828)", () => {
+    function bookingWithTwoCodes(rowAmounts: { summer: number | null; guest: number | null }) {
+      const booking = withMoneyBuildUpProjection({
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        totalPriceCents: 10000,
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+        createdAt: "2026-05-15T10:30:00.000Z",
+        discountCents: 5000,
+        promoAdjustmentCents: -5000,
+        guests: [
+          {
+            id: "guest_1",
+            firstName: "Jordan",
+            lastName: "Hartley-Smith",
+            ageTier: "ADULT",
+            isMember: true,
+            priceCents: 10000,
+            nights: [],
+          },
+        ],
+        payment: {
+          id: "pay_1",
+          status: "SUCCEEDED",
+          amountCents: 5000,
+          stripePaymentIntentId: "pi_1",
+          xeroInvoiceId: null,
+          xeroInvoiceNumber: null,
+        },
+        promoRedemption: null,
+        nightAdjustments: [
+          {
+            bookingGuestId: "guest_1",
+            bookingGuestNightId: null,
+            promoRedemptionId: "red_summer",
+            beneficiaryMemberId: "mem_1",
+            amountCents: rowAmounts.summer,
+          },
+          {
+            bookingGuestId: "guest_1",
+            bookingGuestNightId: null,
+            promoRedemptionId: "red_guest",
+            beneficiaryMemberId: "mem_1",
+            amountCents: rowAmounts.guest,
+          },
+        ],
+      });
+      return {
+        ...booking,
+        // Loaded out of order: the invoice follows the booker's order.
+        promoRedemptions: [
+          {
+            id: "red_guest",
+            applicationOrder: 1,
+            priceAdjustmentCents: -2000,
+            allocations: [{ memberId: "mem_1", priceAdjustmentCents: -2000 }],
+            promoCode: { code: "GUESTFREE", xeroItemCode: "FREE-NIGHT", xeroAccountCode: "205" },
+          },
+          {
+            id: "red_summer",
+            applicationOrder: 0,
+            priceAdjustmentCents: -3000,
+            allocations: [{ memberId: "mem_1", priceAdjustmentCents: -3000 }],
+            promoCode: { code: "SUMMER25", xeroItemCode: "PROMO-DISC", xeroAccountCode: null },
+          },
+        ],
+      };
+    }
+
+    function promoLines() {
+      const call = mocks.xeroClientInstance.accountingApi.createInvoices.mock.calls[0];
+      return (call[1].invoices[0].lineItems as Array<Record<string, unknown>>).filter((line) =>
+        String(line.description ?? "").startsWith("Promo adjustment"),
+      );
+    }
+
+    it("raises one coded line per code, in the booker's order, summing to promoAdjustmentCents", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        bookingWithTwoCodes({ summer: -3000, guest: -2000 }),
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      expect(promoLines()).toEqual([
+        {
+          description: "Promo adjustment - SUMMER25",
+          quantity: 1,
+          unitAmount: -30,
+          taxType: "OUTPUT2",
+          itemCode: "PROMO-DISC",
+        },
+        {
+          description: "Promo adjustment - GUESTFREE",
+          quantity: 1,
+          unitAmount: -20,
+          taxType: "OUTPUT2",
+          itemCode: "FREE-NIGHT",
+          accountCode: "205",
+        },
+      ]);
+      expect(
+        promoLines().reduce((sum, line) => sum + Math.round(Number(line.unitAmount) * 100), 0),
+      ).toBe(-5000);
+      expect(mocks.startXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestPayload: expect.objectContaining({
+            promoLines: {
+              promoLineSource: "PER_CODE",
+              promoLineReason: null,
+              promoLineAggregateCents: -5000,
+              promoLineCodes: [
+                { code: "SUMMER25", amountCents: -3000 },
+                { code: "GUESTFREE", amountCents: -2000 },
+              ],
+            },
+          }),
+        }),
+      );
+    });
+
+    it("falls back to one aggregate line, recorded on the operation, when a code's build-up is not known", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        bookingWithTwoCodes({ summer: null, guest: -2000 }),
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      expect(promoLines()).toEqual([
+        expect.objectContaining({
+          description: "Promo adjustment - SUMMER25, GUESTFREE",
+          quantity: 1,
+          unitAmount: -50,
+          taxType: "OUTPUT2",
+        }),
+      ]);
+      expect(mocks.startXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestPayload: expect.objectContaining({
+            promoLines: expect.objectContaining({
+              promoLineSource: "AGGREGATE_FALLBACK",
+              promoLineReason: "CODE_BUILDUP_NOT_KNOWN",
+              promoLineAggregateCents: -5000,
+            }),
+          }),
+        }),
+      );
+    });
+
+    it("records nothing new on a one-code booking's operation", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        withMoneyBuildUpProjection({
+          id: "booking_1",
+          memberId: "mem_1",
+          member: { id: "mem_1" },
+          totalPriceCents: 10000,
+          checkIn: "2026-07-31T00:00:00.000Z",
+          checkOut: "2026-08-02T00:00:00.000Z",
+          createdAt: "2026-05-15T10:30:00.000Z",
+          discountCents: 5000,
+          promoAdjustmentCents: -5000,
+          guests: [
+            { id: "guest_1", firstName: "Jo", lastName: "Solo", ageTier: "ADULT", isMember: true, priceCents: 10000, nights: [] },
+          ],
+          payment: {
+            id: "pay_1",
+            status: "SUCCEEDED",
+            amountCents: 5000,
+            stripePaymentIntentId: "pi_1",
+            xeroInvoiceId: null,
+            xeroInvoiceNumber: null,
+          },
+          promoRedemption: {
+            promoCode: { code: "SUMMER25", xeroItemCode: null, xeroAccountCode: null },
+            priceAdjustmentCents: -5000,
+            allocations: [{ memberId: "mem_1", priceAdjustmentCents: -5000 }],
+          },
+          nightAdjustments: [
+            { bookingGuestId: "guest_1", beneficiaryMemberId: "mem_1", amountCents: -5000, bookingGuestNight: null },
+          ],
+        }),
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      const payload = mocks.startXeroSyncOperation.mock.calls[0]![0].requestPayload;
+      expect(Object.keys(payload).sort()).toEqual(["invoices", "moneyBuildUp", "moneyReconciliation"]);
+      expect(promoLines()).toEqual([
+        expect.objectContaining({ description: "Promo adjustment - SUMMER25", unitAmount: -50 }),
+      ]);
+    });
+  });
+
+  // #1765 — repay-after-refund: the Payment aggregate sits in
+  // PARTIALLY_REFUNDED at invoice time (gross captures across generations
+  // minus refunds), so the payment write must gate on captured-status +
+  // positive NET cash and record the NET capture, never gate on
+  // `status === "SUCCEEDED"` or write the gross aggregate.
+  describe("#1765 repay-after-refund invoice payment", () => {
+    function repayBooking(paymentOverrides: Record<string, unknown> = {}) {
+      return withMoneyBuildUpProjection({
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+        createdAt: "2026-05-15T10:30:00.000Z",
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        guests: [
+          {
+            firstName: "Jordan",
+            lastName: "Hartley-Smith",
+            ageTier: "ADULT",
+            isMember: true,
+            priceCents: 9000,
+          },
+        ],
+        payment: {
+          id: "pay_1",
+          // Production shape from #1765: paid 19500, fully refunded, repay
+          // captured 9000 → gross 28500, refunded 19500, aggregate
+          // PARTIALLY_REFUNDED. Net capture = 9000.
+          status: "PARTIALLY_REFUNDED",
+          amountCents: 28500,
+          refundedAmountCents: 19500,
+          creditAppliedCents: 0,
+          stripePaymentIntentId: "pi_repay",
+          xeroInvoiceId: null,
+          xeroInvoiceNumber: null,
+          source: "STRIPE",
+          ...paymentOverrides,
+        },
+      });
+    }
+
+    beforeEach(() => {
+      mocks.xeroClientInstance.accountingApi.createPayment.mockResolvedValue({
+        body: { paymentID: "xpay_repay" },
+      });
+      mocks.allocateAppliedCreditForBooking.mockResolvedValue(undefined);
+      mocks.xeroClientInstance.accountingApi.createInvoices.mockResolvedValue({
+        body: {
+          invoices: [
+            {
+              invoiceID: "inv_repay",
+              invoiceNumber: "INV-9",
+              total: 90,
+              amountDue: 90,
+              status: "AUTHORISED",
+            },
+          ],
+        },
+      });
+    });
+
+    it("records the NET capture (gross − refunded) as the invoice payment for a repay-settled booking", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(repayBooking());
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe(
+        "inv_repay"
+      );
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.createPayment
+      ).toHaveBeenCalledTimes(1);
+      const xeroPayment =
+        mocks.xeroClientInstance.accountingApi.createPayment.mock.calls[0][1];
+      // Net 9000 cents = $90, NOT the $285 gross aggregate.
+      expect(xeroPayment.amount).toBe(90);
+      expect(xeroPayment.reference).toBe("Stripe pi_repay");
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({
+          responsePayload: expect.objectContaining({
+            paymentSkipped: false,
+            paymentSkipReason: null,
+          }),
+        })
+      );
+    });
+
+    it("caps the recorded payment at the invoice's amount due (Xero rejects overpayment)", async () => {
+      // Legacy full-price capture on a booking whose invoice was repriced
+      // below the captured cash: net 19500 > amountDue 9000.
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        repayBooking({
+          status: "SUCCEEDED",
+          amountCents: 19500,
+          refundedAmountCents: 0,
+        })
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      const xeroPayment =
+        mocks.xeroClientInstance.accountingApi.createPayment.mock.calls[0][1];
+      expect(xeroPayment.amount).toBe(90);
+    });
+
+    it("skips loudly, with a populated reason, when captured cash was fully refunded (net 0)", async () => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        repayBooking({
+          status: "REFUNDED",
+          amountCents: 19500,
+          refundedAmountCents: 19500,
+        })
+      );
+
+      await createXeroInvoiceForBooking("booking_1");
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.createPayment
+      ).not.toHaveBeenCalled();
+      expect(mocks.logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          bookingId: "booking_1",
+          netCapturedCents: 0,
+          paymentStatus: "REFUNDED",
+        }),
+        "Captured Stripe cash was fully refunded; no net cash remains to record against the invoice."
+      );
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({
+          responsePayload: expect.objectContaining({
+            paymentSkipped: true,
+            paymentSkipReason:
+              "Captured Stripe cash was fully refunded; no net cash remains to record against the invoice.",
+          }),
+        })
+      );
+    });
+
+    it("still allocates applied credit for a repay booking that carries applied credit", async () => {
+      // Repay generation captured the credit-reduced effective amount:
+      // finalPrice 9000, applied 2000 → repay capture 7000; gross 26500.
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        repayBooking({
+          amountCents: 26500,
+          refundedAmountCents: 19500,
+          creditAppliedCents: 2000,
+        })
+      );
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe(
+        "inv_repay"
+      );
+
+      // Net cash $70 recorded, then the applied slice allocated — the old
+      // status === "SUCCEEDED" gate skipped both for a PARTIALLY_REFUNDED
+      // repay aggregate.
+      const xeroPayment =
+        mocks.xeroClientInstance.accountingApi.createPayment.mock.calls[0][1];
+      expect(xeroPayment.amount).toBe(70);
+      expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalledWith(
+        "booking_1",
+        expect.anything()
+      );
+    });
+
+    // #3637: the capture decision now asks `isCapturedPaymentStatus` instead
+    // of this module's own copy of the list. Every Payment status, with net
+    // cash and applied credit on the row, pins both decisions the list makes
+    // here - record the invoice payment, allocate the applied credit - and the
+    // payment's amount, reference and idempotency key, so the swap is
+    // behaviour-identical.
+    it.each([
+      ["SUCCEEDED", true],
+      ["PARTIALLY_REFUNDED", true],
+      ["REFUNDED", true],
+      ["PENDING", false],
+      ["PROCESSING", false],
+      ["FAILED", false],
+    ])("%s: records the payment and allocates credit = %s", async (status, captured) => {
+      mocks.prisma.booking.findUnique.mockResolvedValue(
+        repayBooking({
+          status,
+          amountCents: 7000,
+          refundedAmountCents: 0,
+          creditAppliedCents: 2000,
+        })
+      );
+
+      await expect(createXeroInvoiceForBooking("booking_1")).resolves.toBe(
+        "inv_repay"
+      );
+
+      const createPayment = mocks.xeroClientInstance.accountingApi.createPayment;
+      if (captured) {
+        expect(createPayment).toHaveBeenCalledTimes(1);
+        const [, xeroPayment, idempotencyKey] = createPayment.mock.calls[0];
+        expect(xeroPayment).toMatchObject({
+          invoice: { invoiceID: "inv_repay" },
+          amount: 70,
+          reference: "Stripe pi_repay",
+        });
+        expect(idempotencyKey).toBe("payment:pay_1:invoice-payment:v1");
+        expect(mocks.allocateAppliedCreditForBooking).toHaveBeenCalledWith(
+          "booking_1",
+          expect.anything()
+        );
+      } else {
+        expect(createPayment).not.toHaveBeenCalled();
+        expect(mocks.allocateAppliedCreditForBooking).not.toHaveBeenCalled();
+      }
+      // A status that never captured is not a "skipped" payment either.
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_1" }),
+        expect.objectContaining({
+          responsePayload: expect.objectContaining({
+            paymentSkipped: false,
+            paymentSkipReason: null,
+          }),
+        })
+      );
+    });
+  });
+});
+
+describe("createXeroCreditNoteForModification", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetXeroRateLimitStateForTests();
+    vi.stubEnv(
+      "XERO_ENCRYPTION_KEY",
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    vi.stubEnv("XERO_CLIENT_ID", "client-id");
+    vi.stubEnv("XERO_CLIENT_SECRET", "client-secret");
+    // #3036: on a copy the funnel reads the linked contact back and contains it
+    // before returning its id. On the club's live site none of this runs.
+    mocks.prisma.xeroSandboxContactContainment.findUnique.mockResolvedValue(null);
+    mocks.prisma.xeroSandboxContactContainment.upsert.mockResolvedValue({});
+    mocks.xeroClientInstance.accountingApi.getContact.mockResolvedValue({
+      body: {
+        contacts: [
+          { contactID: "contact_1", emailAddress: "member@example.com" },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateContact.mockResolvedValue({
+      body: {},
+    });
+
+    mocks.prisma.$transaction.mockImplementation(async (callback) => callback(mocks.tx));
+    mocks.tx.$executeRaw.mockResolvedValue(1);
+    mocks.tx.member.findUnique.mockResolvedValue({
+      id: "mem_1",
+      email: "member@example.com",
+      xeroContactId: "contact_1",
+    });
+    mocks.prisma.booking.findUnique.mockResolvedValue({
+      id: "booking_1",
+      memberId: "mem_1",
+      checkIn: "2026-07-31T00:00:00.000Z",
+      checkOut: "2026-08-02T00:00:00.000Z",
+      payment: {
+        id: "pay_1",
+        xeroInvoiceId: "inv_1",
+      },
+    });
+    mockXeroConnection(
+      mocks.prisma,
+      connectedXeroFixture({
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      tenantId: "tenant_1",
+      }),
+    );
+    mocks.prisma.xeroAccountMapping.findUnique.mockResolvedValue(null);
+    mocks.xeroClientInstance.accountingApi.createCreditNotes.mockResolvedValue({
+      body: {
+        creditNotes: [
+          {
+            creditNoteID: "cn_1",
+            creditNoteNumber: "CN-1",
+          },
+        ],
+      },
+    });
+    // #3993: an edit's note first reads what the invoice still owes. These
+    // cases are about notes the invoice CAN take, so it is open for $100.
+    mocks.xeroClientInstance.accountingApi.getInvoice.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_1", status: "AUTHORISED", amountDue: 100 }] },
+    });
+  });
+
+  it("keeps created modification credit notes partial when allocation fails", async () => {
+    mocks.xeroClientInstance.accountingApi.createCreditNoteAllocation.mockRejectedValue(
+      new Error("allocation failed")
+    );
+
+    await expect(
+      createXeroCreditNoteForModification({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking_1",
+        refundAmountCents: 3200,
+        bookingModificationId: "mod_1",
+        syncOperation: xeroClaim("op_1"),
+      })
+    ).resolves.toBe("cn_1");
+
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_1" }),
+      expect.objectContaining({
+        status: "PARTIAL",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_1",
+        xeroObjectNumber: "CN-1",
+        extraLinks: [
+          expect.objectContaining({
+            localModel: "BookingModification",
+            localId: "mod_1",
+            xeroObjectType: "CREDIT_NOTE",
+            xeroObjectId: "cn_1",
+            role: "MODIFICATION_CREDIT_NOTE",
+          }),
+        ],
+      })
+    );
+    expect(mocks.failXeroSyncOperation).not.toHaveBeenCalled();
+  });
+
+  it("MUTATION (#3954 round 6, F5): a billed-offset note waits while the edit's own note is still queued, and is raised once it is not", async () => {
+    const noteOp = (fields: { id: string; queueType: string; requestPayload: Record<string, unknown> }) => ({
+      status: "PENDING",
+      entityType: "CREDIT_NOTE",
+      operationType: "CREATE",
+      ...fields,
+    });
+    mocks.prisma.xeroSyncOperation.findMany.mockResolvedValueOnce([
+      noteOp({ id: "op_own_note", queueType: "MODIFICATION_CREDIT_NOTE", requestPayload: { queueType: "MODIFICATION_CREDIT_NOTE" } }),
+    ]);
+    const call = () =>
+      createXeroCreditNoteForModification({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking_1",
+        refundAmountCents: 2000,
+        bookingModificationId: "mod_1",
+        reviewTaskId: "unpaid-ask-billed-offset",
+        noteWording: "invoice-correction",
+        syncOperation: xeroClaim("op_billed_offset"),
+      });
+
+    await expect(call()).rejects.toMatchObject({ name: "XeroAppliedCreditOperationBusyError" });
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+
+    // Round 8 (`INV-SSOT-001`): the one definition of the edit's own note - an
+    // account-credit own note holds it too.
+    mocks.prisma.xeroSyncOperation.findMany.mockResolvedValueOnce([
+      noteOp({
+        id: "op_own_account_note",
+        queueType: "MODIFICATION_ACCOUNT_CREDIT_NOTE",
+        requestPayload: { queueType: "MODIFICATION_ACCOUNT_CREDIT_NOTE" },
+      }),
+    ]);
+    await expect(call()).rejects.toMatchObject({ name: "XeroAppliedCreditOperationBusyError" });
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+
+    // Only scoped notes beside it are left: the edit's own has been raised.
+    mocks.prisma.xeroSyncOperation.findMany.mockResolvedValueOnce([
+      noteOp({
+        id: "op_give_back",
+        queueType: "MODIFICATION_CREDIT_NOTE",
+        requestPayload: { queueType: "MODIFICATION_CREDIT_NOTE", reviewTaskId: "applied-credit-give-back" },
+      }),
+    ]);
+    await expect(call()).resolves.toBe("cn_1");
+  });
+
+  it("MUTATION (#3954 round 7, F6): a billed-offset note whose edit expects its own note waits while none is queued yet, then fails for a person past the age limit", async () => {
+    const { BILLED_OFFSET_OWN_NOTE_MISSING_MESSAGE, BILLED_OFFSET_OWN_NOTE_WAIT_MS } = await import("@/lib/unpaid-ask-billed-offset-order");
+    const queuedAt = (ageMs: number) => ({
+      requestPayload: { queueType: "MODIFICATION_CREDIT_NOTE", reviewTaskId: "unpaid-ask-billed-offset", ownNoteExpected: true },
+      createdAt: new Date(Date.now() - ageMs),
+    });
+    const call = () =>
+      createXeroCreditNoteForModification({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking_1",
+        refundAmountCents: 2000,
+        bookingModificationId: "mod_1",
+        reviewTaskId: "unpaid-ask-billed-offset",
+        noteWording: "invoice-correction",
+        syncOperation: xeroClaim("op_billed_offset"),
+      });
+
+    // Nothing of the edit's own note exists yet: it waits - coded (round 8),
+    // so the outbox spaces out its next look rather than retry every kick.
+    mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValueOnce(queuedAt(60_000));
+    mocks.prisma.xeroObjectLink.findMany.mockResolvedValueOnce([]);
+    await expect(call()).rejects.toMatchObject({
+      name: "XeroAppliedCreditOperationBusyError",
+      waitCode: "BILLED_OFFSET_AWAITING_OWN_NOTE",
+    });
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+
+    // Past the age limit it stops waiting and fails, raising nothing.
+    mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValueOnce(queuedAt(BILLED_OFFSET_OWN_NOTE_WAIT_MS + 1));
+    mocks.prisma.xeroObjectLink.findMany.mockResolvedValueOnce([]);
+    await expect(call()).rejects.toThrow(BILLED_OFFSET_OWN_NOTE_MISSING_MESSAGE);
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(expect.objectContaining({ id: "op_billed_offset" }), expect.any(Error));
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+  });
+
+  it("MUTATION (#3954 round 7, F6): once the edit's own note exists (its unscoped link), the expected-own-note billed-offset note goes ahead", async () => {
+    mocks.prisma.xeroSyncOperation.findUnique.mockResolvedValueOnce({
+      requestPayload: { queueType: "MODIFICATION_CREDIT_NOTE", reviewTaskId: "unpaid-ask-billed-offset", ownNoteExpected: true },
+      createdAt: new Date(Date.now() - 60_000),
+    });
+    mocks.prisma.xeroObjectLink.findMany.mockResolvedValueOnce([
+      { xeroObjectType: "CREDIT_NOTE", role: "MODIFICATION_CREDIT_NOTE", active: true, metadata: null },
+    ]);
+    await expect(
+      createXeroCreditNoteForModification({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking_1",
+        refundAmountCents: 2000,
+        bookingModificationId: "mod_1",
+        reviewTaskId: "unpaid-ask-billed-offset",
+        noteWording: "invoice-correction",
+        syncOperation: xeroClaim("op_billed_offset"),
+      }),
+    ).resolves.toBe("cn_1");
+  });
+});
+
+describe("createXeroCreditNote", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetXeroRateLimitStateForTests();
+    vi.stubEnv(
+      "XERO_ENCRYPTION_KEY",
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+    vi.stubEnv("XERO_CLIENT_ID", "client-id");
+    vi.stubEnv("XERO_CLIENT_SECRET", "client-secret");
+    // #3036: on a copy the funnel reads the linked contact back and contains it
+    // before returning its id. On the club's live site none of this runs.
+    mocks.prisma.xeroSandboxContactContainment.findUnique.mockResolvedValue(null);
+    mocks.prisma.xeroSandboxContactContainment.upsert.mockResolvedValue({});
+    mocks.xeroClientInstance.accountingApi.getContact.mockResolvedValue({
+      body: {
+        contacts: [
+          { contactID: "contact_1", emailAddress: "member@example.com" },
+        ],
+      },
+    });
+    mocks.xeroClientInstance.accountingApi.updateContact.mockResolvedValue({
+      body: {},
+    });
+    mocks.findCanonicalPaymentRefundCreditNote.mockResolvedValue(null);
+    mocks.prisma.xeroObjectLink.findMany.mockResolvedValue([]);
+    // Default: every refunded cent is provider-backed cash (#2902 cases
+    // override per test), so the pre-#2902 arithmetic is unchanged.
+    mocks.resolveStripeCashRefundEvidence.mockImplementation(
+      async (payment: { refundedAmountCents: number }) => ({
+        cashRefundCents: payment.refundedAmountCents,
+        countedRefundCents: payment.refundedAmountCents,
+        refundLedgerRowCount: 1,
+        accountCreditCents: 0,
+        source: "provider-ledger",
+      })
+    );
+  });
+
+  it("reuses an existing refund credit note link before attempting a new create", async () => {
+    mocks.prisma.payment.findUnique.mockResolvedValue({
+      id: "pay_1",
+      xeroInvoiceId: "inv_1",
+      xeroRefundCreditNoteId: null,
+      booking: {
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        guests: [],
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+      },
+    });
+    mocks.prisma.xeroObjectLink.findFirst.mockResolvedValue({
+      xeroObjectId: "cn_existing",
+      xeroObjectNumber: "CN-99",
+    });
+    mocks.findCanonicalPaymentRefundCreditNote.mockResolvedValue({
+      xeroObjectId: "cn_existing",
+      xeroObjectNumber: "CN-99",
+      source: "link",
+    });
+    mocks.prisma.payment.update.mockResolvedValue({ id: "pay_1" });
+
+    await expect(createXeroCreditNote("pay_1", 2500)).resolves.toBe("cn_existing");
+
+    expect(mocks.prisma.payment.update).toHaveBeenCalledWith({
+      where: { id: "pay_1" },
+      data: {
+        xeroRefundCreditNoteId: "cn_existing",
+      },
+    });
+    expect(mocks.upsertXeroObjectLink).toHaveBeenCalledWith({
+      localModel: "Payment",
+      localId: "pay_1",
+      xeroObjectType: "CREDIT_NOTE",
+      xeroObjectId: "cn_existing",
+      xeroObjectNumber: "CN-99",
+      role: "REFUND_CREDIT_NOTE",
+    });
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+    expect(mocks.xeroClientInstance.accountingApi.createPayments).not.toHaveBeenCalled();
+  });
+
+  it("skips the delta note when an active link already covers the watermark (#1162)", async () => {
+    mocks.prisma.payment.findUnique.mockResolvedValue({
+      id: "pay_1",
+      xeroInvoiceId: "inv_1",
+      xeroRefundCreditNoteId: null,
+      refundedAmountCents: 8000,
+      booking: {
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        guests: [],
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+      },
+    });
+    mocks.prisma.xeroObjectLink.findMany.mockResolvedValue([
+      {
+        xeroObjectId: "cn_delta",
+        xeroObjectNumber: "CN-8",
+        metadata: { amountCents: 8000, watermarkCents: 8000 },
+      },
+    ]);
+    mocks.prisma.payment.update.mockResolvedValue({ id: "pay_1" });
+
+    await expect(
+      createXeroCreditNote("pay_1", 3000, { watermarkCents: 8000 })
+    ).resolves.toBe("cn_delta");
+
+    // A covering note already settles this watermark: no new Xero writes, and
+    // the canonical single-note lookup is bypassed in delta mode.
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+    expect(mocks.xeroClientInstance.accountingApi.createPayments).not.toHaveBeenCalled();
+    expect(mocks.findCanonicalPaymentRefundCreditNote).not.toHaveBeenCalled();
+    expect(mocks.prisma.payment.update).toHaveBeenCalledWith({
+      where: { id: "pay_1" },
+      data: { xeroRefundCreditNoteId: "cn_delta" },
+    });
+  });
+
+  it("creates a new delta note when no active link covers the higher watermark (#1162)", async () => {
+    mocks.prisma.payment.findUnique.mockResolvedValue({
+      id: "pay_1",
+      xeroInvoiceId: "inv_1",
+      xeroRefundCreditNoteId: "cn_delta",
+      refundedAmountCents: 11000,
+      booking: {
+        id: "booking_1",
+        memberId: "mem_1",
+        member: { id: "mem_1" },
+        guests: [],
+        checkIn: "2026-07-31T00:00:00.000Z",
+        checkOut: "2026-08-02T00:00:00.000Z",
+      },
+    });
+    mocks.prisma.xeroObjectLink.findMany.mockResolvedValue([
+      {
+        xeroObjectId: "cn_delta",
+        xeroObjectNumber: "CN-8",
+        metadata: { amountCents: 8000, watermarkCents: 8000 },
+      },
+    ]);
+    mocks.tx.member.findUnique.mockResolvedValue({
+      id: "mem_1",
+      email: "member@example.com",
+      xeroContactId: "contact_1",
+    });
+    mockXeroConnection(
+      mocks.prisma,
+      connectedXeroFixture({
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      tenantId: "tenant_1",
+      }),
+    );
+    mocks.prisma.xeroAccountMapping.findUnique.mockResolvedValue(null);
+    mocks.prisma.xeroItemCodeMapping.findMany.mockResolvedValue([]);
+    mocks.prisma.payment.update.mockResolvedValue({ id: "pay_1" });
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "op_delta_1" });
+    mocks.xeroClientInstance.accountingApi.createCreditNotes.mockResolvedValue({
+      body: { creditNotes: [{ creditNoteID: "cn_new", creditNoteNumber: "CN-11" }] },
+    });
+    mocks.xeroClientInstance.accountingApi.createPayments.mockResolvedValue({
+      body: { payments: [{ paymentID: "xpay_new" }] },
+    });
+
+    await expect(
+      createXeroCreditNote("pay_1", 3000, {
+        watermarkCents: 11000,
+        syncOperation: xeroClaim("op_delta_1"),
+      })
+    ).resolves.toBe("cn_new");
+
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).toHaveBeenCalledTimes(1);
+    // The credit note is keyed on the new cumulative watermark, not the amount.
+    expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).toHaveBeenCalledWith(
+      "tenant_1",
+      expect.anything(),
+      undefined,
+      undefined,
+      "payment:pay_1:refund-credit-note:11000:v2"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // F4 (#1354): delta amounts are derived from EXECUTION-TIME state. The
+  // enqueue-time watermark can be stale (two refunds in one outbox interval),
+  // and pre-#1354 a stale-low watermark made an existing higher note look
+  // covering — the delta was marked done without creating anything.
+  // ---------------------------------------------------------------------------
+  describe("execution-time watermark recompute (#1354)", () => {
+    function armCreatePath(refundedAmountCents: number, linkRows: unknown[]) {
+      mocks.prisma.payment.findUnique.mockResolvedValue({
+        id: "pay_1",
+        xeroInvoiceId: "inv_1",
+        xeroRefundCreditNoteId: null,
+        refundedAmountCents,
+        booking: {
+          id: "booking_1",
+          memberId: "mem_1",
+          member: { id: "mem_1" },
+          guests: [],
+          checkIn: "2026-07-31T00:00:00.000Z",
+          checkOut: "2026-08-02T00:00:00.000Z",
+        },
+      });
+      mocks.prisma.xeroObjectLink.findMany.mockResolvedValue(linkRows);
+      mocks.prisma.xeroSyncOperation.findMany.mockResolvedValue([]);
+      mocks.tx.member.findUnique.mockResolvedValue({
+        id: "mem_1",
+        email: "member@example.com",
+        xeroContactId: "contact_1",
+      });
+      mockXeroConnection(
+        mocks.prisma,
+        connectedXeroFixture({
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        tenantId: "tenant_1",
+        }),
+      );
+      mocks.prisma.xeroAccountMapping.findUnique.mockResolvedValue(null);
+      mocks.prisma.xeroItemCodeMapping.findMany.mockResolvedValue([]);
+      mocks.prisma.payment.update.mockResolvedValue({ id: "pay_1" });
+      mocks.startXeroSyncOperation.mockResolvedValue({ id: "op_delta_x" });
+      mocks.xeroClientInstance.accountingApi.createPayments.mockResolvedValue({
+        body: { payments: [{ paymentID: "xpay_x" }] },
+      });
+    }
+
+    it("creates the uncovered delta even when the enqueue-time watermark is stale-low (the F4 swallow)", async () => {
+      // Ledger says 8000c refunded; one 5000c note exists (watermark 5000).
+      // The second refund's op carries the STALE watermark 3000 — pre-#1354
+      // the 5000-watermark note looked covering (5000 >= 3000) and the 3000c
+      // delta was silently swallowed.
+      armCreatePath(8000, [
+        {
+          xeroObjectId: "cn_first",
+          xeroObjectNumber: "CN-1",
+          metadata: { amountCents: 5000, watermarkCents: 5000 },
+        },
+      ]);
+      mocks.xeroClientInstance.accountingApi.createCreditNotes.mockResolvedValue({
+        body: { creditNotes: [{ creditNoteID: "cn_second", creditNoteNumber: "CN-2" }] },
+      });
+
+      await expect(
+        createXeroCreditNote("pay_1", 3000, {
+          watermarkCents: 3000,
+          syncOperation: xeroClaim("op_delta_x"),
+        })
+      ).resolves.toBe("cn_second");
+
+      // The note is created for the true uncovered amount, keyed by the
+      // EXECUTION-TIME watermark (5000 covered + 3000 = 8000).
+      expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).toHaveBeenCalledWith(
+        "tenant_1",
+        expect.objectContaining({
+          creditNotes: [
+            expect.objectContaining({
+              lineItems: [expect.objectContaining({ unitAmount: 30 })],
+            }),
+          ],
+        }),
+        undefined,
+        undefined,
+        "payment:pay_1:refund-credit-note:8000:v2"
+      );
+      // Completion records the execution-time amounts for future coverage math.
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_delta_x" }),
+        expect.objectContaining({
+          extraLinks: expect.arrayContaining([
+            expect.objectContaining({
+              role: "REFUND_CREDIT_NOTE",
+              metadata: { amountCents: 3000, watermarkCents: 8000 },
+            }),
+          ]),
+        })
+      );
+    });
+
+    it("caps the note at the ledger's uncovered amount when a competing note landed first", async () => {
+      // Requested 5000 but the ledger only shows 2000 uncovered.
+      armCreatePath(7000, [
+        {
+          xeroObjectId: "cn_first",
+          xeroObjectNumber: "CN-1",
+          metadata: { amountCents: 5000, watermarkCents: 5000 },
+        },
+      ]);
+      mocks.xeroClientInstance.accountingApi.createCreditNotes.mockResolvedValue({
+        body: { creditNotes: [{ creditNoteID: "cn_cap", creditNoteNumber: "CN-3" }] },
+      });
+
+      await createXeroCreditNote("pay_1", 5000, {
+        watermarkCents: 10000,
+        syncOperation: xeroClaim("op_delta_x"),
+      });
+
+      expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).toHaveBeenCalledWith(
+        "tenant_1",
+        expect.objectContaining({
+          creditNotes: [
+            expect.objectContaining({
+              lineItems: [expect.objectContaining({ unitAmount: 20 })],
+            }),
+          ],
+        }),
+        undefined,
+        undefined,
+        "payment:pay_1:refund-credit-note:7000:v2"
+      );
+    });
+
+    // #3635 (`INV-INT-025`): the execution-time cap reads the same coverage as
+    // the enqueue - links PLUS notes an officer raised by hand in Xero - so a
+    // note resolved after this one was queued (a kept late capture's
+    // credit-back, say) is not credited twice.
+    /** The coverage read's hand-resolved rows; #4688's fence read (stamped rows) finds none. */
+    const answerResolvedNoteReads = (rows: unknown[]) =>
+      mocks.prisma.xeroSyncOperation.findMany.mockImplementation(async (args?: { where?: { lastErrorCode?: unknown } }) =>
+        args?.where?.lastErrorCode === "REFUND_NOTE_UNRECORDED" ? [] : rows);
+
+    it("counts a note resolved by hand in Xero as covered at execution time (#3635)", async () => {
+      // 7000 refunded: a 5000 linked note and a 2000 note made by hand.
+      armCreatePath(7000, [
+        {
+          xeroObjectId: "cn_first",
+          xeroObjectNumber: "CN-1",
+          metadata: { amountCents: 5000, watermarkCents: 5000 },
+        },
+      ]);
+      answerResolvedNoteReads([
+        {
+          id: "op_resolved_note",
+          correlationKey: "payment:pay_1:refund-credit-note:7000:v2",
+          requestPayload: { queueType: "REFUND_CREDIT_NOTE", refundAmountCents: 2000, watermarkCents: 7000 },
+        },
+      ]);
+
+      await createXeroCreditNote("pay_1", 2000, {
+        watermarkCents: 7000,
+        syncOperation: xeroClaim("op_delta_x"),
+      });
+
+      expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+    });
+
+    it("refuses at execution time when a hand-resolved note's amount cannot be read (#3635)", async () => {
+      armCreatePath(7000, []);
+      answerResolvedNoteReads([{ id: "op_unreadable", correlationKey: null, requestPayload: null }]);
+
+      await expect(
+        createXeroCreditNote("pay_1", 2000, { watermarkCents: 7000, syncOperation: xeroClaim("op_delta_x") })
+      ).rejects.toThrow(/no readable amount/);
+      expect(mocks.xeroClientInstance.accountingApi.createCreditNotes).not.toHaveBeenCalled();
+    });
+
+    it("two stepped refunds sum to the exact refunded total whatever order their operations execute (#1354 validation)", async () => {
+      // Stripe refunded 5000 then 3000 (ledger 8000). The ops execute in the
+      // BUG order: the 3000 op (stale watermark) runs FIRST here, then the
+      // 5000 op — the created notes must still sum to exactly 8000.
+      armCreatePath(8000, []);
+      mocks.xeroClientInstance.accountingApi.createCreditNotes.mockResolvedValueOnce({
+        body: { creditNotes: [{ creditNoteID: "cn_a", creditNoteNumber: "CN-A" }] },
+      });
+      await createXeroCreditNote("pay_1", 3000, {
+        watermarkCents: 3000,
+        syncOperation: xeroClaim("op_delta_x"),
+      });
+      const firstCall =
+        mocks.xeroClientInstance.accountingApi.createCreditNotes.mock.calls[0];
+      const firstCents = Math.round(
+        firstCall[1].creditNotes[0].lineItems[0].unitAmount * 100
+      );
+
+      // The first note (3000c, watermark 3000) is now an active link.
+      mocks.prisma.xeroObjectLink.findMany.mockResolvedValue([
+        {
+          xeroObjectId: "cn_a",
+          xeroObjectNumber: "CN-A",
+          metadata: { amountCents: firstCents, watermarkCents: firstCents },
+        },
+      ]);
+      mocks.xeroClientInstance.accountingApi.createCreditNotes.mockResolvedValueOnce({
+        body: { creditNotes: [{ creditNoteID: "cn_b", creditNoteNumber: "CN-B" }] },
+      });
+      await createXeroCreditNote("pay_1", 5000, {
+        watermarkCents: 8000,
+        syncOperation: xeroClaim("op_delta_x"),
+      });
+      const secondCall =
+        mocks.xeroClientInstance.accountingApi.createCreditNotes.mock.calls[1];
+      const secondCents = Math.round(
+        secondCall[1].creditNotes[0].lineItems[0].unitAmount * 100
+      );
+
+      expect(firstCents + secondCents).toBe(8000);
+      expect(
+        mocks.xeroClientInstance.accountingApi.createCreditNotes
+      ).toHaveBeenCalledTimes(2);
+    });
+
+    it("completes a queued account-credit-only operation without billing Xero (#2902)", async () => {
+      // The pre-#2902 defect: an account-credit cancellation moved the mirror
+      // (34100) with no Stripe cash, a fictitious delta op was queued, and
+      // execution minted a real Xero note plus a Stripe-bank payment. The
+      // execution-time recompute now reads the cash evidence (zero), so an
+      // already-queued fictitious operation completes as a no-op.
+      armCreatePath(34100, []);
+      mocks.resolveStripeCashRefundEvidence.mockResolvedValue({
+        cashRefundCents: 0,
+        countedRefundCents: 0,
+        refundLedgerRowCount: 0,
+        accountCreditCents: 34100,
+        source: "legacy-mirror",
+      });
+
+      await expect(
+        createXeroCreditNote("pay_1", 34100, {
+          watermarkCents: 34100,
+          syncOperation: xeroClaim("op_delta_x"),
+        })
+      ).resolves.toBe("");
+
+      expect(
+        mocks.xeroClientInstance.accountingApi.createCreditNotes
+      ).not.toHaveBeenCalled();
+      expect(
+        mocks.xeroClientInstance.accountingApi.createPayments
+      ).not.toHaveBeenCalled();
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_delta_x" }),
+        expect.objectContaining({
+          responsePayload: expect.objectContaining({
+            skippedNothingUncovered: true,
+            cashRefundCents: 0,
+            cashEvidenceSource: "legacy-mirror",
+          }),
+        })
+      );
+    });
+  });
+});

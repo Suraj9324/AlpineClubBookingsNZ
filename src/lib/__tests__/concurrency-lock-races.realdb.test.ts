@@ -1,0 +1,2275 @@
+/**
+ * Real-DB race regression harness for the two-tier lock protocol (#1881).
+ *
+ * These tests reproduce the concurrent interleavings the protocol exists to
+ * defend against, against a REAL PostgreSQL. They are OFF by default and MUST be
+ * a no-op in ordinary CI/local runs:
+ *
+ *   - They run ONLY when `RUN_CONCURRENCY_RACE_TESTS=1`. With the flag unset the
+ *     whole suite is `describe.skip`, so `pnpm test` never needs a live DB.
+ *   - They read ONLY `CONCURRENCY_RACE_DATABASE_URL` and require a loopback host,
+ *     explicit port 55442+, and a database name containing the dedicated
+ *     `concurrency_race_1881` marker. Any mismatch aborts before Prisma imports.
+ *
+ * Run locally against a scratch database, e.g.:
+ *   RUN_CONCURRENCY_RACE_TESTS=1 \
+ *   CONCURRENCY_RACE_DATABASE_URL=postgresql://user:pass@127.0.0.1:55442/concurrency_race_1881 \
+ *   pnpm exec vitest run src/lib/__tests__/concurrency-lock-races.realdb.test.ts
+ *
+ * After validation, the dedicated URL is copied to DATABASE_URL solely for the
+ * app's Prisma singleton/driver adapter used by this isolated test process.
+ *
+ * The harness validates the MECHANISMS the fixes rest on — advisory-lock
+ * mutual exclusion plus status-guarded compare-and-set, and the trusted
+ * induction baseline's maintenance-only table lock — against the migrated
+ * schema. This keeps the probes deterministic while proving actual PostgreSQL
+ * lock/rollback behavior.
+ */
+import type { Prisma, PrismaClient } from "@prisma/client";
+// #4107: FIRST, so its snapshot predates every imported suite's hooks and its
+// afterAll runs last: the harness leaves `process.env` as it found it.
+import "./support/race-harness-env-guard";
+// #4234: after suite teardown, no queued Xero work may remain. Consumers also
+// check ownership before processing, so an earlier leak cannot be consumed away.
+import "./support/race-harness-outbox-guard";
+// #2363 reuses this suite's already-guarded, disposable hosted PostgreSQL but
+// creates/drops its own unique schema. Importing registers the trigger proofs in
+// the explicit CI race command without changing the workflow or making ordinary
+// `pnpm test` depend on a database.
+// #4432: scheduled/manual inbound exclusion and dead-holder recovery.
+import "./xero-inbound-run-claim.realdb.test";
+import "./xero-sync-now.realdb.test";
+// #4531: a payment deleted in Xero retires its link; the replay and the backfill write nothing more.
+import "./xero-deleted-payment-links.realdb.test";
+import "./minimum-stay-policy-trigger.realdb.test";
+// #2532 reuses the same guarded harness to prove the AI Diagnostics monthly
+// budget (AID-2, #2371) can never be overspent by concurrent reservers. Its
+// race describe is `describe.skip` unless RUN_CONCURRENCY_RACE_TESTS=1, so this
+// import adds the over-budget race proof to the explicit CI race command without
+// making ordinary `pnpm test` depend on a database.
+import "./ai-diagnostics-budget-race.realdb.test";
+// #2786 reuses the same guarded harness to prove the AI Diagnostics read-only
+// SEAM against a real server rather than a double: that the transaction really is
+// READ ONLY and REPEATABLE READ inside the callback, that the statement timeout
+// really took, that an INSERT is refused with 25006 on a connection whose
+// privileges would otherwise permit it, and that the timeout is released at commit
+// instead of leaking onto the pooled application connection. The unit suite can
+// only prove the statements were SENT. Same envelope: a no-op unless
+// RUN_CONCURRENCY_RACE_TESTS=1.
+import "./ai-diagnostics-readonly-seam.realdb.test";
+// #2597 reuses this suite's guarded PostgreSQL to force ordinary-queue/member-
+// merge winner orders, whole-transaction NOWAIT rollback, under-lock fan-out
+// drift, and the existing policy/config/merge lock order against production
+// seams. It remains a no-op unless RUN_CONCURRENCY_RACE_TESTS=1.
+import "./adult-member-hosting-queue-merge.realdb.test";
+// #2594 reuses this guarded disposable PostgreSQL to force the reviewed reset
+// apply path against the real move, explicit auto-allocation, lifecycle, and
+// cancellation writers. Its own describe stays skipped unless the shared race
+// flag is set, and its uniquely-namespaced fixtures are cleaned independently.
+import "./bed-allocation-removal-races.realdb.test";
+// #3032 reuses the same guarded disposable PostgreSQL to prove the two race
+// properties the unpriceable-edit review lifecycle turns on and that no mock can
+// show: that two concurrent applies of ONE occurrence queue on lock(1) and raise
+// exactly one task, and that two admins completing ONE task queue on its row and
+// issue exactly one credit. Its own describe stays skipped unless the shared race
+// flag is set, and its uniquely-namespaced fixtures are cleaned independently.
+import "./edit-financial-review-races.realdb.test";
+// #3809 reuses it to prove a credit-paid booking's price reduction gives back
+// like a card refund through the REAL guest removal and cancel, and that the
+// removal takes the member's credit-ledger key before any Payment row lock.
+// Its describe stays skipped unless the shared race flag is set.
+import "./credit-paid-reduction.realdb.test";
+// #4317 reuses it to prove every edit door PRICES what #3031/#3166/#3170
+// parked - the removal, the date change and the batch edit, each against real
+// rows with blank, drifted and negative stored history - and raises no review.
+// Its describe stays skipped unless the shared race flag is set.
+import "./edit-auto-pricing-doors.realdb.test";
+// #3954 reuses it to prove a reduction cancels or shrinks the unpaid card ask
+// before it refunds, through the REAL guest removal on card-paid and credit-paid
+// bookings, and that a capture racing the reduction either rolls the edit back
+// or is refunded by the superseded-capture path. Its describe stays skipped
+// unless the shared race flag is set.
+import "./additional-ask-reduction.realdb.test";
+// #3836 reuses it to prove a card booking paid entirely by credit has its credit
+// allocated against its invoice by the one engine, through the invoice
+// operation's replay and the repair pass, then deallocated by #3809's reduction
+// and left consistent by the cancel, on a fake Xero switched on only inside its
+// own describe. Its describe stays skipped unless the shared race flag is set.
+import "./credit-only-card-allocation.realdb.test";
+// #4219 proves that a credit note spent in Xero outside the app converges the
+// credit ledger from the allocation worker alone (a fully and a partly spent note,
+// two concurrent runs, the written-down lot and the release row never planned as
+// credit, and the fail-closed refusals), on a fake Xero that keeps the outside
+// spend and refuses an over-allocation in Xero's own words. The fake is installed
+// with spies for its own describe only, so it cannot replace the suite above's.
+// Its describe stays skipped unless the shared race flag is set.
+import "./credit-note-spent-outside-app.realdb.test";
+// #4270 proves the inbound mirror of a credit note spent or un-spent in Xero: the free part
+// written down and a reversed spend restored, the member's credit lock taken and the global
+// one not, and agreement with the #4219 converge in either order and at once. Its describe
+// stays skipped unless the shared race flag is set.
+import "./credit-note-outside-spend-mirror.realdb.test";
+// #2595 reuses the same guarded disposable PostgreSQL to prove that a member
+// merge cannot leave two people sharing a double bed with no confirmed
+// partnership, driving the real `executeMemberMerge` and the real
+// bed-allocation reconciliation. Its own describe stays skipped unless the
+// shared race flag is set, and its uniquely-namespaced fixtures are cleaned
+// independently.
+import "./member-merge-shared-double-races.realdb.test";
+// #2656 reuses the same guarded PostgreSQL to prove the shared-DOUBLE
+// invariants against the real indexes: the two dangerous write outcomes are
+// both properties of `@@unique([bedId, stayDate, isSecondOccupant])` and of the
+// partial index behind it, which no mock can establish. Its describe stays
+// skipped unless RUN_CONCURRENCY_RACE_TESTS=1 and its fixtures are namespaced
+// and cleaned independently.
+import "./bed-allocation-shared-double.realdb.test";
+// #2622 reuses the same guarded PostgreSQL to force both winner orders of a
+// booking date change against roster Save/Regenerate/Confirm now that a chore
+// row can legitimately sit on a booking's CHECK-OUT date. Its describe stays
+// skipped unless RUN_CONCURRENCY_RACE_TESTS=1 and its fixtures are namespaced
+// and cleaned independently.
+import "./roster-checkout-day-races.realdb.test";
+// #2701 shares the same guarded database to prove booking admission versus
+// lodge deactivation, last-two-lodge deactivation, and hut-leader overlap
+// serialization on the production lock helpers.
+import "./lodge-admission-races.realdb.test";
+// #2926 shares the same guarded database to prove that the hut-leader overlap
+// predicate's school-teacher carve-out is a property of the ROW rather than of
+// the member — specifically that reclassifying a member as an organisation
+// leaves their LIVE assignment in the predicate, which is a claim about
+// executing the predicate on either side of a real membership edit and not
+// about the shape of the query. Its describe stays skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1 and its fixtures are namespaced and cleaned
+// independently.
+import "./hut-leader-teacher-exclusion.realdb.test";
+// #3039 shares the same guarded database to prove the per-TRIP coverage key:
+// that it is mutually exclusive and occupies a keyspace disjoint from the
+// per-owner key, that a reconciliation acquires it BEFORE any owner key as
+// EXECUTED rather than as written, that it is held for the whole transaction so a
+// concurrent sibling writer is answered with the stable retry, and that the
+// sibling set is re-read under it so a joiner committed between the unlocked plan
+// and the key rolls the whole change back. Its describe stays skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1 and its `race-3039-` fixtures are cleaned
+// independently.
+import "./adult-member-hosting-group-trip-races.realdb.test";
+// #3292 reuses this guarded database to prove the Member/MemberPartnerLink
+// triggers, canonical pair-row application protocol, direct-SQL bypass races,
+// cascade cleanup and opposing multi-pair lock orders against PostgreSQL.
+import "./member-parent-partner-exclusion-races.realdb.test";
+// #3377 reuses this guarded database to prove the deploy guard's migration
+// lock timeout: that PostgreSQL accepts the bound as a libpq startup option,
+// cancels a BLOCKED (not a running) DDL statement at it with 55P03, waits
+// indefinitely without it, and that Prisma's schema engine threads the option
+// through rather than dropping it. Eighty safety-ledger rows name that control,
+// and every one of those claims is about software this repository does not own.
+// Its describe stays skipped unless RUN_CONCURRENCY_RACE_TESTS=1 and it owns and
+// drops its own probe table.
+import "./migration-lock-timeout.realdb.test";
+// #3595 reuses this guarded database to prove the booking ledger's
+// idempotency in PostgreSQL itself: a repeated posting key is SKIPPED (not
+// refused) and its transaction survives to commit, the same repeat without the
+// door's skip is refused and loses the transaction, and the per-booking
+// confirmation fence sees a line with no key. A mock can pin none of those.
+// Its describe stays skipped unless RUN_CONCURRENCY_RACE_TESTS=1, and it owns
+// and cleans its own `race-3595-` fixtures.
+import "./booking-ledger-posting-key.realdb.test";
+// #3581 reuses this guarded database to prove the booking ledger's settlement
+// lines converge at the real chokepoint (`reconcilePaymentAggregates`): one line
+// per captured transaction and recorded refund, a mark-paid reversal reversed
+// exactly once, a failed refund reversed, and the settled total equal to the
+// mirror the same function derives. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-3581-` fixtures.
+import "./booking-ledger-settlement-sync.realdb.test";
+// #3599 reuses it to prove account-credit and hand-back lines from the REAL
+// writers — credit applied and clamped, a tiered restore, a cancellation
+// credit, and a hand-back completed through the real resolver. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3599-` fixtures.
+import "./booking-ledger-credit-sync.realdb.test";
+// #3582 reuses it to prove an edit's and a review closure's charge lines against
+// the table's real constraints: two edits in turn (the second reverses the first
+// edit's re-post, never a line already reversed), a replay that posts nothing
+// and still commits, an unconfirmed booking that posts nothing, and a closure's
+// re-price under its history row. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-3582-` fixtures.
+import "./booking-ledger-modification.realdb.test";
+// #3611 reuses it to prove a cancellation's charge lines: after an edit the
+// cancellation reverses the edit's re-post and never a line already reversed,
+// the CANCELLATION_FEE posts what the policy kept, and through the REAL
+// cancelBooking the lines commit with the claim and owed(b) reaches zero once
+// the hand-back posts. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-3611-` fixtures.
+import "./booking-ledger-cancellation.realdb.test";
+// #3583 reuses it to prove the booking-ledger projection census against what
+// the REAL writers leave: a card booking settled, re-dated and part-refunded, a
+// booking paid partly by credit, and a cash booking cancelled and handed back
+// all agree, and one rogue line through the write door is named. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3583-` fixtures.
+import "./booking-ledger-projection-census.realdb.test";
+// #3583 PR 2 reuses it to prove the back-post: histories built by the REAL
+// writers with their lines deleted are posted so the census agrees, an
+// un-postable booking is listed and left alone, a second --apply posts nothing,
+// and a live date shift or card refund racing it leaves one set of lines.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-3583b-` fixtures.
+import "./booking-ledger-back-post.realdb.test";
+// #3640 reuses it to prove the one card-refund writer adds each refund exactly
+// once: two writers recording the SAME refund meet at `ON CONFLICT DO NOTHING`
+// and add it once, and two recording DIFFERENT refunds both survive the mirror's
+// compare-and-set - each forced behind a held row lock, not raced for. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3640-`
+// fixtures.
+import "./card-refund-mirror-races.realdb.test";
+// #3793 reuses it to prove a paid cancel tiers its refund off the refunded
+// total read under the Payment row lock: the REAL cancelBooking queues behind a
+// webhook holding that row, which then records a dashboard refund, and only the
+// still-refundable share is tiered. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-3793-` fixtures.
+import "./paid-cancel-refunded-total-race.realdb.test";
+// #2941 reuses it to prove the application client's dietary/allergy omission
+// against PostgreSQL itself: absent from a plain read, a nested relation, an
+// interactive-transaction read and create/update results, present only through
+// the one dietary module's select. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-2941-` fixtures.
+import "./member-dietary-omit.realdb.test";
+// #3642 reuses it to prove the bound group-settlement invoice against
+// PostgreSQL itself: a refused change really rolls back the bed it claimed, the
+// reaper's release and the create worker's fence decide one invoice exactly
+// once in either order, and two observers abandoning one invoice converge on
+// one VOID row. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans
+// its own `race-3642-` fixtures.
+import "./group-settlement-invoice-binding-races.realdb.test";
+// #3402 reuses it to prove a review-charge raise is single-flight per edit: two
+// claims parked on the one claim row let exactly one through, an expired lease
+// is taken over by exact token, and the $60/$100-against-$50 interleaving -
+// forced through the real sync with only Stripe gated - ends with the true total
+// at the provider and on the row. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-3402-` fixtures.
+import "./edit-financial-review-charge-raise-claim.realdb.test";
+// #3792 reuses it to prove the late internet-banking capacity cancel gives back
+// the booking's applied account credit through the REAL inbound reconcile: the
+// worked example ends with $200 of credit and owed(b) zero, a replay and the
+// orphan heal add nothing, and a cash-only booking is unchanged. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3792-` fixtures.
+import "./ib-capacity-cancel-credit-restore.realdb.test";
+// #3979 reuses it to prove a bank transfer settles at the cash its invoice
+// collected through the REAL inbound settle, ledger sync, cancel and credit-note
+// sync: a re-price before the invoice, a finished-stay fee and the late capacity
+// cancel all record the cash, and an invoice-correction note refunds nothing.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-3979-` fixtures, and its email and Xero doubles pass through for every
+// other suite.
+import "./ib-settle-from-cash.realdb.test";
+// #4449 reuses it to prove a cancel queued behind a KEPT bank-transfer settle
+// reads the net the cash supports: the REAL settle decides the whole refunded
+// total in its own transaction, and the REAL credit-note allocation write takes
+// the Payment row first and decides it under that lock, in either commit order.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4449-` fixtures.
+import "./kept-settle-queued-cancel.realdb.test";
+// #4449 review: a kept settle takes a card refund Stripe failed later off the total it decides (#4370).
+import "./kept-settle-failed-card-refund.realdb.test";
+// #4449 verify: one bank-transfer floor alert per payment per inbound credit-note sync.
+import "./allocation-floor-alert-once.realdb.test";
+// #4047: read-only invoice discovery and post-provider audience/lifecycle fences.
+import "./booking-outstanding-observation.realdb.test";
+// #3864 reuses it to prove an edit's stored credit election is never spent on top
+// of an old full-price card intent: the REAL edit, pay-step route and webhook,
+// with the old intent captured and its webhook delivered at each point, end with
+// the price paid once. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-3864-` fixtures, and its Stripe and session doubles pass
+// through for every other suite.
+import "./election-double-pay-race.realdb.test";
+import "./whole-lodge-payment-review.realdb.test";
+// #3835 reuses it to prove a review completed after the REAL cancel of a
+// captured payment gives back only what the cancellation's refund left owed,
+// by card and by credit plus card at three tiers, on both captured routes and
+// across sibling reviews. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns
+// and cleans its own `race-3835-` fixtures.
+import "./edit-financial-review-captured-cancel.realdb.test";
+// #3880 reuses it to prove a review's card refund or bank-transfer hand-back on
+// a booking the REAL cancel already closed queues the cancellation's own kind
+// of Xero refund note, sized to the netted figure, keyed on the review task and
+// never touching the cancelled invoice. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3880-` fixtures.
+import "./edit-financial-review-cancelled-refund-xero.realdb.test";
+// #3454 reuses it, and #3806 R2 extends it, to prove the Xero token store's
+// fences against real row locks: simultaneous refresh-lease claims (this code
+// against itself, and against the previous release's own claim statement) let
+// exactly one through, both leases are claimed or neither, a refresh whose
+// credential-store compare-and-set loses rolls everything back, and the previous
+// release keeps reading the store copy after this release's writes. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it clears the singleton `XeroToken` and
+// `XeroConnection` tables and its own `xero-oauth` row.
+import "./xero-token-credential-store.realdb.test";
+// #3653 reuses it to prove an organiser-settled child's refund out of the
+// group's combined card payment: recorded once, converged after an ambiguous
+// Stripe answer, capped under lock(1) against a racing reduction, and planned
+// for a cancellation from what remains. Stripe is an in-memory double handed to
+// the executor's seam. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-3653-` fixtures.
+import "./organiser-child-refund.realdb.test";
+// #3372 reuses it to prove the "Paid another way" close of a dead card refund:
+// under lock(1), a double click closes once, with one allocation and one audit
+// row. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-3372-paw-` fixtures.
+import "./card-refund-paid-another-way.realdb.test";
+// #4083 reuses it to prove a card refund Stripe answered failed or canceled
+// stays owed: the edit's enqueue is one row whose refused plan reads back
+// exactly, "Refunds owed" counts it until a retry makes it, and the runner moves
+// a refused slice to a fresh key only on the attempt it holds. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4083-` fixtures.
+import "./refused-card-refund-retry.realdb.test";
+// #4104 reuses it to prove a card refund Stripe accepted and failed later is
+// owed again: each door's refund taken out once and owed once by one new row,
+// replays and concurrent deliveries write one, the event before the door's own
+// write, the retry's fresh key, and a held row rolling the write back. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4104-` fixtures.
+import "./card-refund-failed-later.realdb.test";
+// #4284 reuses it to prove the card-refund owed figure reads a createdAt tie
+// the same in either physical order: the same tied rows written in opposite
+// orders, read through the real Net Collected select. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4284-` fixtures.
+import "./card-refund-owed-tie-order.realdb.test";
+// #4097 reuses it to prove an own-card cancel whose card refund plan carries
+// less than the refund due raises one hand-back task for the rest in its claim,
+// which "Refunds owed" counts until the treasurer pays it back (its BANK_REFUND
+// line posted on the card payment) or dismisses it. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4097-` fixtures.
+import "./cancel-card-refund-shortfall.realdb.test";
+// #4154 reuses it to prove a capacity race whose card refund plan is short raises
+// one hand-back task to check in the void's claim, which completes (BANK_REFUND
+// line, Xero note) once the race's card refund is made, or is dismissed. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4154-` fixtures.
+import "./capacity-race-refund-shortfall-task.realdb.test";
+// #4125 reuses it to prove the capacity race's card refund, made by the
+// recovery runner, writes one REFUNDED booking event for the frozen plan's
+// total - none from a late inline close or a second run - and that the booking
+// page's read of the row says still being sent, dead or made. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4125-` fixtures.
+import "./capacity-race-refund-event.realdb.test";
+// #4145 reuses it to prove a member cancel's card refund writes one REFUNDED
+// booking event, dated by the close that made it and for the frozen plan's
+// total - the cancel's own close or the recovery runner's, never both - through
+// the real cancel, runner and "paid another way" close, and that the booking
+// page's narrative follows each path. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4145-` fixtures.
+import "./cancel-card-refund-event.realdb.test";
+// #4166 reuses it to prove a cancel's card refund that Stripe failed after its
+// REFUNDED event is told by the row that owes it again - on its way, made again,
+// stalled, paid another way - through the real cancel, capacity race, runner,
+// failed-later writer and "paid another way" close. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4166-` fixtures.
+import "./cancel-card-refund-failed-later.realdb.test";
+// #4280 reuses it to prove a card refund's reversal keeps the bank cash a "Paid
+// another way" close recorded: full and part closes, a late pending or
+// succeeded refund then failed or cancelled, each note state, several charges,
+// credit beside it, undone hand-backs never counted, the close and the refund
+// racing in both orders, and a rolled-back failure. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4280-` fixtures.
+import "./card-refund-reversal-bank-cash-floor.realdb.test";
+// #4488 reuses it to prove the same floor keeps the bank cash a completed card
+// refund shortfall recorded - a cancel's and a capacity race's - through the
+// real cancel, runner, close, completion, sync and failure writers: both worked
+// examples, cash on another charge counted once, an open or dismissed shortfall
+// counting for nothing, and the completion and the failure racing in both
+// orders. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its
+// own `race-4488-` fixtures.
+import "./card-refund-reversal-shortfall-floor.realdb.test";
+// #4210 reuses it to prove a card refund that fails later after its row was
+// closed "Paid another way" is held for an officer and alerted, never re-sent:
+// full and part closes, duplicate deliveries, no close and a close on another
+// row unchanged, and the close and the failure racing in both orders. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4210-` fixtures.
+import "./card-refund-failed-later-after-paid-another-way.realdb.test";
+// #4368 reuses it to prove a dead card refund's "Try the card again" and
+// "Nothing left owed": a re-arm and a "Paid another way" close of one row
+// queued in both orders (one wins, the other writes nothing), a write under the
+// Payment row failing their claims, the close against a refund arriving and
+// against it failing later through the real writer, and the real runner's
+// Stripe check running before any send after a re-arm. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4368-` fixtures.
+import "./card-refund-dead-row-actions.realdb.test";
+// #4147 reuses it to prove the booking-ledger census reads a capacity race's
+// cancel by its own refund rows: through the REAL capacity race, back-post and
+// recovery runner, a refund still being sent is IN_FLIGHT_REFUND (the back-post
+// posts it), a made one agrees and a dead one disagrees. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4147-` fixtures.
+import "./booking-ledger-census-capacity-race.realdb.test";
+// #3750 reuses it to prove approving a locked-period change request on a
+// finished stay: the real executor and batch service add, remove, swap and
+// re-date the stay at the same-day tier, two racing approvals make one
+// modification and one ask, and an approval queues behind a cancel's lock(1).
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-3750-` fixtures.
+import "./booking-change-request-execution.realdb.test";
+// #3980 reuses it to prove an edit racing the booking's primary Xero invoice
+// create: a price increase committed mid-create is billed once on a
+// supplementary invoice anchored on the edit, a reduction raises one Xero
+// Operations task, and an edit arriving while the link's save holds the
+// Payment row is refused whole. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-3980-` fixtures.
+import "./primary-invoice-edit-race.realdb.test";
+// #3953 reuses it to prove a change's card capture that no supplementary invoice
+// waited on gets one Xero receipt operation: the webhook and the confirm route
+// at once and a replay through the real late-success release, and the enqueue
+// queueing behind the change's supplementary-invoice anchor lock. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3953-` fixtures.
+import "./additional-capture-receipt.realdb.test";
+import "./additional-capture-receipt-sweep-retry.realdb.test";
+// #4434: a receipt split across invoices, sent and retried leg by leg.
+import "./additional-capture-receipt-legs.realdb.test";
+// #3953 round 7: a change capture whose ledger row carries no change stamp - a
+// review charge (read to its change by its reason) or an older member ask (the
+// booking's lock, taken before the anchor's) - still has one recorder. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3953u-` fixtures.
+import "./additional-capture-receipt-unattributed.realdb.test";
+// #4324 reuses it to prove a late change capture a treasurer kept on a
+// cancelled, invoiced booking has one recorder: the keep against the repair
+// tool's supplementary invoice and its own kept-capture action, a webhook
+// replay after the keep, and an approval while the receipt's worker runs.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4324-` fixtures.
+import "./kept-change-capture-record.realdb.test";
+// #3854 reuses it to prove a group organiser's settlement posts its children's
+// money to the booking ledger through the real card settle, the Internet Banking
+// invoice's inbound reconcile, the organiser cancel's refund plan and #3653's
+// per-child refunds, with each child's owed(b) zero and a replay posting nothing.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-3854-` fixtures.
+import "./booking-ledger-group-settlement.realdb.test";
+// #3949 reuses it to prove an edit's and an approved appeal's hand-back on a
+// joiner the organiser paid for by internet banking completes onto the child's
+// mirror, dismisses and reopens as the rules say, and that a group cancel after
+// one (live, and re-driven after its plan froze) neither skips nor double-counts
+// it. Its describe stays skipped unless the shared race flag is set.
+import "./ib-group-child-hand-back.realdb.test";
+// #3971 reuses it to prove the membership subscription invoice retry: a row
+// stored before the fix comes back PENDING as its bare queue type, two retries
+// requeue it once, and the real active-correlation-key index refuses it while
+// another attempt for the charge is live. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3971-` fixtures.
+import "./xero-subscription-invoice-retry.realdb.test";
+// #4046 reuses it to prove a Xero void of the refund credit note a payment's
+// pointer names moves that pointer in the same write that deactivates the
+// mirror - never onto a #3880 per-refund note - and rolls back with it.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4046-` fixtures.
+import "./xero-refund-note-void-pointer.realdb.test";
+// #4195 reuses it to prove a refund request's own Xero note, voided in Xero, is
+// written inactive by the inbound reconcile and never re-adopted: no retry
+// re-raises it (#4214), a re-raise takes a fresh note under a key naming the
+// voided one, and a link write racing the void keeps it. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4195-` fixtures.
+import "./xero-refund-request-note-void.realdb.test";
+// #4223 reuses it to prove a bank-transfer payment's one canonical refund note,
+// voided in Xero while a retry records it as its cover, stays inactive with its
+// status and its pointer released: the retry's status-less link write waits on
+// the void's row and re-reads it. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-4223-` fixtures.
+import "./xero-canonical-refund-note-void-race.realdb.test";
+// #4200 reuses it to prove an inbound void of a refund credit note and a
+// refund-note create on the same payment lock the Payment row and then the
+// note's link, in that order. The create holds the Payment row; the void
+// waits there and does not hold the link, so the create can take the link
+// and both commit. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-4200-` fixtures.
+import "./xero-refund-note-void-lock-order.realdb.test";
+// #4288 reuses it to prove an older live Xero reading of a refund note - the
+// inbound reconcile's, the Stripe status recorder's, or a reconcile's write for
+// a per-refund or request note - never revives a mirror a later write recorded
+// VOIDED, and that between two live readings the older keeps the newer.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4288-` fixtures.
+import "./xero-refund-note-stale-live-status.realdb.test";
+// #4215 reuses it to prove the inbound repair of a bank-transfer payment's
+// canonical refund note keeps the cash a refund request paid back through the
+// real completion - queued, raised or voided, and with the canonical note
+// voided. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its
+// own `race-4215-` fixtures.
+import "./xero-bt-repair-request-cash.realdb.test";
+// #4230 reuses it to pin the bank-transfer recount: a group organiser's
+// hand-back moves no payment's total; the recount never writes the charge rows
+// the #4162 floor keeps; a later refund noted on its own record (#4287, #4312),
+// and one folded before them, kept by the floor and alerted; which void states reach that alert; and the
+// deploy note's read-only query.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4230-` fixtures.
+import "./xero-bt-recount-handbacks.realdb.test";
+// #4287 reuses it to prove a later cancellation hand-back on a bank transfer
+// gets its own Xero note, keyed and sized on its task: through the real
+// completion and outbox worker (a fake Xero transport), two completions racing
+// on the Payment row lock, a card note never squeezed by it, the readers and
+// the #4162 floor, no note for a refund the old release absorbed, and the
+// self-heal never selecting a bank transfer.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4287-` fixtures.
+import "./xero-bt-per-refund-notes.realdb.test";
+// #4312 reuses it to prove a card refund on a bank transfer gets its own Xero
+// note, keyed on its PaymentRefund row: through the refund request's real
+// approval route and its recovery replay, the `charge.refunded` webhook and a
+// late capture's note, the outbox worker and inbound reconcile (a fake Xero
+// transport), the readers and the #4162 floor; never for a refund made before
+// the cutover; one row for two writers racing; a voided card note never undone
+// as a bank refund. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-4312-` fixtures.
+import "./xero-bt-card-refund-notes.realdb.test";
+// #4098 reuses it to prove closing a subscription charge as already paid: two
+// closes at once close it once (one audit row, each voidGeneration bumped
+// once), and a manual reversal committing while the close waits for the
+// subscription row rolls the close back whole. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4098-` fixtures.
+import "./membership-subscription-charge-close.realdb.test";
+// #4110 reuses it to prove a family whose per-family charge was closed as
+// already paid or voided is billed again end to end (close or void -> reverse
+// -> preview -> confirm -> a new charge), under the partial family/type/season
+// index that still refuses a second LIVE family charge. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4110-` fixtures.
+import "./membership-family-rebill.realdb.test";
+// #5190 reuses it to prove a club's subscription-liability opt-in moves only
+// untouched NOT_REQUIRED rows, that billing confirm, the settings save and the
+// seasonal-assignment reconcile serialise on the billing season key in both
+// orders, and that the SQL date-of-birth filter agrees with the TS rule at every
+// tier birthday. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans
+// its own `race-5190-` fixtures.
+import "./subscription-liability-opt-in.realdb.test";
+// #4131 reuses it to prove the booking's own payment captured after its booking
+// was cancelled is refunded from its own charge through the real webhook
+// processor: never a fee the cancel kept on another charge, and only what a part
+// refunded capture still holds. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it
+// owns and cleans its own `race-4131-` fixtures.
+import "./late-capture-own-charge-refund.realdb.test";
+// #4149 reuses it to prove a late capture whose automatic refund went out while
+// its record did not is recorded exactly once - by the nightly self-heal's check
+// or a webhook redelivery, racing each other - and that the self-heal's gap no
+// longer counts its refund. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns
+// and cleans its own `race-4149-` fixtures.
+import "./late-capture-record-recovery.realdb.test";
+// #4824 reuses it to prove a treasurer's approval of a held late capture reads
+// what the capture still holds under the Payment row: a `charge.refunded` sync
+// recording a refund of it while the approval waits for that row is read, and
+// the approval refuses - no second refund owed. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4824-` fixtures.
+import "./late-capture-approval-refund-race.realdb.test";
+// #4838 reuses it to prove a #2700 hand-back of a late capture reads what the
+// capture still holds under the Payment row: a `charge.refunded` sync recording
+// a dashboard refund of it, before the hand-back or while it waits for that row,
+// is read and the hand-back refused - never mirrored onto the kept fee as well.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4838-` fixtures.
+import "./late-capture-hand-back-race.realdb.test";
+// #4132 reuses it to prove a payment's ledger rows written in one transaction
+// keep insertion order (`createdAt`, then `insertionSeq`) after CLUSTER
+// deliberately changes heap order, through the loader, mirror, reduction's ask and
+// card refund plan. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-4132-` fixtures.
+import "./ledger-insertion-seq.realdb.test";
+// #4177 reuses it to prove the duplicate-capture refund names the first-inserted
+// settled capture as the settlement, not the one PostgreSQL's heap order puts
+// first. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4177-` fixtures.
+import "./settled-capture-order.realdb.test";
+// #4211 reuses it to prove a member paying one booking three times keeps exactly
+// one capture and has the other two refunded, in every arrival order, through
+// the real settle. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-4211-` fixtures.
+import "./third-duplicate-capture.realdb.test";
+// #4285 reuses it to prove a card capture's success arriving on a COMPLETED
+// booking is judged as on a PAID one: settled by card through the webhook,
+// completed by the real cron, the settler's redelivery answers 200 and changes
+// nothing, and another capture is refunded as a duplicate. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4285-` fixtures.
+import "./completed-redelivery.realdb.test";
+// #4146 reuses it to prove a key-prefix lookup built from an id matches only
+// its own rows: Prisma's `startsWith` is SQL `LIKE`, whose `_` no mock reads as
+// a wildcard. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans
+// its own `race-4146-` fixtures.
+import "./prisma-exact-prefix.realdb.test";
+// #4165 reuses it to prove the audit category filters' literal action
+// prefixes select the same real rows the wildcard ones did, on every category
+// and on a member's own timeline, and refuse the rows only a `_` reached.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4165` rows.
+import "./audit-query-exact-prefix.realdb.test";
+// #4162 reuses it to prove "undo, then ask once" for a voided bank-transfer
+// refund note: the inbound floor, the nightly undo (allocation, line, total and
+// one follow-up together), a spare note, a create in flight, #4161's heal, two
+// runs, a concurrent reconcile and recount, both answers, the previous app
+// version, report-only and the count's buckets. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4162b-` fixtures.
+import "./bank-refund-void-follow-up.realdb.test";
+// #4217 reuses it to prove every payment-ledger writer takes the Payment row
+// before its first row write and the aggregate rebuild reads under it: seven
+// forced interleavings against the refund writers, the settle, the Internet
+// Banking settle (#4094) and the manual-payment reversal, the P2028 cost among
+// them. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4217-` fixtures.
+import "./payment-lock-before-rebuild.realdb.test";
+// #4022 reuses it to prove the nightly card self-heal never fills a bank
+// hand-back's note with a card note: an edit review's (both wordings), an
+// approved refund request's and an edit's refund hand-back, each completed
+// through the REAL resolution on the internet-banking payment its writer raises
+// it on, are never read by the self-heal's list, which still lists a card
+// payment's uncovered card refund. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-4022-` fixtures.
+import "./self-heal-bank-hand-back-sources.realdb.test";
+// #4250 reuses it to prove a refund note an officer resolved by hand in Xero
+// stops counting as coverage once its note is voided or deleted: a live or
+// unlinked one still covers its refund once, a voided one covers nothing and
+// refuses nothing, and the nightly card self-heal then lists the gap and queues
+// a fresh card note under an after-void key. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4250-` fixtures.
+import "./resolved-voided-refund-note-coverage.realdb.test";
+// #4936 reuses it to prove the refund-note gap list's pre-filter drops only
+// payments their links' recorded amounts cover, lets legacy links without one
+// through to the exact reader, and lists exactly what that reader would.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4936-` fixtures.
+import "./refund-gap-prefilter.realdb.test";
+// #4256 reuses it to prove a PARTIAL invoice repair claims its row before it
+// writes or calls Xero: a resolve or a mark non-replayable committed while the
+// retry waits on its claim wins, two retries make one payment write, and a
+// failed write gives the row back PARTIAL. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4256-` fixtures.
+import "./xero-partial-repair-claim.realdb.test";
+// #4279 reuses it to prove a refund credit-note repair that loses its claim
+// after Xero voids or deletes the note leaves the payment pointing at no
+// voided note and no live link to it, through the real retry, inbound void and
+// stale reset; the pointer is adopted only inside a completion that wins its
+// claim. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its
+// own `race-4279-` fixtures.
+import "./xero-refund-repair-lost-claim-void.realdb.test";
+// #4259 reuses it to prove the PARTIAL modification credit-note repair claims
+// its row the same way and closes it: a resolve or a mark committed while it
+// waits wins, two retries make one allocation and close the row once SUCCEEDED,
+// and a refused allocation gives the row back PARTIAL. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4259-` fixtures.
+import "./xero-modification-note-repair-claim.realdb.test";
+// #4356 reuses it to prove two callers sharing one ACTIVE Xero operation row
+// never let a failure overwrite a recorded success: the real
+// createXeroPaymentForInvoice twice onto one row, each Xero call held on a gate,
+// in both orders, a success replacing an earlier failure, and a late failure
+// kept off a PARTIAL repair's claim. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4356-` fixtures.
+import "./xero-shared-operation-outcome.realdb.test";
+// #4291 reuses it to prove a refund note Xero voided still recounts the payment
+// whose mirror the void turned off: the retry of a void event that died after
+// its link write finishes the recount, the mirror stays off and the pointer
+// released, and neither a live read nor a mirror retired unvoided resolves.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4291-` fixtures.
+import "./xero-voided-note-recount.realdb.test";
+// #4300 reuses it to prove a card intent an edit superseded never settles the
+// booking through any door: the confirm route, the pay step's and the /pay
+// link's reload, and the webhook after the cancel worker handed it off. It
+// drives the session routes through the harness's one `@/lib/auth` double.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4300-` fixtures.
+import "./superseded-intent-card-doors.realdb.test";
+// #4320 reuses it to prove a manual mark-paid's reversal withdraws the
+// cancellations the mark-paid queued, one Stripe's outage left FAILED and
+// retrying included, so the member's capture of the intent it made payable
+// again settles the booking; and leaves an edit's earlier cancellation to do
+// its job. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its
+// own `race-4320-` fixtures.
+import "./manual-reversal-retrying-cancel.realdb.test";
+// #4316 reuses it to prove an edit's after-commit mint never leaves a live ask
+// on a booking cancelled in the gap: the REAL cancelBooking before the mint,
+// between the provider call and the row write, and queued on the Payment row
+// in both orders against the row write (on a fully REFUNDED payment's
+// never-captured cancel too); and the recovery runner's replay of a
+// failed mint, bumped before it runs and cancelled mid-mint. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4316-` fixtures.
+import "./ended-booking-ask-mint-race.realdb.test";
+// #3403 (`INV-PAY-140`) reuses it to prove a superseded card change's waiting
+// Xero invoice follows the request that carries its balance: released with
+// that request's capture, each invoice for its own amount, retired when it is
+// never paid; and the move forced on the anchor's key against a price
+// reduction's retire and the repair pass's enqueue, in both orders. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-3403-`
+// fixtures.
+import "./superseded-ask-invoice-carry.realdb.test";
+// #4491 (`INV-ADDPAY-052`) reuses it to prove a credit release merges into an
+// unpaid edit request: one request for both, the edit's invoice following it,
+// and the one card payment recorded against both invoices once; the wait where
+// the edit's invoice cannot follow; and the edit paid or withdrawn between the
+// release's read and its claim. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it
+// owns and cleans its own `race-4491-` fixtures.
+import "./credit-release-merge-into-edit.realdb.test";
+// #4357 reuses it to prove every saved-card door charges the booking's worth:
+// a change fee the edit lifecycle's writer recorded on an unsettled payment is
+// charged by the charge-saved-method route and the officer's
+// confirm-pending-guests route, and the REAL settle takes it. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4357-` fixtures.
+import "./saved-card-charge-worth.realdb.test";
+// #4646 reuses it to prove a saved-card charge whose answer was lost and whose
+// capture was asynchronous (`payment_intent.succeeded` with `request: null`) is
+// adopted by the attempt id a `_v2` attempt's metadata carries: the lost POST
+// mints `_v2` and the asynchronous capture settles the booking once, with no
+// alert; a redelivery adds nothing, and the key and metadata adoptions racing
+// for one row have one winner. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4646-` fixtures.
+import "./saved-card-async-capture-adopt.realdb.test";
+// #4993 (`INV-PAY-158`) reuses it to prove a saved-card claim stranded
+// CONFIRMED by an interrupted charge is handed back to PENDING once, its hold
+// the claim marker and its attempt row untouched; a young claim and a captured
+// one are left; and recovery racing the capture's adoption resolves either way
+// with one row, no refund and the booking settled once. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4993-` fixtures.
+import "./saved-card-claim-recovery.realdb.test";
+// #4265 reuses it to prove a refund-note row covers only its own live,
+// non-request note: a refund request's note resolved by hand through the real
+// outbox and resolve route covers nothing, live or voided, so the bank-void
+// follow-up undoes a voided note it once called spare; a close row covered by
+// another note counts none of it (#4258); and the hand-made answer refuses a
+// note a resolved row records (#4321). Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4265-` fixtures.
+import "./own-live-refund-note-coverage.realdb.test";
+// #4366 reuses it to prove a late central-server version answer records
+// nothing once its connection has changed: the same key saved again or a moved
+// address is refused, and a recorder racing a key change queues on the settings
+// row and then refuses rather than writing over the forget. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans the singleton settings row.
+import "./servernz-version-record-race.realdb.test";
+
+// #4436: address/key replacement and request capture share the settings fence.
+import "./servernz-connection-race.realdb.test";
+// #4586 reuses it to prove the message-board mirror's release leaves a claim a
+// second pass took over, and that a mirror tombstone and an admin removal of
+// one post, each held after its first lock, finish without deadlock in both
+// orders (post row before image rows). Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns `race-4586-` posts and the singleton
+// settings row. #4588 adds the board lifecycle races there: a pass taken over
+// writes nothing more, a removed mirror keeps its blank words, a claim queued
+// ahead of the orphan sweep keeps its upload, and retention lists a picture a
+// mirror update adds mid-pass. It owns `race-4588-` rows and puts the board's
+// settings row back. #4590 adds a share the server accepted recorded through
+// the mirror's copy and never re-sent, a retention pass taken over leaving the
+// new claim, and a post refused when the sweep deleted its upload first
+// (`race-4590-` rows). Its review adds the inline share and the cron retry
+// sending once (#4592), and an accepted share recorded nowhere never re-sent.
+import "./club-post-mirror-concurrency.realdb.test";
+// #4262: the other-lodge name-index pair's windowed declaration measured, not
+// asserted: the previous release's name-keyed upsert refused once it applies,
+// and each reverse script's duplicate-name refusal and order. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and drops its own scratch schema.
+import "./other-lodge-name-index-window.realdb.test";
+// #4421 reuses it to prove "Resolve by hand" on a refund-note create that
+// names no note records the officer's note, and that note then records no
+// other refund: the real resolve route and the real hand-made answer, in
+// sequence both ways and each holding lock(1) past its check while the other
+// queues, and an inbound void of the recorded note undone by the nightly
+// follow-up through the link the resolve wrote. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4421-` fixtures.
+import "./resolve-records-refund-note.realdb.test";
+// #4426 reuses it to prove a refund credit-note create that stalls in Xero, is
+// marked failed and is resolved by hand recording the officer's note, records
+// nothing when it returns: the officer's note stays recorded and linked, the
+// late note is alerted once and never linked or settled; and with no resolve the
+// late note lands as before. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it
+// owns and cleans its own `race-4426-` fixtures.
+import "./xero-late-refund-note-after-resolve.realdb.test";
+// #4656 reuses it to prove the refund-note create's record asks freshness under
+// the Payment row (a second record of the same note queues there, though neither
+// takes the pointer, and is refused), records behind a holder past Prisma's 5s
+// default, and, behind one past its whole budget, records nothing, fails nothing
+// and audits and alerts the note once. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-4656-` fixtures.
+import "./xero-refund-note-record-gaps.realdb.test";
+// #4688 reuses it to prove a refund note Xero made but the app could not record
+// (its record lost its wait) fences the payment's later refund notes past the
+// 15-minute in-flight hold: a later refund's note, the nightly self-heal and Retry
+// all raise nothing until Resolve by hand records it, and the next note is then
+// sized with it counted. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-4688-` fixtures.
+import "./xero-unrecorded-refund-note-fence.realdb.test";
+// #4655 reuses it to prove an organiser adjustment's credit note that Xero creates
+// after its stalled job was reset is recorded or surfaced: it lands on a reset or
+// re-queued row (one note, never a second), and on a row resolved by hand or held by
+// a retry's claim it is audited and alerted once, never written over the officer's
+// row. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4655-` fixtures.
+import "./organiser-late-note-after-reset.realdb.test";
+// #4680 reuses it to prove an organiser adjustment run whose claim a reset took
+// after it recorded its credit note never allocates or pays out after an
+// officer's Resolve: it stands down before the money-moving call, audited and
+// alerted once, and a Retry finishes from the recorded note. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4680-` fixtures.
+import "./organiser-run-claim-check.realdb.test";
+// #4673 reuses it to prove a stalled run's late failure never undoes an officer's
+// in-place Retry after a stale reset: the row stays PENDING and the queued run
+// completes it, a queued run's own failure is kept, and with no Retry the failure
+// lands on its own claim's reset row. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-4673-` fixtures.
+import "./xero-late-failure-after-retry.realdb.test";
+// #4609 reuses it to prove the per-account password throttle's claim: two
+// failures racing on one account both count, a burst at the end of a wait admits
+// exactly one guess, two first-ever claims both count, and a row deleted between
+// the ensure and the lock is re-ensured. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4609-` rows.
+import "./login-throttle.realdb.test";
+// #4616 reuses it to prove two concurrent consumes of one reauthentication
+// challenge yield one success, and a replay, an expiry or another member's
+// claim does not. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and
+// cleans its own `race-4616-` member.
+import "./session-reauth.realdb.test";
+// #5261 reuses it to prove the stored-password cost upgrade, a compare-and-swap
+// on the proved hash, never overwrites a password changed at the same moment,
+// including a change it waited on. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-5261-` member.
+import "./password-rehash.realdb.test";
+// #4617 reuses it to prove one of two concurrent passkey challenge claims
+// succeeds, and one of two concurrent counter updates. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4617-` member.
+import "./webauthn.realdb.test";
+// #4618 reuses it to prove one grace stamp from two concurrent refreshes, no
+// grace after a reset, and no factor left when a reset races an enrolment.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4618-` members.
+import "./officer-two-factor.realdb.test";
+// #4445 reuses it to prove two writers merging metadata onto one Xero link
+// (an existing row, or a missing one both create) both keep their keys, and
+// that the one-statement merge writes what the old spread wrote. Skipped
+// unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4445-`
+// links.
+import "./xero-object-link-metadata-merge.realdb.test";
+// #4657 reuses it to prove the erased-member contact status check keeps a
+// concurrent writer's link metadata; it owns and cleans its own `race-4657-` links.
+import "./xero-erased-contact-status-metadata.realdb.test";
+// #4690 reuses it to prove a superseded payment's refund is announced once,
+// whichever recovery attempt sends it: a stalled attempt that lost its close to
+// the reaper, the reclaiming runner, or the next claim that finds the refund
+// made. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4690-` fixtures.
+import "./superseded-refund-notice-once.realdb.test";
+// #4858 reuses it to prove a superseded intent's refund with no stored plan
+// holds, rather than sends, while another door's refund since it was raised
+// sizes it: that door's ledger write racing the runner's preflight on the
+// Payment row, and that refund then failing later, owed once on a row of its
+// own. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4858-` fixtures.
+import "./superseded-refund-another-door-hold.realdb.test";
+// #4866 reuses it to prove a cancellation leaves a live superseded capture to
+// its own refund: neither counted as paid for the booking nor planned on by the
+// cancellation's card refund, including when the cancel's claim queues behind
+// the hand-off flipping that charge captured on the Payment row. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4866-` fixtures.
+import "./superseded-refund-cancel-hold-back.realdb.test";
+// #4872 reuses it to prove the other refund doors leave a live superseded
+// capture to its own refund: an edit's own-card plan, an approved refund
+// request, a capacity race, a booking-change credit, a plan-less recovery row,
+// and a manual hand-back including a card-shortfall check. Each claim queues
+// behind the hand-off flipping that charge captured on the Payment row.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4872-` fixtures.
+import "./superseded-refund-4872-hold-back.realdb.test";
+// #4879 reuses it to prove an edit financial review's card refund and a "Paid
+// another way" close leave a live superseded capture to its own refund, while
+// closing that superseded refund itself still records it on its own charge,
+// including when the door queues behind the hand-off on the Payment row.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4879-` fixtures.
+import "./superseded-refund-other-doors-hold-back.realdb.test";
+// #4685 reuses it to prove an account-credit Xero note stamps the one credit it
+// was raised for, by id, and that a row queued without the id still stamps.
+// Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own
+// `race-4685-` fixtures.
+import "./xero-account-credit-note-stamp.realdb.test";
+// #4661 reuses it to prove an edit's change fee on an Internet Banking booking
+// still to be paid is recorded once on its payment and posts one CHANGE_FEE
+// line under the edit at the settle. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-4661-` fixtures.
+import "./unpaid-edit-change-fee-owed.realdb.test";
+// #4924 reuses it to prove a save carrying figures its preview showed before the
+// club day crossed a change-fee band is refused with the fresh figures and writes
+// nothing. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its
+// own `race-4924-` fixtures.
+import "./edit-quoted-figures.realdb.test";
+// #4456 reuses it to prove a credential written under a data-encryption ring key
+// survives an AUTH_SECRET rotation and goes through the store's version-guarded
+// claim like any other: a re-key of a legacy row, a write that lost to a row
+// changed underneath it (no side effect, retried), and two writers forced to meet
+// at the claim. It owns and cleans its own `race-4456` credential rows.
+import "./data-encryption-key-ring.realdb.test";
+// #4988 reuses it to prove an opening-credit file posts once when two officers
+// confirm it together, queues behind a member's credit-ledger lock, and
+// reverses only while every credit in it is unspent. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4988-` fixtures.
+import "./opening-credit-batch.realdb.test";
+// #4911 reuses it to prove a paid cancel of a booking whose card capture the
+// cardholder disputes (a lost dispute) issues no card refund and no account
+// credit, by either refund method, and raises one treasurer task naming the
+// dispute; a won dispute restores the credit path. Skipped unless
+// RUN_CONCURRENCY_RACE_TESTS=1; it owns and cleans its own `race-4911-` fixtures.
+import "./stripe-dispute-cancel.realdb.test";
+// INV-INT-038 (the #4921 prerequisite) reuses it to prove an abandoned inbound
+// Xero reconcile operation is recovered under a fresh claim: one winner among
+// racing takeovers or a racing Mark failed, and the abandoned attempt's late
+// outcome refused. It owns and cleans its own `race-alp546-` fixtures.
+import "./xero-inbound-abandoned-operation.realdb.test";
+// INV-INT-039 (#4921) reuses it to prove the automatic worker takes over a
+// stored Xero inbound event a dead worker left PROCESSING past the webhook
+// lease, clearing its dedup row, and that racing workers apply it exactly once.
+// It owns and cleans its own `race-alp642-` fixtures.
+import "./xero-inbound-stale-event-takeover.realdb.test";
+// #4851 reuses it to prove Stuck States' settlement of a dead refund out of the
+// group organiser's card: a refund Stripe already holds is recorded and nobody is
+// paid again, a bank close raises the mirror and its no-Xero-note hand-back, a
+// bank close and a re-arm of one row queued behind lock(1) leave one winner, a
+// re-arm's first runner attempt reads Stripe by key before any send, and an old
+// whole-group row flips and mirrors. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1;
+// it owns and cleans its own `race-4851-` fixtures.
+import "./card-refund-group-settle.realdb.test";
+// The #5061 follow-up proves the same for an edit that lowers the price (date
+// change, guest removal, batch edit): one treasurer task, no money moved. It
+// owns and cleans its own `race-5061e-` fixtures.
+import "./stripe-dispute-edit.realdb.test";
+// #5228 reuses it to prove a queued Xero row a pre-HTTP cooldown refuses after
+// its handler saved the execution request goes back to PENDING with its queued
+// request (five real handlers); that every PENDING writer leaves a claimable
+// request or writes nothing; that rows stuck before the fix are listed,
+// released and retried, sized on today's cover; and that a stale reset never
+// leaves such a row PENDING. Skipped unless RUN_CONCURRENCY_RACE_TESTS=1; each
+// owns and cleans its own `race-5228`-prefixed fixtures.
+import "./xero-cooldown-giveback-queued-request.realdb.test";
+import "./xero-pending-request-transitions.realdb.test";
+import "./xero-stuck-queued-request.realdb.test";
+import "./xero-released-refund-current-cap.realdb.test";
+import "./xero-stale-request-recovery.realdb.test";
+// #2374 (AID-5) deliberately is NOT imported here, unlike the two suites above.
+// `ai-diagnostics-select-only-role.realdb.test.ts` provisions and drops a cluster
+// ROLE and revokes `TEMPORARY ... FROM PUBLIC` on the shared throwaway database
+// for the duration of its run, so it gets its OWN named CI step and its own
+// vitest process rather than interleaving with these lock races on the same
+// database. That step is pinned by `review-findings-contracts.test.ts`.
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
+
+import { realElapsedMs } from "@/lib/__tests__/helpers/clock";
+import { releaseBookingFinancialHistoryForTeardown } from "@/lib/__tests__/support/booking-financial-history-teardown";
+
+let prisma: typeof import("@/lib/prisma")["prisma"];
+let markGroupSettlementIntentFailed: typeof import("@/lib/group-settlement")["markGroupSettlementIntentFailed"];
+let moveBedAllocationsSameDate: typeof import("@/lib/bed-allocation-manual-writes")["moveBedAllocationsSameDate"];
+let runInductionBaseline: typeof import("@/lib/induction-baseline")["runInductionBaseline"];
+let InductionBaselinePlanMismatchError: typeof import("@/lib/induction-baseline")["InductionBaselinePlanMismatchError"];
+let inductionBaselineLockSql: string;
+let baselineClientA: PrismaClient;
+let baselineClientB: PrismaClient;
+let ordinaryWriterClient: PrismaClient;
+
+const RUN = process.env.RUN_CONCURRENCY_RACE_TESTS === "1";
+const RACE_DB_URL = process.env.CONCURRENCY_RACE_DATABASE_URL ?? "";
+
+/**
+ * Guard: never run against a default/production Postgres. Require the dedicated
+ * env URL, loopback, an unusual high port, and the test-only database marker.
+ */
+export function assertSafeRaceDbUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(
+      "Concurrency race tests need a valid CONCURRENCY_RACE_DATABASE_URL."
+    );
+  }
+  const port = Number.parseInt(parsed.port, 10);
+  if (!Number.isFinite(port)) {
+    throw new Error(
+      "Concurrency race DB URL must specify an explicit port (a throwaway instance at 55442+)."
+    );
+  }
+  if (port === 5432 || port < 55442) {
+    throw new Error(
+      `Refusing to run concurrency race tests against port ${port}: use a throwaway Postgres on 55442+ (never the default 5432).`
+    );
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(host)) {
+    throw new Error("Concurrency race DB must be loopback-only.");
+  }
+  const databaseName = decodeURIComponent(parsed.pathname.replace(/^\//, ""));
+  if (!databaseName.includes("concurrency_race_1881")) {
+    throw new Error(
+      "Concurrency race DB name must contain the dedicated marker 'concurrency_race_1881'."
+    );
+  }
+}
+
+const PROBE_TABLE = "_concurrency_race_probe_1881";
+const APP_MEMBER_ID = "race-1881-member";
+const APP_LODGE_ID = "race-1881-lodge";
+const APP_BOOKING_ID = "race-1881-booking";
+const APP_GROUP_ID = "race-1881-group";
+const APP_SETTLEMENT_ID = "race-1881-settlement";
+const BASELINE_ACTOR_ID = "race-2361-admin";
+const BASELINE_MEMBER_A_ID = "race-2361-member-a";
+const BASELINE_MEMBER_B_ID = "race-2361-member-b";
+const BASELINE_NA_MEMBER_ID = "race-2361-member-na";
+const BASELINE_TEMPLATE_ID = "race-2361-template";
+const BASELINE_TEMPLATE_SECTION_ID = "race-2361-template-section";
+const BASELINE_TEMPLATE_ITEM_ID = "race-2361-template-item";
+const BASELINE_CLUB_NAME = "Race 2361 Alpine Club";
+const BASELINE_AUDIT_ACTION = "MEMBER_INDUCTION_LEGACY_BASELINE_APPLIED";
+const BASELINE_PROVENANCE_PREFIX = "Trusted legacy induction baseline:";
+const BASELINE_DATE = "2024-06-30";
+const MOVE_BOOKING_ID = "race-2366-move-booking";
+const MOVE_BLOCKER_BOOKING_ID = "race-2366-blocker-booking";
+const MOVE_ROOM_ID = "race-2366-room";
+const MOVE_OLD_BED_ID = "race-2366-old-double";
+const MOVE_DESTINATION_BED_ID = "race-2366-destination";
+const MOVE_BED_IDS = [MOVE_OLD_BED_ID, MOVE_DESTINATION_BED_ID];
+const MOVE_GUEST_ID = "race-2366-mover";
+const MOVE_PARTNER_GUEST_ID = "race-2366-partner";
+const MOVE_BLOCKER_GUEST_ID = "race-2366-blocker";
+const MOVE_FIRST_ALLOCATION_ID = "race-2366-source-1";
+const MOVE_SECOND_ALLOCATION_ID = "race-2366-source-2";
+const MOVE_PARTNER_ALLOCATION_ID = "race-2366-partner-allocation";
+const MOVE_BLOCKER_ALLOCATION_ID = "race-2366-blocker-allocation";
+const MOVE_FIRST_NIGHT = new Date("2099-02-01");
+const MOVE_SECOND_NIGHT = new Date("2099-02-02");
+const BASELINE_MEMBER_IDS = [
+  APP_MEMBER_ID,
+  BASELINE_ACTOR_ID,
+  BASELINE_MEMBER_A_ID,
+  BASELINE_MEMBER_B_ID,
+  BASELINE_NA_MEMBER_ID,
+];
+const BASELINE_ELIGIBLE_MEMBER_IDS = [
+  APP_MEMBER_ID,
+  BASELINE_ACTOR_ID,
+  BASELINE_MEMBER_A_ID,
+  BASELINE_MEMBER_B_ID,
+];
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * How long the lock pollers below wait before giving up with their own named
+ * diagnostic (far more useful than Vitest's generic test timeout).
+ *
+ * Measured with `process.hrtime.bigint()`, never `Date.now()`: since #2481 every
+ * test file runs with `Date` frozen, so a `Date.now()` deadline can never expire
+ * — the poller would spin against PostgreSQL until the test was killed, with no
+ * lock named. This file is not in the fast local gate; it runs in CI's required
+ * `Migration drift check` job, so the failure would surface at its least useful.
+ */
+const LOCK_POLL_TIMEOUT_MS = 5_000;
+
+async function waitForTableLock(params: {
+  mode: "RowExclusiveLock" | "ShareRowExclusiveLock";
+  granted: boolean;
+  applicationName?: string;
+}): Promise<void> {
+  const startedAt = process.hrtime.bigint();
+  while (realElapsedMs(startedAt) < LOCK_POLL_TIMEOUT_MS) {
+    const applicationName = params.applicationName ?? null;
+    const rows = await prisma.$queryRaw<Array<{ count: number }>>`
+      SELECT COUNT(*)::int AS "count"
+      FROM pg_locks AS locks
+      JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+      WHERE locks.relation = '"MemberInduction"'::regclass
+        AND locks.mode = ${params.mode}
+        AND locks.granted = ${params.granted}
+        AND (${applicationName}::text IS NULL OR activity.application_name = ${applicationName})
+    `;
+    if ((rows[0]?.count ?? 0) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(
+    `Timed out waiting for ${params.granted ? "granted" : "pending"} ${params.mode} on MemberInduction`,
+  );
+}
+
+async function waitForPendingGlobalAdvisoryLock(): Promise<void> {
+  const startedAt = process.hrtime.bigint();
+  while (realElapsedMs(startedAt) < LOCK_POLL_TIMEOUT_MS) {
+    const rows = await prisma.$queryRaw<Array<{ count: number }>>`
+      SELECT COUNT(*)::int AS "count"
+      FROM pg_locks
+      WHERE locktype = 'advisory'
+        AND classid = 0
+        AND objid = 1
+        AND granted = false
+    `;
+    if ((rows[0]?.count ?? 0) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(
+    "Timed out waiting for the bed move to queue on global advisory lock(1)",
+  );
+}
+
+type BaselineStoreHooks = {
+  afterLock?: (tx: Prisma.TransactionClient) => Promise<void>;
+  replaceAuditCreate?: (tx: Prisma.TransactionClient) => Promise<never>;
+};
+
+/**
+ * Test-only transaction proxy. It delegates every operation to a real
+ * PrismaClient/transaction, pausing only after PostgreSQL has granted the
+ * production lock or replacing the audit create with an intentional real-DB
+ * failure. No production hook is needed.
+ */
+function createBaselineStore(
+  client: PrismaClient,
+  hooks: BaselineStoreHooks = {},
+) {
+  return {
+    $transaction<T>(
+      callback: (tx: Prisma.TransactionClient) => Promise<T>,
+      options: {
+        isolationLevel: Prisma.TransactionIsolationLevel;
+        maxWait: number;
+        timeout: number;
+      },
+    ) {
+      return client.$transaction(async (tx) => {
+        let lockHookRan = false;
+        const txProxy = new Proxy(tx, {
+          get(target, property) {
+            if (property === "$executeRawUnsafe") {
+              const execute = target.$executeRawUnsafe.bind(target) as (
+                query: string,
+                ...values: unknown[]
+              ) => Promise<number>;
+              return async (query: string, ...values: unknown[]) => {
+                const result = await execute(query, ...values);
+                if (
+                  !lockHookRan &&
+                  query === inductionBaselineLockSql &&
+                  hooks.afterLock
+                ) {
+                  lockHookRan = true;
+                  await hooks.afterLock(target);
+                }
+                return result;
+              };
+            }
+            if (property === "auditLog" && hooks.replaceAuditCreate) {
+              return new Proxy(target.auditLog, {
+                get(delegate, delegateProperty) {
+                  if (delegateProperty === "create") {
+                    return () => hooks.replaceAuditCreate!(target);
+                  }
+                  const value = Reflect.get(delegate, delegateProperty);
+                  return typeof value === "function"
+                    ? value.bind(delegate)
+                    : value;
+                },
+              });
+            }
+            const value = Reflect.get(target, property);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        return callback(txProxy);
+      }, options);
+    },
+  };
+}
+
+describe("concurrency race DB safety guard (#1881)", () => {
+  it("accepts only a dedicated loopback scratch database", () => {
+    expect(() =>
+      assertSafeRaceDbUrl(
+        "postgresql://user:pass@127.0.0.1:55442/concurrency_race_1881"
+      )
+    ).not.toThrow();
+  });
+
+  it.each([
+    "postgresql://user:pass@db.example.org:55442/concurrency_race_1881",
+    "postgresql://user:pass@127.0.0.1:5432/concurrency_race_1881",
+    "postgresql://user:pass@127.0.0.1:55442/app",
+  ])("rejects unsafe target %s", (url) => {
+    expect(() => assertSafeRaceDbUrl(url)).toThrow();
+  });
+});
+
+// Run only when explicitly enabled; otherwise this is a pure no-op.
+(RUN ? describe : describe.skip)(
+  "two-tier lock protocol — real-DB interleavings (#1881)",
+  () => {
+    let setupCompleted = false;
+
+    async function clearBaselineRunState() {
+      await prisma.auditLog.deleteMany({
+        where: {
+          OR: [
+            { action: BASELINE_AUDIT_ACTION },
+            { id: "race-2361-forced-audit-failure" },
+          ],
+        },
+      });
+      await prisma.memberInduction.deleteMany({
+        where: { memberId: { in: BASELINE_MEMBER_IDS } },
+      });
+    }
+
+    async function clearBaselineFixtures() {
+      await clearBaselineRunState();
+      await prisma.inductionChecklistTemplate.deleteMany({
+        where: { id: BASELINE_TEMPLATE_ID },
+      });
+      await prisma.memberAccessRole.deleteMany({
+        where: { memberId: { in: BASELINE_MEMBER_IDS } },
+      });
+      await prisma.member.deleteMany({
+        where: {
+          id: {
+            in: [
+              BASELINE_ACTOR_ID,
+              BASELINE_MEMBER_A_ID,
+              BASELINE_MEMBER_B_ID,
+              BASELINE_NA_MEMBER_ID,
+            ],
+          },
+        },
+      });
+      await prisma.membershipNominationSettings.deleteMany({
+        where: { id: "default" },
+      });
+      await prisma.ageTierSetting.deleteMany({
+        where: { tier: { in: ["INFANT", "CHILD", "YOUTH", "ADULT"] } },
+      });
+      await prisma.clubIdentitySettings.deleteMany({
+        where: { id: "default" },
+      });
+    }
+
+    async function seedBaselineFixtures() {
+      await prisma.clubIdentitySettings.create({
+        data: { id: "default", name: BASELINE_CLUB_NAME },
+      });
+      await prisma.ageTierSetting.createMany({
+        data: [
+          {
+            tier: "INFANT",
+            minAge: 0,
+            maxAge: 4,
+            label: "Infant",
+            sortOrder: 0,
+          },
+          {
+            tier: "CHILD",
+            minAge: 5,
+            maxAge: 9,
+            label: "Child",
+            sortOrder: 1,
+          },
+          {
+            tier: "YOUTH",
+            minAge: 10,
+            maxAge: 17,
+            label: "Youth",
+            sortOrder: 2,
+          },
+          {
+            tier: "ADULT",
+            minAge: 18,
+            maxAge: null,
+            label: "Adult",
+            sortOrder: 3,
+          },
+        ],
+      });
+      await prisma.membershipNominationSettings.create({
+        data: { id: "default", requiredSignOffs: 2 },
+      });
+      await prisma.inductionChecklistTemplate.create({
+        data: {
+          id: BASELINE_TEMPLATE_ID,
+          name: "Race harness New Member induction",
+          version: "race-2361-v1",
+          kind: "NEW_MEMBER",
+          isActive: true,
+          sections: {
+            create: {
+              id: BASELINE_TEMPLATE_SECTION_ID,
+              title: "Safety",
+              priority: "GENERAL",
+              items: {
+                create: {
+                  id: BASELINE_TEMPLATE_ITEM_ID,
+                  label: "Emergency exits",
+                },
+              },
+            },
+          },
+        },
+      });
+      await prisma.member.createMany({
+        data: [
+          {
+            id: BASELINE_ACTOR_ID,
+            email: "race-2361-admin@example.invalid",
+            passwordHash: "not-a-real-password",
+            firstName: "Baseline",
+            lastName: "Admin",
+            role: "ADMIN",
+            ageTier: "ADULT",
+            canLogin: true,
+          },
+          {
+            id: BASELINE_MEMBER_A_ID,
+            email: "race-2361-a@example.invalid",
+            passwordHash: "not-a-real-password",
+            firstName: "Baseline",
+            lastName: "Child",
+            role: "USER",
+            ageTier: "CHILD",
+          },
+          {
+            id: BASELINE_MEMBER_B_ID,
+            email: "race-2361-b@example.invalid",
+            passwordHash: "not-a-real-password",
+            firstName: "Baseline",
+            lastName: "Adult",
+            role: "USER",
+            ageTier: "ADULT",
+          },
+          {
+            id: BASELINE_NA_MEMBER_ID,
+            email: "race-2361-na@example.invalid",
+            passwordHash: "not-a-real-password",
+            firstName: "Baseline",
+            lastName: "NotApplicable",
+            role: "USER",
+            ageTier: "NOT_APPLICABLE",
+          },
+        ],
+      });
+      await prisma.memberAccessRole.create({
+        data: { memberId: BASELINE_ACTOR_ID, role: "ADMIN" },
+      });
+    }
+
+    function baselineDatabaseTarget() {
+      const parsed = new URL(RACE_DB_URL);
+      return {
+        host: parsed.host,
+        databaseName: decodeURIComponent(parsed.pathname.replace(/^\/+/, "")),
+      };
+    }
+
+    function planInductionBaseline(
+      store: PrismaClient | ReturnType<typeof createBaselineStore>,
+    ) {
+      return runInductionBaseline({
+        actorMemberId: BASELINE_ACTOR_ID,
+        baselineDate: BASELINE_DATE,
+        provenanceNote: "Race harness committee minute",
+        databaseTarget: baselineDatabaseTarget(),
+        store: store as never,
+        fallbackClubName: "unused",
+        fallbackClubNameSource: "primary",
+      });
+    }
+
+    function applyInductionBaseline(
+      store: PrismaClient | ReturnType<typeof createBaselineStore>,
+      confirmPlanDigest: string,
+    ) {
+      return runInductionBaseline({
+        actorMemberId: BASELINE_ACTOR_ID,
+        baselineDate: BASELINE_DATE,
+        provenanceNote: "Race harness committee minute",
+        databaseTarget: baselineDatabaseTarget(),
+        apply: true,
+        confirmClubName: BASELINE_CLUB_NAME,
+        confirmPlanDigest,
+        store: store as never,
+        fallbackClubName: "unused",
+        fallbackClubNameSource: "primary",
+      });
+    }
+
+    async function countBaselineRows() {
+      return prisma.memberInduction.count({
+        where: {
+          memberId: { in: BASELINE_ELIGIBLE_MEMBER_IDS },
+          status: "COMPLETED",
+          finalComments: { startsWith: BASELINE_PROVENANCE_PREFIX },
+        },
+      });
+    }
+
+    async function countBaselineAudits() {
+      return prisma.auditLog.count({
+        where: { action: BASELINE_AUDIT_ACTION },
+      });
+    }
+
+    beforeAll(async () => {
+      // Never touch a default/production DB: the singleton connects via
+      // dedicated URL, so guard THAT before importing Prisma or creating any
+      // scratch state. Keeping the import behind the opt-in hook makes the
+      // skipped suite a true no-op when the dedicated URL is absent.
+      assertSafeRaceDbUrl(RACE_DB_URL);
+      process.env.DATABASE_URL = RACE_DB_URL;
+      ({ prisma } = await import("@/lib/prisma"));
+      ({ markGroupSettlementIntentFailed } = await import("@/lib/group-settlement"));
+      ({ moveBedAllocationsSameDate } = await import(
+        "@/lib/bed-allocation-manual-writes"
+      ));
+      const baseline = await import("@/lib/induction-baseline");
+      runInductionBaseline = baseline.runInductionBaseline;
+      InductionBaselinePlanMismatchError =
+        baseline.InductionBaselinePlanMismatchError;
+      inductionBaselineLockSql = baseline.INDUCTION_BASELINE_LOCK_SQL;
+      const [{ PrismaClient: SeparatePrismaClient }, { createPrismaPgAdapter }] =
+        await Promise.all([
+          import("@prisma/client"),
+          import("@/lib/prisma-adapter"),
+        ]);
+      const createSeparateClient = (applicationName: string) => {
+        const url = new URL(RACE_DB_URL);
+        url.searchParams.set("connection_limit", "1");
+        url.searchParams.set("application_name", applicationName);
+        return new SeparatePrismaClient({
+          adapter: createPrismaPgAdapter(url.toString()),
+        });
+      };
+      baselineClientA = createSeparateClient("race-2361-baseline-a");
+      baselineClientB = createSeparateClient("race-2361-baseline-b");
+      ordinaryWriterClient = createSeparateClient("race-2361-writer");
+      await Promise.all([
+        baselineClientA.$connect(),
+        baselineClientB.$connect(),
+        ordinaryWriterClient.$connect(),
+      ]);
+
+      await prisma.$executeRawUnsafe(
+        `CREATE TABLE IF NOT EXISTS "${PROBE_TABLE}" (id text PRIMARY KEY, status text NOT NULL)`
+      );
+      // Idempotent recovery from an interrupted earlier opt-in run. #4514: a
+      // group's settlement no longer goes with it (INV-MONEY-043).
+      await releaseBookingFinancialHistoryForTeardown(prisma, [APP_BOOKING_ID, MOVE_BOOKING_ID, MOVE_BLOCKER_BOOKING_ID]);
+      await prisma.groupBooking.deleteMany({ where: { id: APP_GROUP_ID } });
+      await prisma.booking.deleteMany({
+        where: { id: { in: [MOVE_BOOKING_ID, MOVE_BLOCKER_BOOKING_ID] } },
+      });
+      await prisma.lodgeBed.deleteMany({
+        where: { id: { in: MOVE_BED_IDS } },
+      });
+      await prisma.lodgeRoom.deleteMany({ where: { id: MOVE_ROOM_ID } });
+      await prisma.booking.deleteMany({ where: { id: APP_BOOKING_ID } });
+      await prisma.lodge.deleteMany({ where: { id: APP_LODGE_ID } });
+      await clearBaselineFixtures();
+      await prisma.member.deleteMany({ where: { id: APP_MEMBER_ID } });
+
+      await prisma.member.create({
+        data: {
+          id: APP_MEMBER_ID,
+          email: "race-1881@example.invalid",
+          passwordHash: "not-a-real-password",
+          firstName: "Race",
+          lastName: "Harness",
+        },
+      });
+      await prisma.lodge.create({
+        data: { id: APP_LODGE_ID, name: "Race Harness", slug: "race-1881" },
+      });
+      await prisma.booking.create({
+        data: {
+          id: APP_BOOKING_ID,
+          memberId: APP_MEMBER_ID,
+          lodgeId: APP_LODGE_ID,
+          checkIn: new Date("2099-01-01"),
+          checkOut: new Date("2099-01-02"),
+          totalPriceCents: 100,
+          finalPriceCents: 100,
+        },
+      });
+      await prisma.lodgeRoom.create({
+        data: {
+          id: MOVE_ROOM_ID,
+          lodgeId: APP_LODGE_ID,
+          name: "Race 2366 Room",
+        },
+      });
+      await prisma.lodgeBed.createMany({
+        data: [
+          {
+            id: MOVE_OLD_BED_ID,
+            roomId: MOVE_ROOM_ID,
+            name: "Old double",
+            bedType: "DOUBLE",
+          },
+          {
+            id: MOVE_DESTINATION_BED_ID,
+            roomId: MOVE_ROOM_ID,
+            name: "Destination",
+            bedType: "SINGLE",
+          },
+        ],
+      });
+      await prisma.booking.createMany({
+        data: [
+          {
+            id: MOVE_BOOKING_ID,
+            memberId: APP_MEMBER_ID,
+            lodgeId: APP_LODGE_ID,
+            checkIn: MOVE_FIRST_NIGHT,
+            checkOut: new Date("2099-02-03"),
+            status: "CONFIRMED",
+            totalPriceCents: 200,
+            finalPriceCents: 200,
+          },
+          {
+            id: MOVE_BLOCKER_BOOKING_ID,
+            memberId: APP_MEMBER_ID,
+            lodgeId: APP_LODGE_ID,
+            checkIn: MOVE_FIRST_NIGHT,
+            checkOut: new Date("2099-02-03"),
+            status: "CONFIRMED",
+            totalPriceCents: 200,
+            finalPriceCents: 200,
+          },
+        ],
+      });
+      await prisma.bookingGuest.createMany({
+        data: [
+          {
+            id: MOVE_GUEST_ID,
+            bookingId: MOVE_BOOKING_ID,
+            firstName: "Move",
+            lastName: "Guest",
+            ageTier: "ADULT",
+            stayStart: MOVE_FIRST_NIGHT,
+            stayEnd: new Date("2099-02-03"),
+            priceCents: 200,
+          },
+          {
+            id: MOVE_PARTNER_GUEST_ID,
+            bookingId: MOVE_BLOCKER_BOOKING_ID,
+            firstName: "Partner",
+            lastName: "Guest",
+            ageTier: "ADULT",
+            stayStart: MOVE_FIRST_NIGHT,
+            stayEnd: MOVE_SECOND_NIGHT,
+            priceCents: 100,
+          },
+          {
+            id: MOVE_BLOCKER_GUEST_ID,
+            bookingId: MOVE_BLOCKER_BOOKING_ID,
+            firstName: "Blocker",
+            lastName: "Guest",
+            ageTier: "ADULT",
+            stayStart: MOVE_SECOND_NIGHT,
+            stayEnd: new Date("2099-02-03"),
+            priceCents: 100,
+          },
+        ],
+      });
+      await prisma.groupBooking.create({
+        data: {
+          id: APP_GROUP_ID,
+          organiserBookingId: APP_BOOKING_ID,
+          organiserMemberId: APP_MEMBER_ID,
+          joinCode: "RACE1881",
+          paymentMode: "ORGANISER_PAYS",
+        },
+      });
+      await prisma.groupBookingSettlement.create({
+        data: {
+          id: APP_SETTLEMENT_ID,
+          groupBookingId: APP_GROUP_ID,
+          stripePaymentIntentId: "pi_race_old",
+          amountCents: 100,
+        },
+      });
+      await seedBaselineFixtures();
+      setupCompleted = true;
+    }, 60_000);
+
+    afterAll(async () => {
+      const cleanupErrors: unknown[] = [];
+      const attemptCleanup = async (cleanup: () => Promise<unknown>) => {
+        try {
+          await cleanup();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      };
+
+      if (typeof prisma !== "undefined") {
+        await attemptCleanup(() => clearBaselineFixtures());
+        // #4514: a group's settlement no longer goes with it (INV-MONEY-043).
+        await attemptCleanup(() =>
+          releaseBookingFinancialHistoryForTeardown(prisma, [APP_BOOKING_ID, MOVE_BOOKING_ID, MOVE_BLOCKER_BOOKING_ID])
+        );
+        await attemptCleanup(() =>
+          prisma.groupBooking.deleteMany({ where: { id: APP_GROUP_ID } })
+        );
+        await attemptCleanup(() =>
+          prisma.auditLog.deleteMany({
+            where: {
+              action: {
+                in: [
+                  "BED_ALLOCATION_BULK_SET",
+                  "BED_ALLOCATION_MANUAL_SET",
+                  "BED_ALLOCATION_PARTNER_PROMOTED",
+                ],
+              },
+              memberId: APP_MEMBER_ID,
+            },
+          })
+        );
+        await attemptCleanup(() =>
+          prisma.booking.deleteMany({
+            where: { id: { in: [MOVE_BOOKING_ID, MOVE_BLOCKER_BOOKING_ID] } },
+          })
+        );
+        await attemptCleanup(() =>
+          prisma.lodgeBed.deleteMany({
+            where: { id: { in: MOVE_BED_IDS } },
+          })
+        );
+        await attemptCleanup(() =>
+          prisma.lodgeRoom.deleteMany({ where: { id: MOVE_ROOM_ID } })
+        );
+        await attemptCleanup(() =>
+          prisma.booking.deleteMany({ where: { id: APP_BOOKING_ID } })
+        );
+        await attemptCleanup(() =>
+          prisma.lodge.deleteMany({ where: { id: APP_LODGE_ID } })
+        );
+        await attemptCleanup(() =>
+          prisma.member.deleteMany({ where: { id: APP_MEMBER_ID } })
+        );
+        await attemptCleanup(() =>
+          prisma.$executeRawUnsafe(`DROP TABLE IF EXISTS "${PROBE_TABLE}"`)
+        );
+      }
+      if (typeof baselineClientA !== "undefined") {
+        await attemptCleanup(() => baselineClientA.$disconnect());
+      }
+      if (typeof baselineClientB !== "undefined") {
+        await attemptCleanup(() => baselineClientB.$disconnect());
+      }
+      if (typeof ordinaryWriterClient !== "undefined") {
+        await attemptCleanup(() => ordinaryWriterClient.$disconnect());
+      }
+      if (typeof prisma !== "undefined") {
+        await attemptCleanup(() => prisma.$disconnect());
+      }
+
+      // A partial setup already has a primary beforeAll failure. Best-effort
+      // teardown must never replace it with a secondary cleanup error.
+      if (setupCompleted && cleanupErrors.length > 0) {
+        throw new AggregateError(
+          cleanupErrors,
+          "Real-DB race harness teardown failed"
+        );
+      }
+    }, 60_000);
+
+    async function seedProbe(id: string, status: string) {
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO "${PROBE_TABLE}" (id, status) VALUES ($1, $2)
+         ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status`,
+        id,
+        status
+      );
+    }
+
+    async function readStatus(id: string): Promise<string> {
+      const rows = await prisma.$queryRawUnsafe<{ status: string }[]>(
+        `SELECT status FROM "${PROBE_TABLE}" WHERE id = $1`,
+        id
+      );
+      return rows[0]?.status ?? "";
+    }
+
+    /**
+     * One "writer": take an advisory lock (transaction-scoped), then a
+     * status-guarded compare-and-set from `fromStatus` to `toStatus`. Returns
+     * the number of rows it claimed (1 = winner, 0 = lost the race).
+     */
+    async function guardedClaim(
+      id: string,
+      lockSql: string,
+      fromStatus: string,
+      toStatus: string
+    ): Promise<number> {
+      return prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe(lockSql);
+        const res = await tx.$executeRawUnsafe(
+          `UPDATE "${PROBE_TABLE}" SET status = $1 WHERE id = $2 AND status = $3`,
+          toStatus,
+          id,
+          fromStatus
+        );
+        return typeof res === "number" ? res : 0;
+      });
+    }
+
+    const GLOBAL_LOCK = "SELECT pg_advisory_xact_lock(1)";
+
+    async function resetBedMoveFixture() {
+      await prisma.auditLog.deleteMany({
+        where: {
+          action: {
+            in: [
+              "BED_ALLOCATION_BULK_SET",
+              "BED_ALLOCATION_MANUAL_SET",
+              "BED_ALLOCATION_PARTNER_PROMOTED",
+            ],
+          },
+          memberId: APP_MEMBER_ID,
+        },
+      });
+      await prisma.bedAllocation.deleteMany({
+        where: {
+          id: {
+            in: [
+              MOVE_FIRST_ALLOCATION_ID,
+              MOVE_SECOND_ALLOCATION_ID,
+              MOVE_PARTNER_ALLOCATION_ID,
+              MOVE_BLOCKER_ALLOCATION_ID,
+            ],
+          },
+        },
+      });
+      await prisma.booking.update({
+        where: { id: MOVE_BOOKING_ID },
+        data: { status: "CONFIRMED" },
+      });
+      await prisma.bedAllocation.createMany({
+        data: [
+          {
+            id: MOVE_FIRST_ALLOCATION_ID,
+            bookingId: MOVE_BOOKING_ID,
+            bookingGuestId: MOVE_GUEST_ID,
+            roomId: MOVE_ROOM_ID,
+            bedId: MOVE_OLD_BED_ID,
+            bedType: "DOUBLE",
+            stayDate: MOVE_FIRST_NIGHT,
+          },
+          {
+            id: MOVE_SECOND_ALLOCATION_ID,
+            bookingId: MOVE_BOOKING_ID,
+            bookingGuestId: MOVE_GUEST_ID,
+            roomId: MOVE_ROOM_ID,
+            bedId: MOVE_OLD_BED_ID,
+            bedType: "DOUBLE",
+            stayDate: MOVE_SECOND_NIGHT,
+          },
+          {
+            id: MOVE_PARTNER_ALLOCATION_ID,
+            bookingId: MOVE_BLOCKER_BOOKING_ID,
+            bookingGuestId: MOVE_PARTNER_GUEST_ID,
+            roomId: MOVE_ROOM_ID,
+            bedId: MOVE_OLD_BED_ID,
+            bedType: "DOUBLE",
+            stayDate: MOVE_FIRST_NIGHT,
+            isSecondOccupant: true,
+          },
+          {
+            id: MOVE_BLOCKER_ALLOCATION_ID,
+            bookingId: MOVE_BLOCKER_BOOKING_ID,
+            bookingGuestId: MOVE_BLOCKER_GUEST_ID,
+            roomId: MOVE_ROOM_ID,
+            bedId: MOVE_DESTINATION_BED_ID,
+            bedType: "SINGLE",
+            stayDate: MOVE_SECOND_NIGHT,
+          },
+        ],
+      });
+    }
+
+    describe("bed-allocation move global/lodge transaction (#2366)", () => {
+      beforeEach(resetBedMoveFixture);
+
+      it("waits for cancellation's prune and cannot resurrect the deleted allocation", async () => {
+        const cancelPruned = deferred();
+        const releaseCancel = deferred();
+        const cancellation = ordinaryWriterClient.$transaction(async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+          await tx.booking.update({
+            where: { id: MOVE_BOOKING_ID },
+            data: { status: "CANCELLED" },
+          });
+          await tx.bedAllocation.deleteMany({
+            where: { bookingId: MOVE_BOOKING_ID },
+          });
+          cancelPruned.resolve();
+          await releaseCancel.promise;
+        });
+        await cancelPruned.promise;
+
+        const move = moveBedAllocationsSameDate({
+          allocationIds: [MOVE_FIRST_ALLOCATION_ID],
+          bedId: MOVE_DESTINATION_BED_ID,
+          actorMemberId: APP_MEMBER_ID,
+        });
+        await waitForPendingGlobalAdvisoryLock();
+        releaseCancel.resolve();
+        await cancellation;
+
+        await expect(move).rejects.toMatchObject({
+          status: 404,
+          message: "Allocation not found",
+        });
+        expect(
+          await prisma.bedAllocation.count({
+            where: { bookingId: MOVE_BOOKING_ID },
+          }),
+        ).toBe(0);
+        expect(
+          await prisma.auditLog.count({
+            where: {
+              memberId: APP_MEMBER_ID,
+              action: {
+                in: [
+                  "BED_ALLOCATION_BULK_SET",
+                  "BED_ALLOCATION_MANUAL_SET",
+                  "BED_ALLOCATION_PARTNER_PROMOTED",
+                ],
+              },
+            },
+          }),
+        ).toBe(0);
+      });
+
+      it("rolls back the earlier row move and partner promotion when a later night conflicts", async () => {
+        await expect(
+          moveBedAllocationsSameDate({
+            allocationIds: [
+              MOVE_FIRST_ALLOCATION_ID,
+              MOVE_SECOND_ALLOCATION_ID,
+            ],
+            bedId: MOVE_DESTINATION_BED_ID,
+            actorMemberId: APP_MEMBER_ID,
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining("No allocations were moved"),
+        });
+
+        const [first, second, partner, audits] = await Promise.all([
+          prisma.bedAllocation.findUniqueOrThrow({
+            where: { id: MOVE_FIRST_ALLOCATION_ID },
+            select: { bedId: true },
+          }),
+          prisma.bedAllocation.findUniqueOrThrow({
+            where: { id: MOVE_SECOND_ALLOCATION_ID },
+            select: { bedId: true },
+          }),
+          prisma.bedAllocation.findUniqueOrThrow({
+            where: { id: MOVE_PARTNER_ALLOCATION_ID },
+            select: { isSecondOccupant: true },
+          }),
+          prisma.auditLog.count({
+            where: {
+              memberId: APP_MEMBER_ID,
+              action: {
+                in: [
+                  "BED_ALLOCATION_BULK_SET",
+                  "BED_ALLOCATION_PARTNER_PROMOTED",
+                ],
+              },
+            },
+          }),
+        ]);
+        expect(first.bedId).toBe(MOVE_OLD_BED_ID);
+        expect(second.bedId).toBe(MOVE_OLD_BED_ID);
+        expect(partner.isSecondOccupant).toBe(true);
+        expect(audits).toBe(0);
+      });
+    });
+
+    it("global lock(1) + status guard: exactly one of two concurrent claimers wins (cancel-vs-capture shape)", async () => {
+      // Reproduces F1/F3/F2: two money/status writers race to flip the SAME row
+      // out of PENDING (one to PAID, one to CANCELLED). Under lock(1) they
+      // serialise, and the status-guarded update makes exactly one win.
+      for (let i = 0; i < 25; i += 1) {
+        const id = `race-global-${i}`;
+        await seedProbe(id, "PENDING");
+        const [a, b] = await Promise.all([
+          guardedClaim(id, GLOBAL_LOCK, "PENDING", "PAID"),
+          guardedClaim(id, GLOBAL_LOCK, "PENDING", "CANCELLED"),
+        ]);
+        // Exactly one writer claimed the row.
+        expect(a + b).toBe(1);
+        // The final state is whichever writer won — never a clobbered hybrid.
+        expect(["PAID", "CANCELLED"]).toContain(await readStatus(id));
+      }
+    });
+
+    it("status guard is the STRUCTURAL backstop even on mismatched keys (why the shared key matters)", async () => {
+      // Reproduces the pre-#1881 defect shape: the two writers hold DIFFERENT
+      // advisory keys (one global, one per-lodge), so they do NOT mutually
+      // exclude. The status-guarded compare-and-set still yields exactly one
+      // winner — proving the guard is the structural safety net beneath the
+      // lock. (Without the guard, a bare UPDATE by id would let the loser
+      // clobber the winner; see the next test.)
+      const perLodgeLock =
+        "SELECT pg_advisory_xact_lock(hashtextextended('lodge-x', 0))";
+      for (let i = 0; i < 25; i += 1) {
+        const id = `race-mismatched-${i}`;
+        await seedProbe(id, "PENDING");
+        const [a, b] = await Promise.all([
+          guardedClaim(id, GLOBAL_LOCK, "PENDING", "PAID"),
+          guardedClaim(id, perLodgeLock, "PENDING", "CANCELLED"),
+        ]);
+        expect(a + b).toBe(1);
+        expect(["PAID", "CANCELLED"]).toContain(await readStatus(id));
+      }
+    });
+
+    it("demonstrates that a BARE id-only update on mismatched keys CAN clobber (the bug the guard fixes)", async () => {
+      // Documents the failure mode the status guard prevents: two bare updates
+      // by id on different locks both "succeed", and the final state is simply
+      // the last writer's — a cancelled booking resurrected to PAID, or vice
+      // versa. This test asserts the clobber is POSSIBLE (both claim 1 row),
+      // which is exactly why every status write in the cluster is guarded.
+      const perLodgeLock =
+        "SELECT pg_advisory_xact_lock(hashtextextended('lodge-y', 0))";
+      async function bareClaim(id: string, lockSql: string, toStatus: string) {
+        return prisma.$transaction(async (tx) => {
+          await tx.$executeRawUnsafe(lockSql);
+          const res = await tx.$executeRawUnsafe(
+            `UPDATE "${PROBE_TABLE}" SET status = $1 WHERE id = $2`,
+            toStatus,
+            id
+          );
+          return typeof res === "number" ? res : 0;
+        });
+      }
+      const id = "race-bare-clobber";
+      await seedProbe(id, "PENDING");
+      const [a, b] = await Promise.all([
+        bareClaim(id, GLOBAL_LOCK, "PAID"),
+        bareClaim(id, perLodgeLock, "CANCELLED"),
+      ]);
+      // Both bare updates matched the row by id (no status guard), so both
+      // report a claim — the clobber the guarded pattern eliminates.
+      expect(a).toBe(1);
+      expect(b).toBe(1);
+    });
+
+    it("application settlement failure cannot clobber an intent re-pointed under lock(1)", async () => {
+      for (let i = 0; i < 20; i += 1) {
+        const oldIntent = `pi_race_old_${i}`;
+        const newIntent = `pi_race_new_${i}`;
+        await prisma.groupBookingSettlement.update({
+          where: { id: APP_SETTLEMENT_ID },
+          data: { stripePaymentIntentId: oldIntent, status: "PENDING" },
+        });
+
+        await Promise.all([
+          // Real application webhook writer.
+          markGroupSettlementIntentFailed(oldIntent),
+          // Representative settlement retry writer using the production lock
+          // order and re-pointing the provider identity atomically.
+          prisma.$transaction(async (tx) => {
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+            await tx.groupBookingSettlement.update({
+              where: { id: APP_SETTLEMENT_ID },
+              data: { stripePaymentIntentId: newIntent, status: "PENDING" },
+            });
+          }),
+        ]);
+
+        const current = await prisma.groupBookingSettlement.findUniqueOrThrow({
+          where: { id: APP_SETTLEMENT_ID },
+          select: { stripePaymentIntentId: true, status: true },
+        });
+        expect(current).toEqual({
+          stripePaymentIntentId: newIntent,
+          status: "PENDING",
+        });
+      }
+    });
+
+    describe("trusted induction baseline table-lock protocol (#2361)", { timeout: 15_000 }, () => {
+      beforeEach(async () => {
+        await clearBaselineRunState();
+      });
+
+      it("holds SHARE ROW EXCLUSIVE until commit and blocks an ordinary induction create", async () => {
+        const plan = await planInductionBaseline(baselineClientA);
+        const lockAcquired = deferred();
+        const releaseBaseline = deferred();
+        const baselineStore = createBaselineStore(baselineClientA, {
+          afterLock: async () => {
+            lockAcquired.resolve();
+            await releaseBaseline.promise;
+          },
+        });
+        const applyPromise = applyInductionBaseline(
+          baselineStore,
+          plan.planDigest,
+        );
+        await lockAcquired.promise;
+
+        let writerSettled = false;
+        const writerPromise = ordinaryWriterClient
+          .$transaction((tx) =>
+            tx.memberInduction.create({
+              data: {
+                id: "race-2361-writer-after-baseline",
+                memberId: BASELINE_MEMBER_A_ID,
+                templateId: BASELINE_TEMPLATE_ID,
+                kind: "RE_INDUCTION",
+                status: "IN_PROGRESS",
+                requiredSignOffs: 2,
+                createdByMemberId: BASELINE_ACTOR_ID,
+              },
+            }),
+          )
+          .finally(() => {
+            writerSettled = true;
+          });
+
+        let observationError: unknown;
+        try {
+          await waitForTableLock({
+            mode: "ShareRowExclusiveLock",
+            granted: true,
+          });
+          await waitForTableLock({ mode: "RowExclusiveLock", granted: false });
+          expect(writerSettled).toBe(false);
+        } catch (error) {
+          observationError = error;
+        } finally {
+          releaseBaseline.resolve();
+        }
+
+        const [report, writer] = await Promise.all([
+          applyPromise,
+          writerPromise,
+        ]);
+        if (observationError) throw observationError;
+        expect(report.appliedCount).toBe(BASELINE_ELIGIBLE_MEMBER_IDS.length);
+        expect(report.planDigest).toBe(plan.planDigest);
+        expect(writer.id).toBe("race-2361-writer-after-baseline");
+        expect(await countBaselineRows()).toBe(
+          BASELINE_ELIGIBLE_MEMBER_IDS.length,
+        );
+        expect(await countBaselineAudits()).toBe(1);
+      });
+
+      it("waits behind an ordinary writer, re-reads after commit, and rejects the stale digest before baseline writes", async () => {
+        const plan = await planInductionBaseline(baselineClientA);
+        const writerInserted = deferred();
+        const releaseWriter = deferred();
+        const writerPromise = ordinaryWriterClient.$transaction(async (tx) => {
+          const row = await tx.memberInduction.create({
+            data: {
+              id: "race-2361-writer-before-baseline",
+              memberId: BASELINE_MEMBER_B_ID,
+              templateId: BASELINE_TEMPLATE_ID,
+              kind: "RE_INDUCTION",
+              status: "IN_PROGRESS",
+              requiredSignOffs: 2,
+              createdByMemberId: BASELINE_ACTOR_ID,
+            },
+          });
+          writerInserted.resolve();
+          await releaseWriter.promise;
+          return row;
+        });
+        await writerInserted.promise;
+
+        let applySettled = false;
+        const applyPromise = applyInductionBaseline(
+          baselineClientA,
+          plan.planDigest,
+        ).finally(() => {
+          applySettled = true;
+        });
+        let observationError: unknown;
+        try {
+          await waitForTableLock({ mode: "RowExclusiveLock", granted: true });
+          await waitForTableLock({
+            mode: "ShareRowExclusiveLock",
+            granted: false,
+          });
+          expect(applySettled).toBe(false);
+        } catch (error) {
+          observationError = error;
+        } finally {
+          releaseWriter.resolve();
+        }
+
+        await writerPromise;
+        let applyError: unknown;
+        try {
+          await applyPromise;
+        } catch (error) {
+          applyError = error;
+        }
+        if (observationError) throw observationError;
+        expect(applyError).toBeInstanceOf(
+          InductionBaselinePlanMismatchError,
+        );
+        expect(
+          (
+            applyError as InstanceType<
+              typeof InductionBaselinePlanMismatchError
+            >
+          )
+            .report.openWorkflows,
+        ).toEqual([
+          expect.objectContaining({ memberId: BASELINE_MEMBER_B_ID }),
+        ]);
+        expect(
+          (
+            applyError as InstanceType<
+              typeof InductionBaselinePlanMismatchError
+            >
+          ).report.planDigest,
+        ).not.toBe(plan.planDigest);
+        expect(await countBaselineRows()).toBe(0);
+        expect(await countBaselineAudits()).toBe(0);
+        expect(
+          await prisma.memberInduction.count({
+            where: {
+              memberId: { in: BASELINE_MEMBER_IDS },
+              status: { in: ["DRAFT", "IN_PROGRESS"] },
+            },
+          }),
+        ).toBe(1);
+      });
+
+      it("rolls back baseline rows and audit when the real audit insert fails", async () => {
+        const plan = await planInductionBaseline(baselineClientA);
+        const forcedAuditId = "race-2361-forced-audit-failure";
+        let rowsVisibleBeforeAudit = 0;
+        const baselineStore = createBaselineStore(baselineClientA, {
+          replaceAuditCreate: async (tx) => {
+            rowsVisibleBeforeAudit = await tx.memberInduction.count({
+              where: {
+                memberId: { in: BASELINE_ELIGIBLE_MEMBER_IDS },
+                status: "COMPLETED",
+                finalComments: {
+                  startsWith: BASELINE_PROVENANCE_PREFIX,
+                },
+              },
+            });
+            await tx.$executeRawUnsafe(
+              `INSERT INTO "AuditLog" ("id", "action") VALUES ($1, NULL)`,
+              forcedAuditId,
+            );
+            throw new Error("Expected PostgreSQL to reject a null audit action");
+          },
+        });
+
+        await expect(
+          applyInductionBaseline(baselineStore, plan.planDigest),
+        ).rejects.toThrow();
+        expect(rowsVisibleBeforeAudit).toBe(
+          BASELINE_ELIGIBLE_MEMBER_IDS.length,
+        );
+        expect(await countBaselineRows()).toBe(0);
+        expect(await countBaselineAudits()).toBe(0);
+        expect(
+          await prisma.auditLog.count({ where: { id: forcedAuditId } }),
+        ).toBe(0);
+      });
+
+      it("serializes two concurrent applies so the stale second digest fails, then permits a freshly planned no-op", async () => {
+        const plan = await planInductionBaseline(baselineClientA);
+        const firstLockAcquired = deferred();
+        const releaseFirstApply = deferred();
+        const firstStore = createBaselineStore(baselineClientA, {
+          afterLock: async () => {
+            firstLockAcquired.resolve();
+            await releaseFirstApply.promise;
+          },
+        });
+        const firstPromise = applyInductionBaseline(
+          firstStore,
+          plan.planDigest,
+        );
+        await firstLockAcquired.promise;
+
+        let secondSettled = false;
+        const secondPromise = applyInductionBaseline(
+          baselineClientB,
+          plan.planDigest,
+        );
+        void secondPromise.then(
+          () => {
+            secondSettled = true;
+          },
+          () => {
+            secondSettled = true;
+          },
+        );
+
+        let observationError: unknown;
+        try {
+          await waitForTableLock({
+            mode: "ShareRowExclusiveLock",
+            granted: true,
+            applicationName: "race-2361-baseline-a",
+          });
+          await waitForTableLock({
+            mode: "ShareRowExclusiveLock",
+            granted: false,
+            applicationName: "race-2361-baseline-b",
+          });
+          expect(secondSettled).toBe(false);
+        } catch (error) {
+          observationError = error;
+        } finally {
+          releaseFirstApply.resolve();
+        }
+
+        const outcomes = await Promise.allSettled([
+          firstPromise,
+          secondPromise,
+        ]);
+        if (observationError) throw observationError;
+        expect(outcomes[0]).toMatchObject({
+          status: "fulfilled",
+          value: {
+            appliedCount: BASELINE_ELIGIBLE_MEMBER_IDS.length,
+            planDigest: plan.planDigest,
+          },
+        });
+        expect(outcomes[1]).toMatchObject({ status: "rejected" });
+        if (outcomes[1].status !== "rejected") {
+          throw new Error("Expected the second apply to reject its stale digest");
+        }
+        expect(outcomes[1].reason).toBeInstanceOf(
+          InductionBaselinePlanMismatchError,
+        );
+        const refreshedPlan = await planInductionBaseline(baselineClientB);
+        expect(refreshedPlan.planDigest).not.toBe(plan.planDigest);
+        const noOp = await applyInductionBaseline(
+          baselineClientB,
+          refreshedPlan.planDigest,
+        );
+        expect(noOp.appliedCount).toBe(0);
+        expect(noOp.planDigest).toBe(refreshedPlan.planDigest);
+        expect(await countBaselineRows()).toBe(
+          BASELINE_ELIGIBLE_MEMBER_IDS.length,
+        );
+        expect(await countBaselineAudits()).toBe(1);
+        expect(
+          await prisma.memberInduction.count({
+            where: { memberId: BASELINE_NA_MEMBER_ID },
+          }),
+        ).toBe(0);
+      });
+    });
+  }
+);

@@ -1,0 +1,322 @@
+"use client";
+
+/**
+ * What the public payment-link page SHOWS: the shape it receives on the wire,
+ * its two date formatters, and the card every non-payable state renders
+ * through. `page.tsx` keeps the route shell — the fetches, the state machine
+ * and the Stripe handoff.
+ *
+ * ## Why this is a separate file
+ *
+ * The club-time migration (CT-4 group E, #2870; epic #2988) and the null-safety
+ * hardening beside it carried `page.tsx` past the 500-line route-page budget for
+ * the FIRST time, and the file-size ratchet refuses an allowance for exactly
+ * that case: a module still inside its budget has the cheapest split available
+ * to it, so it should take it (`docs/MAINTENANCE.md` → "File-size budget
+ * ratchet", `size-allowances.d/README.md`). The seam was already here —
+ * everything below sat above the page component and none of it reads the page's
+ * state.
+ *
+ * Nothing below changed meaning in the move. The two formatters in particular
+ * keep every guard they arrived with, because this page is opened by an
+ * UNAUTHENTICATED visitor following an emailed link: there is no session to fall
+ * back on and no way for them to recover, so an unhandled throw in a client
+ * render costs them the whole payment screen over a date they were only being
+ * shown for information.
+ */
+import { AlertTriangle, CheckCircle2, Info } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { StatusRegion } from "@/components/status-region";
+import {
+  parseInstant,
+  type BoundClubTime,
+} from "@/lib/club-time";
+import {
+  CHECKING_PAYMENT_MESSAGE,
+  EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE,
+  isExistingCardTransactionStatusUnconfirmed,
+  isPaymentProcessing,
+  isPaymentReceivedFinalisationPending,
+  isPaymentReceivedStatusUnconfirmed,
+  isSupersededCardPaymentRefunding,
+  PAYMENT_PROCESSING_HEADING,
+  PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE,
+  SUPERSEDED_CARD_PAYMENT_REFUNDING_LINK_MESSAGE,
+} from "@/lib/payment-recovery-contract";
+
+/**
+ * The page's one h1 on every screen that has no title of its own - the loading
+ * view, the "Checking your payment..." view and a link that will not load
+ * (#4951). One definition, so a rename cannot leave the three out of step.
+ */
+export const PAY_LINK_PAGE_HEADING = "Payment Link";
+
+export interface Narrative {
+  state: string;
+  headline: string;
+  message: string;
+  nextStep: string;
+}
+
+export interface PaymentLinkContext {
+  state: string;
+  narrative: Narrative;
+  firstName: string;
+  payable: {
+    checkIn: string;
+    checkOut: string;
+    guestCount: number;
+    status: string;
+    amountCents: number;
+    internetBankingReference?: string;
+    /**
+     * #3638: false on a booking switched to Internet Banking — no card button.
+     * Optional on the wire, read as "available" when absent, so a page served
+     * an older response keeps its card.
+     */
+    cardPaymentAvailable?: boolean;
+    expiresAt: string;
+  } | null;
+  canRequestFreshLink: boolean;
+  /**
+   * The lodge THIS booking is at (#2919). Optional on the wire so a page served
+   * from a cached/older response still renders — the club default stands in.
+   */
+  lodgeName?: string;
+  /**
+   * #3194: this booking has an OPEN financial review — a saved change whose
+   * refund or charge the club is still working out.
+   *
+   * Optional on the wire for the same reason `lodgeName` is: nothing validates
+   * this payload on the way in, and a response served from an older deployment
+   * carries no such field. Absent is read as FALSE, which is exactly the page
+   * this route has always rendered — the disclosure is added by a newer server,
+   * never invented by the client.
+   */
+  financialReviewPending?: boolean;
+}
+
+type Tone = "success" | "warning" | "info";
+
+export type PaymentRecovery = {
+  heading: string;
+  message: string;
+};
+
+const TONE_STYLES: Record<Tone, { wrap: string; icon: typeof Info }> = {
+  success: { wrap: "text-success-11", icon: CheckCircle2 },
+  warning: { wrap: "text-warning-11", icon: AlertTriangle },
+  info: { wrap: "text-info-11", icon: Info },
+};
+
+/**
+ * The moment the link stops working, spelled in the CLUB's zone (CT-4, #2870;
+ * INV-CONFIG-002).
+ *
+ * Deliberately NOT the same route as the stay dates rendered beside it: those
+ * are calendar days and take no zone at all, and merging the two is the defect
+ * this epic exists to end.
+ *
+ * ## Why the TIME is on it, and why that is a fix rather than a flourish
+ *
+ * This used to render the bare civil DAY. Two lines above it the stay reads
+ * "Dates: 16 Apr 2026 to 18 Apr 2026", so a second bare day underneath read as
+ * a restatement of the stay — and it could name a different one. `expiresAt` was
+ * then minted through `APP_TIME_ZONE`, so for a club whose persisted zone is not
+ * the container's the instant landed on the following civil day: a club in
+ * `Pacific/Auckland` on a `TZ=UTC` host got "expires on 17 Apr 2026" beside a
+ * stay starting on the 16th, and the link in fact died at 11:59 AM on the 17th.
+ * A bare day therefore misstated the deadline by most of a day, in the direction
+ * that costs the payer their link.
+ *
+ * `instantDateTime` states the moment as a moment. It also makes this page agree
+ * with the email that delivered the link: `email-templates/booking-requests.ts`
+ * renders the same value into the same sentence with `emailClubDateTime`, which
+ * is `instantDateTime` through the same persisted zone (CT-5, #2869). This page
+ * was the one surface spelling it short.
+ *
+ * THAT EMAIL HAS TWO RENDERERS, NOT ONE, and the second one had to be moved
+ * before this paragraph was true. A club that has saved a body override gets its
+ * whole message rebuilt from `templateData` by `prepareEmailMessage`, and the
+ * shipped default body for both payment-link templates contains `{{expiresAt}}`
+ * — so the copy in `src/lib/email/booking-requests.ts` is a real member-facing
+ * rendering and not an internal detail. It went through `formatNZDateTime`, the
+ * CONTAINER's zone, so on a divergent deployment an edited-wording club read a
+ * different time from this page and from an unedited club. Both copies now use
+ * `emailClubDateTime` (#2870), which is what lets this say "agree" without a
+ * qualifier. The ~146 sibling `templateData` date sites across the email surface
+ * still carry the same two-authority split and are their own census.
+ *
+ * THE MINT NOW AGREES, so this page states the end of the check-in day in the
+ * club's own reckoning rather than a moment that merely renders faithfully. All
+ * nine `src/lib` sites go through `paymentLinkExpiryForCheckIn`, which takes the
+ * persisted zone (#2870). A link minted BEFORE that change keeps the instant it
+ * was stored with — `INV-CONFIG-002` rewrites nothing — so on a divergent
+ * deployment such a row can still render as the following civil day until it
+ * lapses or is re-issued. This line reports the row faithfully either way, which
+ * is the whole point of stating the moment as a moment.
+ *
+ * FAIL-SOFT FOR THE SAME REASON THE STAY DATES ARE (`formatStayDateOrNull`), which is the half that was
+ * missing: this line sits nine below one whose docblock justifies its own
+ * try/catch by "nothing validates this payload on the way in", and then handed
+ * `new Date(...)` straight to a formatter. `Intl.DateTimeFormat.format` on an
+ * invalid `Date` is a `RangeError`, and an unhandled throw in a client render
+ * replaces the whole payment page with an error boundary — over a line that only
+ * tells the payer when the link expires.
+ */
+export function formatLinkExpiry(value: string, club: BoundClubTime): string {
+  if (typeof value !== "string") return "";
+  const instant = parseInstant(value);
+  if (instant === null) return value;
+  try {
+    return club.instantDateTime(instant);
+  } catch {
+    return value;
+  }
+}
+
+export function toneForState(state: string): Tone {
+  if (state === "paid") return "success";
+  if (
+    state === "cancelled_post_payment" ||
+    state === "cancelled_pre_payment" ||
+    state === "declined"
+  ) {
+    return "warning";
+  }
+  return "info";
+}
+
+export function NarrativeCard({
+  narrative,
+  tone,
+  children,
+}: {
+  narrative: Narrative;
+  tone: Tone;
+  children?: React.ReactNode;
+}) {
+  const { wrap, icon: Icon } = TONE_STYLES[tone];
+  return (
+    <Card className="w-full max-w-lg">
+      <CardHeader>
+        {/* The narrative card is the whole /pay/[token] page in every state
+            that renders it, so its title is the page's one h1. */}
+        <CardTitle headingLevel={1}>{narrative.headline}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className={`flex items-start gap-2 ${wrap}`}>
+          <Icon className="h-6 w-6 shrink-0" />
+          <p className="font-medium">{narrative.message}</p>
+        </div>
+        <p className="text-sm text-muted-foreground">{narrative.nextStep}</p>
+        {children}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * The money-under-review disclosure, on a page that is showing the member an
+ * amount of its own (#3194, epic #2797).
+ *
+ * IT CARRIES NO WORDING. Every sentence it can render is composed in
+ * `booking-financial-review-copy.ts`, which is also where the booking-detail
+ * banner's review sentences come from — so this page and that one cannot come to
+ * disagree about one booking, which is the defect #3194 exists to close. This
+ * component owns the box and nothing else.
+ *
+ * `info`, not `warning`: nothing has gone wrong and the member is not being
+ * asked to act. The booking page reaches the same conclusion for the same
+ * state.
+ */
+export function FinancialReviewNotice({ note }: { note: string }) {
+  return (
+    <div
+      data-testid="payment-link-financial-review"
+      className="flex items-start gap-2 rounded-md border border-info-6 bg-info-3 px-3 py-2 text-sm text-info-11"
+    >
+      <Info className="h-5 w-5 shrink-0" />
+      <p>{note}</p>
+    </div>
+  );
+}
+
+/**
+ * #3638 (`INV-PAY-102`): shown in place of the card button once the booking has
+ * switched to Internet Banking, because the card door would refuse the attempt.
+ */
+export function CardPaymentUnavailableNotice() {
+  return (
+    <p className="rounded-md bg-muted px-3 py-2 text-sm text-foreground">
+      This booking is being paid by internet banking, so it can&apos;t be paid by
+      card here. Use the bank-transfer details below.
+    </p>
+  );
+}
+
+/**
+ * The whole card while the server is asked what a payment did (#4300, #4955).
+ * It replaces the card form, or the page on a redirect return, so the status
+ * line takes the focus the form's Pay Now button held (#4949). One region serves
+ * both exits; it mounts already filled, a limit docs/STAGING_ACCESSIBILITY.md states.
+ */
+export function CheckingPaymentCard() {
+  return (
+    <Card className="w-full max-w-lg">
+      {/* This card replaces the whole page, so it carries the page's one h1
+          (#4951); the status line below is not a heading. */}
+      <h1 className="sr-only">{PAY_LINK_PAGE_HEADING}</h1>
+      <CardContent className="py-8 text-center">
+        <StatusRegion id="payment-link-check-status" visible visibleClassName="text-muted-foreground" outcomeKey>
+          {CHECKING_PAYMENT_MESSAGE}
+        </StatusRegion>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * What the page shows for a 409 from the link's payment-intent route that a
+ * payer must not answer with another payment, or null for any other refusal
+ * (shown as an ordinary error). Moved from the page unchanged; #4300 adds a
+ * superseded payment going back to the card.
+ */
+export function paymentRecoveryForRefusal(data: Record<string, unknown>): PaymentRecovery | null {
+  if (data.status === "CANCELLED" && typeof data.refunded === "boolean") {
+    return data.refunded
+      ? {
+          heading: "Booking cancelled - payment refunded",
+          message:
+            "The booking was cancelled because lodge capacity was no longer available, and the card payment was refunded. Reload the payment link to check the latest booking status. Do not try another payment.",
+        }
+      : {
+          heading: "Booking cancelled - refund needs attention",
+          message:
+            "The booking was cancelled because lodge capacity was no longer available, but the refund could not be confirmed. Reload the payment link and contact the club if the refund is not confirmed. Do not try another payment.",
+        };
+  }
+  if (isPaymentReceivedFinalisationPending(data)) {
+    return {
+      heading: "Payment received - finalisation pending",
+      message:
+        "Your card payment was received, but booking finalisation is still pending. Reload the payment link and check the booking status before trying any payment again.",
+    };
+  }
+  if (isPaymentReceivedStatusUnconfirmed(data)) {
+    return { heading: "Payment received - check booking status", message: PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE };
+  }
+  if (isExistingCardTransactionStatusUnconfirmed(data)) {
+    return { heading: "Card transaction found - check payment status", message: EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE };
+  }
+  if (isPaymentProcessing(data)) return { heading: PAYMENT_PROCESSING_HEADING, message: data.error };
+  if (isSupersededCardPaymentRefunding(data)) {
+    return { heading: "Card payment being returned", message: SUPERSEDED_CARD_PAYMENT_REFUNDING_LINK_MESSAGE };
+  }
+  return null;
+}
+
+/** The bank-transfer box's heading: an alternative to the card, or the only way. */
+export function internetBankingHeading(link: { cardPaymentAvailable?: boolean }): string {
+  return link.cardPaymentAvailable !== false ? "Or pay by internet banking" : "Pay by internet banking";
+}

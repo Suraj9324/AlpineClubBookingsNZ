@@ -1,0 +1,1212 @@
+import { prisma } from "./prisma";
+import { storedShortBookingId } from "@/lib/booking-reference";
+import { ApiError } from "@/lib/api-error";
+import {
+  AdminCreditAdjustmentRequestStatus,
+  BookingEventType,
+  BookingStatus,
+  CreditType,
+  PaymentSource,
+  Prisma,
+} from "@prisma/client";
+import { syncBookingLedgerCredits } from "@/lib/booking-ledger-credit-sync";
+import { RESTORED_CREDIT_PREFIX, bookingAppliedCreditWhere, buildBookingAppliedCreditDescription } from "@/lib/member-credit-booking-rows";
+import { createAuditLog } from "./audit";
+import { isPrismaUniqueConstraintError } from "./prisma-errors";
+import { withStoreTransaction } from "@/lib/db-transaction";
+import { applyLocalRefundAllocation, lockPaymentForRefundedTotal } from "./payment-transactions";
+import { readSupersededCaptureHeldBack } from "@/lib/superseded-capture-hold-back";
+import logger from "@/lib/logger";
+import { formatCents } from "@/lib/utils";
+import { clubFormatValues } from "@/lib/club-format-server";
+import type { ClubFormat } from "@/lib/club-format";
+import {
+  adminCreditGrantAuditClause,
+  GRANT_ACCOUNT_MISSING_MESSAGE,
+  type AdminCreditGrantAccount,
+} from "@/lib/admin-credit-grant-account";
+import { assertDeductionLeavesNotedCreditUntouched, enqueueAdminGrantCreditNote } from "@/lib/admin-grant-credit-note";
+import { buildXeroIdempotencyKey, startXeroSyncOperation } from "@/lib/xero-sync";
+import { XERO_OUTBOX_APPLIED_CREDIT_DEALLOCATION_TYPE } from "@/lib/xero-operation-outbox-payload";
+import { repairLegacyAppliedCreditNoteAllocationsForBooking } from "@/lib/xero-applied-credit-allocation-repair";
+import { assertNoAppliedCreditDeallocationFence } from "@/lib/xero-applied-credit-operation-serialization";
+import {
+  assertGrantAccountMatchesAmount,
+  assertMatchingIdempotentAdjustmentRequest,
+  calculateAppliedCreditAmount,
+  calculateRestoredCreditAmount,
+  formatAdjustmentAmount,
+  MemberCreditValidationError,
+  validateAdjustmentAmount,
+  validateCreditApplicationAmount,
+  validateCreditApplicationAgainstBalance,
+  validateNegativeAdjustmentAgainstBalance,
+} from "@/lib/policies/member-credit";
+import { cancellationCreditDescription } from "@/lib/cancellation-settled-money";
+
+const MEMBER_CREDIT_LOCK_NAMESPACE = "member-credit-ledger";
+
+const adminAdjustmentRequestSelect = {
+  id: true,
+  memberId: true,
+  amountCents: true,
+  description: true,
+  grantAccount: true,
+  idempotencyKey: true,
+  status: true,
+  requestedById: true,
+} satisfies Prisma.AdminCreditAdjustmentRequestSelect;
+
+type AdminAdjustmentRequestRecord = Prisma.AdminCreditAdjustmentRequestGetPayload<{
+  select: typeof adminAdjustmentRequestSelect;
+}>;
+
+const bookingModificationCreditSelect = {
+  id: true,
+  memberId: true,
+  amountCents: true,
+  type: true,
+  sourceBookingId: true,
+  sourceBookingModificationId: true,
+  xeroCreditNoteId: true,
+} satisfies Prisma.MemberCreditSelect;
+
+type BookingModificationCreditRecord = Prisma.MemberCreditGetPayload<{
+  select: typeof bookingModificationCreditSelect;
+}>;
+
+const adminAdjustmentRequestListSelect = {
+  id: true,
+  memberId: true,
+  amountCents: true,
+  description: true,
+  grantAccount: true,
+  status: true,
+  requestedById: true,
+  reviewedById: true,
+  reviewedAt: true,
+  createdAt: true,
+  member: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+    },
+  },
+  requestedBy: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+    },
+  },
+  reviewedBy: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+    },
+  },
+  approvedCredit: {
+    select: {
+      id: true,
+      createdAt: true,
+    },
+  },
+} satisfies Prisma.AdminCreditAdjustmentRequestSelect;
+
+export type AdminAdjustmentRequestListItem =
+  Prisma.AdminCreditAdjustmentRequestGetPayload<{
+    select: typeof adminAdjustmentRequestListSelect;
+  }>;
+
+/**
+ * Get a member's available credit balance (sum of all credit entries).
+ * Positive entries = credit added, negative entries = credit used.
+ */
+export async function getMemberCreditBalance(
+  memberId: string,
+  tx?: Prisma.TransactionClient
+): Promise<number> {
+  const db = tx || prisma;
+  const result = await db.memberCredit.aggregate({
+    where: { memberId },
+    _sum: { amountCents: true },
+  });
+  return result._sum.amountCents ?? 0;
+}
+
+/** Create a credit entry for a cancellation refund held as credit; returns its id, which its Xero note stamps (#4685). */
+export async function createCancellationCredit(
+  db: Prisma.TransactionClient,
+  memberId: string,
+  amountCents: number,
+  bookingId: string,
+  xeroCreditNoteId?: string
+): Promise<string> {
+  const { id } = await db.memberCredit.create({
+    data: {
+      memberId,
+      amountCents,
+      type: CreditType.CANCELLATION_REFUND,
+      description: cancellationCreditDescription(bookingId),
+      sourceBookingId: bookingId,
+      xeroCreditNoteId: xeroCreditNoteId ?? null,
+    },
+  });
+  await syncBookingLedgerCredits({ bookingId, store: db });
+
+  // INV-PAY-152: this settlement fact commits or rolls back with its credit.
+  // Do not swallow an insert failure: PostgreSQL has already aborted the claim.
+  await db.bookingEvent.create({
+    data: {
+      bookingId,
+      type: BookingEventType.CREDITED,
+      amountCents,
+      reason: "Cancellation refund held as account credit.",
+    },
+  });
+  return id;
+}
+
+/**
+ * Create a credit entry for a booking modification refund held as account credit.
+ *
+ * When `paymentId` is provided, the credit is also allocated against the
+ * payment's captured transactions (`applyLocalRefundAllocation`), exactly as
+ * the cancellation credit path does (#1031): a credit-settled reduction
+ * consumes refundable value like a card refund, so `refundedAmountCents` must
+ * reflect it or a later cancel refunds the same cents twice.
+ */
+/**
+ * The MEMBER whose account a reduction is being credited to, or a refusal.
+ *
+ * Account credit lands in a person's ledger and is spent from their own
+ * bookings page. An organisation has no such account, and the invented school
+ * member's was unspendable because that row could not sign in — so a school's
+ * reduction cannot be settled this way, and saying so is better than minting a
+ * balance nobody can reach (#3369). Whether a school's reduction should instead
+ * be refunded is a money decision that issue does not make; this refusal is
+ * what puts it in front of a person.
+ *
+ * One home for it because four settlement paths ask the same question, and four
+ * copies of a refusal is four chances to word it differently (`INV-SSOT`).
+ *
+ * ## IT IS A TYPED 400, AND THAT IS THE HALF THAT REACHES THE OFFICER
+ *
+ * It threw a bare `Error` at first, which matched no `instanceof` branch on any
+ * of the six routes these four services sit behind. Measured on all six: four
+ * fell through to a masked `"Failed to modify booking"` 400 and two to a 500,
+ * with the whole edit rolled back and the sentence above reaching nobody. So an
+ * officer offered "refund or account credit" on a school's booking picked credit
+ * and got a server error, with no way to learn that the other option was the
+ * only one available.
+ *
+ * `ApiError` is what every one of those routes already tests for and renders
+ * with its own status — the file's own idiom, two lines away in
+ * `api-error.ts` — so the explanation now arrives at the screen where the
+ * choice was made. The one route that tests only `ManualBookingPaymentError`
+ * converts it at its own boundary, where that conversion already lives.
+ */
+export class SchoolHasNoCreditAccountError extends ApiError {
+  constructor() {
+    super(
+      "This booking belongs to a school, which has no account to credit. Settle the reduction as a refund instead — a school has no member account for credit to be spent from (#3369).",
+      400,
+    );
+    this.name = "SchoolHasNoCreditAccountError";
+  }
+}
+
+export function requireMemberCreditRecipient(memberId: string | null): string {
+  if (!memberId) {
+    throw new SchoolHasNoCreditAccountError();
+  }
+  return memberId;
+}
+
+export async function createBookingModificationCredit(
+  memberId: string,
+  amountCents: number,
+  bookingId: string,
+  bookingModificationId: string,
+  xeroCreditNoteId?: string,
+  tx?: Prisma.TransactionClient,
+  paymentId?: string
+): Promise<void> {
+  // #4872: the credit, its ledger lines and the payment allocation commit together.
+  // A root-client caller gets its own transaction; a caller that already holds one
+  // keeps it. The Payment row comes after the member-ledger writes (`INV-LOCK-002`).
+  await withStoreTransaction(tx ?? prisma, async (db) => {
+    const existingCredit = await findBookingModificationCredit(
+      db,
+      bookingModificationId
+    );
+    if (existingCredit) {
+      await assertMatchingBookingModificationCredit(db, existingCredit, {
+        memberId,
+        amountCents,
+        bookingId,
+        bookingModificationId,
+        xeroCreditNoteId,
+      });
+      return;
+    }
+
+    try {
+      await db.memberCredit.create({
+        data: {
+          memberId,
+          amountCents,
+          type: CreditType.BOOKING_MODIFICATION_REFUND,
+          description: `Booking reduction credit for booking ${storedShortBookingId(bookingId)}`,
+          sourceBookingId: bookingId,
+          sourceBookingModificationId: bookingModificationId,
+          xeroCreditNoteId: xeroCreditNoteId ?? null,
+        },
+      });
+    } catch (error) {
+      if (!isPrismaUniqueConstraintError(error)) {
+        throw error;
+      }
+
+      const replayedCredit = await findBookingModificationCredit(
+        db,
+        bookingModificationId
+      );
+      if (!replayedCredit) {
+        throw error;
+      }
+      await assertMatchingBookingModificationCredit(db, replayedCredit, {
+        memberId,
+        amountCents,
+        bookingId,
+        bookingModificationId,
+        xeroCreditNoteId,
+      });
+      // Replay: the allocation happened atomically with the original credit.
+      return;
+    }
+    await syncBookingLedgerCredits({ bookingId, store: db });
+
+    if (paymentId) {
+      await lockPaymentForRefundedTotal(db, paymentId);
+      const heldBack = await readSupersededCaptureHeldBack(db, paymentId);
+      await applyLocalRefundAllocation({
+        paymentId,
+        amountCents,
+        store: db,
+        heldBackByTransaction: heldBack.byTransaction,
+      });
+    }
+  });
+}
+
+async function findBookingModificationCredit(
+  db: Prisma.TransactionClient | typeof prisma,
+  bookingModificationId: string
+): Promise<BookingModificationCreditRecord | null> {
+  return db.memberCredit.findUnique({
+    where: { sourceBookingModificationId: bookingModificationId },
+    select: bookingModificationCreditSelect,
+  });
+}
+
+async function assertMatchingBookingModificationCredit(
+  db: Prisma.TransactionClient | typeof prisma,
+  existingCredit: BookingModificationCreditRecord,
+  expected: {
+    memberId: string;
+    amountCents: number;
+    bookingId: string;
+    bookingModificationId: string;
+    xeroCreditNoteId?: string;
+  }
+): Promise<void> {
+  if (
+    existingCredit.memberId !== expected.memberId ||
+    existingCredit.amountCents !== expected.amountCents ||
+    existingCredit.type !== CreditType.BOOKING_MODIFICATION_REFUND ||
+    existingCredit.sourceBookingId !== expected.bookingId ||
+    existingCredit.sourceBookingModificationId !== expected.bookingModificationId
+  ) {
+    throw new Error(
+      `Booking modification credit ${expected.bookingModificationId} already exists with different ledger details`
+    );
+  }
+
+  const expectedXeroCreditNoteId = expected.xeroCreditNoteId ?? null;
+  if (
+    existingCredit.xeroCreditNoteId &&
+    expectedXeroCreditNoteId &&
+    existingCredit.xeroCreditNoteId !== expectedXeroCreditNoteId
+  ) {
+    throw new Error(
+      `Booking modification credit ${expected.bookingModificationId} already links to a different Xero credit note`
+    );
+  }
+
+  if (!existingCredit.xeroCreditNoteId && expectedXeroCreditNoteId) {
+    await db.memberCredit.update({
+      where: { id: existingCredit.id },
+      data: { xeroCreditNoteId: expectedXeroCreditNoteId },
+    });
+  }
+}
+
+/**
+ * Apply credit to a booking (creates a negative entry).
+ * Validates that the member has sufficient balance.
+ * Must be called within a transaction to prevent race conditions.
+ */
+/**
+ * Total account credit locally applied to a booking, as a positive cents amount
+ * (`|Σ BOOKING_APPLIED|`). This is the ledger truth the effective booking price is
+ * derived from: `effectivePriceCents = finalPriceCents − deriveBookingAppliedCreditCents`.
+ *
+ * Reads ALL BOOKING_APPLIED rows (not the `xeroCreditNoteId: null` unallocated
+ * subset the Xero allocation engine keys on): the applied total is what every
+ * payment amount was minted against and is stable across allocation stamping, so
+ * it is the correct basis for the card/IB effective-price guards (#1641, mirroring
+ * the #1620 switch-to-internet-banking derive). Restores live in CANCELLED
+ * bookings (a positive CANCELLATION_REFUND row + status CANCELLED), which the card
+ * payment path never reconciles, so no restore subtraction is needed here.
+ */
+export async function deriveBookingAppliedCreditCents(
+  bookingId: string,
+  db: Prisma.TransactionClient | typeof prisma = prisma
+): Promise<number> {
+  const agg = await db.memberCredit.aggregate({
+    where: bookingAppliedCreditWhere(bookingId),
+    _sum: { amountCents: true },
+  });
+  return Math.max(0, -(agg._sum.amountCents ?? 0));
+}
+
+/**
+ * F20 (#1887): reconcile the account credit already applied to a booking against
+ * a modification's new (repriced) final price. A pre-payment reduction can drop
+ * `finalPriceCents` BELOW the credit consumed at booking-create, which would
+ * otherwise leave the booking unpayable — the card intent guard rejects
+ * `effectivePriceCents = finalPriceCents − appliedCredit <= 0` — with the
+ * member's credit over-consumed. Refund the over-consumed slice back to the
+ * member and clamp the net applied credit to the new price. Money integer cents.
+ *
+ * The refund is an append-only positive `BOOKING_APPLIED` offset row against the
+ * same booking, so `deriveBookingAppliedCreditCents` nets to exactly
+ * `newWorthCents` and `getMemberCreditBalance` regains the excess. Because
+ * the clamp only fires when `applied > newWorthCents`, it always lands the
+ * booking fully credit-covered (effective price 0); the caller then advances it
+ * to PAID through the shared zero-dollar path.
+ *
+ * Must run inside the caller's transaction; takes the member-credit ledger lock
+ * so it cannot interleave with `applyCreditToBooking` or restores. Idempotent
+ * under transaction re-drive: a re-run re-derives the now-clamped applied total,
+ * finds no excess, and writes nothing.
+ *
+ * Returns the post-clamp applied credit (what the effective-price and $0 auto-pay
+ * decisions must use) and the excess refunded on THIS call.
+ *
+ * F3 (#1887): an IB booking may already have ACCRECCREDIT notes allocated to its
+ * Xero invoice. The positive ledger offset and durable provider-deallocation
+ * operation commit together below. The worker performs provider calls after
+ * this transaction, preserving the no-provider-call-under-ledger-lock invariant.
+ */
+export async function clampAppliedCreditToBookingPrice(
+  {
+    memberId,
+    bookingId,
+    newWorthCents,
+    format,
+  }: {
+    /** The booking OWNER, or null when it is owned by an Organisation (#3369). */
+    memberId: string | null;
+    bookingId: string;
+    /**
+     * What the booking is worth after the reprice: its final price plus the
+     * change fee recorded on its payment (`bookingWorthCents`, #3750). Credit
+     * is kept up to this, never the bare price, so a recorded fee is not
+     * dropped by giving back the credit that pays it (#3955 review F1).
+     */
+    newWorthCents: number;
+    /** Club format resolved before the caller's transaction or ledger lock. */
+    format: ClubFormat;
+  },
+  tx: Prisma.TransactionClient
+): Promise<{ appliedCreditCents: number; refundedExcessCents: number }> {
+  // #3369: the clamp trims a MEMBER's applied credit to the booking's new
+  // price. An organisation-owned booking holds no applied credit, so there is
+  // nothing to clamp, no ledger to lock and no excess to refund. Returning
+  // zeroes is the fact rather than a default.
+  if (memberId === null) {
+    return { appliedCreditCents: 0, refundedExcessCents: 0 };
+  }
+  const { appliedCreditCents, givenBackCents: excessCents } = await giveBackAppliedCredit({
+    memberId,
+    bookingId,
+    giveBackCentsOf: (applied) => applied - Math.max(0, newWorthCents),
+    description: `Applied credit returned after booking ${storedShortBookingId(bookingId)} reprice`,
+    format,
+  }, tx);
+
+  return {
+    appliedCreditCents: appliedCreditCents - excessCents,
+    refundedExcessCents: excessCents,
+  };
+}
+
+/**
+ * THE GIVE-BACK OF APPLIED CREDIT, the one mechanism (#1887's clamp; #3791,
+ * `INV-SSOT`). Its callers: the clamp above, a credit-paid booking's review
+ * share (`edit-financial-review-account-credit.ts`) and its price reduction
+ * (`booking-modify-credit-give-back.ts`, #3809). Under the ledger lock and the
+ * deallocation fence it writes one positive `BOOKING_APPLIED` row for what
+ * `giveBackCentsOf` returns, capped at the credit applied, and posts it through
+ * the credit sync.
+ *
+ * THE XERO STEP IS PART OF IT (owner decision 1 on #3791): where a booking's
+ * applied credit is allocated (bank transfer, or card since #1641) against its Xero
+ * invoice beyond the new applied figure, the durable deallocation operation
+ * commits with the row, so the next inbound sync cannot pull the applied figure
+ * back up to Xero's. Never on a CANCELLED booking, whose invoice would reopen.
+ * The worker makes the provider calls after this transaction, never under the
+ * ledger lock.
+ *
+ * `giveBackCentsOf` is asked under the lock, with the applied credit and the
+ * payment just read, so its answer cannot be stale. Returns that applied credit
+ * (read BEFORE the give-back), what was given back and the payment; the
+ * `Payment.creditAppliedCents` mirror stays the caller's.
+ */
+export async function giveBackAppliedCredit(
+  { memberId, bookingId, giveBackCentsOf, description, format, sourceBookingId }: {
+    memberId: string;
+    bookingId: string;
+    /**
+     * Marks the row as a financial review's give-back (#3791): later reviews of
+     * the booking find the give-backs already made by it, not by a description
+     * a Xero repair may rewrite. Absent on the clamp's.
+     */
+    sourceBookingId?: string;
+    giveBackCentsOf: (
+      appliedCreditCents: number,
+      payment: AppliedCreditGiveBackPayment | null,
+    ) => number | Promise<number>;
+    description: string;
+    /** Club format resolved before the caller's transaction or ledger lock. */
+    format: ClubFormat;
+  },
+  tx: Prisma.TransactionClient,
+): Promise<{ appliedCreditCents: number; givenBackCents: number; payment: AppliedCreditGiveBackPayment | null }> {
+  await lockMemberCreditLedger(memberId, tx);
+  const booking = await tx.booking.findUnique({
+    where: { id: bookingId },
+    select: { status: true, payment: { select: { id: true, source: true, xeroInvoiceId: true, creditAppliedCents: true } } },
+  });
+  const payment = booking?.payment ?? null;
+  if (payment) await assertNoAppliedCreditDeallocationFence(payment.id, tx);
+
+  const appliedCreditCents = await deriveBookingAppliedCreditCents(bookingId, tx);
+  const givenBackCents = Math.max(0, Math.min(appliedCreditCents, await giveBackCentsOf(appliedCreditCents, payment)));
+  if (givenBackCents <= 0) return { appliedCreditCents, givenBackCents: 0, payment };
+
+  await tx.memberCredit.create({
+    data: {
+      memberId,
+      amountCents: givenBackCents,
+      type: CreditType.BOOKING_APPLIED,
+      description,
+      appliedToBookingId: bookingId,
+      ...(sourceBookingId ? { sourceBookingId } : {}),
+    },
+  });
+  await syncBookingLedgerCredits({ bookingId, store: tx });
+
+  // Never on a CANCELLED booking: its invoice stands as the cancellation left
+  // it, and releasing credit allocated against it would reopen it with an
+  // amount due. The caller returns that money in Xero another way (#3791).
+  // #3809: the allocation SLICES decide, not the payment's source - a card
+  // booking's are #1641's - and are checked against their provenance first.
+  if (booking?.status !== BookingStatus.CANCELLED && payment?.xeroInvoiceId) {
+    if (payment.source === PaymentSource.INTERNET_BANKING || (await tx.memberCreditNoteAllocation.count({ where: { appliedToBookingId: bookingId } })) > 0) {
+      await repairLegacyAppliedCreditNoteAllocationsForBooking(bookingId, payment.xeroInvoiceId, tx, format);
+    }
+    const allocated = await tx.memberCreditNoteAllocation.aggregate({
+      where: { appliedToBookingId: bookingId },
+      _sum: { amountCents: true },
+    });
+    const targetAppliedCents = appliedCreditCents - givenBackCents;
+    if ((allocated._sum.amountCents ?? 0) > targetAppliedCents) {
+      const correlationKey = buildXeroIdempotencyKey(
+        "booking", bookingId, "applied-credit-deallocation", targetAppliedCents, "v1"
+      );
+      await startXeroSyncOperation({
+        direction: "OUTBOUND",
+        entityType: "ALLOCATION",
+        operationType: "UPDATE",
+        localModel: "Payment",
+        localId: payment.id,
+        status: "PENDING",
+        idempotencyKey: correlationKey,
+        correlationKey,
+        requestPayload: { queueType: XERO_OUTBOX_APPLIED_CREDIT_DEALLOCATION_TYPE, bookingId },
+        store: tx,
+      });
+    }
+  }
+  return { appliedCreditCents, givenBackCents, payment };
+}
+
+/** The booking's payment as the give-back reads it, under the ledger lock. */
+export type AppliedCreditGiveBackPayment = {
+  id: string;
+  source: PaymentSource;
+  xeroInvoiceId: string | null;
+  creditAppliedCents: number;
+};
+
+export async function applyCreditToBooking(
+  memberId: string,
+  amountCents: number,
+  bookingId: string,
+  tx: Prisma.TransactionClient,
+  /**
+   * The club's format, for the insufficient-balance message. A PARAMETER
+   * because this runs inside the caller's transaction, under the member's
+   * ledger lock, and the format is resolved before that transaction opens
+   * (#3565).
+   */
+  format: ClubFormat,
+  options?: { description?: string },
+): Promise<void> {
+  validateCreditApplicationAmount(amountCents);
+
+  await lockMemberCreditLedger(memberId, tx);
+
+  const balance = await getMemberCreditBalance(memberId, tx);
+  validateCreditApplicationAgainstBalance(amountCents, balance, format);
+
+  await tx.memberCredit.create({
+    data: {
+      memberId,
+      amountCents: calculateAppliedCreditAmount(amountCents),
+      type: CreditType.BOOKING_APPLIED,
+      description: options?.description ?? buildBookingAppliedCreditDescription(bookingId),
+      appliedToBookingId: bookingId,
+    },
+  });
+  await syncBookingLedgerCredits({ bookingId, store: tx });
+}
+
+/**
+ * Restore credit that was previously applied to a booking (on cancellation).
+ * Creates a positive CANCELLATION_REFUND entry to reverse the applied credit.
+ *
+ * `restoreAmountCentsOverride` (#1164 / D7): the member-cancellation path passes
+ * the tiered restore amount so the applied-credit slice is penalised by the same
+ * cancellation tier as the card slice. When omitted, the FULL applied total is
+ * restored — the payment-reconciliation `capacity_failed` system void relies on
+ * this default (a system void must never penalise the member).
+ *
+ * Idempotency (#1636): the restore row carries `restoredFromBookingId = bookingId`,
+ * a nullable-unique key that only this function sets, so at most ONE restore row
+ * per booking can exist REGARDLESS of the caller's advisory-lock granularity. The
+ * insert goes through `createMany({ skipDuplicates: true })` — i.e. `INSERT ...
+ * ON CONFLICT DO NOTHING` — so a duplicate (a concurrent or sequential second
+ * restore of the same booking, e.g. after a future per-lodge lock split moves a
+ * credit-restoring path off the shared `lock(1)`) neither raises nor aborts the
+ * caller's transaction: it inserts nothing and returns 0. (The no-abort property
+ * is READ COMMITTED-scoped — every current caller's isolation level; under
+ * SERIALIZABLE a raced duplicate aborts as 40001, but that attempt writes
+ * nothing, so "never a second credit" holds at every isolation level.)
+ * First call returns the
+ * restored amount unchanged. A plain `create` + catch-P2002 would NOT work here —
+ * a unique violation aborts the whole Postgres transaction, breaking every caller
+ * that does more work after the restore. Returning 0 (not the existing amount) is
+ * the correct no-op: it keeps the orphaned-applied-credit backfill's
+ * `restoredCents <= 0 => did not heal` contract honest and avoids double
+ * notifications. This is ledger-level dedupe, not a claim-first status layer —
+ * the callers' status-guard already single-flights the path, so a second claim
+ * would invert to money-loss (house precedent); a unique key cannot.
+ */
+export async function restoreCreditFromBooking(
+  memberId: string,
+  bookingId: string,
+  tx?: Prisma.TransactionClient,
+  restoreAmountCentsOverride?: number
+): Promise<number> {
+  const db = tx || prisma;
+  // #3792: the member ledger lock, before the read, so the inbound Xero
+  // credit-note sync (same key) cannot post a de-allocation against applied
+  // rows this restore is about to give back. Re-entrant for callers already
+  // holding it; every caller takes lock(1) (and its lodge lock) first.
+  if (tx) await lockMemberCreditLedger(memberId, tx);
+
+  // Find all BOOKING_APPLIED credits for this booking
+  const appliedCredits = await db.memberCredit.findMany({
+    where: bookingAppliedCreditWhere(bookingId),
+  });
+
+  if (appliedCredits.length === 0) {
+    return 0;
+  }
+
+  // The credit still applied = the SIGNED net of the BOOKING_APPLIED rows, not
+  // Σ|amount| (F20 F2, #1887): the clamp appends a positive offset row, so the
+  // abs-sum would over-restore by 2×excess. calculateRestoredCreditAmount nets.
+  const totalApplied = calculateRestoredCreditAmount(appliedCredits);
+
+  // Cap the override at what was actually applied. INVARIANT the cap relies on:
+  // payment.creditAppliedCents (the mirror the cancel path tiers) == the SIGNED
+  // net of BOOKING_APPLIED (this ledger total, post-clamp). The clamp updates the
+  // mirror to the clamped net whenever it fires, so mirror == net still holds; if
+  // the mirror ever exceeds the ledger net, the cap makes actual < preview — the
+  // SAFE direction (never over-restore). Do NOT remove the cap as "dead code".
+  const amount =
+    restoreAmountCentsOverride === undefined
+      ? totalApplied
+      : Math.max(0, Math.min(restoreAmountCentsOverride, totalApplied));
+
+  if (amount <= 0) {
+    return 0;
+  }
+
+  // Create a positive entry to restore the credit. `skipDuplicates` makes this an
+  // INSERT ... ON CONFLICT DO NOTHING keyed on the unique restoredFromBookingId,
+  // so a second restore of this booking is a structural no-op that does not abort
+  // the caller's transaction (see the idempotency note above). A restore row sets
+  // no other unique column, so the only conflict this can hit is restoredFromBookingId.
+  const inserted = await db.memberCredit.createMany({
+    data: [
+      {
+        memberId,
+        amountCents: amount,
+        type: CreditType.CANCELLATION_REFUND,
+        description: `${RESTORED_CREDIT_PREFIX} ${storedShortBookingId(bookingId)}`,
+        sourceBookingId: bookingId,
+        restoredFromBookingId: bookingId,
+      },
+    ],
+    skipDuplicates: true,
+  });
+  await syncBookingLedgerCredits({ bookingId, store: db });
+
+  // count === 0 => a restore row for this booking already existed; nothing was
+  // written and no credit was restored on THIS call.
+  if (inserted.count === 0) {
+    return 0;
+  }
+
+  return amount;
+}
+
+/**
+ * Get credit transaction history for a member.
+ */
+export async function getMemberCreditHistory(memberId: string) {
+  return prisma.memberCredit.findMany({
+    where: { memberId },
+    include: {
+      sourceBooking: {
+        select: { id: true, checkIn: true, checkOut: true },
+      },
+      appliedToBooking: {
+        select: { id: true, checkIn: true, checkOut: true },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+/**
+ * Get credit transaction history for a member, including admin approval metadata.
+ */
+export async function getAdminMemberCreditHistory(memberId: string) {
+  return prisma.memberCredit.findMany({
+    where: { memberId },
+    include: {
+      sourceBooking: {
+        select: { id: true, checkIn: true, checkOut: true },
+      },
+      appliedToBooking: {
+        select: { id: true, checkIn: true, checkOut: true },
+      },
+      requestedBy: {
+        select: { id: true, firstName: true, lastName: true },
+      },
+      approvedBy: {
+        select: { id: true, firstName: true, lastName: true },
+      },
+      approvalRequest: {
+        select: { createdAt: true, reviewedAt: true },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+/**
+ * Get pending admin adjustment requests for a member.
+ */
+export async function getPendingAdminAdjustmentRequests(memberId: string) {
+  return prisma.adminCreditAdjustmentRequest.findMany({
+    where: {
+      memberId,
+      status: AdminCreditAdjustmentRequestStatus.PENDING,
+    },
+    include: {
+      requestedBy: {
+        select: { id: true, firstName: true, lastName: true },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+/**
+ * Get admin adjustment requests across all members for the shared review queue.
+ */
+export async function getAdminAdjustmentRequests(
+  status: AdminCreditAdjustmentRequestStatus | "ALL" = AdminCreditAdjustmentRequestStatus.PENDING
+): Promise<AdminAdjustmentRequestListItem[]> {
+  return prisma.adminCreditAdjustmentRequest.findMany({
+    where:
+      status === "ALL"
+        ? undefined
+        : {
+            status,
+          },
+    select: adminAdjustmentRequestListSelect,
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+/**
+ * Serialize all writers of one member's credit ledger. Take this advisory lock
+ * (transaction-scoped) at the top of any transaction that reads-then-writes a
+ * member's MemberCredit rows so balance validations and restores cannot
+ * interleave. Exported for the orphaned-applied-credit backfill (#1547), which
+ * re-checks its heal predicate under this lock to stay idempotent.
+ */
+export async function lockMemberCreditLedger(
+  memberId: string,
+  tx: Prisma.TransactionClient
+) {
+  await tx.$executeRaw`
+    SELECT pg_advisory_xact_lock(
+      hashtext(${MEMBER_CREDIT_LOCK_NAMESPACE}),
+      hashtext(${memberId})
+    )
+  `;
+}
+
+async function validateNegativeAdjustmentBalance(
+  memberId: string,
+  amountCents: number,
+  format: ClubFormat,
+  tx?: Prisma.TransactionClient
+) {
+  if (amountCents < 0) {
+    const balance = await getMemberCreditBalance(memberId, tx);
+    validateNegativeAdjustmentAgainstBalance(amountCents, balance, format);
+  }
+}
+
+/**
+ * Opening-credit rows (#4988, `INV-PAY-162`), kept here so this module stays
+ * the one place that creates `MemberCredit` rows. The caller is the batch
+ * transaction in `opening-credit-batch.ts`: it holds every member's
+ * `lockMemberCreditLedger`, sorted (`INV-LOCK-002`), and has claimed the batch.
+ * Neither writer queues a Xero note, sends an email or needs a second approver:
+ * the batch total is the one approval.
+ */
+export type OpeningCreditRowInput = { memberId: string; amountCents: number; description: string };
+
+/** What a member sees on a reversal row; the officer's reason stays on the batch. */
+export const OPENING_CREDIT_REVERSED_DESCRIPTION = "Opening credit reversed";
+
+export async function postOpeningCreditRows(
+  tx: Prisma.TransactionClient,
+  input: { batchId: string; approvedById: string; credits: readonly OpeningCreditRowInput[] },
+) {
+  for (const credit of input.credits) {
+    if (!Number.isSafeInteger(credit.amountCents) || credit.amountCents <= 0) {
+      throw new MemberCreditValidationError("An opening credit must be a positive whole number of cents");
+    }
+  }
+  await tx.memberCredit.createMany({
+    data: input.credits.map((credit) => ({
+      memberId: credit.memberId,
+      amountCents: credit.amountCents,
+      type: CreditType.ADMIN_ADJUSTMENT,
+      description: credit.description,
+      approvedById: input.approvedById,
+      openingCreditBatchId: input.batchId,
+    })),
+  });
+}
+
+/**
+ * One negative row per credit of a reversed batch. Every deduction must pass the
+ * same balance rule as an approved negative adjustment before any row is
+ * written; one that does not throws `MemberCreditValidationError` and writes
+ * nothing, and the caller's transaction rolls back its claim.
+ */
+export async function reverseOpeningCreditRows(
+  tx: Prisma.TransactionClient,
+  input: {
+    batchId: string;
+    approvedById: string;
+    credits: readonly { memberId: string; amountCents: number }[];
+    format: ClubFormat;
+  },
+) {
+  for (const credit of input.credits) {
+    await validateNegativeAdjustmentBalance(credit.memberId, -credit.amountCents, input.format, tx);
+  }
+  await tx.memberCredit.createMany({
+    data: input.credits.map((credit) => ({
+      memberId: credit.memberId,
+      amountCents: -credit.amountCents,
+      type: CreditType.ADMIN_ADJUSTMENT,
+      description: OPENING_CREDIT_REVERSED_DESCRIPTION,
+      approvedById: input.approvedById,
+      openingCreditBatchId: input.batchId,
+    })),
+  });
+}
+
+async function findAdminAdjustmentRequestByIdempotencyKey(
+  requestedById: string,
+  idempotencyKey: string
+): Promise<AdminAdjustmentRequestRecord | null> {
+  return prisma.adminCreditAdjustmentRequest.findUnique({
+    where: {
+      requestedById_idempotencyKey: {
+        requestedById,
+        idempotencyKey,
+      },
+    },
+    select: adminAdjustmentRequestSelect,
+  });
+}
+
+/**
+ * Create an admin manual credit adjustment request.
+ * A second admin must approve the request before the credit is applied.
+ */
+export async function createAdminAdjustmentRequest(
+  memberId: string,
+  amountCents: number,
+  description: string,
+  adminId: string,
+  idempotencyKey: string,
+  grantAccount: AdminCreditGrantAccount | null,
+  ipAddress?: string
+) {
+  validateAdjustmentAmount(amountCents);
+  assertGrantAccountMatchesAmount(amountCents, grantAccount);
+  const storedGrantAccount = amountCents > 0 ? grantAccount : null;
+
+  const existingRequest = await findAdminAdjustmentRequestByIdempotencyKey(
+    adminId,
+    idempotencyKey
+  );
+
+  if (existingRequest) {
+    assertMatchingIdempotentAdjustmentRequest(existingRequest, {
+      memberId,
+      amountCents,
+      description,
+      requestedById: adminId,
+      grantAccount: storedGrantAccount,
+    });
+
+    logger.info(
+      {
+        memberId,
+        amountCents,
+        adminId,
+        requestId: existingRequest.id,
+        idempotencyKey,
+      },
+      "Admin credit adjustment request replayed"
+    );
+
+    return {
+      request: existingRequest,
+      replayed: true,
+    };
+  }
+
+  // Resolved BEFORE the transaction opens (#3565): a settings read has no
+  // business inside it, and the balance check and the audit line below both
+  // render money.
+  const format = await clubFormatValues();
+
+  try {
+    const request = await prisma.$transaction(async (tx) => {
+      await lockMemberCreditLedger(memberId, tx);
+      await assertDeductionLeavesNotedCreditUntouched(memberId, amountCents, tx);
+
+      const createdRequest = await tx.adminCreditAdjustmentRequest.create({
+        data: {
+          memberId,
+          amountCents,
+          description,
+          grantAccount: storedGrantAccount,
+          idempotencyKey,
+          requestedById: adminId,
+        },
+        select: adminAdjustmentRequestSelect,
+      });
+
+      await validateNegativeAdjustmentBalance(memberId, amountCents, format, tx);
+
+      await createAuditLog(
+        {
+          action: "member.credit.adjustment.request",
+          category: "payment",
+          entityType: "AdminCreditAdjustmentRequest",
+          entityId: createdRequest.id,
+          memberId: adminId,
+          targetId: memberId,
+          details: `Requested admin credit adjustment ${createdRequest.id}: ${formatAdjustmentAmount(amountCents, format)}. Reason: ${description}.${adminCreditGrantAuditClause(storedGrantAccount)}`,
+          ipAddress,
+        },
+        tx
+      );
+
+      return createdRequest;
+    });
+
+    logger.info(
+      { memberId, amountCents, adminId, requestId: request.id, idempotencyKey },
+      "Admin credit adjustment request created"
+    );
+
+    return {
+      request,
+      replayed: false,
+    };
+  } catch (error) {
+    if (isPrismaUniqueConstraintError(error)) {
+      const replayedRequest = await findAdminAdjustmentRequestByIdempotencyKey(
+        adminId,
+        idempotencyKey
+      );
+
+      if (replayedRequest) {
+        assertMatchingIdempotentAdjustmentRequest(replayedRequest, {
+          memberId,
+          amountCents,
+          description,
+          requestedById: adminId,
+          grantAccount: storedGrantAccount,
+        });
+
+        logger.info(
+          {
+            memberId,
+            amountCents,
+            adminId,
+            requestId: replayedRequest.id,
+            idempotencyKey,
+          },
+          "Admin credit adjustment request replayed after unique conflict"
+        );
+
+        return {
+          request: replayedRequest,
+          replayed: true,
+        };
+      }
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Review a pending admin adjustment request.
+ * Approval applies the adjustment and stamps both admins onto the credit row.
+ */
+export async function reviewAdminAdjustmentRequest(
+  memberId: string,
+  requestId: string,
+  decision: "APPROVE" | "REJECT",
+  adminId: string,
+  ipAddress?: string
+) {
+  // Before the transaction and its ledger lock (#3565).
+  const format = await clubFormatValues();
+
+  const result = await prisma.$transaction(async (tx) => {
+    await lockMemberCreditLedger(memberId, tx);
+
+    const request = await tx.adminCreditAdjustmentRequest.findUnique({
+      where: { id: requestId },
+      select: adminAdjustmentRequestSelect,
+    });
+
+    if (!request || request.memberId !== memberId) {
+      throw new MemberCreditValidationError("Adjustment request not found");
+    }
+
+    if (request.status !== AdminCreditAdjustmentRequestStatus.PENDING) {
+      throw new MemberCreditValidationError("This adjustment request has already been reviewed");
+    }
+
+    if (request.requestedById === adminId) {
+      throw new MemberCreditValidationError("A different admin must approve this adjustment");
+    }
+
+    if (decision === "APPROVE" && request.amountCents > 0 && !request.grantAccount) {
+      throw new MemberCreditValidationError(GRANT_ACCOUNT_MISSING_MESSAGE);
+    }
+
+    if (decision === "APPROVE") {
+      await assertDeductionLeavesNotedCreditUntouched(request.memberId, request.amountCents, tx);
+      validateAdjustmentAmount(request.amountCents);
+      await validateNegativeAdjustmentBalance(
+        request.memberId,
+        request.amountCents,
+        format,
+        tx
+      );
+    }
+
+    const reviewedAt = new Date();
+    const updated = await tx.adminCreditAdjustmentRequest.updateMany({
+      where: {
+        id: request.id,
+        memberId,
+        status: AdminCreditAdjustmentRequestStatus.PENDING,
+      },
+      data: {
+        status:
+          decision === "APPROVE"
+            ? AdminCreditAdjustmentRequestStatus.APPROVED
+            : AdminCreditAdjustmentRequestStatus.REJECTED,
+        reviewedById: adminId,
+        reviewedAt,
+      },
+    });
+
+    if (updated.count !== 1) {
+      throw new MemberCreditValidationError("This adjustment request has already been reviewed");
+    }
+
+    if (decision === "REJECT") {
+      await createAuditLog(
+        {
+          action: "member.credit.adjustment.reject",
+          category: "payment",
+          entityType: "AdminCreditAdjustmentRequest",
+          entityId: request.id,
+          memberId: adminId,
+          targetId: memberId,
+          details: `Rejected admin credit adjustment ${request.id}: ${formatAdjustmentAmount(request.amountCents, format)}. Requested by ${request.requestedById}. Reason: ${request.description}.${adminCreditGrantAuditClause(request.grantAccount)}`,
+          ipAddress,
+        },
+        tx
+      );
+
+      return {
+        decision,
+        request,
+        credit: null,
+      };
+    }
+
+    const credit = await tx.memberCredit.create({
+      data: {
+        memberId: request.memberId,
+        amountCents: request.amountCents,
+        type: CreditType.ADMIN_ADJUSTMENT,
+        description: request.description,
+        requestedById: request.requestedById,
+        approvedById: adminId,
+        approvalRequestId: request.id,
+      },
+    });
+
+    if (request.amountCents > 0 && request.grantAccount) {
+      await enqueueAdminGrantCreditNote(tx, {
+        id: credit.id,
+        amountCents: request.amountCents,
+        grantAccount: request.grantAccount,
+      });
+    }
+
+    await createAuditLog(
+      {
+        action: "member.credit.adjustment.approve",
+        category: "payment",
+        entityType: "AdminCreditAdjustmentRequest",
+        entityId: request.id,
+        memberId: adminId,
+        targetId: memberId,
+        details: `Approved admin credit adjustment ${request.id} as credit ${credit.id}: ${formatAdjustmentAmount(request.amountCents, format)}. Requested by ${request.requestedById}. Reason: ${request.description}.${adminCreditGrantAuditClause(request.grantAccount)}`,
+        // #2695 (`INV-PRIV-018`) — DECLARED MEMBER-FACING, owner decision of
+        // 9 August 2026. The only explanation a member ever gets for why their
+        // credit balance moved, which is why both fixes the issue originally
+        // sketched were refused: each would have taken it away.
+        //
+        // Written out rather than reusing `details` above, and that is the
+        // point: `details` is the officers' record. It names the credit row and
+        // the member who asked for the adjustment, and NEITHER reaches any
+        // member surface (`INV-PRIV-012`). And `formatAdjustmentAmount` renders the
+        // officers' amount SIGNED (`+$25.00`, #3533); a member reads the
+        // direction as a word, with the amount unsigned.
+        //
+        // The claim is the free text only, on purpose: the adjustment REQUEST's
+        // id is this row's `entityId`, which the timeline returns to both
+        // audiences, so that one identifier does cross — as an opaque handle on
+        // the member's own request, not as an explanation. Withholding it is a
+        // change to every row on the timeline rather than to this sentence.
+        memberDisclosure: {
+          visibility: "member-facing",
+          text:
+            request.amountCents >= 0
+              ? `Credit of ${formatCents(request.amountCents, format)} added to your account. Reason: ${request.description}`
+              : `Credit of ${formatCents(Math.abs(request.amountCents), format)} deducted from your account. Reason: ${request.description}`,
+        },
+        ipAddress,
+      },
+      tx
+    );
+
+    return {
+      decision,
+      request,
+      credit,
+    };
+  });
+
+  logger.info(
+    {
+      memberId,
+      requestId: result.request.id,
+      creditId: result.credit?.id,
+      amountCents: result.request.amountCents,
+      adminId,
+    },
+    result.decision === "APPROVE"
+      ? "Admin credit adjustment approved"
+      : "Admin credit adjustment rejected"
+  );
+
+  if (result.decision === "APPROVE" && result.request.amountCents > 0 && result.credit) {
+    void import("@/lib/xero-operation-outbox")
+      .then(({ kickQueuedXeroOutboxOperationsIfConnected }) => kickQueuedXeroOutboxOperationsIfConnected())
+      .catch((error: unknown) => {
+        logger.error(
+          { err: error, memberId, requestId },
+          "Failed to kick the Xero outbox after approving an admin credit grant",
+        );
+      });
+  }
+
+  return result;
+}

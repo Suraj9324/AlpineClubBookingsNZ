@@ -1,0 +1,127 @@
+// test seam
+import type { AdminCreditGrantAccount } from "@/lib/admin-credit-grant-account";
+import { isAdminCreditGrantAccount } from "@/lib/admin-credit-grant-account";
+import { formatCents, formatSignedCents } from "@/lib/utils";
+
+import type { ClubFormat } from "@/lib/club-format";
+export const ADMIN_ADJUSTMENT_IDEMPOTENCY_CONFLICT =
+  "This idempotency key was already used for a different adjustment request";
+
+export class MemberCreditValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MemberCreditValidationError";
+  }
+}
+
+export interface AdminAdjustmentRequestComparison {
+  memberId: string;
+  amountCents: number;
+  description: string;
+  requestedById: string;
+  grantAccount: AdminCreditGrantAccount | null;
+}
+
+/**
+ * A positive grant names one of the two accounts. A deduction names none.
+ * A positive request stored without one cannot be approved later by guessing.
+ */
+export function assertGrantAccountMatchesAmount(
+  amountCents: number,
+  grantAccount: AdminCreditGrantAccount | null,
+): void {
+  if (amountCents > 0 && !isAdminCreditGrantAccount(grantAccount)) {
+    throw new MemberCreditValidationError("Choose which account this credit belongs to.");
+  }
+  if (amountCents < 0 && grantAccount !== null) {
+    throw new MemberCreditValidationError("A deduction does not choose a Xero account.");
+  }
+}
+
+export interface CreditAmountEntry {
+  amountCents: number;
+}
+
+export function formatAdjustmentAmount(
+  amountCents: number,
+  format: ClubFormat,
+): string {
+  return formatSignedCents(amountCents, format);
+}
+
+export function validateAdjustmentAmount(amountCents: number): void {
+  if (amountCents === 0) {
+    throw new MemberCreditValidationError("Adjustment amount cannot be zero");
+  }
+}
+
+export function validateNegativeAdjustmentAgainstBalance(
+  amountCents: number,
+  balanceCents: number,
+  format: ClubFormat,
+): void {
+  if (amountCents < 0 && balanceCents + amountCents < 0) {
+    throw new MemberCreditValidationError(
+      `Cannot deduct ${formatCents(Math.abs(amountCents), format)}: only ${formatCents(balanceCents, format)} available`
+    );
+  }
+}
+
+export function validateCreditApplicationAmount(amountCents: number): void {
+  if (amountCents <= 0) {
+    throw new MemberCreditValidationError("Credit amount must be positive");
+  }
+}
+
+export function validateCreditApplicationAgainstBalance(
+  amountCents: number,
+  balanceCents: number,
+  format: ClubFormat,
+): void {
+  validateCreditApplicationAmount(amountCents);
+
+  if (balanceCents < amountCents) {
+    throw new MemberCreditValidationError(
+      `Insufficient credit balance: ${formatCents(balanceCents, format)} available, ${formatCents(amountCents, format)} requested`
+    );
+  }
+}
+
+export function calculateAppliedCreditAmount(amountCents: number): number {
+  validateCreditApplicationAmount(amountCents);
+  return -amountCents;
+}
+
+/**
+ * Credit still applied to a booking, as a positive cents amount — the correct
+ * default restore total.
+ *
+ * This is the SIGNED net of the BOOKING_APPLIED rows (`max(0, -Σ amount)`), NOT
+ * `Σ|amount|`. Before F20 (#1887) every BOOKING_APPLIED row was negative, so the
+ * two were equal. The F20 clamp appends a POSITIVE BOOKING_APPLIED offset row to
+ * return an over-consumed slice on a pre-payment reprice, so `Σ|amount|` now
+ * over-counts by 2×excess; a default (no-override) restore keyed on the abs-sum
+ * would mint credit from nothing. Netting is exact for any mix of signs and
+ * identical to the old abs-sum when all rows are negative.
+ */
+export function calculateRestoredCreditAmount(
+  appliedCredits: CreditAmountEntry[]
+): number {
+  const net = appliedCredits.reduce((sum, credit) => sum + credit.amountCents, 0);
+  return Math.max(0, -net);
+}
+
+export function assertMatchingIdempotentAdjustmentRequest(
+  request: AdminAdjustmentRequestComparison,
+  expected: AdminAdjustmentRequestComparison
+): void {
+  if (
+    request.memberId !== expected.memberId ||
+    request.amountCents !== expected.amountCents ||
+    request.description !== expected.description ||
+    request.requestedById !== expected.requestedById ||
+    request.grantAccount !== expected.grantAccount
+  ) {
+    throw new MemberCreditValidationError(ADMIN_ADJUSTMENT_IDEMPOTENCY_CONFLICT);
+  }
+}

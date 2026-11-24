@@ -1,0 +1,1147 @@
+/**
+ * P2.3: Subscription check for member guests on booking creation
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { NextRequest } from "next/server";
+
+// ─── Mocks ────────────────────────────────────────────────────────────────────
+
+const mockTx = {
+  $executeRaw: vi.fn().mockResolvedValue(undefined),
+  $executeRawUnsafe: vi.fn().mockResolvedValue(undefined),
+  // #2364: the hosting review is reconciled inside the booking write, so
+  // every prisma/tx double a booking path runs against needs this client.
+  adultMemberHostingPolicy: { findMany: vi.fn().mockResolvedValue([]) },
+  booking: {
+    findMany: vi.fn(),
+    create: vi.fn(),
+    update: vi.fn(),
+    updateMany: vi.fn(),
+  },
+  bookingGuest: {
+    findMany: vi.fn(),
+  },
+  payment: { create: vi.fn() },
+  season: { findMany: vi.fn() },
+  promoRedemption: { count: vi.fn(), create: vi.fn() },
+  promoCode: { findUnique: vi.fn(), update: vi.fn() },
+  member: { findUnique: vi.fn() },
+  memberSubscription: { findFirst: vi.fn(), findMany: vi.fn() },
+};
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    // #3770 R2: the create route reads the booker's lodge restrictions before
+    // its member lookup; nobody here has one.
+    memberLodgeAccess: { findMany: vi.fn().mockResolvedValue([]) },
+    lodge: {
+      findFirst: vi.fn().mockResolvedValue({ id: "lodge-1" }),
+      // #2701: the create resolves the lodge the request NAMED, so the route
+      // reads it back by id instead of falling through to the default lodge.
+      findUnique: vi.fn().mockResolvedValue({ id: "lodge-1", active: true }),
+    },
+    // #1982: default lodge capacity is a self-healed DB override.
+    lodgeSettings: { findUnique: async () => ({ capacity: 100 }) },
+    // #2364: the hosting review is reconciled inside the booking write, so
+    // every prisma/tx double a booking path runs against needs this client.
+    adultMemberHostingPolicy: { findMany: vi.fn().mockResolvedValue([]) },
+    // #3032: the preview half of the pending-review fence reads this. Empty by
+    // default - no financial review is open - so this suite asserts exactly what
+    // it asserted before.
+    // #3954: no increase is waiting on its mint's recovery for a reduction to net off.
+    paymentRecoveryOperation: { findMany: vi.fn(async () => []) },
+    // #5061 follow-up: a card payment's reduction reads its captures for a dispute hold; none is disputed.
+    paymentTransaction: { findMany: vi.fn(async () => []) },
+    stripeDispute: { findMany: vi.fn(async () => []) },
+    manualRefundTask: { aggregate: vi.fn(async () => ({ _sum: { amountCents: null } })), findFirst: vi.fn().mockResolvedValue(null) },
+    booking: {
+      findUnique: vi.fn(),
+      findMany: vi.fn(),
+      findFirst: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    bookingGuest: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    bookingRequest: {
+      findFirst: vi.fn().mockResolvedValue(null),
+    },
+    payment: { create: vi.fn() },
+    member: {
+      count: vi.fn(),
+      findUnique: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    memberSubscription: {
+      findFirst: vi.fn(),
+      findMany: vi.fn(),
+    },
+    // Rate resolver (#1930, E4): the NON_MEMBER type is the default rate key.
+    membershipType: {
+      findMany: vi.fn().mockResolvedValue([
+        { id: "type-nonmember", key: "NON_MEMBER" },
+        { id: "type-full", key: "FULL" },
+      ]),
+    },
+    seasonalMembershipAssignment: { findMany: vi.fn().mockResolvedValue([]) },
+    familyGroupMember: { findMany: vi.fn() },
+    season: { findMany: vi.fn() },
+    promoCode: { findUnique: vi.fn(), update: vi.fn() },
+    promoRedemption: { count: vi.fn(), create: vi.fn() },
+    auditLog: { create: vi.fn().mockResolvedValue({}) },
+    groupDiscountSetting: { findUnique: vi.fn().mockResolvedValue(null) },
+    $transaction: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/auth", () => ({ auth: vi.fn() }));
+vi.mock("@/lib/cancellation", () => ({
+  getNonMemberHoldDays: vi.fn().mockResolvedValue(7),
+  getNonMemberHoldPolicy: vi.fn().mockResolvedValue({
+    enabled: true,
+    holdDays: 7,
+    source: "default",
+  }),
+  daysUntilDate: vi.fn().mockReturnValue(30),
+  loadCancellationPolicy: vi.fn().mockResolvedValue([
+    {
+      daysBeforeStay: 0,
+      refundPercentage: 50,
+      creditRefundPercentage: 75,
+      fixedFeeCents: 0,
+      creditFixedFeeCents: 0,
+    },
+  ]),
+  calculateDualRefundAmounts: (paidAmountCents: number) => ({
+    cardRefundAmountCents: Math.round((paidAmountCents * 50) / 100),
+    cardRefundPercentage: 50,
+    creditRefundAmountCents: Math.round((paidAmountCents * 75) / 100),
+    creditRefundPercentage: 75,
+  }),
+}));
+vi.mock("@/lib/pricing", () => ({
+  calculateBookingPrice: vi.fn().mockReturnValue({
+    totalPriceCents: 10000,
+    guests: [
+      { priceCents: 5000, perNightCents: [2500, 2500] },
+      { priceCents: 5000, perNightCents: [2500, 2500] },
+    ],
+  }),
+  getStayNights: vi.fn((checkIn: Date, checkOut: Date) => {
+    const nights: Date[] = [];
+    const current = new Date(checkIn);
+    while (current < checkOut) {
+      nights.push(new Date(current));
+      current.setUTCDate(current.getUTCDate() + 1);
+    }
+    return nights;
+  }),
+}));
+vi.mock("@/lib/booking-policies", () => ({
+  validateMinimumStay: vi.fn().mockResolvedValue({ valid: true, violations: [] }),
+  formatViolationsDetail: vi.fn().mockReturnValue(""),
+}));
+vi.mock("@/lib/capacity", () => ({
+  acquireLodgeCapacityLock: vi.fn().mockResolvedValue(undefined),
+  checkCapacity: vi.fn().mockResolvedValue({ available: true, minAvailable: 29, nightDetails: [] }),
+  checkCapacityForGuestRanges: vi.fn().mockResolvedValue({ available: true, minAvailable: 29, nightDetails: [] }),
+  getOccupiedBedsForNight: vi.fn().mockReturnValue(0),
+  LODGE_CAPACITY: 29,
+}));
+vi.mock("@/lib/promo", () => ({
+  validatePromoCodeRules: vi.fn().mockReturnValue(null),
+  validateAndCalculatePromoDiscount: vi.fn().mockResolvedValue({
+    discount: { discountCents: 0, priceAdjustmentCents: 0, freeNightsUsed: 0, eligibleGuestCount: 0, allocations: [] },
+    beneficiaryMemberIds: [],
+  }),
+  shouldPersistPromoRedemption: vi.fn().mockReturnValue(true),
+  redeemPromoCode: vi.fn(),
+  getMemberFreeNightsUsed: vi.fn().mockResolvedValue(0),
+}));
+vi.mock("@/lib/rate-limit", () => ({ applyRateLimit: vi.fn().mockReturnValue(null), rateLimiters: { bookingCreate: {} } }));
+vi.mock("@/lib/email", () => ({
+  sendBookingPendingEmail: vi.fn().mockResolvedValue(undefined),
+  sendBookingConfirmedEmail: vi.fn().mockResolvedValue(undefined),
+  sendAdminNewBookingAlert: vi.fn().mockResolvedValue(undefined),
+  sendWaitlistConfirmationEmail: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/xero-token-store", () => ({ isXeroConnected: vi.fn().mockResolvedValue(false) }));
+vi.mock("@/lib/xero-booking-invoices", () => ({ createXeroInvoiceForBooking: vi.fn() }));
+vi.mock("@/lib/xero-operation-outbox", () => ({
+  enqueueXeroBookingInvoiceOperation: vi.fn().mockResolvedValue({
+    queueOperationId: null,
+    message: "already linked",
+  }),
+  kickQueuedXeroOutboxOperationsIfConnected: vi.fn().mockResolvedValue(null),
+}));
+vi.mock("@/lib/stripe", () => ({ createPaymentIntent: vi.fn(), findOrCreateCustomer: vi.fn(), getPaymentIntent: vi.fn() }));
+vi.mock("@/lib/logger", () => ({ default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+vi.mock("@/lib/waitlist", () => ({}));
+vi.mock("@/lib/member-credit", () => ({ getMemberCreditBalance: vi.fn().mockResolvedValue(0), applyCreditToBooking: vi.fn() }));
+vi.mock("@/lib/session-guards", () => ({ requireActiveSessionUser: vi.fn().mockResolvedValue(null) }));
+// The booking-time subscription gates consult the effective module flags
+// (Xero-off bypass); default to Xero on so guest checks behave as before.
+const mockLoadEffectiveModuleFlags = vi.fn();
+vi.mock("@/lib/module-settings", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/module-settings");
+  return {
+    ...actual,
+    loadEffectiveModuleFlags: (...args: unknown[]) =>
+      mockLoadEffectiveModuleFlags(...args),
+  };
+});
+
+// ─── Imports ──────────────────────────────────────────────────────────────────
+
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+import { POST as createBooking } from "@/app/api/bookings/route";
+import { POST as getModifyQuote } from "@/app/api/bookings/[id]/modify-quote/route";
+
+const mockPrisma = prisma as unknown as {
+  booking: { findUnique: ReturnType<typeof vi.fn>; findMany: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn> };
+  bookingGuest: { findMany: ReturnType<typeof vi.fn> };
+  bookingRequest: { findFirst: ReturnType<typeof vi.fn> };
+  payment: { create: ReturnType<typeof vi.fn> };
+  member: { count: ReturnType<typeof vi.fn>; findUnique: ReturnType<typeof vi.fn>; findMany: ReturnType<typeof vi.fn> };
+  memberSubscription: { findFirst: ReturnType<typeof vi.fn>; findMany: ReturnType<typeof vi.fn> };
+  familyGroupMember: { findMany: ReturnType<typeof vi.fn> };
+  season: { findMany: ReturnType<typeof vi.fn> };
+  $transaction: ReturnType<typeof vi.fn>;
+};
+
+const mockAuth = auth as ReturnType<typeof vi.fn>;
+
+/**
+ * Stub `member.findMany` for the id-list queries this suite was written for,
+ * while answering #2721's own-dependant query with `[]`.
+ *
+ * `POST /api/bookings` now also asks `member.findMany` who the BOOKER'S OWN
+ * recorded dependants are, and that query is recognisable by its `OR` over the
+ * two parent-link columns. The blanket stubs below were written when this table
+ * was asked exactly one question, so without this wrapper they answer BOTH with
+ * the same rows — and a member-linked guest is read back as a dependant of the
+ * booker, which turns a guest-subscription case into an identity refusal. This
+ * suite's booker has no recorded dependants.
+ */
+function stubMemberFindMany(
+  rows:
+    | unknown[]
+    | ((args: {
+        where?: { id?: { in?: string[] } };
+      }) => Promise<unknown[]> | unknown[]),
+) {
+  mockPrisma.member.findMany.mockImplementation(
+    async (args: { where?: { OR?: unknown; id?: { in?: string[] } } }) => {
+      if (args?.where?.OR) return [];
+      return typeof rows === "function" ? rows(args) : rows;
+    },
+  );
+}
+
+const checkInDate = "2026-12-01";
+const checkOutDate = "2026-12-03";
+const checkIn = new Date(`${checkInDate}T00:00:00.000Z`);
+const checkOut = new Date(`${checkOutDate}T00:00:00.000Z`);
+
+function makeRequest(guests: Array<Record<string, unknown>>, extra: Record<string, unknown> = {}) {
+  return new NextRequest("http://localhost/api/bookings", {
+    method: "POST",
+    body: JSON.stringify({
+      checkIn: checkInDate,
+      checkOut: checkOutDate,
+      guests,
+      // #2701: a create must NAME its lodge — the route refuses one that does
+      // not rather than resolving the blank to the club's default lodge.
+      lodgeId: "lodge-1",
+      ...extra,
+    }),
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function makeModifyQuoteRequest(body: Record<string, unknown>) {
+  return new NextRequest("http://localhost/api/bookings/booking-1/modify-quote", {
+    method: "POST",
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+
+  // Xero module effectively on so subscription enforcement is active.
+  mockLoadEffectiveModuleFlags.mockResolvedValue({
+    kiosk: true,
+    chores: true,
+    financeDashboard: true,
+    waitlist: true,
+    xeroIntegration: true,
+    bedAllocation: true,
+    internetBankingPayments: false,
+  });
+
+  // Active, verified member by default
+  mockPrisma.member.count.mockResolvedValue(1);
+  mockPrisma.member.findUnique.mockResolvedValue({ id: "member-1", active: true, emailVerified: true, xeroContactId: "xero-1" });
+  // Guest memberId resolution — member-1 and guest-member-1 share a family group
+  mockPrisma.familyGroupMember.findMany.mockImplementation(async (args: { where?: { memberId?: string; familyGroupId?: { in?: string[] } } }) => {
+    if (args?.where?.memberId === "member-1") {
+      return [{ familyGroupId: "family-1", memberId: "member-1" }];
+    }
+    if (args?.where?.familyGroupId) {
+      return [
+        { familyGroupId: "family-1", memberId: "member-1" },
+        { familyGroupId: "family-1", memberId: "guest-member-1" },
+        { familyGroupId: "family-1", memberId: "guest-member-2" },
+      ];
+    }
+    return [];
+  });
+  stubMemberFindMany([
+    { id: "member-1", ageTier: "ADULT" },
+    { id: "guest-member-1", ageTier: "ADULT", firstName: "Bob", lastName: "Jones" },
+  ]);
+  mockPrisma.booking.findUnique.mockResolvedValue({
+    id: "booking-1",
+    memberId: "member-1",
+    checkIn,
+    checkOut,
+    status: "CONFIRMED",
+    finalPriceCents: 10000,
+    discountCents: 0,
+    guests: [
+      {
+        id: "existing-1",
+        firstName: "Alice",
+        lastName: "Smith",
+        ageTier: "ADULT",
+        isMember: true,
+        memberId: "member-1",
+        priceCents: 5000,
+      },
+    ],
+    payment: null,
+    promoRedemption: null,
+  });
+  // Owner has paid subscription
+  mockPrisma.memberSubscription.findFirst.mockResolvedValue({ id: "sub-1", status: "PAID" });
+  // Guest subscription check — default: all paid
+  mockPrisma.memberSubscription.findMany.mockResolvedValue([
+    {
+      memberId: "guest-member-1",
+      status: "PAID",
+      xeroOnlineInvoiceUrl: null,
+      xeroInvoiceNumber: null,
+    },
+  ]);
+  mockPrisma.bookingGuest.findMany.mockResolvedValue([]);
+  mockPrisma.season.findMany.mockResolvedValue([]);
+
+  mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx as unknown as typeof mockTx));
+  mockTx.$executeRaw.mockResolvedValue(undefined);
+  mockTx.booking.findMany.mockResolvedValue([]);
+  mockTx.bookingGuest.findMany.mockResolvedValue([]);
+  mockTx.booking.create.mockResolvedValue({
+    id: "booking-1",
+    status: "CONFIRMED",
+    finalPriceCents: 10000,
+    nonMemberHoldUntil: null,
+    guests: [{ id: "g1" }, { id: "g2" }],
+  });
+  mockTx.season.findMany.mockResolvedValue([]);
+});
+
+describe("P2.3: Guest subscription check", () => {
+  it("blocks booking when a member-guest has unpaid subscription", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.memberSubscription.findMany.mockResolvedValue([
+      {
+        memberId: "guest-member-1",
+        status: "UNPAID",
+        xeroOnlineInvoiceUrl: "https://pay.xero.com/rebecca",
+        xeroInvoiceNumber: "INV-REB-1",
+      },
+    ]);
+    // member.findMany is called multiple times:
+    // 1. resolveLinkedBookingMembers (needs ageTier for linked members)
+    // 2. unpaid member name lookup (needs firstName/lastName)
+    stubMemberFindMany([
+      { id: "member-1", ageTier: "ADULT", firstName: "Alice", lastName: "Smith" },
+      { id: "guest-member-1", ageTier: "ADULT", firstName: "Bob", lastName: "Jones" },
+    ]);
+
+    const req = makeRequest([
+      { firstName: "Alice", lastName: "Smith", ageTier: "ADULT", isMember: true },
+      { firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true, memberId: "guest-member-1" },
+    ]);
+
+    const res = await createBooking(req);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.code).toBe("GUEST_SUBSCRIPTION_REQUIRED");
+    expect(body.unpaidMembers).toContain("Bob Jones");
+    expect(body.unpaidMemberInvoices).toContainEqual(
+      expect.objectContaining({
+        memberId: "guest-member-1",
+        name: "Bob Jones",
+        invoiceUrl: "https://pay.xero.com/rebecca",
+        invoiceNumber: "INV-REB-1",
+        status: "UNPAID",
+      })
+    );
+  });
+
+  it("allows booking when all member-guests have paid subscriptions", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    // findMany returns paid sub for guest-member-1
+    mockPrisma.memberSubscription.findMany.mockResolvedValue([
+      {
+        memberId: "guest-member-1",
+        status: "PAID",
+        xeroOnlineInvoiceUrl: null,
+        xeroInvoiceNumber: null,
+      },
+    ]);
+
+    const req = makeRequest([
+      { firstName: "Alice", lastName: "Smith", ageTier: "ADULT", isMember: true },
+      { firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true, memberId: "guest-member-1" },
+    ]);
+
+    const res = await createBooking(req);
+    // Should not be 403 — either 201 or other valid response
+    expect(res.status).not.toBe(403);
+  });
+
+  it("allows child and infant member-guests without subscription invoice rows", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.memberSubscription.findMany.mockResolvedValue([]);
+    stubMemberFindMany(async (args: { where?: { id?: { in?: string[] } } }) => {
+      const ids = args?.where?.id?.in ?? [];
+      if (ids.includes("guest-member-1")) {
+        return [
+          { id: "member-1", ageTier: "ADULT", firstName: "Alice", lastName: "Smith" },
+          { id: "guest-member-1", ageTier: "CHILD", firstName: "Bob", lastName: "Jones" },
+        ];
+      }
+      return [{ id: "member-1", ageTier: "ADULT", firstName: "Alice", lastName: "Smith" }];
+    });
+
+    const req = makeRequest([
+      { firstName: "Alice", lastName: "Smith", ageTier: "ADULT", isMember: true },
+      { firstName: "Bob", lastName: "Jones", ageTier: "CHILD", isMember: true, memberId: "guest-member-1" },
+    ]);
+
+    const res = await createBooking(req);
+    const body = await res.json().catch(() => ({}));
+    expect(res.status).not.toBe(403);
+    expect(body.code).not.toBe("GUEST_SUBSCRIPTION_REQUIRED");
+  });
+
+  it("uses the stored member age tier when deciding if a guest subscription is required", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.memberSubscription.findMany.mockResolvedValue([]);
+    stubMemberFindMany([
+      { id: "member-1", ageTier: "ADULT", firstName: "Alice", lastName: "Smith" },
+      { id: "guest-member-1", ageTier: "ADULT", firstName: "Bob", lastName: "Jones" },
+    ]);
+
+    const req = makeRequest([
+      { firstName: "Alice", lastName: "Smith", ageTier: "ADULT", isMember: true },
+      { firstName: "Bob", lastName: "Jones", ageTier: "CHILD", isMember: true, memberId: "guest-member-1" },
+    ]);
+
+    const res = await createBooking(req);
+    const body = await res.json();
+    expect(res.status).toBe(403);
+    expect(body.code).toBe("GUEST_SUBSCRIPTION_REQUIRED");
+    expect(body.unpaidMembers).toContain("Bob Jones");
+  });
+
+  it("admin-created bookings bypass guest subscription check", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "admin-1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } });
+    // No paid subs for guest
+    mockPrisma.memberSubscription.findMany.mockResolvedValue([]);
+
+    const req = makeRequest(
+      [
+        { firstName: "Alice", lastName: "Smith", ageTier: "ADULT", isMember: true },
+        { firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true, memberId: "guest-member-1" },
+      ],
+      { forMemberId: "member-1" }
+    );
+
+    const res = await createBooking(req);
+    // Admin bypass — should not be 403 GUEST_SUBSCRIPTION_REQUIRED
+    const body = await res.json();
+    expect(body.code).not.toBe("GUEST_SUBSCRIPTION_REQUIRED");
+  });
+
+  it("non-member guests are not checked for subscriptions", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+
+    const req = makeRequest([
+      { firstName: "Alice", lastName: "Smith", ageTier: "ADULT", isMember: true },
+      { firstName: "Random", lastName: "Visitor", ageTier: "ADULT", isMember: false },
+    ]);
+
+    const res = await createBooking(req);
+    // memberSubscription.findMany should NOT be called for non-member guests
+    // The call is only made when there are member guests with memberIds
+    expect(res.status).not.toBe(403);
+  });
+
+  it("error message includes names of all unpaid members", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.memberSubscription.findMany.mockResolvedValue([]);
+    stubMemberFindMany(async (args: { where?: { id?: { in?: string[] } } }) => {
+      const ids = args?.where?.id?.in;
+      if (ids && (ids.includes("guest-member-1") || ids.includes("guest-member-2"))) {
+        return [
+          { id: "guest-member-1", ageTier: "ADULT", firstName: "Bob", lastName: "Jones" },
+          { id: "guest-member-2", ageTier: "ADULT", firstName: "Carol", lastName: "White" },
+        ];
+      }
+      return [{ id: "member-1", ageTier: "ADULT" }];
+    });
+
+    const req = makeRequest([
+      { firstName: "Alice", lastName: "Smith", ageTier: "ADULT", isMember: true },
+      { firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true, memberId: "guest-member-1" },
+      { firstName: "Carol", lastName: "White", ageTier: "ADULT", isMember: true, memberId: "guest-member-2" },
+    ]);
+
+    const res = await createBooking(req);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.code).toBe("GUEST_SUBSCRIPTION_REQUIRED");
+    expect(body.unpaidMembers).toContain("Bob Jones");
+    expect(body.unpaidMembers).toContain("Carol White");
+    expect(body.error).toContain("Bob Jones");
+    expect(body.error).toContain("Carol White");
+  });
+
+  it("blocks the modify quote flow from adding an unpaid member-guest later", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.memberSubscription.findMany.mockResolvedValue([]);
+    stubMemberFindMany([
+      { id: "member-1", ageTier: "ADULT", firstName: "Alice", lastName: "Smith" },
+      { id: "guest-member-1", ageTier: "ADULT", firstName: "Bob", lastName: "Jones" },
+    ]);
+
+    const req = makeModifyQuoteRequest({
+      addGuests: [
+        {
+          firstName: "Bob",
+          lastName: "Jones",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: "guest-member-1",
+        },
+      ],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.code).toBe("GUEST_SUBSCRIPTION_REQUIRED");
+    expect(body.unpaidMembers).toContain("Bob Jones");
+  });
+
+  it("blocks the modify quote preview for quote-priced bookings (#1032)", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    // The booking was converted from a booking request: previewing an edit
+    // would show a season-rate delta the mutating endpoints refuse anyway.
+    mockPrisma.bookingRequest.findFirst.mockResolvedValueOnce({ id: "req_1" });
+
+    const req = makeModifyQuoteRequest({
+      addGuests: [
+        { firstName: "New", lastName: "Student", ageTier: "CHILD", isMember: false },
+      ],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("negotiated booking-request price");
+  });
+
+  it("previews identity-only edits on a quote-priced booking as a zero-delta quote (#1099)", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    // Quote-converted school booking with a placeholder student.
+    mockPrisma.bookingRequest.findFirst.mockResolvedValueOnce({ id: "req_1" });
+    mockPrisma.booking.findUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      checkIn,
+      checkOut,
+      status: "CONFIRMED",
+      totalPriceCents: 87000,
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      finalPriceCents: 87000,
+      guests: [
+        {
+          id: "student-1",
+          firstName: "School Child",
+          lastName: "1",
+          ageTier: "YOUTH",
+          isMember: false,
+          memberId: null,
+          priceCents: 87000,
+        },
+      ],
+      payment: null,
+      promoRedemption: null,
+    });
+
+    const req = makeModifyQuoteRequest({
+      guestUpdates: [
+        { guestId: "student-1", firstName: "Aroha", lastName: "Ngata" },
+      ],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Zero-delta: the negotiated price is echoed back untouched, and the
+    // pricing engine never runs.
+    expect(body.priceDiffCents).toBe(0);
+    expect(body.netChargeCents).toBe(0);
+    expect(body.newFinalPriceCents).toBe(87000);
+    expect(body.itemizedChanges).toEqual([
+      { label: "Guest name update", amountCents: 0 },
+    ]);
+  });
+
+  it("previews an identity-preserving typo fix on a fully-paid booking as zero-delta (#1386)", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    // Ordinary (non-quoted) fully-paid booking with a free-text non-member guest.
+    mockPrisma.booking.findUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      checkIn,
+      checkOut,
+      status: "PAID",
+      totalPriceCents: 5000,
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      finalPriceCents: 5000,
+      guests: [
+        {
+          id: "guest-1",
+          firstName: "Jhon",
+          lastName: "Doe",
+          ageTier: "ADULT",
+          isMember: false,
+          memberId: null,
+          priceCents: 5000,
+        },
+      ],
+      payment: {
+        status: "SUCCEEDED",
+        amountCents: 5000,
+        additionalAmountCents: 0,
+        additionalPaymentStatus: null,
+      },
+      promoRedemption: null,
+    });
+
+    const req = makeModifyQuoteRequest({
+      guestUpdates: [{ guestId: "guest-1", firstName: "John", lastName: "Doe" }],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.priceDiffCents).toBe(0);
+    expect(body.netChargeCents).toBe(0);
+    expect(body.newFinalPriceCents).toBe(5000);
+  });
+
+  it("rejects a swap in the modify-quote preview on a fully-paid booking (#1386)", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.booking.findUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      checkIn,
+      checkOut,
+      status: "PAID",
+      totalPriceCents: 5000,
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      finalPriceCents: 5000,
+      guests: [
+        {
+          id: "guest-1",
+          firstName: "Old",
+          lastName: "Guest",
+          ageTier: "ADULT",
+          isMember: false,
+          memberId: null,
+          priceCents: 5000,
+        },
+      ],
+      payment: {
+        status: "SUCCEEDED",
+        amountCents: 5000,
+        additionalAmountCents: 0,
+        additionalPaymentStatus: null,
+      },
+      promoRedemption: null,
+    });
+
+    const req = makeModifyQuoteRequest({
+      guestUpdates: [{ guestId: "guest-1", firstName: "New", lastName: "Guest" }],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("spelling corrections");
+  });
+
+  it("quotes per-guest stay range changes by guest-night ranges", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    const { checkCapacityForGuestRanges } = await import("@/lib/capacity");
+    const { calculateBookingPrice } = await import("@/lib/pricing");
+    const mockedRangeCapacity = vi.mocked(checkCapacityForGuestRanges);
+    const mockedPrice = vi.mocked(calculateBookingPrice);
+
+    mockedRangeCapacity.mockResolvedValue({
+      available: true,
+      minAvailable: 29,
+      nightDetails: [],
+    });
+    mockedPrice.mockReturnValue({
+      totalPriceCents: 7500,
+      guests: [
+        { ageTier: "ADULT" as const, isMember: true, rateMembershipTypeId: "type-member", nights: 1, priceCents: 2500, perNightCents: [2500], nightDates: [] },
+        { ageTier: "ADULT" as const, isMember: true, rateMembershipTypeId: "type-member", nights: 2, priceCents: 5000, perNightCents: [2500, 2500], nightDates: [] },
+      ],
+    });
+    mockPrisma.booking.findUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      checkIn,
+      checkOut,
+      status: "CONFIRMED",
+      totalPriceCents: 10000,
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      finalPriceCents: 10000,
+      guests: [
+        {
+          id: "existing-1",
+          firstName: "Alice",
+          lastName: "Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: "member-1",
+          stayStart: checkIn,
+          stayEnd: checkOut,
+          priceCents: 5000,
+          // #3166: the two nights this guest holds, carrying what they were sold
+          // for. Every edit path is now judged on exact stored sold-price
+          // evidence, so a strand with no night rows PARKS the quote for
+          // financial review and no settlement figure is quoted at all — which
+          // is the gate working, not the range or refund question these cases
+          // are about.
+          nights: [
+            { stayDate: checkIn, priceCents: 2500, priceSource: "SOLD" },
+            {
+              stayDate: new Date("2026-12-02T00:00:00.000Z"),
+              priceCents: 2500,
+              priceSource: "SOLD",
+            },
+          ],
+        },
+        {
+          id: "existing-2",
+          firstName: "Bob",
+          lastName: "Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: null,
+          stayStart: checkIn,
+          stayEnd: checkOut,
+          priceCents: 5000,
+          // #3166: the two nights this guest holds, carrying what they were sold
+          // for. Every edit path is now judged on exact stored sold-price
+          // evidence, so a strand with no night rows PARKS the quote for
+          // financial review and no settlement figure is quoted at all — which
+          // is the gate working, not the range or refund question these cases
+          // are about.
+          nights: [
+            { stayDate: checkIn, priceCents: 2500, priceSource: "SOLD" },
+            {
+              stayDate: new Date("2026-12-02T00:00:00.000Z"),
+              priceCents: 2500,
+              priceSource: "SOLD",
+            },
+          ],
+        },
+      ],
+      payment: null,
+      promoRedemption: null,
+    });
+
+    const req = makeModifyQuoteRequest({
+      checkOut: "2026-12-04",
+      guestStayRanges: [
+        {
+          guestId: "existing-1",
+          stayStart: "2026-12-01",
+          stayEnd: "2026-12-02",
+        },
+        {
+          guestId: "existing-2",
+          stayStart: "2026-12-02",
+          stayEnd: "2026-12-04",
+        },
+      ],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.newTotalPriceCents).toBe(7500);
+    expect(mockedRangeCapacity).toHaveBeenCalledWith(
+      "lodge-1",
+      new Date("2026-12-01T00:00:00.000Z"),
+      new Date("2026-12-04T00:00:00.000Z"),
+      [
+        expect.objectContaining({
+          stayStart: new Date("2026-12-01T00:00:00.000Z"),
+          stayEnd: new Date("2026-12-02T00:00:00.000Z"),
+        }),
+        expect.objectContaining({
+          stayStart: new Date("2026-12-02T00:00:00.000Z"),
+          stayEnd: new Date("2026-12-04T00:00:00.000Z"),
+        }),
+      ],
+      "booking-1"
+    );
+    expect(mockedPrice).toHaveBeenCalledWith(
+      new Date("2026-12-01T00:00:00.000Z"),
+      new Date("2026-12-04T00:00:00.000Z"),
+      [
+        expect.objectContaining({
+          stayStart: new Date("2026-12-01T00:00:00.000Z"),
+          stayEnd: new Date("2026-12-02T00:00:00.000Z"),
+        }),
+        expect.objectContaining({
+          stayStart: new Date("2026-12-02T00:00:00.000Z"),
+          stayEnd: new Date("2026-12-04T00:00:00.000Z"),
+        }),
+      ],
+      expect.any(Array),
+      undefined
+    );
+  });
+
+  it("includes policy-adjusted card refund and account credit options for paid booking reductions", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    const { calculateBookingPrice } = await import("@/lib/pricing");
+    const mockedPrice = vi.mocked(calculateBookingPrice);
+
+    mockedPrice.mockReturnValue({
+      totalPriceCents: 5000,
+      guests: [{ ageTier: "ADULT" as const, isMember: true, rateMembershipTypeId: "type-member", nights: 2, priceCents: 5000, perNightCents: [2500, 2500], nightDates: [] }],
+    });
+    mockPrisma.booking.findUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      checkIn,
+      checkOut,
+      status: "CONFIRMED",
+      totalPriceCents: 10000,
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      finalPriceCents: 10000,
+      guests: [
+        {
+          id: "existing-1",
+          firstName: "Alice",
+          lastName: "Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: "member-1",
+          stayStart: checkIn,
+          stayEnd: checkOut,
+          priceCents: 5000,
+          // #3166: the two nights this guest holds, carrying what they were sold
+          // for. Every edit path is now judged on exact stored sold-price
+          // evidence, so a strand with no night rows PARKS the quote for
+          // financial review and no settlement figure is quoted at all — which
+          // is the gate working, not the range or refund question these cases
+          // are about.
+          nights: [
+            { stayDate: checkIn, priceCents: 2500, priceSource: "SOLD" },
+            {
+              stayDate: new Date("2026-12-02T00:00:00.000Z"),
+              priceCents: 2500,
+              priceSource: "SOLD",
+            },
+          ],
+        },
+        {
+          id: "existing-2",
+          firstName: "Bob",
+          lastName: "Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: null,
+          stayStart: checkIn,
+          stayEnd: checkOut,
+          priceCents: 5000,
+          // #3166: the two nights this guest holds, carrying what they were sold
+          // for. Every edit path is now judged on exact stored sold-price
+          // evidence, so a strand with no night rows PARKS the quote for
+          // financial review and no settlement figure is quoted at all — which
+          // is the gate working, not the range or refund question these cases
+          // are about.
+          nights: [
+            { stayDate: checkIn, priceCents: 2500, priceSource: "SOLD" },
+            {
+              stayDate: new Date("2026-12-02T00:00:00.000Z"),
+              priceCents: 2500,
+              priceSource: "SOLD",
+            },
+          ],
+        },
+      ],
+      payment: {
+        id: "payment-1",
+        amountCents: 10000,
+        refundedAmountCents: 0,
+        status: "SUCCEEDED",
+        source: "STRIPE",
+        stripePaymentIntentId: "pi_card",
+      },
+      promoRedemption: null,
+    });
+
+    const req = makeModifyQuoteRequest({
+      removeGuestIds: ["existing-2"],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.netChargeCents).toBe(-5000);
+    expect(body.settlementOptions).toEqual({
+      basisAmountCents: 5000,
+      cardRefundAmountCents: 2500,
+      cardRefundPercentage: 50,
+      accountCreditAmountCents: 3750,
+      accountCreditPercentage: 75,
+      daysUntilCheckIn: 30,
+      requiresSettlementMethod: true,
+      returnsToOrganiser: false,
+      organiserRefundByBankTransfer: false,
+      refundByBankTransfer: false,
+      refundHeldForDispute: false,
+    });
+  });
+
+  it("blocks the modify quote flow from pricing incomplete linked member guests", async () => {
+    mockAuth.mockResolvedValue({ user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] } });
+    mockPrisma.familyGroupMember.findMany.mockImplementation(async (args: { where?: { memberId?: string | { in?: string[] }; familyGroupId?: { in?: string[] } } }) => {
+      if (args?.where?.memberId === "member-1") {
+        return [{ familyGroupId: "family-1", memberId: "member-1" }];
+      }
+      if (args?.where?.familyGroupId) {
+        return [
+          { familyGroupId: "family-1", memberId: "member-1" },
+          { familyGroupId: "family-1", memberId: "guest-member-1" },
+        ];
+      }
+      if (typeof args?.where?.memberId === "object" && args.where.memberId.in) {
+        return [
+          { familyGroupId: "family-1", memberId: "member-1" },
+          { familyGroupId: "family-1", memberId: "guest-member-1" },
+        ];
+      }
+      return [];
+    });
+    stubMemberFindMany(async (args: { where?: { id?: { in?: string[] } } }) => {
+      const ids = args?.where?.id?.in ?? [];
+      if (ids.includes("guest-member-1")) {
+        return [
+          {
+            id: "guest-member-1",
+            active: true,
+            ageTier: "ADULT",
+            canLogin: false,
+            firstName: "Bob",
+            lastName: "Jones",
+            phoneCountryCode: "64",
+            phoneAreaCode: "27",
+            phoneNumber: "4224115",
+            dateOfBirth: null,
+            streetAddressLine1: "1 Snow Road",
+            streetCity: "Taupo",
+            streetRegion: "Waikato",
+            streetPostalCode: "3330",
+            streetCountry: "NZ",
+            postalAddressLine1: "1 Snow Road",
+            postalCity: "Taupo",
+            postalRegion: "Waikato",
+            postalPostalCode: "3330",
+            postalCountry: "NZ",
+            role: "MEMBER",
+            profileCompletedAt: null,
+            detailsConfirmedAt: null,
+            detailsConfirmedByMemberId: null,
+            onboardingConfirmedAt: null,
+          },
+        ];
+      }
+      if (ids.includes("member-1")) {
+        return [{ id: "member-1", active: true, canLogin: true, ageTier: "ADULT" }];
+      }
+      return [];
+    });
+
+    const req = makeModifyQuoteRequest({
+      addGuests: [
+        {
+          firstName: "Bob",
+          lastName: "Jones",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: "guest-member-1",
+        },
+      ],
+    });
+
+    const res = await getModifyQuote(req, {
+      params: Promise.resolve({ id: "booking-1" }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.code).toBe("GUEST_PROFILE_REQUIRED");
+    expect(body.members).toContainEqual(
+      expect.objectContaining({
+        memberId: "guest-member-1",
+        missingFields: expect.arrayContaining(["Date of Birth"]),
+        action: "complete_details",
+      })
+    );
+    expect(mockPrisma.memberSubscription.findMany).not.toHaveBeenCalled();
+  });
+
+  it("quotes a pre-check-in removal on a booking with no stored rows at the departing guest's stored price (#4317, T2)", async () => {
+    // THE PREVIEW HALF of INV-MOD-028's quote/save parity requirement. #3166
+    // parked this preview; since #4317 the save prices it, so the preview must
+    // quote the same: the departing guest's stored $50 is credited, and the
+    // remaining guest — no night rows, valued at their stored $50 — is
+    // unchanged.
+    //
+    // The strand is the ordinary two-night one, with its night rows removed —
+    // a legacy booking, or one created by approving a request (#2739).
+    mockAuth.mockResolvedValue({
+      user: { id: "member-1", role: "MEMBER", accessRoles: [{ role: "USER" }] },
+    });
+    const { calculateBookingPrice } = await import("@/lib/pricing");
+    vi.mocked(calculateBookingPrice).mockReturnValue({
+      totalPriceCents: 5000,
+      guests: [
+        {
+          ageTier: "ADULT" as const,
+          isMember: true,
+          rateMembershipTypeId: "type-member",
+          nights: 2,
+          priceCents: 5000,
+          perNightCents: [2500, 2500],
+          nightDates: [],
+        },
+      ],
+    });
+    mockPrisma.booking.findUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      checkIn,
+      checkOut,
+      status: "CONFIRMED",
+      totalPriceCents: 10000,
+      discountCents: 0,
+      promoAdjustmentCents: 0,
+      finalPriceCents: 10000,
+      guests: [
+        {
+          id: "existing-1",
+          firstName: "Alice",
+          lastName: "Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: "member-1",
+          stayStart: checkIn,
+          stayEnd: checkOut,
+          priceCents: 5000,
+          nights: [],
+        },
+        {
+          id: "existing-2",
+          firstName: "Bob",
+          lastName: "Smith",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: null,
+          stayStart: checkIn,
+          stayEnd: checkOut,
+          priceCents: 5000,
+          nights: [],
+        },
+      ],
+      payment: {
+        id: "payment-1",
+        amountCents: 10000,
+        refundedAmountCents: 0,
+        status: "SUCCEEDED",
+      },
+      promoRedemption: null,
+    });
+
+    const res = await getModifyQuote(
+      makeModifyQuoteRequest({ removeGuestIds: ["existing-2"] }),
+      { params: Promise.resolve({ id: "booking-1" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Priced, the same as the identical removal on the booking WITH night rows
+    // (the case above): a $50 reduction, and no review notice.
+    expect(body.financialReviewRequired).toBeUndefined();
+    expect(body.priceDiffCents).toBe(-5000);
+    expect(body.netChargeCents).toBe(-5000);
+    expect(body.newFinalPriceCents).toBe(5000);
+  });
+});

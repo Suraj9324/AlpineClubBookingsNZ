@@ -1,0 +1,98 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema-jsonc.json",
+  // Keep exports that are referenced only within their own file (e.g. a constant
+  // or function exported for a sibling test but also used internally). This
+  // collapses the bulk of the "unused type-only export" surface that #1129/#1178
+  // deliberately kept, leaving only exports with genuinely zero references.
+  "ignoreExportsUsedInFile": true,
+  "entry": [
+    // Framework / tooling entry points knip's plugins cannot trace to their caller.
+    // Playwright reaches this only via `testMatch: /auth\.setup\.ts/` in playwright.config.ts.
+    "e2e/auth.setup.ts",
+    // Invoked from scripts/e2e-stack.sh (shell), never imported.
+    "e2e/setup/enable-e2e-modules.ts",
+    // Invoked from scripts/e2e-stack.sh (shell) to relativize booking seasons on
+    // the E2E DB so seeded fixtures never expire (#2117), never imported.
+    "e2e/setup/relativize-seasons.ts",
+    // Invoked from scripts/e2e-stack.sh (shell) only when E2E_MULTI_LODGE=1
+    // (advisory multi-lodge project, #1568), never imported.
+    "e2e/setup/seed-second-lodge.ts",
+    // Invoked from scripts/e2e-stack.sh (shell) to seed test-mode Stripe keys
+    // into the encrypted credential store (#2082), never imported.
+    "e2e/setup/seed-stripe-credentials.ts",
+    // Invoked from scripts/e2e-stack.sh (shell) to capture the shared fixture
+    // club date before seeding (#3702), never imported by a TypeScript caller.
+    "scripts/e2e-fixture-today.ts",
+    // Invoked by hand (node scripts/branding/generate-calendar-icons.mjs) to
+    // regenerate the committed add-to-calendar email icons under
+    // public/branding/calendar/ (triyder/AlpineClubBookingsNZ#41); never imported.
+    "scripts/branding/generate-calendar-icons.mjs",
+    // Invoked from scripts/codex/run-next-issue.sh + docs, never imported.
+    "scripts/codex/create-review-issues.mjs",
+    "scripts/codex/issue-to-prompt.mjs",
+    // Transpiled by the `theme:vendor-transpile` script, never imported. knip
+    // traced it through that script while it was `npx -y esbuild@… <file>`,
+    // but it does not parse `pnpm dlx` (#3673), so it needs saying here.
+    "scripts/theme/vendor/generate-radix-colors.tsx",
+    // Named by `vitest.configFile` in stryker.config.mjs (#4459), a string in a
+    // config knip's Stryker plugin does not follow, so nothing imports it.
+    "vitest.stryker.config.mts",
+    // Loaded by the fixture's index.html, which the Vite server in
+    // scripts/e2e-contracts/dialog-viewport.pw.ts serves (#4967); never imported.
+    "scripts/e2e-contracts/fixtures/dialog-viewport/main.tsx"
+    // NOTE: the five documented operator CLIs listed here until #2850 —
+    // xero-booking-repair, xero-refund-note-link-repair,
+    // backfill-orphaned-applied-credits, audit-ib-hold-clearing and
+    // diagnose-calendar-access — no longer need an entry. Each is now
+    // published as an npm script so the operator does not have to remember
+    // `--conditions=react-server`, and knip's package.json plugin reaches
+    // them through those scripts. Left in place, the patterns made knip
+    // report five redundant entries and exit 1.
+    // NOTE: scripts/diagnostics/generate-knowledge-bundle.ts (AID-3, #2372) does
+    // NOT need an entry — knip's package.json plugin already reaches it through
+    // the `diagnostics:bundle` npm script.
+    // `src/instrumentation.node.ts` deliberately has NO entry here. It used to
+    // (#1178), partly justified by an `onRequestError` export that Next never
+    // reads from this file — that hook now lives on `src/instrumentation.ts`,
+    // where the framework actually looks (#2356 review). The remaining
+    // justification was hollow too: knip already follows the dynamic
+    // `import("./instrumentation.node")` in `src/instrumentation.ts`, which the
+    // Next plugin supplies as an entry, so the carve-out changed nothing.
+    // Verified by removing it and re-running `npx knip` (exit 0).
+  ],
+  // The k6 load harness (#1884) is operator-invoked tooling that runs under the
+  // k6 binary, not Node/Next — its scripts import k6-runtime modules (k6/http,
+  // k6/execution, ...) that are not npm packages, so knip cannot analyze them.
+  // Dead-code coverage for load/ comes from `node --check` + eslint instead.
+  // #2686: `.semgrep/**` holds the repository's own Semgrep rules and their
+  // must-fail/must-pass fixtures. Nothing in the application imports them —
+  // Semgrep reads them directly, and the `Static analysis gate` job runs
+  // `semgrep --test` over them on every pull request, which is what proves they
+  // are alive. knip would report every fixture as an unused file.
+  //
+  // The #2352/#2663 measurement harness (`measurement/**`) carried the same
+  // kind of carve-out here. It was removed whole by #3382, so the carve-out
+  // went with it rather than becoming a stale ignore for a directory that no
+  // longer exists.
+  "ignore": ["load/**", ".semgrep/**"],
+  "ignoreBinaries": [
+    // Runtime shell-outs; these binaries live on the host/container, not node_modules.
+    // #2418: the data-migration gate's contract test runs the shared awk statement
+    // splitter (scripts/lib/split-sql-statements.awk) directly, to prove it agrees
+    // with the TypeScript splitter the runner executes with.
+    "awk",
+    "psql", // src/lib/backup.ts + scripts/audit-access-role-membership-cleanup.ts
+    "pg_dump", // src/lib/backup.ts logical backups
+    "gunzip", // src/lib/backup.ts restore path
+    // Windows system tools the worktree-removal suite uses to build a
+    // volume-path junction and an unreadable folder (#3673).
+    "mountvol",
+    "icacls",
+    "k6" // load/ harness, run via the `load:*` scripts (#1884); host binary, not a dep
+  ],
+  "ignoreIssues": {
+    // shadcn/ui vendored primitives keep the full Radix-parity export/type surface
+    // by design; unused idiom exports are expected (#1129/#1178 kept class).
+    "src/components/ui/**": ["exports", "types"]
+  }
+}

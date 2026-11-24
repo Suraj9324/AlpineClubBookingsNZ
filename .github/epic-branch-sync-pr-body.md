@@ -1,0 +1,80 @@
+<!-- The pull-request description that `.github/workflows/epic-branch-sync.yml`
+     writes when it opens a `main` -> `epic/**` sync pull request.
+
+     IT LIVES IN A FILE RATHER THAN IN THE WORKFLOW'S SHELL for one reason: it
+     has to satisfy the `## Concurrency And Lock Impact` gate, whose field
+     labels are matched EXACTLY, and a template nobody can run through that gate
+     offline is a template whose next typo surfaces as a red pull request from a
+     scheduled job that may well run with nobody awake to read it.
+     `scripts/ci/render-epic-sync-pr-body.test.mjs` runs this file
+     through the real gates, and through the real field list in
+     `.github/pull_request_template.md`, so a mistyped label fails `pnpm test`
+     instead.
+
+     TWO WRITERS, ONE TEXT (#3721). The workflow renders it for the sync pull
+     requests it opens from `main`; `pnpm run epic:sync-body` renders it for a
+     sync a person opens by hand from a merge branch. Everything outside a
+     marked block is shared, so the five field labels below are written once.
+     A block between the `workflow` open and close markers is kept only in the
+     workflow's body, and one between the `by-hand` markers only in the
+     hand-opened one. A block may sit inside a line or span whole lines; a
+     whole-line block is removed together with its line breaks.
+
+     Substituted literally, with no escaping and no other placeholders:
+       __BRANCH__       the epic branch being synced, e.g. epic/2943-group-trip-hosting
+       __RUN_URL__      (workflow) the run that opened or refreshed this pull request
+       __HEAD_SHA__     (by hand) the sync merge commit
+       __EPIC_SHA__     (by hand) its first parent, the epic branch's tip
+       __MAIN_SHA__     (by hand) its second parent, the `main` commit merged in
+       __RESOLUTIONS__  (by hand) every path git reported as conflicted or whose
+                        content differs from its automatic merge, read from
+                        `git merge-tree`, never from the author -->
+
+<!-- workflow -->
+Automated sync of `main` into this epic's integration branch (#3002), opened or refreshed every six hours.
+<!-- /workflow -->
+<!-- by-hand -->
+Sync of `main` into `__BRANCH__` (#3002), opened by hand from a merge branch because `epic/**` does not take direct pushes.
+
+- Merge commit: `__HEAD_SHA__`
+- Epic tip (first parent): `__EPIC_SHA__`
+- `main` merged in (second parent): `__MAIN_SHA__`
+- Hand resolutions: __RESOLUTIONS__
+<!-- /by-hand -->
+
+It exists so the eventual `__BRANCH__` → `main` merge is a series of small reconciles rather than one large one. This repository has twice shipped a **wrong value** out of a hand-resolved long-lived conflict — #2979's file-size ceiling, and the `CHANGELOG.md` churn #2452 ended — so the cost of letting this sit is not merely inconvenience.
+
+<!-- workflow -->
+**It merges immediately only after the composed-tree check passes and GitHub reports `CLEAN`.** The workflow combines the `main` and epic tips locally, runs `pnpm run ci:fast-censuses --base <exact-epic-sha>`, and re-checks both tips before merging. Prior auto-merge is disabled; all other states stay unarmed until a fresh check or hand resolution. The check and its stated limits are described in `docs/agents/EPIC_PLAYBOOK.md` → "Drift".
+
+**If it conflicts,** resolve it by hand on a merge branch made from `origin/__BRANCH__`, and open that as a hand sync with `pnpm run epic:sync-body` (the steps are in `docs/agents/ISSUE_WORKFLOW.md` → "Drift"); `epic/**` takes no direct push. Do not force-push a shared integration branch, and do not let a merge tool pick a side unread. Classify each conflict: where the two sides differ only in a NUMBER, that number is usually measured and must be RE-measured after the merge rather than picked; where they differ in words, both edits usually belong.
+
+Run: __RUN_URL__
+<!-- /workflow -->
+
+## Plan Deviation
+
+- None — a sync builds no plan of its own. Every commit in the range merged to `main` on its own pull request, which answered this section for its own issue's plan.
+
+large-pr: a sync merges `main` commits that were each reviewed on their own pull request; nothing in the range is new code to review here.
+
+## Concurrency And Lock Impact
+
+**<!-- workflow -->The sync workflow<!-- /workflow --><!-- by-hand -->`pnpm run epic:sync-body`<!-- /by-hand --> wrote this section; no person examined the diff to produce it, and it must not be read as though one had.** It is here because the gate that requires it is the first step of `verify`, so without it the job fails in under half a minute and every later step — lint, typecheck, knip, the suite, the build — is skipped. That is precisely backwards: proving `main` and this epic branch still work together is the entire point of the sync, and the missing section was stopping the proof from ever running (#3142).
+
+The answers below are true structurally, not because anything was inspected. <!-- workflow -->**This pull request's head IS `main`.**<!-- /workflow --><!-- by-hand -->**This pull request's head is a merge of a `main` commit into this branch, and no hand resolution in it touches a concurrency-sensitive path** — the command refuses to write this section otherwise.<!-- /by-hand --> It therefore introduces no commit that has not already merged to `main` under its own declaration and its own nine required checks — nothing in the range is being reviewed here for the first time, and no writer, key or acquisition order anywhere is added, removed or reordered by merging `main` into a branch.
+
+`N/A` is deliberately not ticked. The range does carry concurrency-sensitive paths — `prisma/schema.prisma` and `prisma/migrations/` among them — so ticking it would assert something untrue about the diff even though it is true about the merge.
+
+- [ ] N/A
+- Writer class(es), canonical lock key(s), and acquisition order: None new, structurally — see above. Every writer and lock key in this range landed on `main` on its own pull request, under its own declaration.
+- Immutable pre-lock key source and mutable under-lock re-read: Unchanged. No lock-taking code is written by this merge, so no key source and no under-lock re-read moves.
+- Status-guarded claim and proof that a lost claim runs no side effect: Unchanged. No status-guarded claim is added or altered, and merging already-merged commits onto an integration branch runs no side effect of its own.
+- Relevant open/last-10 PR numbers, counterpart writers/tests, and compatibility evidence: #3002 is the integration-branch model this sync serves and #3142 is why this section exists. The evidence that matters is not a list of pull request numbers: <!-- workflow -->it is the run linked above, whose cheap composed-tree checks must pass on the exact `main` and `__BRANCH__` tips before an immediate `CLEAN` merge (#3513).<!-- /workflow --><!-- by-hand -->it is the nine required checks running on **this** pull request, over `main` and `__BRANCH__` merged together.<!-- /by-hand --> Whether the two sides' writers actually compose is measured there, which is the whole reason the sync opens as a pull request instead of pushing.
+- Provider calls inside a transaction (write `None`, or justify the bounded exception from `docs/CONCURRENCY_AND_LOCKING.md`): None.
+
+**Where the real lock question gets asked.** A merge can compose two writers that were each declared correctly and still disagree — `main` taking lock A then B while this epic takes B then A. Nothing above rules that out, and nothing above claims to. That question belongs to `__BRANCH__`'s own pull request into `main`, which is an ordinary gated pull request with a real author writing a real declaration over the epic's real diff.
+
+## Changelog Entry
+
+- changelog: none — a sync introduces no source change of its own. Every entry for the commits in this range is already a `changelog.d/` fragment written by the pull request that landed it on `main`, and it compiles at release from there; writing a second entry here would double-count it.

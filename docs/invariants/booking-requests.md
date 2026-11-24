@@ -1,0 +1,374 @@
+# Booking Requests
+
+Audience: Developer, Agent.
+
+Prefix defined in this file: **`INV-REQ`** — which of a Booking Officer's two
+notes a member reads, what the member's own request area is allowed to say about
+a request's state, and what an officer may correct on a request before it is
+converted.
+
+Read this file when you are changing booking-request notes, the member's own
+request area, or the officer's correction of an unconverted request.
+
+Index: [`docs/DOMAIN_INVARIANTS.md`](../DOMAIN_INVARIANTS.md) — every `INV-*` ID
+with a one-line description of what it covers. ID scheme and allocation rules:
+[`SCHEME.md`](SCHEME.md).
+
+Every heading below whose whole text is an `INV-*` ID defines that invariant. IDs
+are permanent: never renumbered, never reused. **The text under each ID is a
+verbatim move from the source document and must not be reworded in place** —
+only the ID heading lines were added.
+
+## The officer-note split on booking requests (#2562)
+
+### INV-REQ-001
+
+A Booking Officer's decision carries **two** notes, and which audience reads which
+is an invariant, not a convention. It is **table-wide**, which means all three
+officer surfaces that decide a request on these tables and not just the
+policy-exception one: `BookingChangeRequest` holds both kinds of row, and its
+LOCKED_PERIOD half is decided from a different panel
+(`booking-change-requests-panel.tsx` → `PATCH
+/api/admin/booking-change-requests/[id]`) that writes the same column. On a
+finished stay that approval also APPLIES the request (#3750), and the two notes
+are written by the same guarded claim that executes it.
+
+### INV-REQ-002
+
+- `adminNotes` is **member-visible**, on both request tables and for both kinds of
+  `BookingChangeRequest` row. It is the decision explanation, written for the
+  member: rendered on their own request list, on their booking page under "Change
+  Requests", and interpolated into the policy-exception approval and refusal
+  emails. A `LOCKED_PERIOD` decision sends no email of its own; an executed one
+  (#3750) reaches the member as the ordinary booking-change email. Every officer
+  screen labels it as member-visible *before* the decision is submitted, so nobody
+  discovers the audience afterwards. A box headed only "Admin notes" over this
+  column is a defect — it is what let an officer type a judgement about a member
+  into the sentence that member then read verbatim.
+
+### INV-REQ-003
+
+- `internalNotes` is **never member-visible**, on either table or either kind. It is
+  the officer's private commentary — a judgement about the member, a reference to
+  somebody else's booking, a note for the next officer — and is read only by
+  admin-guarded surfaces (the two officer queues and the per-request detail
+  endpoint, all behind `requireAdmin`). Every officer surface that offers the
+  member-facing field offers this one beside it, because an officer with no private
+  field writes private things in the public one.
+
+### INV-REQ-004
+
+Four structural properties hold that boundary, so it does not depend on any single
+call site remembering it:
+
+1. **The member DTO has no slot for it.** `toMemberExceptionRequestItem`
+   (`src/lib/member-exception-requests.ts`) is a strict allowlist that never spreads
+   a row, and its INPUT type does not accept `internalNotes` — handing the private
+   note to the member projection is a typecheck failure, not a privacy incident.
+2. **Every member-reachable read names its columns and omits the column.**
+   `readMemberExceptionRequests` does, and so does every handler on
+   `/api/bookings/[id]/change-requests` — GET **and** POST — through the shared
+   manifest in `booking-change-request-member-view.ts`, whose census test proves the
+   two halves of the manifest cover the whole scalar enum. So a column added to the
+   model fails that test until somebody decides in writing whether a member may read
+   it, and on the member path there is nothing in memory for a later mapper edit to
+   leak. The member's booking page selects `adminNotes` and not `internalNotes`.
+3. **No email, notification or member-facing template names it.** The approval and
+   refusal emails compose their optional line from `adminNotes` alone.
+4. **The audit log records its EXISTENCE, never its text**
+   (`internalNoteRecorded: boolean`). The audit trail is read by more surfaces than
+   the officer queue, and copying the text there would make it private in one place
+   and not the other.
+
+### INV-REQ-005
+
+**A private note is never a substitute for the member-facing one.** Refusing a
+policy-exception request still requires `adminNotes`, and so does approving an
+adult-member hosting exception (D-R4's reason-for-the-record): a refusal the member
+cannot read is a refusal they cannot act on. The exception decision route says so
+in its own 400 message rather than silently accepting an internal note in its
+place, and the locked-period panel keeps BOTH decision buttons disabled until that
+request's own member-facing field is filled in. "That request's own" is part of the
+rule, and it is held STRUCTURALLY rather than by a marker: the panel draws every
+open request's form at once and keeps **one draft per request id**
+(`decisionDrafts[request.id]`), which each field reads, writes and submits from, so
+a note begun against one request is neither submitted with another nor able to
+unlock another's buttons — whichever field is typed in, in whatever order. Two
+earlier shapes both failed that: the original guard read
+`reviewingId === request.id && !adminNotes.trim()`, which left every untouched row
+decidable with no explanation at all; the shared-slot repair that followed still let
+the internal-note and modification-id handlers move the ownership marker while the
+previous row's sentence sat in the shared slot, so a keystroke on one card put
+another member's explanation into this card's field, unlocked its buttons and posted
+it under that member's request. The sibling policy-exception queue is an accordion
+(one `openId`, one mounted form, draft reset on open) and its decision path refuses
+to act for any card that is not the open one.
+
+### INV-REQ-006
+
+The column is an expand-only addition
+(`20260803040000_add_policy_exception_internal_notes`), nullable with no backfill on
+both tables, so a decision written by an older deployment carries `internalNotes`
+NULL — which reads correctly as "the officer left no private note", because that
+deployment had no field to write one in.
+
+## The member's own request area (#2562)
+
+### INV-REQ-007
+
+The member-facing projection of an exception request states only facts, never
+intentions:
+
+- **Capacity comes from the reservation ledger, never from the policy's capacity
+  mode.** `capacityHeld` is true only where live `PolicyExceptionReservationNight`
+  rows exist. It is therefore false for **every** new-booking request whatever its
+  mode says (the ledger keys to an existing `BookingChangeRequest`, and there is no
+  booking yet), and false for a modification whose incremental footprint came out
+  empty — a pure shrink. The generic sentence "your beds are held while we review"
+  is false for the whole new-booking population and appears nowhere.
+- **A recorded conflict is reported, not hidden.** A `REQUESTED` row with
+  `lastConflictAt` set reads as "an officer tried and the lodge was full", never as
+  "nobody has looked". Those are different facts and the second is one the member
+  would act on.
+- **Approval is never described as the moment beds are secured**, on either the
+  pending or the approved sentence. An approval creates the booking the member's own
+  wizard would have created (PENDING or PAYMENT_PENDING), which holds nothing until
+  it is paid, so a pending new-booking row says availability is rechecked at review
+  *and* that an approved new booking still holds no beds until it is paid.
+- **The created booking is described from TWO facts about its own row**, both
+  established by the caller and neither derived from the other:
+  `createdBookingHoldsCapacity` (`bookingHoldsCapacity`) and
+  `createdBookingAwaitsPayment` (still inside `ACTIVE_BOOKING_STATUSES`). "Holds no
+  beds" is equally true of an unpaid booking and of a cancelled or reaped one, so the
+  instruction to open it and pay it is conditional on the second fact; a closed
+  booking gets a sentence that says it is no longer live, and an unreadable one gets
+  the rule with no instruction at all.
+- **Withdraw and replace are offered only where the API would accept them**,
+  derived from the same `status = REQUESTED` condition the cancel and supersede
+  services' guarded claims name.
+- **The request action is offered only where the SERVER classified the refusal as
+  reviewable.** One shared rule (`readExceptionOffer`,
+  `src/lib/booking-exception-offer.ts`) decides it for both wizards, and it fails
+  closed: an allowlist of reviewable refusal codes that can never contain a
+  hard-stop code, a required non-empty `exceptionReview`, the server's own
+  `exceptionEligible: true` on every violation, and a known capacity mode. One
+  unrecognised violation disqualifies the whole refusal, because a request can only
+  override the rules it froze.
+
+## Correcting a request before it is converted (#2936)
+
+### INV-REQ-008
+
+**Correcting an unconverted request re-opens it, in the claim's own
+transaction.** `correctBookingRequest` (`src/lib/booking-request-corrections.ts`)
+is the one writer; every price and every quote on a request was computed from
+the shape it corrects, so none of them may outlive the correction.
+
+- **Every `DRAFT` and `SENT` quote becomes `SUPERSEDED`**, `priceCents`,
+  `pricedByMemberId` and `pricedAt` are cleared and the status returns to
+  `VERIFIED`, in the transaction that claims the row. No edit is small enough to
+  skip it; the quote status is `SUPERSEDED`, never `CANCELLED`.
+- **An accepted quote refuses the correction (`409`) on either evidence**: a
+  quote row at `ACCEPTED`, or the request's own `acceptedQuoteId`.
+- **The guarded claim fences on all four together** — `version`, a correctable
+  status, `convertedBookingId: null`, `acceptedQuoteId: null` — so each refusal
+  holds under a race, and a lost claim writes nothing.
+- **Correctable is the six live, undecided states**
+  (`CORRECTABLE_BOOKING_REQUEST_STATUSES`); `NEW` is excluded because the
+  requester has not confirmed their own address.
+- **A row whose stored party cannot be read back is refused, not guessed**
+  (#2342's rule).
+- **A correction that rewrites the party clears `linkedGuestMembers` in the same
+  claim.** Those links are keyed by POSITION and resolved by index, so a
+  rewritten list would give one member's identity to whoever now stands in their
+  place. Cleared only when the list changed; the count is returned, audited and
+  shown, and the officer re-links before quoting.
+- **The REQUEST's type decides the shape, not the payload's.** A school half on
+  a general request, or a guest list on a school one, is refused.
+- **Every post-claim failure is reported as a correction that SAVED**, not only
+  the hold release's own: the whole block is wrapped as `declineBookingRequest`'s
+  is, because a retry would refuse on the bumped version.
+
+Pinned by `src/lib/__tests__/booking-request-corrections.test.ts` and
+`src/lib/__tests__/admin-booking-request-correction-routes.test.ts`.
+
+### INV-REQ-009
+
+**A corrected school name is stored only against the school record the officer
+was actually shown.** Since #3367 approval resolves `schoolName` to an
+`Organisation` owning that school's durable Xero customer (`INV-INT-018`,
+`INV-INT-020`), so correcting the name chooses which school the club invoices.
+
+- **The correction carries an acknowledgement, not a tick**: `outcome`
+  `"existing"` naming the record's id, or `"new"` naming none.
+  `assertSchoolRecordOutcomeAcknowledged`
+  (`src/lib/school-organisation-preview.ts`) refuses every other pairing — the
+  right outcome pointed at the wrong record included — with a `409` naming the
+  school.
+- **It is checked against a preview re-read INSIDE the claim transaction**,
+  under `pg_advisory_xact_lock(1)`, never against the one the screen rendered.
+  Approvals are the only writer of those records and take that key, so none can
+  appear in between. The key is NOT what fences the conversion's own write: both
+  approvals claim on `version` (#1923). What a version fence did not close are
+  four quote writers. Save claims version; send claims `DRAFT`/`SENT`.
+  Acceptance and MODIFY/QUERY require `SENT`/`QUOTE_SENT` under the global key
+  (#3415); MODIFY/QUERY also match loaded version
+  (`INV-LOCK-001`; [locking guide](../CONCURRENCY_AND_LOCKING.md)).
+- **The preview only ever reads.** `resolveOrCreateSchoolOrganisation` runs only
+  inside the approval transaction; the preview asks the same filter
+  (`schoolOrganisationNameClaim`) with the same ordering.
+- **The name is normalised once** (`normaliseSchoolNameForStorage`).
+- **The contact people it names are shaped and de-duplicated as the provider's
+  are** — one cap (`MAX_XERO_ORGANISATION_CONTACT_PERSONS`), one newest-first
+  ordering, one shaping (`xeroContactPersonFromMember`) and one identity, shared
+  with `readOrganisationForXeroContact` rather than restated (`INV-SSOT`). The
+  ROLE scope is deliberately NOT shared: the preview reads `TEACHER` rows alone,
+  because it answers what approval would displace and
+  `reconcileOrganisationTeachers` replaces teachers alone.
+- **A correction never writes the link.** It changes what approval will resolve,
+  not what it has resolved.
+
+Pinned by `src/lib/__tests__/school-organisation-preview.test.ts` and
+`src/lib/__tests__/organisation-reader-contract.test.ts`.
+
+### INV-REQ-010
+
+**A corrected request never keeps beds held for the shape it no longer has.** A
+hold is a whole `AWAITING_REVIEW` booking built from the request's nights, guest
+rows and owner, so every corrected field except the catering preference
+invalidates it.
+
+- **A catering-only correction keeps the hold**: that is the one corrected field
+  a hold never reads, because it selects quote options, not beds.
+- **Every other correction releases it**, through the shared `cancelBooking`
+  path with the requester's cancellation email suppressed and
+  `requireRequestHold: true` requiring `AWAITING_REVIEW`. Acceptance retains it
+  (#3415); correction refuses acceptance (`INV-REQ-008`). Cancellation re-checks
+  the request under the global lock, refusing `ACCEPTED`. Decline claims
+  `DECLINED` before release.
+- **The release runs AFTER the claim has committed and outside every
+  transaction.** `cancelBooking` takes `pg_advisory_xact_lock(1)` and opens
+  transactions of its own, so nesting it self-deadlocks. This is
+  `declineBookingRequest`'s composition exactly, its member-guest read included.
+- **A release that fails is reported as a correction that SAVED**
+  (`BookingRequestCorrectionCommittedError`), never as a failed save and never
+  as a clean success, and **the audit row is written before that error is
+  rethrown** (`holdOutcome: "releaseFailed"`). The caller must not retry: a
+  retry would refuse on the bumped version.
+- **A pointer to a hold no longer live is detached**, the Release-hold route's
+  own repair.
+- **Beds a correction KEEPS are still swept.** `VERIFIED` joins the stale-hold
+  phase of `cron-quote-expiry-reminders`: a correction leaves exactly that state
+  and both recovery phases used to miss it, so a catering-only correction — or
+  any whose release failed — sterilised its beds with no cron recovery at all.
+  The existing deadline rule still keeps a hold on a request that never had a
+  response window, which protects a deliberate "Hold slots".
+- **Availability is re-measured after the release and is ADVISORY.** A
+  correction is never refused for it.
+
+Pinned by `src/lib/__tests__/booking-request-corrections.test.ts`.
+
+## Structured locked-period change requests (#4030)
+
+### INV-REQ-011
+
+A `LOCKED_PERIOD` change request names the change it asks for. `POST
+/api/bookings/[id]/change-requests` refuses one that carries no new dates, no
+guest added or removed and no guest's nights (400, `STRUCTURED_CHANGE_REQUIRED`);
+the note and `requestedEffectiveDate` are context, never a change, and a guest's
+two-bound range or grid night set counts only when it changes their nights;
+approval passes every one through (`INV-REQ-012`). All
+guest nights use `normalizeGuestStayRange`. Submission and estimate share
+`requestedDatesIgnoredByNightsRefusal` over the merged editor/card proposal:
+a moved date the nights do not reach is refused. A typed guest named like
+one of the owner's dependants is refused at submit and in the officer's entry by
+`checkOwnDependantIdentityForParty` (`INV-GUEST-019`). The member's
+in-progress request card adds guests with the guest editor's fields, each guest's
+nights inside the stay, and estimates only its non-member guests, counting the
+whole proposed party (never resolving another member's rate).
+
+For an older free-text request on a finished stay, the officer enters the
+described guests. The entry is accepted only
+when approving applies the request, and only for one that names no change;
+it is written into `requestedChanges.requested` (`addGuests`, a summary saying it
+was entered on the member's behalf, and `officerEntry` naming the officer and
+keeping the member's own summary) by the approval's guarded claim, in the
+executor's transaction. A refusal after the claim rolls the entry back with it,
+so no request holds officer-entered guests without the approval that applied
+them. An applying approval carries the figures its check showed; if the edit
+produces others under the locks it is refused and rolled back. It then runs through #3750's path unchanged (`INV-MOD-019`), and the
+approval's audit row lists the guests entered. Guarded by
+`booking-change-request-structured.test.ts`,
+`booking-change-request-grid-nights.test.ts`,
+`booking-change-request-officer-entry.test.ts`,
+`booking-change-request-estimate.test.ts` and
+`booking-change-request-execution.realdb.test.ts`.
+
+### INV-REQ-012
+
+A two-bound guest range in a `LOCKED_PERIOD` change request that only repeats
+the guest's own Date In and Date Out keeps the nights the guest holds (#4157,
+owner decision "Keep their nights"). Range mode cannot express gaps (#713), so
+the member's form sends a gapped guest's own dates back unchanged; applied as
+written, that range put the guest on every night inside it and charged for the
+gaps. `lockedPeriodRequestToBatchInput` passes such a guest as their night
+set, so range mode stays on, even beside an officer's entry.
+Only a moved bound re-spreads the guest; a guest who already holds every night
+is passed by the two bounds. Each guest is judged on the entry approval
+applies: the last with both dates or a night set (`effectiveStayRangeByGuest`);
+a new request naming a guest twice is refused. Whether a request names any
+change is judged on that entry as sent, before the kept nights replace it.
+
+`keptNightsByGuest` decides this from one source, for the executor and for the
+officer's card: the booking's live guest rows (under the executor's locks;
+loaded by the admin list for pending requests only), else the request's
+snapshot. An approval's guarded claim, applying or only acknowledging,
+records the kept nights as
+`requestedChanges.keptNights`, empty when none, a key the older schema strips.
+The card reads a pending request against that source and a declined one
+against its snapshot, listing the kept nights as unchanged; an approval with
+the record exactly as recorded. An approval without it (one before this
+release) is listed as asked with neither mark, and is unchanged only where its snapshot holds night rows. Guarded by
+`booking-change-request-repeated-range.test.ts`,
+`booking-change-request-execution.test.ts`,
+`booking-change-request-officer-entry.test.ts`,
+`booking-change-request-list-officer-entry.test.ts`,
+`booking-change-request-grid-nights.test.ts`, `requested-guest-nights.test.tsx`
+and the realdb cases in `booking-change-request-execution.realdb.test.ts`.
+
+## Finished-stay promo corrections (#4533)
+
+### INV-REQ-013
+
+A `LOCKED_PERIOD` change request on a finished stay may carry a promo change:
+Edit Booking's own fields (`promoCode` with its guests, or the `promoCodes`
+list), entered by an officer on the member's behalf and stored as
+`requested.promoChange` with a stamp naming the officer and where it was
+entered, beside `original.promoCodes`, the booking's codes it was entered
+against. It is entered from Edit Booking (`POST
+/api/bookings/[id]/change-requests` with `promoChange`, which refuses a member,
+a stay not eligible (`finishedStayEligibility`), any other change and
+any pending request on the booking) or on approval of a request naming none,
+written by the approval's guarded claim like `INV-REQ-011`'s guests. No change
+removes a code: `promoChangeRefusal`, read by the route and the executor over
+the edit's own resulting list, refuses one that would release a booker's code
+(a working-bee code follows its carry rule) or changes nothing; the card sends
+the carried codes with the new one where `multiPromoCodes` is on.
+
+Approval maps it through `lockedPeriodRequestToBatchInput` onto
+`modifyBookingBatch` under `finishedStayCorrection`, which admits exactly those
+promo keys; eligibility, assignment, caps and the refusal wording are the
+ordinary edit's. A code applied or released since the snapshot is drift. A
+correction that only changes codes is `PROMO_ONLY_NO_FEE`, and is refused if it
+raises the price; any promo change returns its reduction untiered and defaults
+it to account credit, or the way it was paid on an organiser-paid joiner's
+booking (`defaultCorrectionSettlementMethod`). The officer may withhold the change
+email only when the promo change is the request's one change
+(`storedRequestNamesOnlyPromoChange`); `memberEmailed` reports whether it is
+sent, the booking's "No emails" switch included. The approval's audit row
+records the codes, the officer and the email choice. Guarded by
+`booking-change-request-promo.test.ts`,
+`booking-change-request-promo-execution.test.ts`,
+`booking-change-request-promo-submit.test.ts`,
+`booking-finished-stay-correction.test.ts` and
+`booking-change-request-promo-correction.realdb.test.ts`.

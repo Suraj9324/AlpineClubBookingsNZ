@@ -1,0 +1,510 @@
+"use client";
+
+import { useEffect, useEffectEvent, useRef, useState } from "react";
+import * as Sentry from "@sentry/nextjs";
+import { type BookingPaymentMode } from "@/lib/booking-payment-flow";
+import StripeProvider from "./StripeProvider";
+import PaymentForm from "./PaymentForm";
+import SetupForm from "./SetupForm";
+import { RedirectFailedNotice } from "./redirect-failed-notice";
+import { stripeReturnUrl, takeStripeReturn, type StripeReturn } from "@/lib/stripe-return";
+import { creditElectionOutcomeCopy, parseCreditElectionOutcome } from "@/lib/credit-election-outcome-copy";
+import { capacityCancellationRecovery } from "@/lib/booking-card-refund-copy";
+import { useClubFormat } from "@/components/club-format-provider";
+import { FocusedActionError } from "@/components/focused-action-error";
+import { Button } from "@/components/ui/button";
+import { PreviousPaymentRefundingNotice } from "@/components/previous-payment-refunding-notice";
+import {
+  EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE,
+  isCreditElectionNotApplied,
+  isExistingCardTransactionStatusUnconfirmed,
+  isPaymentReceivedFinalisationPending,
+  isPaymentProcessing,
+  isPaymentReceivedStatusUnconfirmed,
+  isRefundedCardTransactionRepaymentRequired,
+  isSupersededCardPaymentRefunding,
+  isSwitchedToInternetBanking,
+  CHECKING_PAYMENT_MESSAGE,
+  PAYMENT_PROCESSING_HEADING,
+  PAYMENT_PROCESSING_MESSAGE,
+  PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE,
+  REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_MESSAGE,
+  SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE,
+  SWITCHED_TO_INTERNET_BANKING_MESSAGE,
+} from "@/lib/payment-recovery-contract";
+import { BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE, isBelowStripeMinimum } from "@/lib/stripe-charge-currency";
+
+/**
+ * Report a payment-initialization failure to ops WITHOUT ever surfacing the raw
+ * provider detail to the member (#1223). The raw detail (from the API response
+ * or a thrown error) can contain partial key material such as
+ * "Invalid API Key provided: sk_test_***", so it must never be rendered AND must
+ * not reach the member's browser console — it is sent only to Sentry, whose
+ * `beforeSend` scrubs `sk_*`/secret material before ingestion. The UI shows only
+ * generic, member-safe copy. The client-side console log is intentionally
+ * detail-free (bookingId only) so no key fragment lands in a member's DevTools.
+ */
+function reportPaymentInitError(bookingId: string, detail: unknown) {
+  Sentry.captureException(
+    detail instanceof Error
+      ? detail
+      : new Error(
+          typeof detail === "string" ? detail : "Payment initialization failed"
+        ),
+    { tags: { area: "booking-payment-init" }, extra: { bookingId, detail } }
+  );
+  console.error("Booking payment initialization failed", { bookingId });
+}
+
+interface BookingPaymentWrapperProps {
+  bookingId: string;
+  amountCents: number;
+  paymentMode: BookingPaymentMode;
+  onPaymentComplete: () => void;
+}
+
+/**
+ * Renders the Stripe flow for a persisted booking state.
+ * Booking status is the source of truth for whether this page should charge now
+ * or only save a payment method for later.
+ *
+ * ALP-569: a redirect method returns the payer to the booking's own page, where
+ * this component reads the return (`takeStripeReturn("booking")`) whether the
+ * payment began there or in the booking wizard. The return URL is built here,
+ * not by callers, so it always names the page that reads it.
+ */
+export default function BookingPaymentWrapper({
+  bookingId,
+  amountCents,
+  paymentMode,
+  onPaymentComplete,
+}: BookingPaymentWrapperProps) {
+  const format = useClubFormat();
+  const [clientSecret, setClientSecret] = useState<string | null>(null);
+  // #1976 — the charge figures the SERVER returns for this booking's payment
+  // intent. chargedAmountCents is the amount actually taken today (the member
+  // portion for a split); deferredGuestAmountCents is the non-member guest
+  // portion charged closer to the stay. Rendered by PaymentForm instead of the
+  // client-computed amountCents prop so every booking shows its actual card
+  // charge after credit, including the member-only charge on a split.
+  const [chargedAmountCents, setChargedAmountCents] = useState<number | null>(
+    null,
+  );
+  // #1976 — the SERVER's authoritative split verdict for this intent. Forwarded
+  // to PaymentForm so the split display is driven by the route, not re-derived
+  // client-side from the deferred amount.
+  const [isSplit, setIsSplit] = useState<boolean | null>(null);
+  const [deferredGuestAmountCents, setDeferredGuestAmountCents] = useState<
+    number | null
+  >(null);
+  const [creditElection, setCreditElection] = useState<ReturnType<typeof parseCreditElectionOutcome>>(null);
+  const [completedWithCredit, setCompletedWithCredit] = useState(false);
+  const [initFailed, setInitFailed] = useState(false);
+  const [initRecoveryError, setInitRecoveryError] = useState("");
+  const [confirmationError, setConfirmationError] = useState("");
+  const [recoveryHeading, setRecoveryHeading] = useState("");
+  // #4300: a payment just made was not confirmed (a superseded intent going
+  // back, or any other refusal): the form is gone, and the reload goes to the booking.
+  const [paymentFormClosed, setPaymentFormClosed] = useState(false);
+  const [previousPaymentRefunding, setPreviousPaymentRefunding] = useState(false);
+  const [loading, setLoading] = useState(true);
+  // ALP-569: the server is being asked what a payment just made did; never the
+  // form meanwhile. A recovery answer replaces this; a paid one leaves the page.
+  const [checkingPayment, setCheckingPayment] = useState(false);
+  const [redirectFailed, setRedirectFailed] = useState(false);
+  // An in-page confirmation that resolved `processing` (#4955's `onProcessing`).
+  const [processingIntentId, setProcessingIntentId] = useState<string | null>(null);
+  // Taken once per mount; a ref, so React strict mode's second effect run sees it.
+  const stripeReturn = useRef<StripeReturn | null>(null);
+  // Set while a returned success is with the confirm route: asked once.
+  const confirmingReturn = useRef(false);
+  // Bumped when the confirm route could not say what a returned success did.
+  const [askDoor, setAskDoor] = useState(0);
+
+  async function handlePaymentSuccess(paymentIntentId: string) {
+    // In the page Stripe.js saw the capture: only a recovery answer stops completion.
+    if ((await confirmPayment(paymentIntentId)) !== "recovery") onPaymentComplete();
+  }
+
+  async function handleReturnedPayment(paymentIntentId: string) {
+    const outcome = await confirmPayment(paymentIntentId, { returned: true });
+    stripeReturn.current = { kind: "none" };
+    confirmingReturn.current = false;
+    if (outcome === "settled") onPaymentComplete();
+    else if (outcome === "recovery") setCheckingPayment(false);
+    // The pay door reads Stripe too: settles a succeeded intent ("already
+    // paid") or, for one that never succeeded, offers the form again.
+    else setAskDoor((n) => n + 1);
+  }
+
+  /**
+   * What the confirm route said: settled; a recovery, now shown; or nothing
+   * either way (no answer, an unrecognised 409, or - for a redirect return,
+   * whose success is only the address bar's word - a refusal).
+   */
+  async function confirmPayment(
+    paymentIntentId: string,
+    { returned = false } = {},
+  ): Promise<"settled" | "recovery" | "unknown"> {
+    try {
+      setConfirmationError("");
+      setRecoveryHeading("");
+      const response = await fetch(`/api/bookings/${bookingId}/confirm-payment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paymentIntentId }),
+      });
+      if (response.status === 409) {
+        const data = (await response.json().catch(() => ({}))) as Record<
+          string,
+          unknown
+        >;
+        const cancellationRecovery = capacityCancellationRecovery(data, format);
+        if (cancellationRecovery) {
+          setRecoveryHeading(cancellationRecovery.heading);
+          setConfirmationError(cancellationRecovery.message);
+          return "recovery";
+        }
+        const safeHostingMessage =
+          typeof data.error === "string"
+            ? data.error
+            : "The booking could not be finalised.";
+        if (
+          data.code === "HOSTING_COVERAGE_PARTICIPANT_RETRY" &&
+          isPaymentReceivedFinalisationPending(data)
+        ) {
+          setRecoveryHeading("Payment received - finalisation pending");
+          setConfirmationError(
+            `${safeHostingMessage} Your card payment was received, but booking finalisation is still pending.`,
+          );
+          return "recovery";
+        }
+        if (isPaymentReceivedStatusUnconfirmed(data)) {
+          setRecoveryHeading("Payment received - check booking status");
+          setConfirmationError(PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE);
+          return "recovery";
+        }
+        if (isExistingCardTransactionStatusUnconfirmed(data)) {
+          setRecoveryHeading("Card transaction found - check payment status");
+          setConfirmationError(
+            EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE,
+          );
+          return "recovery";
+        }
+        if (isRefundedCardTransactionRepaymentRequired(data)) {
+          setRecoveryHeading("Previous card payment refunded");
+          setConfirmationError(
+            REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_MESSAGE,
+          );
+          return "recovery";
+        }
+        // #4300: the payment was on an intent an edit superseded; it is going
+        // back and the booking still owes. The fixed message, never data.error,
+        // and no "Payment successful!" box left on screen beside it.
+        if (isSupersededCardPaymentRefunding(data)) {
+          setRecoveryHeading("Card payment being returned");
+          setConfirmationError(SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE);
+          setPaymentFormClosed(true);
+          return "recovery";
+        }
+      }
+      // #4300: a refusal that is not a recovery 409 (a 400 for an intent the
+      // booking no longer points at, a 5xx) is not a confirmation: money moved,
+      // so never call it complete - say what is known and let the member check.
+      // (An unrecognised 409 keeps its old meaning: nothing to invent.)
+      if (!response.ok && response.status !== 409) {
+        if (returned) return "unknown";
+        setRecoveryHeading("Payment received - check booking status");
+        setConfirmationError(PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE);
+        setPaymentFormClosed(true);
+        return "recovery";
+      }
+      return response.ok ? "settled" : "unknown";
+    } catch {
+      // Non-fatal: the Stripe webhook will still reconcile the booking state.
+      return "unknown";
+    }
+  }
+
+  const handleAlreadyComplete = useEffectEvent(() => onPaymentComplete());
+  const confirmReturnedPayment = useEffectEvent((paymentIntentId: string) => handleReturnedPayment(paymentIntentId));
+
+  useEffect(() => {
+    if (amountCents === 0) return; // No Stripe initialization needed for zero-dollar bookings
+
+    // Only a payment's return: a saved card (setup) never confirms an intent here.
+    stripeReturn.current ??= paymentMode === "payment" ? takeStripeReturn("booking") : { kind: "none" };
+    const returned = stripeReturn.current;
+    if (returned.kind === "failed") setRedirectFailed(true);
+    // A redirect return that succeeded takes the in-page success path: the
+    // confirm route asks Stripe, settles, or answers a recovery.
+    if (returned.kind === "check" && returned.confirmation === "succeeded") {
+      if (confirmingReturn.current) return;
+      confirmingReturn.current = true;
+      setLoading(false);
+      setCheckingPayment(true);
+      void confirmReturnedPayment(returned.intentId);
+      return;
+    }
+    // A `processing` one (returned or in-page) asks the pay door, which hands
+    // the same intent back while it is unsettled - said as "being processed".
+    const awaitedIntentId =
+      processingIntentId ?? (returned.kind === "check" ? returned.intentId : null);
+
+    const initializePayment = async () => {
+      let paid = false;
+      try {
+        setLoading(true);
+        setCheckingPayment(awaitedIntentId !== null);
+        setCreditElection(null);
+        setCompletedWithCredit(false);
+        setChargedAmountCents(null);
+        setInitFailed(false);
+        setInitRecoveryError("");
+        setConfirmationError("");
+        setRecoveryHeading("");
+
+        const endpoint = paymentMode === "setup"
+          ? "/api/payments/create-setup-intent"
+          : "/api/payments/create-payment-intent";
+
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bookingId }),
+        });
+
+        const data = await response.json();
+        const election = parseCreditElectionOutcome(data.creditElection);
+        setCreditElection(election);
+
+        if (!response.ok) {
+          const cancellationRecovery =
+            response.status === 409
+              ? capacityCancellationRecovery(data, format)
+              : null;
+          if (cancellationRecovery) {
+            setRecoveryHeading(cancellationRecovery.heading);
+            setInitRecoveryError(cancellationRecovery.message);
+            return;
+          }
+          if (
+            response.status === 409 &&
+            data.code === "HOSTING_COVERAGE_PARTICIPANT_RETRY" &&
+            data.paymentReceived === true &&
+            data.finalisationPending === true
+          ) {
+            setRecoveryHeading("Payment received - finalisation pending");
+            setInitRecoveryError(
+              `${data.error || "The booking could not be finalised."} Your card payment was received, but booking finalisation is still pending. Reload this page and check the booking status before trying any payment again.`,
+            );
+            return;
+          }
+          if (
+            response.status === 409 &&
+            isPaymentReceivedStatusUnconfirmed(data)
+          ) {
+            setRecoveryHeading("Payment received - check booking status");
+            setInitRecoveryError(
+              PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE,
+            );
+            return;
+          }
+          if (
+            response.status === 409 &&
+            isExistingCardTransactionStatusUnconfirmed(data)
+          ) {
+            setRecoveryHeading("Card transaction found - check payment status");
+            setInitRecoveryError(
+              EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE,
+            );
+            return;
+          }
+          // #3638: the booking is being paid by Internet Banking (switched
+          // before or during this request). Not a fault to report, and not
+          // "pay later" either — a card retry would be refused again. The
+          // fixed message from the shared contract, never data.error.
+          if (response.status === 409 && isSwitchedToInternetBanking(data)) {
+            setRecoveryHeading("Paying by Internet Banking");
+            setInitRecoveryError(SWITCHED_TO_INTERNET_BANKING_MESSAGE);
+            return;
+          }
+          // #3567: an earlier payment is still processing. The server's own copy,
+          // not a provider detail, and not an error worth reporting.
+          if (response.status === 409 && isPaymentProcessing(data)) {
+            setRecoveryHeading(PAYMENT_PROCESSING_HEADING);
+            setInitRecoveryError(data.error);
+            return;
+          }
+          // #4300: the pay step met a superseded capture the settle refused.
+          if (response.status === 409 && isSupersededCardPaymentRefunding(data)) {
+            setRecoveryHeading("Card payment being returned");
+            setInitRecoveryError(SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE);
+            setPaymentFormClosed(true);
+            return;
+          }
+          // #3864: the member's credit was not spent and the booking is still
+          // payable; they retry. The server's own copy, not a fault to report.
+          if (response.status === 409 && isCreditElectionNotApplied(data)) {
+            setRecoveryHeading("Account credit not applied yet");
+            setInitRecoveryError(data.error);
+            return;
+          }
+          // #99: below the card minimum. Refused before Stripe; a retry would be
+          // refused again. The fixed message from the shared module, never data.error.
+          if (response.status === 409 && isBelowStripeMinimum(data)) {
+            setRecoveryHeading("Amount too small to pay by card");
+            setInitRecoveryError(BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE);
+            return;
+          }
+          // The raw provider detail (data.error) may leak partial key material;
+          // log it for ops, but only ever show generic copy to the member (#1223).
+          reportPaymentInitError(bookingId, data.error || "Failed to initialize payment");
+          setInitFailed(true);
+          return;
+        }
+
+        if (data.alreadyPaid || data.alreadySaved) {
+          if (data.alreadyPaid && creditElectionOutcomeCopy(election, format)) {
+            setCompletedWithCredit(true);
+            return;
+          }
+          paid = true;
+          handleAlreadyComplete();
+          return;
+        }
+
+        if (awaitedIntentId !== null && data.paymentIntentId === awaitedIntentId) {
+          setRecoveryHeading(PAYMENT_PROCESSING_HEADING);
+          setInitRecoveryError(PAYMENT_PROCESSING_MESSAGE);
+          setPaymentFormClosed(true);
+          return;
+        }
+
+        // #1976 — adopt the server's charge figures when present (additive
+        // fields; older/other responses simply omit them and PaymentForm falls
+        // back to the amountCents prop for consumers without a server figure).
+        if (typeof data.chargedAmountCents === "number") {
+          setChargedAmountCents(data.chargedAmountCents);
+        }
+        setIsSplit(typeof data.isSplit === "boolean" ? data.isSplit : null);
+        setDeferredGuestAmountCents(
+          typeof data.deferredGuestAmountCents === "number"
+            ? data.deferredGuestAmountCents
+            : null,
+        );
+        // #4300: the member's earlier, superseded payment is going back.
+        setPreviousPaymentRefunding(data.previousPaymentRefunding === true);
+        setClientSecret(data.clientSecret);
+      } catch (error) {
+        reportPaymentInitError(bookingId, error);
+        setInitFailed(true);
+      } finally {
+        setLoading(false);
+        // Paid: keep saying so until the page moves on, not "unable to initialize".
+        if (!paid) setCheckingPayment(false);
+      }
+    };
+
+    initializePayment();
+  }, [bookingId, paymentMode, amountCents, format, processingIntentId, askDoor]);
+
+  // Zero-dollar booking: no payment is required
+  if (amountCents === 0) {
+    return (
+      <div className="rounded-md bg-success-3 p-4 text-sm text-success-11">
+        <p className="font-medium">Booking Complete</p>
+        <p className="mt-1">No payment is required for this booking.</p>
+      </div>
+    );
+  }
+
+  const creditCopy = creditElectionOutcomeCopy(
+    creditElection, format,
+    initRecoveryError || confirmationError || initFailed || paymentFormClosed ? null : chargedAmountCents,
+  );
+
+  if (completedWithCredit) {
+    return (
+      <div className="rounded-md bg-success-3 p-4 text-sm text-success-11">
+        <p role="status" aria-label="Saved account credit">{creditCopy}</p>
+        <Button className="mt-4" onClick={onPaymentComplete}>Continue</Button>
+      </div>
+    );
+  }
+
+  const initializationError = initFailed
+    ? "We couldn't start the card payment. Your booking is saved - you can pay later from your booking page."
+    : !loading && !checkingPayment && !clientSecret && !initRecoveryError
+      ? "Unable to initialize payment. Please try again."
+      : "";
+  const visibleError =
+    initRecoveryError || confirmationError || initializationError;
+  const visibleHeading =
+    initRecoveryError || confirmationError ? recoveryHeading : "Payment Error";
+  const suppressPaymentContent = Boolean(
+    initFailed || initRecoveryError || paymentFormClosed || (!loading && !clientSecret),
+  );
+  // The booking's own page, where a redirect method returns the payer (ALP-569).
+  const bookingPageUrl =
+    typeof window !== "undefined" ? `${window.location.origin}/bookings/${bookingId}` : "";
+
+  return (
+    <>
+      <FocusedActionError
+        id="booking-payment-recovery-error"
+        error={visibleError && creditCopy ? `${visibleError} ${creditCopy}` : visibleError}
+        heading={visibleHeading}
+        className="mb-4"
+        action={
+          paymentFormClosed ? (
+            // The booking's own page, fully loaded: a reload of the /book wizard
+            // would lose the booking, and a client push would keep stale state.
+            // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- a full load on purpose (#4300)
+            <Button variant="outline" onClick={() => window.location.assign(`/bookings/${bookingId}`)}>
+              Reload booking
+            </Button>
+          ) : undefined
+        }
+      />
+      {checkingPayment || loading ? (
+        <div className="flex items-center justify-center p-8">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-info-7 border-t-transparent" />
+          <span role="status" className="ml-3 text-muted-foreground">
+            {checkingPayment ? CHECKING_PAYMENT_MESSAGE : "Preparing payment..."}
+          </span>
+        </div>
+      ) : suppressPaymentContent ? null : (
+        <>
+        {redirectFailed ? <div className="mb-4"><RedirectFailedNotice /></div> : null}
+        {/* #4943: a recovery alert already carries the credit sentence, so it
+            appears here only when no alert is showing. */}
+        {creditCopy && !visibleError && <p role="status" aria-label="Saved account credit" className="mb-4 rounded-md bg-info-3 p-4 text-sm text-info-11">{creditCopy}</p>}
+        <PreviousPaymentRefundingNotice show={previousPaymentRefunding} className="mb-4" />
+        <StripeProvider clientSecret={clientSecret!}>
+          {paymentMode === "payment" ? (
+            <PaymentForm
+              amountCents={amountCents}
+              chargedAmountCents={chargedAmountCents}
+              isSplit={isSplit}
+              deferredGuestAmountCents={deferredGuestAmountCents}
+              returnUrl={bookingPageUrl && stripeReturnUrl("booking", bookingPageUrl)}
+              onSuccess={handlePaymentSuccess}
+              onProcessing={(paymentIntentId) => {
+                setClientSecret(null);
+                setCheckingPayment(true);
+                setProcessingIntentId(paymentIntentId);
+              }}
+            />
+          ) : (
+            <SetupForm
+              returnUrl={bookingPageUrl}
+              onSuccess={() => onPaymentComplete()}
+            />
+          )}
+        </StripeProvider>
+        </>
+      )}
+    </>
+  );
+}

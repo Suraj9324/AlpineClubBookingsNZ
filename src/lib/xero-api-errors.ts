@@ -1,0 +1,133 @@
+import {
+  XeroErrorShape,
+  getXeroErrorBodyMessage,
+  getXeroErrorHeader,
+  getXeroErrorStatusCode,
+} from "@/lib/xero-error-shape";
+
+export interface XeroApiErrorInfo {
+  handled: boolean;
+  status: number;
+  /** Fixed copy safe to return to an authenticated browser client. */
+  clientMessage: string;
+  /** Provider/runtime detail for structured server-side diagnostics only. */
+  diagnosticMessage: string;
+}
+
+function getFallbackMessage(error: unknown, fallbackMessage: string): string {
+  const bodyMessage = getXeroErrorBodyMessage(error);
+  if (bodyMessage) {
+    return bodyMessage;
+  }
+
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  if (typeof error === "object" && error !== null) {
+    const maybeError = error as XeroErrorShape;
+    const detail = maybeError.body?.Detail ?? maybeError.body?.Message ?? maybeError.body?.Title;
+    if (detail) {
+      return detail;
+    }
+    if (maybeError.message) {
+      return maybeError.message;
+    }
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  return fallbackMessage;
+}
+
+export function getXeroApiErrorInfo(
+  error: unknown,
+  fallbackMessage: string
+): XeroApiErrorInfo {
+  const statusCode = getXeroErrorStatusCode(error);
+  const rateLimitProblem = getXeroErrorHeader(error, "x-rate-limit-problem");
+  const isDailyLimit =
+    (error instanceof Error && error.name === "XeroDailyLimitError") ||
+    (statusCode === 429 && rateLimitProblem === "day");
+  const isTransientOutage =
+    error instanceof Error && error.name === "XeroTransientOutageError";
+  const isReconnectRequired =
+    error instanceof Error &&
+    // XeroTokenDecryptError (a stored token that no longer decrypts after the
+    // env→DB upgrade / an auth-secret change) is a reconnect signal too (#2079).
+    (error.name === "XeroReconnectRequiredError" ||
+      error.name === "XeroTokenDecryptError");
+  const diagnosticMessage = getFallbackMessage(error, fallbackMessage);
+
+  if (isDailyLimit) {
+    return {
+      handled: true,
+      status: 429,
+      clientMessage: "Xero daily API limit reached. Please try again tomorrow.",
+      diagnosticMessage,
+    };
+  }
+
+  // A token/tenant failure that only an admin re-authorisation can fix maps to
+  // the same 401-style reconnect guidance a live 401/403 produces.
+  if (isReconnectRequired) {
+    return {
+      handled: true,
+      status: 401,
+      clientMessage: "Xero connection expired. Please reconnect Xero from the admin panel.",
+      diagnosticMessage,
+    };
+  }
+
+  if (statusCode === 429) {
+    return {
+      handled: true,
+      status: 429,
+      clientMessage: "Xero rate limit hit. Please wait a moment and try again.",
+      diagnosticMessage,
+    };
+  }
+
+  if (statusCode === 401 || statusCode === 403) {
+    return {
+      handled: true,
+      status: 401,
+      clientMessage: "Xero connection expired. Please reconnect Xero from the admin panel.",
+      diagnosticMessage,
+    };
+  }
+
+  if (isTransientOutage) {
+    return {
+      handled: true,
+      status: 503,
+      clientMessage: "Xero is temporarily unavailable. Please try again shortly.",
+      diagnosticMessage,
+    };
+  }
+
+  if (statusCode !== undefined && statusCode >= 500 && statusCode <= 599) {
+    const correlationId = getXeroErrorHeader(error, "xero-correlation-id");
+    const retryMessage =
+      `Xero is temporarily unavailable (HTTP ${statusCode}). ` +
+      `${getFallbackMessage(error, fallbackMessage)} ` +
+      "Please try again in a few minutes." +
+      (correlationId ? ` Xero correlation ID: ${correlationId}.` : "");
+
+    return {
+      handled: false,
+      status: 502,
+      clientMessage: "Xero is temporarily unavailable. Please try again in a few minutes.",
+      diagnosticMessage: retryMessage,
+    };
+  }
+
+  return {
+    handled: false,
+    status: 500,
+    clientMessage: fallbackMessage,
+    diagnosticMessage,
+  };
+}

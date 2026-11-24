@@ -1,0 +1,791 @@
+/**
+ * Real-PostgreSQL proof of the bound group-settlement invoice (#3642,
+ * `INV-PAY-105`).
+ *
+ * Every writer of a group settlement serialises on the global `lock(1)`, and
+ * the rule's safety rests on three properties a mock can only imitate:
+ *
+ *  1. A settle that is refused under the lock REALLY rolls back the beds it
+ *     claimed in the same transaction — a joiner never ends up CONFIRMED (bed
+ *     held) on no bill.
+ *  2. The reaper's release and the create worker's post-create fence decide
+ *     the same invoice exactly once, in either order: the settlement never ends
+ *     pointing at an invoice it has abandoned, and an abandoned invoice always
+ *     has its VOID queued.
+ *  3. Two observers abandoning one invoice converge on ONE replayable VOID row
+ *     (the partial unique index on active correlation keys is only real here).
+ *
+ * None of the cases hopes for the interleaving: a third connection holds
+ * `lock(1)` until every writer is queued behind it (read from
+ * `pg_blocking_pids` on a fourth), the method the sibling race suites use.
+ *
+ * Ordinary Vitest runs skip the whole file. It reuses the guarded, disposable
+ * loopback PostgreSQL `concurrency-lock-races.realdb.test.ts` provisions
+ * (#1881), which imports this file so CI reaches it; it owns and cleans its own
+ * `race-3642-` fixtures, and restores the club module settings it switches on.
+ *
+ * #4710 (PR #4708): a stalled CREATE that bound its invoice, was reset and then
+ * queued again in place by Retry, whose late PARTIAL (the email failed) is
+ * refused and traced: the queued run finds the invoice bound and closes its row
+ * SUCCEEDED on it, never left RUNNING for the stale reset to loop on. PR #4708
+ * round 2: in the two other orders - the queued run closes first, or holds the
+ * row RUNNING behind `lock(1)` - the failed email is still audited and alerted.
+ *
+ * #4919: the invoice email fence holds `lock(1)` while Xero answers. An
+ * organiser's cancel that arrives meanwhile waits and commits only after the
+ * fence ends; one that commits first means no email is asked for at all.
+ */
+import type { PrismaClient } from "@prisma/client";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { FROZEN_TEST_CLOCK_BASE_ISO, realElapsedMs } from "@/lib/__tests__/helpers/clock";
+
+const RUN = process.env.RUN_CONCURRENCY_RACE_TESTS === "1";
+const RACE_DB_URL = process.env.CONCURRENCY_RACE_DATABASE_URL ?? "";
+
+const ORGANISER_ID = "race-3642-organiser";
+const LODGE_ID = "race-3642-lodge";
+const ORGANISER_BOOKING_ID = "race-3642-organiser-booking";
+const GROUP_ID = "race-3642-group";
+const JOIN_CODE = "RACE3642";
+const SETTLEMENT_ID = "race-3642-settlement";
+const CHILD_A = "race-3642-child-a";
+const CHILD_B = "race-3642-child-b";
+const CHILD_C = "race-3642-child-c";
+// Far enough out that the Internet Banking lead time never refuses.
+const CHECK_IN = new Date("2027-08-01T00:00:00.000Z");
+const CHECK_OUT = new Date("2027-08-03T00:00:00.000Z");
+
+/** #4710: the invoice a stalled CREATE bound before its email failed. */
+const BOUND_INVOICE = "race-3642-bound-invoice";
+
+const LOCK_POLL_TIMEOUT_MS = 20_000;
+const RACE_TEST_TIMEOUT_MS = 60_000;
+
+/** Standalone fail-closed copy: importing this file must not register another suite. */
+export function assertSafeGroupSettlementRaceDbUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("Group-settlement race proofs need a valid CONCURRENCY_RACE_DATABASE_URL.");
+  }
+  const port = Number.parseInt(parsed.port, 10);
+  if (!Number.isFinite(port) || port === 5432 || port < 55442) {
+    throw new Error(
+      `Refusing to run group-settlement race proofs against port ${parsed.port || "(none)"}: use a throwaway PostgreSQL on 55442+ (never 5432).`,
+    );
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(host)) {
+    throw new Error("Group-settlement race proof DB must be loopback-only.");
+  }
+  const databaseName = decodeURIComponent(parsed.pathname.replace(/^\//, ""));
+  if (!databaseName.includes("concurrency_race_1881")) {
+    throw new Error("Group-settlement race proof DB name must contain 'concurrency_race_1881'.");
+  }
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+let prisma: (typeof import("@/lib/prisma"))["prisma"];
+let createGroupSettlementIntent: (typeof import("@/lib/group-settlement"))["createGroupSettlementIntent"];
+let reapStaleGroupSettlements: (typeof import("@/lib/cron-group-settlement-reaper"))["reapStaleGroupSettlements"];
+let bindCreatedGroupSettlementInvoice: (typeof import("@/lib/xero-group-settlement-invoices"))["bindCreatedGroupSettlementInvoice"];
+let abandonGroupSettlementInvoiceInTx: (typeof import("@/lib/xero-group-settlement-void-outbox"))["abandonGroupSettlementInvoiceInTx"];
+let groupSettlementInvoiceCreateKey: (typeof import("@/lib/xero-group-settlement-invoice-outbox"))["groupSettlementInvoiceCreateKey"];
+let groupSettlementInvoiceVoidKey: (typeof import("@/lib/xero-group-settlement-invoice-outbox"))["groupSettlementInvoiceVoidKey"];
+let lockHolderClient: PrismaClient;
+let observerClient: PrismaClient;
+/** The club module settings row before this suite switched Internet Banking on. */
+let savedModuleSettings: { xeroIntegration: boolean; internetBankingPayments: boolean } | null = null;
+
+(RUN ? describe : describe.skip)(
+  "the bound group-settlement invoice under real concurrency — real PostgreSQL (#3642, INV-PAY-105)",
+  { timeout: RACE_TEST_TIMEOUT_MS },
+  () => {
+    const bookingIds = [CHILD_A, CHILD_B, CHILD_C, ORGANISER_BOOKING_ID];
+
+    async function deleteFixtures() {
+      await prisma.xeroObjectLink.deleteMany({ where: { localId: SETTLEMENT_ID } });
+      await prisma.xeroSyncOperation.deleteMany({ where: { localId: SETTLEMENT_ID } });
+      await prisma.groupBookingSettlement.deleteMany({ where: { id: SETTLEMENT_ID } });
+      await prisma.groupBooking.deleteMany({ where: { id: GROUP_ID } });
+      await prisma.hostingCoverageReevaluation.deleteMany({ where: { memberId: ORGANISER_ID } });
+      await prisma.bookingEvent.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await prisma.bedAllocation.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await prisma.booking.deleteMany({ where: { id: { in: [CHILD_A, CHILD_B, CHILD_C] } } });
+      await prisma.booking.deleteMany({ where: { id: ORGANISER_BOOKING_ID } });
+      await prisma.lodge.deleteMany({ where: { id: LODGE_ID } });
+      await prisma.member.deleteMany({ where: { id: ORGANISER_ID } });
+    }
+
+    /** Sessions queued behind `blockerPid`, directly or transitively. */
+    async function blockedByHolder(blockerPid: number): Promise<number> {
+      const rows = await observerClient.$queryRaw<Array<{ count: number }>>`
+        WITH RECURSIVE waits AS (
+          SELECT activity.pid AS waiter, blocker.pid AS blocker
+          FROM pg_stat_activity AS activity
+          CROSS JOIN LATERAL unnest(pg_blocking_pids(activity.pid)) AS blocker(pid)
+          WHERE activity.datname = current_database()
+            AND activity.pid <> pg_backend_pid()
+        ),
+        chain AS (
+          SELECT waiter, blocker FROM waits
+          UNION
+          SELECT chain.waiter, waits.blocker
+          FROM chain
+          JOIN waits ON waits.waiter = chain.blocker
+        )
+        SELECT COUNT(DISTINCT waiter)::int AS "count"
+        FROM chain
+        WHERE blocker = ${blockerPid}::int
+      `;
+      return rows[0]?.count ?? 0;
+    }
+
+    /**
+     * Run the writers while a third connection holds `lock(1)`, release it only
+     * once `expected` of them are queued behind it, and run `whileHeld` inside
+     * the holder's transaction first (committed as the lock is released).
+     */
+    async function raceBehindLockOne(
+      writers: Array<() => Promise<unknown>>,
+      expected: number,
+      diagnostic: string,
+      whileHeld?: (tx: Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0]) => Promise<void>,
+    ): Promise<PromiseSettledResult<unknown>[]> {
+      const lockHeld = deferred();
+      const writersQueued = deferred();
+      let holderPid = 0;
+      let holderError: unknown;
+      const holder = lockHolderClient
+        .$transaction(
+          async (tx) => {
+            const rows = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`;
+            holderPid = rows[0]?.pid ?? 0;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+            lockHeld.resolve();
+            await writersQueued.promise;
+            if (whileHeld) await whileHeld(tx);
+          },
+          { maxWait: 10_000, timeout: 30_000 },
+        )
+        .catch((error: unknown) => {
+          holderError = error;
+          lockHeld.resolve();
+        });
+      await lockHeld.promise;
+      if (holderError) {
+        throw new Error(`The lock-holder connection could not hold lock(1): ${String(holderError)}`);
+      }
+
+      // Writers start one at a time, each only once the one before it is
+      // queued: PostgreSQL grants a contended lock in queue order, so the order
+      // they are listed in is the order they run in.
+      const pending: Array<Promise<unknown>> = [];
+      let seen = 0;
+      let settled: PromiseSettledResult<unknown>[] = [];
+      try {
+        for (const [index, write] of writers.entries()) {
+          pending.push(write());
+          const want = Math.min(index + 1, expected);
+          const startedAt = process.hrtime.bigint();
+          while (realElapsedMs(startedAt) < LOCK_POLL_TIMEOUT_MS) {
+            seen = await blockedByHolder(holderPid);
+            if (seen >= want) break;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          if (seen < want) break;
+        }
+      } finally {
+        writersQueued.resolve();
+        settled = await Promise.allSettled(pending);
+        await holder;
+      }
+      if (holderError) throw holderError;
+      if (seen < expected) {
+        throw new Error(`Timed out waiting for ${expected} writer(s) to queue behind pid ${holderPid} — saw ${seen}. ${diagnostic}`);
+      }
+      return settled;
+    }
+
+    async function child(id: string, status: "CONFIRMED" | "PAYMENT_PENDING", cents: number) {
+      await prisma.booking.create({
+        data: {
+          id,
+          memberId: ORGANISER_ID,
+          lodgeId: LODGE_ID,
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          status,
+          parentBookingId: ORGANISER_BOOKING_ID,
+          organiserSettled: true,
+          totalPriceCents: cents,
+          finalPriceCents: cents,
+        },
+      });
+    }
+
+    async function boundSettlement(fields: { xeroInvoiceId: string | null; amountCents: number }) {
+      await prisma.groupBookingSettlement.create({
+        data: {
+          id: SETTLEMENT_ID,
+          groupBookingId: GROUP_ID,
+          source: "INTERNET_BANKING",
+          status: "PENDING",
+          amountCents: fields.amountCents,
+          xeroInvoiceId: fields.xeroInvoiceId,
+        },
+      });
+      // Its first invoice attempt is on record, as the settle that bound it left it.
+      await prisma.xeroSyncOperation.create({
+        data: {
+          direction: "OUTBOUND",
+          entityType: "INVOICE",
+          operationType: "CREATE",
+          localModel: "GroupBookingSettlement",
+          localId: SETTLEMENT_ID,
+          status: "SUCCEEDED",
+          correlationKey: groupSettlementInvoiceCreateKey(SETTLEMENT_ID, 0),
+          idempotencyKey: groupSettlementInvoiceCreateKey(SETTLEMENT_ID, 0),
+          requestPayload: { queueType: "GROUP_SETTLEMENT_INVOICE", settlementId: SETTLEMENT_ID },
+          queueType: "GROUP_SETTLEMENT_INVOICE",
+        },
+      });
+    }
+
+    async function abandonVoidRows(invoiceId: string) {
+      return prisma.xeroSyncOperation.findMany({
+        where: {
+          localId: SETTLEMENT_ID,
+          correlationKey: groupSettlementInvoiceVoidKey(SETTLEMENT_ID, invoiceId, "abandon"),
+        },
+        select: { id: true, status: true },
+      });
+    }
+
+    beforeAll(async () => {
+      assertSafeGroupSettlementRaceDbUrl(RACE_DB_URL);
+      process.env.DATABASE_URL = RACE_DB_URL;
+      ({ prisma } = await import("@/lib/prisma"));
+      ({ createGroupSettlementIntent } = await import("@/lib/group-settlement"));
+      ({ reapStaleGroupSettlements } = await import("@/lib/cron-group-settlement-reaper"));
+      ({ bindCreatedGroupSettlementInvoice } = await import("@/lib/xero-group-settlement-invoices"));
+      ({ abandonGroupSettlementInvoiceInTx } = await import("@/lib/xero-group-settlement-void-outbox"));
+      ({ groupSettlementInvoiceCreateKey, groupSettlementInvoiceVoidKey } = await import(
+        "@/lib/xero-group-settlement-invoice-outbox"
+      ));
+
+      const [{ PrismaClient: SeparatePrismaClient }, { createPrismaPgAdapter }] = await Promise.all([
+        import("@prisma/client"),
+        import("@/lib/prisma-adapter"),
+      ]);
+      const createSeparateClient = (applicationName: string) => {
+        const url = new URL(RACE_DB_URL);
+        url.searchParams.set("connection_limit", "1");
+        url.searchParams.set("application_name", applicationName);
+        return new SeparatePrismaClient({ adapter: createPrismaPgAdapter(url.toString()) });
+      };
+      lockHolderClient = createSeparateClient("race-3642-lock-holder");
+      observerClient = createSeparateClient("race-3642-observer");
+      await Promise.all([lockHolderClient.$connect(), observerClient.$connect()]);
+
+      // The Internet Banking settle is gated on both modules; switch them on for
+      // this suite and put the row back afterwards.
+      savedModuleSettings = await prisma.clubModuleSettings.findUnique({
+        where: { id: "default" },
+        select: { xeroIntegration: true, internetBankingPayments: true },
+      });
+      await prisma.clubModuleSettings.upsert({
+        where: { id: "default" },
+        create: { id: "default", xeroIntegration: true, internetBankingPayments: true },
+        update: { xeroIntegration: true, internetBankingPayments: true },
+        select: { id: true },
+      });
+
+      await deleteFixtures();
+      await prisma.member.create({
+        data: {
+          id: ORGANISER_ID,
+          email: `${ORGANISER_ID}@example.invalid`,
+          passwordHash: "not-a-real-password",
+          firstName: "Group",
+          lastName: "Organiser",
+          ageTier: "ADULT",
+        },
+      });
+      await prisma.lodge.create({ data: { id: LODGE_ID, name: "Race 3642 Lodge", slug: "race-3642" } });
+      // The settle, reaper and worker module graphs are large; loading them is
+      // not what this suite measures.
+    }, RACE_TEST_TIMEOUT_MS);
+
+    beforeEach(async () => {
+      // #4710: the late part-success's audit rows and once-ever alert claim.
+      const ops = (await prisma.xeroSyncOperation.findMany({ where: { localId: SETTLEMENT_ID }, select: { id: true } })).map((op) => op.id);
+      await prisma.auditLog.deleteMany({ where: { entityId: { in: ops } } });
+      await prisma.alertCooldown.deleteMany({ where: { key: { in: ops.map((op) => `xero-success-after-resolution:${op}:${BOUND_INVOICE}`) } } });
+      await prisma.xeroObjectLink.deleteMany({ where: { localId: SETTLEMENT_ID } });
+      await prisma.xeroSyncOperation.deleteMany({ where: { localId: SETTLEMENT_ID } });
+      await prisma.groupBookingSettlement.deleteMany({ where: { id: SETTLEMENT_ID } });
+      await prisma.groupBooking.deleteMany({ where: { id: GROUP_ID } });
+      await prisma.hostingCoverageReevaluation.deleteMany({ where: { memberId: ORGANISER_ID } });
+      await prisma.bookingEvent.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await prisma.bedAllocation.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      await prisma.booking.deleteMany({ where: { id: { in: [CHILD_A, CHILD_B, CHILD_C] } } });
+      await prisma.booking.deleteMany({ where: { id: ORGANISER_BOOKING_ID } });
+      await prisma.booking.create({
+        data: {
+          id: ORGANISER_BOOKING_ID,
+          memberId: ORGANISER_ID,
+          lodgeId: LODGE_ID,
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          status: "CONFIRMED",
+          totalPriceCents: 0,
+          finalPriceCents: 0,
+        },
+      });
+      await prisma.groupBooking.create({
+        data: {
+          id: GROUP_ID,
+          organiserBookingId: ORGANISER_BOOKING_ID,
+          organiserMemberId: ORGANISER_ID,
+          joinCode: JOIN_CODE,
+          paymentMode: "ORGANISER_PAYS",
+        },
+      });
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.setSystemTime(new Date(FROZEN_TEST_CLOCK_BASE_ISO));
+    });
+
+    afterAll(async () => {
+      if (!prisma) return;
+      const ops = (await prisma.xeroSyncOperation.findMany({ where: { localId: SETTLEMENT_ID }, select: { id: true } })).map((op) => op.id);
+      await prisma.auditLog.deleteMany({ where: { entityId: { in: ops } } });
+      await prisma.alertCooldown.deleteMany({ where: { key: { in: ops.map((op) => `xero-success-after-resolution:${op}:${BOUND_INVOICE}`) } } });
+      await deleteFixtures();
+      if (savedModuleSettings) {
+        // Only the two switches this suite turned on are put back.
+        await prisma.clubModuleSettings.update({
+          where: { id: "default" },
+          data: {
+            xeroIntegration: savedModuleSettings.xeroIntegration,
+            internetBankingPayments: savedModuleSettings.internetBankingPayments,
+          },
+          select: { id: true },
+        });
+      } else {
+        await prisma.clubModuleSettings.deleteMany({ where: { id: "default" } });
+      }
+      await Promise.all([lockHolderClient?.$disconnect(), observerClient?.$disconnect()]);
+    });
+
+    /** #4710: the bound settlement, and its CREATE stalled, reset and queued again in place by Retry. */
+    async function stalledBoundCreateRequeued() {
+      await child(CHILD_A, "CONFIRMED", 4_500);
+      await prisma.groupBookingSettlement.create({
+        data: {
+          id: SETTLEMENT_ID, groupBookingId: GROUP_ID, source: "INTERNET_BANKING", status: "PENDING", amountCents: 4_500,
+          xeroInvoiceId: BOUND_INVOICE, xeroInvoiceNumber: "INV-BOUND",
+        },
+      });
+      // The stalled run's claimed CREATE: it bound the invoice, then stalled emailing it.
+      const stalledClaimAt = new Date();
+      const created = await prisma.xeroSyncOperation.create({
+        data: {
+          direction: "OUTBOUND", entityType: "INVOICE", operationType: "CREATE", localModel: "GroupBookingSettlement", localId: SETTLEMENT_ID,
+          status: "RUNNING", startedAt: stalledClaimAt, createdAt: new Date("2000-01-01T00:00:00.000Z"),
+          correlationKey: groupSettlementInvoiceCreateKey(SETTLEMENT_ID, 0), idempotencyKey: groupSettlementInvoiceCreateKey(SETTLEMENT_ID, 0),
+          requestPayload: { queueType: "GROUP_SETTLEMENT_INVOICE", settlementId: SETTLEMENT_ID }, queueType: "GROUP_SETTLEMENT_INVOICE",
+        },
+      });
+      const operationId = created.id;
+      const { markStaleRunningXeroOperationFailed } = await import("@/lib/xero-stale-operations");
+      await expect(
+        markStaleRunningXeroOperationFailed(operationId, async () => undefined, new Date(stalledClaimAt.getTime() + 16 * 60_000)),
+      ).resolves.toMatchObject({ outcome: "marked", returnedTo: "FAILED" });
+      const { retryXeroSyncOperation } = await import("@/lib/xero-operation-retry");
+      const { CLUB_FORMAT_TEST } = await import("@/lib/__tests__/support/club-format-fixture");
+      await expect(retryXeroSyncOperation(operationId, CLUB_FORMAT_TEST)).resolves.toMatchObject({ message: "Queued the group settlement invoice operation for retry." });
+      expect(await operation(operationId)).toMatchObject({ status: "PENDING", startedAt: null });
+
+      const email = await import("@/lib/email");
+      const send = vi.fn(async () => ({ deliveryAllowed: true, recipients: 1, sent: 1, queuedForRetry: 0, notDelivered: 0 }));
+      vi.spyOn(email, "sendAdminXeroSyncErrorAlert").mockImplementation(send as never);
+      // The queued run makes no Xero call: the invoice is bound. Its claim is a later instant than the stalled one's.
+      const apiClient = await import("@/lib/xero-api-client");
+      vi.spyOn(apiClient, "getAuthenticatedXeroClient").mockRejectedValue(new Error("the queued run must make no Xero call"));
+      vi.setSystemTime(new Date(stalledClaimAt.getTime() + 40 * 60_000));
+      return { operationId, stalledClaimAt, send };
+    }
+
+    const operation = (operationId: string) => prisma.xeroSyncOperation.findUniqueOrThrow({ where: { id: operationId } });
+
+    /** The stalled run's email fails, and it completes PARTIAL under its old claim. */
+    async function lateEmailFailedPartial(operationId: string, stalledClaimAt: Date) {
+      const { completeXeroSyncOperation } = await import("@/lib/xero-sync");
+      return completeXeroSyncOperation(
+        { id: operationId, startedAt: stalledClaimAt },
+        {
+          status: "PARTIAL", responsePayload: { invoice: { invoiceID: BOUND_INVOICE }, invoiceEmailError: new Error("Xero 500: the email failed") },
+          xeroObjectType: "INVOICE", xeroObjectId: BOUND_INVOICE, xeroObjectNumber: "INV-BOUND",
+        },
+      );
+    }
+
+    async function queuedRun() {
+      const { processQueuedXeroOutboxOperations } = await import("@/lib/xero-operation-outbox");
+      return processQueuedXeroOutboxOperations({ limit: 1 });
+    }
+
+    /** The email failure reached officers: one audit row naming it, and one alert. */
+    async function emailFailureTraced(operationId: string, send: ReturnType<typeof vi.fn>) {
+      const audits = await prisma.auditLog.findMany({ where: { entityId: operationId, action: "xero.operation.late_partial_not_recorded" } });
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.metadata).toMatchObject({ fault: "invoice email: Xero 500: the email failed" });
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ errorMessage: expect.stringContaining("invoice email: Xero 500: the email failed") }));
+    }
+
+    /** The queued run closed its own claim SUCCEEDED on the bound invoice, never left RUNNING. */
+    async function closedOnBoundInvoice(operationId: string, stalledClaimAt: Date) {
+      const closed = await operation(operationId);
+      expect(closed).toMatchObject({ status: "SUCCEEDED", xeroObjectId: BOUND_INVOICE, xeroObjectNumber: "INV-BOUND" });
+      expect(closed.startedAt!.getTime()).toBeGreaterThan(stalledClaimAt.getTime());
+      expect(closed.completedAt).not.toBeNull();
+    }
+
+    it("#4710: stall, reset, Retry, then a late PARTIAL whose email failed - refused and traced, and the queued run closes SUCCEEDED on the bound invoice", async () => {
+      const { operationId, stalledClaimAt, send } = await stalledBoundCreateRequeued();
+      await expect(lateEmailFailedPartial(operationId, stalledClaimAt)).resolves.toBeNull();
+      expect(await operation(operationId)).toMatchObject({ status: "PENDING", startedAt: null, xeroObjectId: null });
+      await emailFailureTraced(operationId, send);
+
+      await expect(queuedRun()).resolves.toMatchObject({ succeeded: 1, failed: 0 });
+      await closedOnBoundInvoice(operationId, stalledClaimAt);
+    });
+
+    it("#4708 round 2 (a): the queued run closes SUCCEEDED on the bound invoice first, then the late PARTIAL's failed email arrives - still audited and alerted", async () => {
+      const { operationId, stalledClaimAt, send } = await stalledBoundCreateRequeued();
+      await expect(queuedRun()).resolves.toMatchObject({ succeeded: 1, failed: 0 });
+      await closedOnBoundInvoice(operationId, stalledClaimAt);
+
+      await expect(lateEmailFailedPartial(operationId, stalledClaimAt)).resolves.toBeNull();
+      await closedOnBoundInvoice(operationId, stalledClaimAt);
+      await emailFailureTraced(operationId, send);
+    });
+
+    it("#4708 round 2 (b): the queued run holds the row RUNNING behind lock(1) when the late PARTIAL's failed email arrives - still audited and alerted", async () => {
+      const { operationId, stalledClaimAt, send } = await stalledBoundCreateRequeued();
+      const [queued] = await raceBehindLockOne([queuedRun], 1, "the queued run behind lock(1)", async () => {
+        const held = await operation(operationId);
+        expect(held.status).toBe("RUNNING");
+        expect(held.startedAt!.getTime()).toBeGreaterThan(stalledClaimAt.getTime());
+        await expect(lateEmailFailedPartial(operationId, stalledClaimAt)).resolves.toBeNull();
+        expect(await operation(operationId)).toMatchObject({ status: "RUNNING", startedAt: held.startedAt });
+      });
+      expect(queued).toMatchObject({ status: "fulfilled", value: expect.objectContaining({ succeeded: 1, failed: 0 }) });
+      await closedOnBoundInvoice(operationId, stalledClaimAt);
+      await emailFailureTraced(operationId, send);
+    });
+
+    /**
+     * #4919: a bound invoice whose email is owed, its CREATE claimed for the
+     * re-drive. Xero is faked whole: the client, the email (the deadline and
+     * zero retries are unit-proven), and the VOID the cancel queues.
+     */
+    async function owedEmailRedrive(queued = false) {
+      await child(CHILD_A, "CONFIRMED", 4_500);
+      await prisma.groupBookingSettlement.create({
+        data: {
+          id: SETTLEMENT_ID, groupBookingId: GROUP_ID, source: "INTERNET_BANKING", status: "PENDING", amountCents: 4_500,
+          xeroInvoiceId: BOUND_INVOICE, xeroInvoiceNumber: "INV-BOUND",
+        },
+      });
+      const { deferredGroupInvoiceEmailPayload } = await import("@/lib/xero-group-settlement-invoice-outbox");
+      const { sanitizeForJson } = await import("@/lib/xero-sync");
+      const startedAt = new Date();
+      const claimed = await prisma.xeroSyncOperation.create({
+        data: {
+          direction: "OUTBOUND", entityType: "INVOICE", operationType: "CREATE", localModel: "GroupBookingSettlement", localId: SETTLEMENT_ID,
+          status: queued ? "PENDING" : "RUNNING", startedAt: queued ? null : startedAt, createdAt: new Date("2000-01-01T00:00:00.000Z"),
+          correlationKey: groupSettlementInvoiceCreateKey(SETTLEMENT_ID, 0), idempotencyKey: groupSettlementInvoiceCreateKey(SETTLEMENT_ID, 0),
+          requestPayload: { queueType: "GROUP_SETTLEMENT_INVOICE", settlementId: SETTLEMENT_ID }, queueType: "GROUP_SETTLEMENT_INVOICE",
+          // Stored as the fence stores it: through the payload redactor.
+          responsePayload: sanitizeForJson(deferredGroupInvoiceEmailPayload({ invoiceID: BOUND_INVOICE }, new Error("Xero 429: rate limited"))),
+        },
+      });
+      const allow = { kind: "allow", clearance: {} } as never;
+      const invoiceEmail = await import("@/lib/xero-invoice-email");
+      vi.spyOn(invoiceEmail, "resolveXeroInvoiceEmailPolicy").mockResolvedValue(allow);
+      vi.spyOn(invoiceEmail, "reassertXeroInvoiceEmailPolicy").mockResolvedValue(allow);
+      const voids = await import("@/lib/xero-group-settlement-invoice-voids");
+      const voided = vi.spyOn(voids, "voidCancelledGroupSettlementInvoice").mockResolvedValue(undefined as never);
+      const outbox = await import("@/lib/xero-operation-outbox");
+      vi.spyOn(outbox, "kickQueuedXeroOutboxOperationsIfConnected").mockResolvedValue(undefined as never);
+      const apiClient = await import("@/lib/xero-api-client");
+      const client = vi.spyOn(apiClient, "getAuthenticatedXeroClient").mockResolvedValue({ xero: {}, tenantId: "race-tenant" } as never);
+      const { createXeroInvoiceForGroupSettlement } = await import("@/lib/xero-group-settlement-invoices");
+      const redrive = () => createXeroInvoiceForGroupSettlement(SETTLEMENT_ID, { syncOperation: { id: claimed.id, startedAt } });
+      return { invoiceEmail, voided, client, redrive, operationId: claimed.id };
+    }
+
+    async function organiserCancel() {
+      const { settleGroupBookingOnOrganiserCancel } = await import("@/lib/group-cancel");
+      const { CLUB_FORMAT_TEST } = await import("@/lib/__tests__/support/club-format-fixture");
+      await settleGroupBookingOnOrganiserCancel(ORGANISER_BOOKING_ID, ORGANISER_ID, "127.0.0.1", CLUB_FORMAT_TEST);
+    }
+
+    const groupStatus = async () =>
+      (await observerClient.groupBooking.findUniqueOrThrow({ where: { id: GROUP_ID }, select: { status: true } })).status;
+
+    /** Sessions in this database waiting for an advisory lock. */
+    async function advisoryWaiters(): Promise<number> {
+      const rows = await observerClient.$queryRaw<Array<{ count: number }>>`
+        SELECT COUNT(*)::int AS "count" FROM pg_locks
+        WHERE locktype = 'advisory' AND NOT granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+      `;
+      return rows[0]?.count ?? 0;
+    }
+
+    it("#4919: a slow email holds the fence while the organiser's cancel waits - the cancel commits only after the fence ends", async () => {
+      const { invoiceEmail, voided, redrive, operationId } = await owedEmailRedrive();
+      const events: string[] = [];
+      let cancel: Promise<void> | undefined;
+      const send = vi.spyOn(invoiceEmail, "sendXeroInvoiceEmail").mockImplementation(async () => {
+        events.push("email asked");
+        cancel = organiserCancel().then(() => void events.push("cancel returned"));
+        const startedAt = process.hrtime.bigint();
+        while ((await advisoryWaiters()) < 1) {
+          if (realElapsedMs(startedAt) > LOCK_POLL_TIMEOUT_MS) throw new Error("The cancel never queued on lock(1) behind the email fence.");
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        // Xero is slow; the cancel stays queued, not committed.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        expect(await groupStatus()).toBe("OPEN");
+        events.push("email accepted");
+        return { body: { emailed: true } };
+      });
+
+      await expect(redrive()).resolves.toBe(BOUND_INVOICE);
+      await cancel;
+      expect(events).toEqual(["email asked", "email accepted", "cancel returned"]);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(await groupStatus()).toBe("CANCELLED");
+      // The email won, so the cancel commits its own durable VOID debt.
+      expect(await abandonVoidRows(BOUND_INVOICE)).toHaveLength(0);
+      const cancelVoids = await prisma.xeroSyncOperation.findMany({
+        where: { localId: SETTLEMENT_ID, correlationKey: groupSettlementInvoiceVoidKey(SETTLEMENT_ID, BOUND_INVOICE, "cancel") },
+        select: { status: true },
+      });
+      expect(cancelVoids).toEqual([{ status: "PENDING" }]);
+      expect(voided).not.toHaveBeenCalled();
+      expect(await operation(operationId)).toMatchObject({
+        status: "SUCCEEDED",
+        xeroObjectId: BOUND_INVOICE,
+        responsePayload: expect.objectContaining({ invoiceSendAccepted: true, deferredInvoiceSend: null }),
+      });
+    });
+
+    it("#4919: a cancel that commits before the email fence takes lock(1) - no email is asked for, and the invoice is voided", async () => {
+      const { invoiceEmail, voided, client, redrive } = await owedEmailRedrive();
+      const send = vi.spyOn(invoiceEmail, "sendXeroInvoiceEmail");
+      // Between the re-drive's first fence and its email fence: the cancel commits.
+      client.mockImplementationOnce(async () => {
+        await organiserCancel();
+        return { xero: {}, tenantId: "race-tenant" } as never;
+      });
+
+      await expect(redrive()).resolves.toBeNull();
+      expect(await groupStatus()).toBe("CANCELLED");
+      expect(send).not.toHaveBeenCalled();
+      expect(voided).toHaveBeenCalledWith(expect.objectContaining({ settlementId: SETTLEMENT_ID, invoiceId: BOUND_INVOICE }));
+    });
+
+    it("#4919: an email Xero did not answer in time stays owed through the real outbox - back to PENDING, spaced out, then asked again with the same key", async () => {
+      const { invoiceEmail, operationId } = await owedEmailRedrive(true);
+      const { XeroCallDeadlineError } = invoiceEmail;
+      const send = vi
+        .spyOn(invoiceEmail, "sendXeroInvoiceEmail")
+        .mockRejectedValueOnce(new XeroCallDeadlineError(3_000))
+        .mockResolvedValueOnce({ body: { emailed: true } });
+
+      await expect(queuedRun()).resolves.toMatchObject({ succeeded: 0, failed: 0 });
+      const owed = await operation(operationId);
+      expect(owed).toMatchObject({ status: "PENDING", startedAt: null, lastErrorCode: "GROUP_SETTLEMENT_INVOICE_EMAIL_DEFERRED" });
+      const { readDeferredGroupInvoiceEmail } = await import("@/lib/xero-group-settlement-invoice-outbox");
+      expect(readDeferredGroupInvoiceEmail(owed.responsePayload)).toEqual({ invoice: { invoiceID: BOUND_INVOICE } });
+
+      // Not asked again at once: the scan spaces the wait code out.
+      await expect(queuedRun()).resolves.toMatchObject({ succeeded: 0, failed: 0 });
+      expect(send).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(new Date(Date.now() + 61_000));
+      await expect(queuedRun()).resolves.toMatchObject({ succeeded: 1, failed: 0 });
+      expect(send).toHaveBeenCalledTimes(2);
+      const key = `group-settlement:${SETTLEMENT_ID}:invoice-email:${BOUND_INVOICE}:v1`;
+      expect(send.mock.calls.map(([params]) => params.idempotencyKey)).toEqual([key, key]);
+      expect(await operation(operationId)).toMatchObject({
+        status: "SUCCEEDED",
+        responsePayload: expect.objectContaining({ invoiceSendAccepted: true, deferredInvoiceSend: null }),
+      });
+    });
+
+    it("a refused change to a bound settlement rolls back the bed it claimed for a late joiner", async () => {
+      // A and B are on an invoice still being prepared; C joined afterwards.
+      await child(CHILD_A, "CONFIRMED", 4_500);
+      await child(CHILD_B, "CONFIRMED", 4_500);
+      await child(CHILD_C, "PAYMENT_PENDING", 2_000);
+      await boundSettlement({ xeroInvoiceId: null, amountCents: 9_000 });
+
+      // The organiser asks for an updated invoice. While their claim waits on
+      // lock(1), the create worker binds the invoice that was being prepared —
+      // so the replacement they were cleared for (no invoice yet) is stale.
+      const settled = await raceBehindLockOne(
+        [() => createGroupSettlementIntent(JOIN_CODE, ORGANISER_ID, "internet_banking")],
+        1,
+        "The settle's claim transaction never queued on lock(1).",
+        async (tx) => {
+          await tx.groupBookingSettlement.update({
+            where: { id: SETTLEMENT_ID },
+            data: { xeroInvoiceId: "race-3642-inv-bound", xeroInvoiceNumber: "INV-RACE" },
+          });
+        },
+      );
+
+      expect(settled[0]).toMatchObject({
+        status: "rejected",
+        reason: expect.objectContaining({ code: "GROUP_SETTLEMENT_INVOICE_RETRY" }),
+      });
+      // The claim of C's bed rolled back with the refusal.
+      const c = await prisma.booking.findUniqueOrThrow({ where: { id: CHILD_C }, select: { status: true } });
+      expect(c.status).toBe("PAYMENT_PENDING");
+      expect(await prisma.bedAllocation.count({ where: { bookingId: CHILD_C } })).toBe(0);
+      const settlement = await prisma.groupBookingSettlement.findUniqueOrThrow({
+        where: { id: SETTLEMENT_ID },
+        select: { amountCents: true, xeroInvoiceId: true },
+      });
+      expect(settlement).toEqual({ amountCents: 9_000, xeroInvoiceId: "race-3642-inv-bound" });
+      expect(
+        await prisma.xeroSyncOperation.count({
+          where: { localId: SETTLEMENT_ID, operationType: "CREATE" },
+        }),
+      ).toBe(1);
+      expect(await prisma.hostingCoverageReevaluation.count({ where: { memberId: ORGANISER_ID } })).toBe(0);
+    });
+
+    it.each([
+      ["the create worker's fence first", "fence-first"],
+      ["the reaper's release first", "reaper-first"],
+    ] as const)("the reaper's release and the create worker's fence decide one invoice exactly once — %s", async (_label, order) => {
+      await child(CHILD_A, "CONFIRMED", 9_000);
+      await boundSettlement({ xeroInvoiceId: null, amountCents: 9_000 });
+      const invoiceId = "race-3642-inv-late";
+      // Past the reaper's first window; the release writes the (frozen) current
+      // time back, so the second window, measured from it, has not run out.
+      const reapAt = new Date();
+      const threeDaysAgo = new Date(reapAt.getTime() - 3 * 24 * 60 * 60 * 1000);
+      await prisma.$executeRaw`UPDATE "GroupBookingSettlement" SET "updatedAt" = ${threeDaysAgo} WHERE id = ${SETTLEMENT_ID}`;
+
+      const fence = () =>
+        prisma.$transaction((tx) =>
+          bindCreatedGroupSettlementInvoice(tx, {
+            settlementId: SETTLEMENT_ID,
+            attempt: 0,
+            invoice: { id: invoiceId, number: "INV-LATE", totalCents: 9_000 },
+          }),
+        );
+      // The reaper scans every settlement in the shared database: the forced
+      // order only means "this settlement first" when no other suite's
+      // settlement is waiting to be reaped ahead of it.
+      expect(
+        await prisma.groupBookingSettlement.count({
+          where: { id: { not: SETTLEMENT_ID }, status: { in: ["PENDING", "FAILED"] } },
+        }),
+      ).toBe(0);
+      const reap = () => reapStaleGroupSettlements(reapAt);
+      const settled = await raceBehindLockOne(
+        order === "fence-first" ? [fence, reap] : [reap, fence],
+        2,
+        "The worker's fence and the reaper's release should both queue on lock(1).",
+      );
+      for (const outcome of settled) {
+        if (outcome.status === "rejected") throw outcome.reason;
+      }
+      const fenceResult = settled[order === "fence-first" ? 0 : 1] as PromiseFulfilledResult<{
+        abandoned: boolean;
+      }>;
+      // Fence first: it binds, and the reaper then retires what it bound.
+      // Reaper first: the fence finds the settlement released and abandons.
+      expect(fenceResult.value.abandoned).toBe(order === "reaper-first");
+
+      const settlement = await prisma.groupBookingSettlement.findUniqueOrThrow({
+        where: { id: SETTLEMENT_ID },
+        select: { status: true, xeroInvoiceId: true },
+      });
+      // Released, and never left pointing at the invoice it abandoned...
+      expect(settlement).toEqual({ status: "FAILED", xeroInvoiceId: null });
+      // ...whose VOID is queued exactly once, and whose link is kept inactive.
+      expect(await abandonVoidRows(invoiceId)).toHaveLength(1);
+      const link = await prisma.xeroObjectLink.findFirstOrThrow({
+        where: { localId: SETTLEMENT_ID, xeroObjectId: invoiceId },
+        select: { active: true },
+      });
+      expect(link.active).toBe(false);
+      const a = await prisma.booking.findUniqueOrThrow({ where: { id: CHILD_A }, select: { status: true } });
+      expect(a.status).toBe("PAYMENT_PENDING");
+    });
+
+    it("two observers abandoning one invoice converge on one VOID row", async () => {
+      await child(CHILD_A, "CONFIRMED", 9_000);
+      const invoiceId = "race-3642-inv-shared";
+      await boundSettlement({ xeroInvoiceId: invoiceId, amountCents: 9_000 });
+      await prisma.xeroObjectLink.create({
+        data: {
+          localModel: "GroupBookingSettlement",
+          localId: SETTLEMENT_ID,
+          xeroObjectType: "INVOICE",
+          xeroObjectId: invoiceId,
+          role: "GROUP_SETTLEMENT_INVOICE",
+          active: true,
+        },
+      });
+
+      const abandon = () =>
+        prisma.$transaction(async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+          await abandonGroupSettlementInvoiceInTx(tx, {
+            settlementId: SETTLEMENT_ID,
+            xeroInvoiceId: invoiceId,
+          });
+        });
+      const settled = await raceBehindLockOne(
+        [abandon, abandon],
+        2,
+        "Both observers should queue on lock(1).",
+      );
+      for (const outcome of settled) {
+        if (outcome.status === "rejected") throw outcome.reason;
+      }
+
+      const rows = await abandonVoidRows(invoiceId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].status).toBe("PENDING");
+      const settlement = await prisma.groupBookingSettlement.findUniqueOrThrow({
+        where: { id: SETTLEMENT_ID },
+        select: { xeroInvoiceId: true },
+      });
+      expect(settlement.xeroInvoiceId).toBeNull();
+    });
+  },
+);

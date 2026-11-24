@@ -1,0 +1,155 @@
+## Linked Issue
+
+- Closes or relates to:
+
+## Summary
+
+<!-- Over 800 changed lines (files `.gitattributes` marks `linguist-generated`
+     not counted)? Add a one-line reason on its own line, starting `large-pr:`.
+     A soft limit: `verify` warns, never fails. -->
+
+-
+
+## Plan Deviation
+
+<!-- A material deviation from the issue's approved plan, as defined in
+     docs/agents/ISSUE_WORKFLOW.md → "Plan deviation", goes to the owner first.
+     Write `None` when the PR is built to the plan; otherwise one item per
+     deviation, each linking the owner's answer: the comment URL, or the
+     `#<number>` of the issue whose body records the decision. `verify` fails
+     on a missing, empty or unlinked section. Only dependency manifests and the
+     lockfile may change for an exemption (#4633); the author does not matter. -->
+
+-
+
+## Risk Level
+
+- [ ] Critical
+- [ ] High
+- [ ] Medium
+- [ ] Low
+- [ ] Informational/docs only
+
+## Changed Areas
+
+- [ ] Booking/capacity
+- [ ] Payment/refund/credits
+- [ ] Membership/family lifecycle
+- [ ] Xero/Stripe/SES/Sentry integration
+- [ ] Auth/security/privacy
+- [ ] Admin/finance/lodge UI
+- [ ] Public UI/UX/accessibility
+- [ ] Database schema/migrations
+- [ ] Deployment/operations
+- [ ] Docs/agent workflow only
+
+## Tests Added Or Updated
+
+-
+
+## Validation Commands Run
+
+```bash
+
+```
+
+## Commands Not Run And Why
+
+-
+
+## Screenshots Or UI Evidence
+
+- Required for UI changes; otherwise write `N/A`.
+
+## Security And Privacy Impact
+
+-
+
+## Data Integrity Impact
+
+-
+
+## Concurrency And Lock Impact
+
+<!-- Each field's value must sit on the SAME line as its label. A value wrapped
+     onto the following line reads as EMPTY and fails the gate; continuation
+     lines after that first line are fine. Do not reword the heading or the
+     labels — they are matched exactly.
+     `N/A` is refused when the diff changes the Prisma schema, a migration, or a
+     file under `src/lib` or `src/app/api` named for a sensitive area that is
+     asynchronous or holds a transaction, write, raw SQL, lock, database client
+     or re-export, or imports a module that does (CONTRIBUTING.md → "Branch protection").
+     Check before pushing:  pnpm run pr:check <body-file>  -->
+
+- [ ] N/A — no transaction, lifecycle, capacity, settlement, credit, webhook,
+      cron, or concurrency-sensitive writer changed.
+- Writer class(es), canonical lock key(s), and acquisition order:
+- Immutable pre-lock key source and mutable under-lock re-read:
+- Status-guarded claim and proof that a lost claim runs no side effect:
+- Relevant open/last-10 PR numbers, counterpart writers/tests, and compatibility evidence:
+- Provider calls inside a transaction (write `None`, or justify the bounded exception from `docs/CONCURRENCY_AND_LOCKING.md`):
+
+## Single Source Of Truth
+
+<!-- INV-SSOT. Not a checkbox: name the fact, and where it is DEFINED. A second
+     FORM of one fact is fine; a second DEFINITION is the defect. Write `N/A`
+     only when this change defines no constant, helper, formatter, type,
+     validation rule or config value that a second place could need. -->
+
+- New or moved definitions, and the one module each now lives in:
+- If anything was copied rather than imported, or a guard was added instead of
+  making the wrong thing unrepresentable — which structural option was rejected
+  and why:
+
+## Payment Or Accounting Impact
+
+-
+
+## Migration Or Deployment Impact
+
+-
+
+## Docs Updated
+
+-
+
+## Changelog Entry
+
+- Fragment added (`changelog.d/<pr-number>-<slug>.md`; name it `*.feature.md`
+  when it adds something new, which makes the release minor):
+- Or, if this change genuinely needs no entry, put the no-entry marker
+  documented in `changelog.d/README.md` on its own line here, with the reason.
+  (The marker is deliberately not pre-filled: a marker in every PR body would
+  switch the gate off for everyone.)
+
+## Residual Risks
+
+<!-- A ready PR carries no residuals: known, achievable fixes are made in this
+     PR (AGENTS.md → "Residual risks are resolved in the PR"). List here only
+     stated limits — what was not exercised, and why — or `None`. -->
+
+-
+
+## Manual Checks Required
+
+<!-- A step someone must do once the release is deployed (run a report, map a
+     setting, check a page) is written by this PR's author, human or agent, as
+     its own `changelog.d/<pr-number>-<slug>.deploy.md` in this PR, with the
+     headings Who, What to do and How to check it worked
+     (`changelog.d/README.md`, "After-deploy steps"). `verify` fails a PR whose
+     answer here or under Migration Or Deployment Impact names such a step
+     without one (#5379). With no such step, answer "None. No after-deploy
+     step." -->
+
+-
+
+## Safety Confirmation
+
+- [ ] I did not use production credentials, production databases, production
+      backups, live Stripe, live Xero, live SES, live Sentry, or live provider
+      webhooks for exploratory validation.
+- [ ] Merge handling follows the `AGENTS.md` "Completion and Merge" merge gate
+      (#3959): any risk level merges once complete, green on its exact head,
+      reviewed with the lenses chosen for its risk, and carrying the full
+      Ready-to-Merge comment; no owner Approve is needed. An open owner
+      decision still waits for the owner. Merge commits only.

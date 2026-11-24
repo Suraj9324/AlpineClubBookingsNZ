@@ -1,0 +1,189 @@
+import { describe, expect, it } from "vitest";
+
+import { valuedNightLocksForGuest } from "@/lib/edit-night-valuation";
+import {
+  classifyStoredSoldPriceEvidence,
+  storedSoldPriceEvidenceForGuest,
+} from "@/lib/stored-sold-price-evidence";
+import { requireCalendarDate } from "@/lib/club-time";
+import { buildInvoiceLineItems } from "@/lib/xero-booking-invoices";
+
+/**
+ * #3170 (epic #2797): every reader of `BookingGuestNight.priceCents` meets a
+ * `NULL` now, and the one answer none of them may give is `0`.
+ *
+ * A stored `0` is a real sold price — a comped night — so a reader that turns an
+ * unknown into a zero has not merely lost information, it has made a financial
+ * statement nobody made, and the next edit reads that statement back as evidence
+ * the member paid nothing. Each case below is one consumer and the decision taken
+ * for it.
+ */
+
+const D = (iso: string) => new Date(`${iso}T00:00:00.000Z`);
+const K = (iso: string) => requireCalendarDate(iso);
+const RATE = 5000;
+
+describe("#3170 the evidence reader: a null is an absence, never a price", () => {
+  it("classifies an unknown night exactly like an absent or unusable one", () => {
+    const verdict = classifyStoredSoldPriceEvidence(
+      [
+        { date: K("2026-08-20"), priceCents: RATE },
+        // The row exists and says "not known".
+        { date: K("2026-08-21"), priceCents: null },
+      ],
+      2 * RATE,
+      "WHOLE_GUEST",
+    );
+
+    expect(verdict.kind).toBe("unusable");
+    if (verdict.kind !== "unusable") return;
+    expect(verdict.cause).toBe("PARTIAL_STORED_NIGHT_PRICES");
+    // The unknown night is recorded on the evidence as an absence, so an admin
+    // sees "we do not know" rather than a number that was never a price.
+    expect(verdict.nightPrices).toEqual([
+      { date: K("2026-08-20"), priceCents: RATE },
+      { date: K("2026-08-21"), priceCents: null },
+    ]);
+  });
+
+  it("still prices an evenly-split backfilled strand as EXACT", () => {
+    // A RECORDED WHOLE-GUEST decision, and a large share of historical bookings
+    // depend on it. The two backfills that divided guest totals now carry
+    // `EVEN_SPLIT` provenance, which is inexact for one surrendered night. At
+    // whole-guest grain the stored total itself is still the amount being
+    // valued, so reconciling rows remain exact and go nowhere near a person.
+    const verdict = storedSoldPriceEvidenceForGuest(
+      {
+        priceCents: 3 * RATE,
+        stayStart: D("2026-08-20"),
+        stayEnd: D("2026-08-23"),
+        nights: [
+          { stayDate: D("2026-08-20"), priceCents: RATE },
+          { stayDate: D("2026-08-21"), priceCents: RATE },
+          { stayDate: D("2026-08-22"), priceCents: RATE },
+        ],
+      },
+      { checkIn: D("2026-08-20"), checkOut: D("2026-08-23") },
+      "WHOLE_GUEST",
+    );
+
+    expect(verdict.kind).toBe("exact");
+    if (verdict.kind !== "exact") return;
+    expect(verdict.totalCents).toBe(3 * RATE);
+  });
+
+  it("sends the same strand to a person the moment ONE night goes unknown", () => {
+    // The control for the case above: same booking, same total, one row blanked.
+    // Without this pair, "exact" could be what this function always says.
+    const verdict = storedSoldPriceEvidenceForGuest(
+      {
+        priceCents: 3 * RATE,
+        stayStart: D("2026-08-20"),
+        stayEnd: D("2026-08-23"),
+        nights: [
+          { stayDate: D("2026-08-20"), priceCents: RATE },
+          { stayDate: D("2026-08-21"), priceCents: null },
+          { stayDate: D("2026-08-22"), priceCents: RATE },
+        ],
+      },
+      { checkIn: D("2026-08-20"), checkOut: D("2026-08-23") },
+      "WHOLE_GUEST",
+    );
+
+    expect(verdict.kind).toBe("unusable");
+  });
+});
+
+describe("#3170 the valued lock reader: an unknown night is valued, never locked at zero (#4317)", () => {
+  it("values an unknown night from the stored total rather than locking it at zero or dropping it", () => {
+    const { lockedNightPrices, unattachedCents } = valuedNightLocksForGuest(
+      {
+        // $80 stored: the sold night is $50, the comped night is $0, so the one
+        // unknown night takes the $30 the total has left over (R2, INV-MOD-028).
+        priceCents: 8000,
+        stayStart: D("2026-08-20"),
+        stayEnd: D("2026-08-23"),
+        nights: [
+          { stayDate: D("2026-08-20"), priceCents: RATE, priceSource: "SOLD" },
+          { stayDate: D("2026-08-21"), priceCents: null, priceSource: "UNKNOWN" },
+          // A stored zero IS a price: a comped night keeps its $0 lock. This is
+          // the assertion that stops "null" and "0" being conflated in the
+          // direction that costs the member money.
+          { stayDate: D("2026-08-22"), priceCents: 0, priceSource: "SOLD" },
+        ],
+      },
+      { checkIn: D("2026-08-20"), checkOut: D("2026-08-23") },
+    );
+
+    expect(lockedNightPrices).toEqual([
+      { stayDate: D("2026-08-20"), priceCents: RATE, priceSource: "SOLD" },
+      // Before #4317 this night carried no lock and priced at today's rate.
+      { stayDate: D("2026-08-21"), priceCents: 3000, priceSource: "EVEN_SPLIT" },
+      { stayDate: D("2026-08-22"), priceCents: 0, priceSource: "SOLD" },
+    ]);
+    // The values add up to the stored total, so no money is left unattached.
+    expect(unattachedCents).toBe(0);
+  });
+});
+
+describe("#3170 the Xero invoice builder: lines still reconcile to the guest total", () => {
+  const guest = (nights: Array<{ stayDate: Date; priceCents: number | null }>) => ({
+    firstName: "Alice",
+    lastName: "Member",
+    ageTier: "ADULT",
+    isMember: true,
+    priceCents: 3 * RATE,
+    nights,
+  });
+  const lineTotal = (lines: Array<{ quantity?: number; unitAmount?: number }>) =>
+    Math.round(
+      lines.reduce(
+        (sum, line) => sum + (line.quantity ?? 0) * (line.unitAmount ?? 0) * 100,
+        0,
+      ),
+    );
+
+  it("bills the whole stay when one night's price is not known", () => {
+    // DROPPING THE UNKNOWN NIGHT FROM THE PER-NIGHT RUNS WOULD LOSE MONEY: the
+    // runs reconcile to the guest's total only because they partition every
+    // night held, so omitting one emits an invoice SHORT by it — a real
+    // under-charge on a live Xero document (INV-MONEY-003). So the guest falls
+    // to the whole-range branch, which bills the stored total, a real number.
+    const lines = buildInvoiceLineItems(
+      [
+        guest([
+          { stayDate: D("2026-08-20"), priceCents: RATE },
+          { stayDate: D("2026-08-21"), priceCents: null },
+          { stayDate: D("2026-08-22"), priceCents: RATE },
+        ]),
+      ],
+      D("2026-08-20"),
+      D("2026-08-23"),
+      3,
+    );
+
+    expect(lineTotal(lines)).toBe(3 * RATE);
+  });
+
+  it("keeps the per-night detail when every night is priced", () => {
+    // The control. Without it, the case above would also pass on a builder that
+    // had lost per-night invoicing altogether.
+    const lines = buildInvoiceLineItems(
+      [
+        guest([
+          { stayDate: D("2026-08-20"), priceCents: RATE },
+          { stayDate: D("2026-08-21"), priceCents: 2 * RATE },
+          { stayDate: D("2026-08-22"), priceCents: 0 },
+        ]),
+      ],
+      D("2026-08-20"),
+      D("2026-08-23"),
+      3,
+    );
+
+    // Three different nightly amounts, so three runs — the per-night detail is
+    // intact, and the stored zero is billed as the real (comped) price it is.
+    expect(lines).toHaveLength(3);
+    expect(lineTotal(lines)).toBe(3 * RATE);
+  });
+});

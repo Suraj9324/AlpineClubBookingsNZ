@@ -1,0 +1,433 @@
+import { NextRequest, NextResponse } from "next/server";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { hostingCoverageParticipantRetryResponse } from "@/lib/adult-member-hosting-retry-response";
+import { isDateOnlyOverrideViolation } from "@/lib/booking-modify-quote-request";
+import { batchModifySchema } from "@/lib/booking-modify-request";
+import { EditPriceChangedError, editPriceChangedBody } from "@/lib/edit-quoted-figures";
+import {
+  guestRequestSchemaError,
+} from "@/lib/booking-guest-stay-range-input";
+
+import { AdultMemberHostingRequiredError, buildAdultMemberHostingRefusalBody } from "@/lib/adult-member-hosting-refusal";
+import {
+  SameOwnerCoverageOverrideRequiredError,
+  SameOwnerCoverageWouldBreakError,
+  buildSameOwnerCoverageOverrideRequiredBody,
+  buildSameOwnerCoverageRefusalBody,
+} from "@/lib/adult-member-hosting-same-owner";
+import { ApiError } from "@/lib/api-error";
+import { auth } from "@/lib/auth";
+import { getClientIp } from "@/lib/rate-limit-http";
+import {
+  OwnDependantIdentityRefusedError,
+} from "@/lib/booking-dependant-identity";
+import {
+  dependantIdentityRefusalBody,
+  dependantIdentitySpeaksOnBehalf,
+} from "@/lib/booking-dependant-identity-doors";
+import {
+  BookingGuestValidationError,
+  getBookingGuestValidationErrorResponse,
+} from "@/lib/booking-guests";
+import {
+  BookingMemberNightConflictError,
+  getBookingMemberNightConflictResponse,
+} from "@/lib/booking-member-night-conflicts";
+import {
+  handleMemberGuestAddRefusal,
+  startMemberGuestRefusalClock,
+} from "@/lib/member-guest-probe-guard";
+import {
+  SameOwnerCoverageLinkedMoveRequiredError,
+  buildSameOwnerCoverageLinkedMoveBody,
+} from "@/lib/adult-member-hosting-linked-move";
+import { modifyBookingWithLinkedMoveSupport } from "@/lib/booking-linked-date-move-arms";
+import { clubTime } from "@/lib/club-time/server";
+import { adminShiftBookingDates } from "@/lib/booking-date-modification-service";
+import { EditFinancialReviewPendingError } from "@/lib/edit-financial-review";
+import {
+  BookingModifyReviewJustificationRequiredError,
+} from "@/lib/booking-modify-validation";
+import { MinimumStayPolicyViolationError } from "@/lib/booking-policy-exceptions";
+import {
+  buildPaidUpAdultRefusalBody,
+  PaidUpAdultMemberRequiredError,
+} from "@/lib/subscription-lockout-enforcement";
+import { OverCapacityConfirmationRequiredError } from "@/lib/over-capacity-confirmation";
+import { isBookingEnvelopeInvariantViolation } from "@/lib/booking-envelope-invariants";
+import {
+  getMembershipTypeBookingPolicyErrorBody,
+  MembershipTypeBookingPolicyError,
+} from "@/lib/membership-type-policy";
+import logger from "@/lib/logger";
+import {
+  TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE,
+  transactionContendedResponse,
+} from "@/lib/transaction-contended-response";
+import { requireActiveSessionUser } from "@/lib/session-guards";
+import { bookingManagementAuthorizationRole } from "@/lib/admin-permissions";
+import { getXeroLockGuardErrorResponse } from "@/lib/xero-period-lock-guard";
+import { clubFormatValues } from "@/lib/club-format-server";
+
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  // #2388 / MG3 (#2308). This route is a member-facing member-guest ADD path —
+  // `addGuests` is in its schema above and any authenticated member reaches it —
+  // so it owes the same three mitigations as the quote and guest-add routes: the
+  // refusal is throttled, audited, and held to the timing floor. It carried none
+  // of them until the privacy review found it (H2).
+  //
+  // It reads a MONOTONIC clock, never the wall clock:
+  // `review-findings-contracts.test.ts` forbids a wall-clock read in this file
+  // outright — as a blunt source grep, comments included, which is exactly how
+  // this comment first failed it — because a booking-modification idempotency key
+  // built from one would mint a fresh Stripe key on every retry. See the note on
+  // `startMemberGuestRefusalClock`.
+  const startedAt = startMemberGuestRefusalClock();
+
+  const session = await auth();
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+  }
+
+  const inactiveResponse = await requireActiveSessionUser(session.user.id);
+  if (inactiveResponse) {
+    return inactiveResponse;
+  }
+
+  const { id: bookingId } = await params;
+
+  const json = await parseJsonRequestBody(request);
+  if (!json.ok) return json.response;
+
+  const parsed = batchModifySchema.safeParse(json.body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: guestRequestSchemaError(parsed.error, "Invalid input"), details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const ipAddress = getClientIp(request);
+
+  // Issue #1313 (option A2): a Booking Officer (bookings:edit) resolves to ADMIN
+  // so they receive the SAME admin-on-behalf modify authority as a Full Admin.
+  const actorRole = bookingManagementAuthorizationRole(session.user);
+
+  // Issue #1668: admin-only date override gating.
+  const { adminOverride, pricingMode, confirmOverCapacity, notifyMember } =
+    parsed.data;
+  const hasOverrideFlags =
+    adminOverride !== undefined ||
+    pricingMode !== undefined ||
+    confirmOverCapacity !== undefined ||
+    notifyMember !== undefined;
+  if (hasOverrideFlags && actorRole !== "ADMIN") {
+    return NextResponse.json(
+      { error: "Admin override is not available for this account" },
+      { status: 403 },
+    );
+  }
+  // #1746: partner-shared placement is admin-initiated by owner decision.
+  if (parsed.data.partnerSharedGuests?.length && actorRole !== "ADMIN") {
+    return NextResponse.json(
+      { error: "Partner-shared placement is not available for this account" },
+      { status: 403 },
+    );
+  }
+  if (adminOverride && !pricingMode) {
+    return NextResponse.json(
+      { error: "Choose a pricing mode for the admin override" },
+      { status: 400 },
+    );
+  }
+  // Issue #1696: an admin may now suppress the member-facing modified email on
+  // ANY edit, so notifyMember is allowed alone (without adminOverride). The
+  // pricing/capacity override flags still require adminOverride. actorRole is
+  // already the booking-management role (ADMIN for Full Admin / Booking Officer),
+  // so the service honours the admin's choice on every edit.
+  if (
+    !adminOverride &&
+    (pricingMode !== undefined || confirmOverCapacity !== undefined)
+  ) {
+    return NextResponse.json(
+      {
+        error: "adminOverride is required for pricingMode/confirmOverCapacity",
+      },
+      { status: 400 },
+    );
+  }
+  if (
+    adminOverride &&
+    isDateOnlyOverrideViolation(parsed.data)
+  ) {
+    return NextResponse.json(
+      { error: "Admin override edits change dates only" },
+      { status: 400 },
+    );
+  }
+
+  // #3123 — the CLUB's day, from its persisted `ClubTimeSettings.timeZone`
+  // (`INV-CONFIG-002`), resolved HERE because this is the last position on this
+  // path that is outside every transaction on every route in. `modifyBookingBatch`
+  // is transaction-AWARE (`withOptionalTransaction`), so it cannot resolve one
+  // for itself without reading the club's zone under the caller's locks on the
+  // policy-exception path — `INV-LOCK-004`, and the reason its `todayAtClub` is
+  // a required parameter.
+  const todayAtClub = (await clubTime()).today();
+  // The club's format (#3565), resolved once, before any transaction or
+  // lock below — never per amount and never inside a transaction.
+  const format = await clubFormatValues();
+
+  try {
+    const result =
+      adminOverride && pricingMode === "shift"
+        ? await adminShiftBookingDates({
+            bookingId,
+            actor: { id: session.user.id, role: actorRole },
+            ...(parsed.data.hostingCoverageOverride
+              ? { hostingCoverageOverride: parsed.data.hostingCoverageOverride }
+              : {}),
+            input: {
+              checkIn: parsed.data.checkIn,
+              checkOut: parsed.data.checkOut,
+              quotedFigures: parsed.data.quotedFigures,
+              confirmOverCapacity,
+              notifyMember,
+            },
+            ipAddress,
+          })
+        : await modifyBookingWithLinkedMoveSupport({
+            format,
+            bookingId,
+            actor: { id: session.user.id, role: actorRole },
+            ...(parsed.data.hostingCoverageOverride
+              ? { hostingCoverageOverride: parsed.data.hostingCoverageOverride }
+              : {}),
+            ...(parsed.data.hostingCoverageLinkedMove
+              ? { linkedMove: parsed.data.hostingCoverageLinkedMove }
+              : {}),
+            input: parsed.data,
+            ipAddress,
+            todayAtClub,
+          });
+
+    return NextResponse.json(result);
+  } catch (err) {
+    // #4924 (`INV-MOD-062`): the save's own figures differ from the ones the
+    // member previewed. Thrown inside the save's transaction before its first
+    // write, so nothing was settled; the body carries the fresh figures.
+    if (err instanceof EditPriceChangedError) {
+      return NextResponse.json(editPriceChangedBody(err), { status: err.status });
+    }
+    // The edit commits before its refund and additional-ask steps, so a
+    // contended lock(1) transaction (INV-LOCK-006) asks for a status check.
+    // The linked move answers its own LINKED_MOVE_CONTENDED 503 below.
+    const contended = transactionContendedResponse(
+      err,
+      "Booking modification contended for the lock(1) budget",
+      { message: TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE, context: { bookingId } },
+    );
+    if (contended) return contended;
+    const hostingRetry = hostingCoverageParticipantRetryResponse(err);
+    if (hostingRetry) return hostingRetry;
+    // #3451 (`INV-GUEST-019`): an added guest is named as one of the owner's
+    // recorded dependants with no live answer. The create route's body and code;
+    // `onBehalf` is ownership, not role — an officer's OWN booking reads as theirs.
+    if (err instanceof OwnDependantIdentityRefusedError) {
+      return NextResponse.json(
+        dependantIdentityRefusalBody(err.refusal, {
+          onBehalf: dependantIdentitySpeaksOnBehalf({
+            actorIsAdmin: actorRole === "ADMIN",
+            actorId: session.user.id,
+            ownerMemberId: err.ownerMemberId,
+          }),
+          surface: "edit",
+        }),
+        { status: err.refusal.status },
+      );
+    }
+    if (err instanceof OverCapacityConfirmationRequiredError) {
+      return NextResponse.json(
+        {
+          error: err.message,
+          code: err.code,
+          nightDetails: err.nightDetails,
+        },
+        { status: err.status },
+      );
+    }
+    if (err instanceof MembershipTypeBookingPolicyError) {
+      // Finding 2 (privacy re-review of MG3 #2308). The membership-type refusal
+      // is D-8's FOURTH collapsing refusal, so when it collapsed it owes the
+      // same three mitigations as its siblings — the throttle unit, the audit
+      // row naming actor and target, and the timing floor. A no-op for every
+      // other membership-type block: the handler returns immediately unless the
+      // error carries `crossFamilyMemberIds`, which only a collapsed one does.
+      await handleMemberGuestAddRefusal({
+        request,
+        actorMemberId: session.user.id,
+        error: err,
+        route: "bookings/modify",
+        startedAt,
+        throttle: "CHARGE_NOW",
+        skipAuthorization: actorRole === "ADMIN",
+      });
+      return NextResponse.json(
+        getMembershipTypeBookingPolicyErrorBody(err),
+        { status: err.status },
+      );
+    }
+    if (err instanceof BookingGuestValidationError) {
+      // #2388, refusal path only — the same shape `api/bookings/[id]/guests`
+      // uses, and for the same reason: this route resolves its members INSIDE
+      // `prisma.$transaction` while holding the per-lodge capacity lock, so the
+      // throttle cannot be spent on the way in without taking a second
+      // connection under that lock. Spending it here still counts every probe,
+      // and the channel #2388 describes is built out of refusals. A SUCCESSFUL
+      // cross-family add on this route is not a probe: it mutates a real booking
+      // and emails the person it added.
+      await handleMemberGuestAddRefusal({
+        request,
+        actorMemberId: session.user.id,
+        error: err,
+        route: "bookings/modify",
+        startedAt,
+        throttle: "CHARGE_NOW",
+        skipAuthorization: actorRole === "ADMIN",
+      });
+      return NextResponse.json(getBookingGuestValidationErrorResponse(err), {
+        status: err.status,
+      });
+    }
+    if (err instanceof BookingMemberNightConflictError) {
+      return NextResponse.json(
+        getBookingMemberNightConflictResponse(err.conflicts, format),
+        { status: 409 },
+      );
+    }
+    // #2104: a member modification tripped the no-adult review rule for the
+    // first time without a justification. Echo the machine-readable code (before
+    // the generic ApiError branch — this error extends ApiError) so the edit
+    // panel can reveal the required justification field even when its local
+    // predicate missed the trip.
+    if (err instanceof BookingModifyReviewJustificationRequiredError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.status },
+      );
+    }
+    // #3032: and the same courtesy for the fence - this booking's LAST edit is
+    // still under review, so this one would have to price against an amount
+    // nobody has confirmed. It was falling through to the generic ApiError
+    // branch and losing its code, while the PREVIEW route already surfaced it,
+    // so quote and apply disagreed about the same refusal - which is exactly the
+    // parity the epic requires of them.
+    if (err instanceof EditFinancialReviewPendingError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.status },
+      );
+    }
+    // Xero lock-date guard (#1697): keep the machine-readable code + lockDate
+    // (both errors extend ApiError, so this branch must come first).
+    const xeroLockGuardResponse = getXeroLockGuardErrorResponse(err);
+    if (xeroLockGuardResponse) {
+      return NextResponse.json(xeroLockGuardResponse.body, {
+        status: xeroLockGuardResponse.status,
+      });
+    }
+    // #2363: the minimum-stay block on this save path carries the frozen review
+    // snapshot (policy id/version/scope/nights/requirements/capacity mode) so
+    // the edit panel can tell the member exactly which rule stopped the change.
+    // MUST stay above the generic ApiError branch — this error extends ApiError,
+    // and the generic branch would drop the code and the snapshot.
+    if (err instanceof MinimumStayPolicyViolationError) {
+      return NextResponse.json(
+        {
+          error: err.message,
+          code: err.code,
+          details: err.details,
+          violations: err.violations,
+          exceptionReview: err.exceptionReview,
+        },
+        { status: err.status },
+      );
+    }
+    // #2543 — the paid-up-adult refusal on the SAVE path. Above the generic
+    // ApiError branch for exactly the reason the minimum-stay one is: it extends
+    // ApiError, and the generic branch would strip the code, the frozen
+    // violation, the HOLD promise and the path to ask a Booking Officer, leaving
+    // the member with a bare 409 and no way to act on it.
+    if (err instanceof PaidUpAdultMemberRequiredError) {
+      return NextResponse.json(buildPaidUpAdultRefusalBody(err.violation), {
+        status: err.status,
+      });
+    }
+    // #2569 — same reason, same order: `AdultMemberHostingRequiredError` extends
+    // ApiError, so it must be tested BEFORE the generic branch or the ENFORCED
+    // hosting refusal is flattened to a bare sentence and the member loses the
+    // exception door. Host identities are withheld from this body (#2569 §5).
+    if (err instanceof AdultMemberHostingRequiredError) {
+      return NextResponse.json(
+        buildAdultMemberHostingRefusalBody(err.violation),
+        { status: err.status },
+      );
+    }
+    // #2576 §6, and ABOVE the generic ApiError branch below for the same reason
+    // as its neighbour: a batch edit that would leave another booking on the
+    // member's own account without adult-member cover is refused, and the body is
+    // what names the affected booking, its lodge and the uncovered nights.
+    // #3232 D1, ABOVE its bare-refusal sibling. Moving this booking would strand
+    // another of the member's own bookings that they cannot move themselves, so
+    // they are OFFERED the linked move — both together on one combined figure, or
+    // this one alone with the other left uncovered and the officer told. The bare
+    // refusal below is still right for a stranding they CAN fix on the affected
+    // booking; this one is for the shape where every such remedy is closed.
+    if (err instanceof SameOwnerCoverageLinkedMoveRequiredError) {
+      return NextResponse.json(buildSameOwnerCoverageLinkedMoveBody(err), {
+        status: err.status,
+      });
+    }
+    if (err instanceof SameOwnerCoverageWouldBreakError) {
+      return NextResponse.json(buildSameOwnerCoverageRefusalBody(err), {
+        status: err.status,
+      });
+    }
+    // #2576 §7. The officer is not refused: they are shown which bookings and
+    // nights the change would strand and asked to confirm it with a reason.
+    if (err instanceof SameOwnerCoverageOverrideRequiredError) {
+      return NextResponse.json(
+        buildSameOwnerCoverageOverrideRequiredBody(err),
+        { status: err.status },
+      );
+    }
+    if (err instanceof ApiError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    if (isBookingEnvelopeInvariantViolation(err)) {
+      // A write-path bug produced a guest stay range outside the booking
+      // envelope; the deferred DB triggers caught it and rolled back.
+      logger.error(
+        { err, bookingId },
+        "Booking envelope invariant violated during batch modify — write-path bug",
+      );
+      return NextResponse.json(
+        {
+          error:
+            "The booking update failed an internal consistency check and no changes were saved. Please report this to an administrator.",
+        },
+        { status: 500 },
+      );
+    }
+    // #1888 — unexpected (non-typed) errors must not leak their message to
+    // the client; the raw error stays in the log only.
+    logger.error({ err, bookingId }, "Batch modify failed");
+    return NextResponse.json(
+      { error: "Failed to modify booking" },
+      { status: 400 }
+    );
+  }
+}

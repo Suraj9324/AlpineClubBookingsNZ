@@ -1,0 +1,819 @@
+import "server-only";
+
+import {
+  formatClubInstantDate,
+  formatStayDate,
+  type ClubTimeZone,
+} from "@/lib/club-time";
+import { bookingOwner } from "@/lib/booking-owner";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import { refreshFinancialYearConfig } from "@/lib/financial-year-server";
+import { prisma } from "@/lib/prisma";
+import { seasonYearsLabel } from "@/lib/season-label";
+import { formatCents } from "@/lib/utils";
+import type { ClubFormat } from "@/lib/club-format";
+import { applyXeroOrgShortCode, buildXeroObjectUrl } from "@/lib/xero-links";
+import { getXeroOrgShortCode } from "@/lib/xero-link-short-code";
+import { getXeroOperationRetryMeta } from "@/lib/xero-operation-retry";
+import { buildLocalAdminUrl, type XeroLocalModel } from "@/lib/xero-record-links";
+import { canReplayXeroInboundEvent } from "@/lib/xero-stale-operations";
+import { inboundEventCategoriesForXeroObjectType } from "@/lib/xero-webhook-categories";
+import type {
+  XeroRecordActivityData,
+  XeroRecordActivityOperation,
+  XeroRecordBackLink,
+  XeroRecordInboundEvent,
+  XeroRecordObjectLink,
+  XeroRecordReference,
+} from "@/lib/xero-record-types";
+
+import { adminHref, adminLink, getAdminPage } from "@/lib/admin-hubs";
+interface XeroRecordScope {
+  rootRecord: XeroRecordReference
+  scopeRecords: XeroRecordReference[]
+  relatedRecords: XeroRecordReference[]
+  backLink: XeroRecordBackLink | null
+}
+
+/**
+ * A real INSTANT as the club calendar day it fell on. The zone is required and
+ * comes from the persisted club setting — one formatter for two different
+ * concepts is how a `submittedAt` came to be rendered by the same helper as a
+ * lodge night (INV-DATE-019).
+ */
+function formatInstantDate(
+  value: Date,
+  zone: ClubTimeZone,
+  format: ClubFormat,
+): string {
+  return formatClubInstantDate(value, zone, format);
+}
+
+function formatStatusLabel(value: string): string {
+  return value.replace(/_/g, " ").toLowerCase().replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+/**
+ * The club's year-end, RESOLVED rather than taken from `seasonYearsLabel`'s
+ * default - see `season-label.ts` for why that default is wrong off a request
+ * path (#3116). The RETURN VALUE is what gets passed down, never the cache this
+ * call also seeds, so the answer cannot depend on what warmed the process. The
+ * read is in-process cached and never rejects, so a display path can afford it.
+ */
+async function resolveYearEndMonth(): Promise<number> {
+  return refreshFinancialYearConfig();
+}
+
+function createRecordReference(
+  localModel: string,
+  localId: string,
+  label: string,
+  relation: string
+): XeroRecordReference {
+  return {
+    localModel,
+    localId,
+    label,
+    relation,
+    url: buildLocalAdminUrl(localModel, localId),
+  };
+}
+
+function dedupeRecordReferences(records: XeroRecordReference[]): XeroRecordReference[] {
+  const seen = new Set<string>();
+  return records.filter((record) => {
+    const key = `${record.localModel}:${record.localId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function getScopeWhere(records: XeroRecordReference[]) {
+  return {
+    OR: records.map((record) => ({
+      localModel: record.localModel,
+      localId: record.localId,
+    })),
+  };
+}
+
+async function getMemberScope(localId: string, yearEndMonth: number): Promise<XeroRecordScope | null> {
+  const member = await prisma.member.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      subscriptions: {
+        orderBy: { seasonYear: "desc" },
+        select: {
+          id: true,
+          seasonYear: true,
+          status: true,
+        },
+      },
+    },
+  });
+
+  if (!member) {
+    return null;
+  }
+
+  const rootRecord = createRecordReference(
+    "Member",
+    member.id,
+    `${member.firstName} ${member.lastName}`,
+    "Member"
+  );
+  const subscriptionRecords = member.subscriptions.map((subscription) =>
+    createRecordReference(
+      "MemberSubscription",
+      subscription.id,
+      `Subscription ${seasonYearsLabel(subscription.seasonYear, yearEndMonth)} (${formatStatusLabel(subscription.status)})`,
+      "Subscription"
+    )
+  );
+
+  return {
+    rootRecord,
+    scopeRecords: [rootRecord, ...subscriptionRecords],
+    relatedRecords: [],
+    backLink: {
+      href: `${adminHref("member-detail", { id: member.id })}`,
+      label: `${member.firstName} ${member.lastName}`,
+    },
+  };
+}
+
+async function getPaymentScope(localId: string, format: ClubFormat): Promise<XeroRecordScope | null> {
+  const payment = await prisma.payment.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      amountCents: true,
+      booking: {
+        select: {
+          id: true,
+          checkIn: true,
+          checkOut: true,
+          member: {
+            select: {
+              firstName: true,
+              lastName: true,
+            },
+          },
+          // #3369: the owner may be an Organisation; bookingOwner() reads both.
+          organisation: { select: { name: true, email: true } },
+        },
+      },
+    },
+  });
+
+  if (!payment) {
+    return null;
+  }
+
+  const rootRecord = createRecordReference(
+    "Payment",
+    payment.id,
+    `Payment ${formatCents(payment.amountCents, format)} for ${bookingOwner(payment.booking).member.firstName} ${bookingOwner(payment.booking).member.lastName}`,
+    "Payment"
+  );
+  const relatedBooking = createRecordReference(
+    "Booking",
+    payment.booking.id,
+    `Booking ${formatStayDate(payment.booking.checkIn, format)} - ${formatStayDate(payment.booking.checkOut, format)}`,
+    "Booking"
+  );
+
+  return {
+    rootRecord,
+    scopeRecords: [rootRecord],
+    relatedRecords: [relatedBooking],
+    backLink: adminLink("payments"),
+  };
+}
+
+async function getBookingScope(localId: string, format: ClubFormat): Promise<XeroRecordScope | null> {
+  const booking = await prisma.booking.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      checkIn: true,
+      checkOut: true,
+      member: {
+        select: {
+          firstName: true,
+          lastName: true,
+        },
+      },
+      // #3369: the owner may be an Organisation; bookingOwner() reads both.
+      organisation: { select: { name: true, email: true } },
+      payment: {
+        select: {
+          id: true,
+          amountCents: true,
+        },
+      },
+      modifications: {
+        orderBy: { createdAt: "desc" },
+        select: {
+          id: true,
+          modificationType: true,
+          priceDiffCents: true,
+        },
+      },
+    },
+  });
+
+  if (!booking) {
+    return null;
+  }
+
+  const rootRecord = createRecordReference(
+    "Booking",
+    booking.id,
+    `${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName} (${formatStayDate(booking.checkIn, format)} - ${formatStayDate(booking.checkOut, format)})`,
+    "Booking"
+  );
+  const scopeRecords = [rootRecord];
+
+  if (booking.payment) {
+    scopeRecords.push(
+      createRecordReference(
+        "Payment",
+        booking.payment.id,
+        `Payment ${formatCents(booking.payment.amountCents, format)}`,
+        "Payment"
+      )
+    );
+  }
+
+  for (const modification of booking.modifications) {
+    const prefix = formatStatusLabel(modification.modificationType);
+    const amount =
+      modification.priceDiffCents === 0
+        ? "No price change"
+        : modification.priceDiffCents > 0
+          ? `+${formatCents(modification.priceDiffCents, format)}`
+          : formatCents(modification.priceDiffCents, format);
+
+    scopeRecords.push(
+      createRecordReference(
+        "BookingModification",
+        modification.id,
+        `${prefix} (${amount})`,
+        "Modification"
+      )
+    );
+  }
+
+  return {
+    rootRecord,
+    scopeRecords,
+    relatedRecords: [],
+    backLink: {
+      href: adminHref("bookings"),
+      label: "Bookings",
+    },
+  };
+}
+
+async function getBookingModificationScope(localId: string, format: ClubFormat): Promise<XeroRecordScope | null> {
+  const modification = await prisma.bookingModification.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      modificationType: true,
+      priceDiffCents: true,
+      booking: {
+        select: {
+          id: true,
+          checkIn: true,
+          checkOut: true,
+          payment: {
+            select: {
+              id: true,
+              amountCents: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!modification) {
+    return null;
+  }
+
+  const amount =
+    modification.priceDiffCents === 0
+      ? "No price change"
+      : modification.priceDiffCents > 0
+        ? `+${formatCents(modification.priceDiffCents, format)}`
+        : formatCents(modification.priceDiffCents, format);
+
+  const rootRecord = createRecordReference(
+    "BookingModification",
+    modification.id,
+    `${formatStatusLabel(modification.modificationType)} (${amount})`,
+    "Modification"
+  );
+  const relatedRecords = [
+    createRecordReference(
+      "Booking",
+      modification.booking.id,
+      `Booking ${formatStayDate(modification.booking.checkIn, format)} - ${formatStayDate(modification.booking.checkOut, format)}`,
+      "Booking"
+    ),
+  ];
+
+  if (modification.booking.payment) {
+    relatedRecords.push(
+      createRecordReference(
+        "Payment",
+        modification.booking.payment.id,
+        `Payment ${formatCents(modification.booking.payment.amountCents, format)}`,
+        "Payment"
+      )
+    );
+  }
+
+  return {
+    rootRecord,
+    scopeRecords: [rootRecord],
+    relatedRecords,
+    backLink: {
+      href: buildLocalAdminUrl("Booking", modification.booking.id) ?? adminHref("bookings"),
+      label: "Booking Activity",
+    },
+  };
+}
+
+/**
+ * #3193 fix round: the SECOND ASK's record page.
+ *
+ * A second supplementary invoice is anchored on the review task whose settled
+ * share it bills, so that the booking change's own "is an invoice already going
+ * out?" reads cannot find it and raise it to the combined total. Nothing else in
+ * the admin Xero screens knew that anchor, so an operation that failed in Xero
+ * appeared as untitled plain text with no page behind it - and the booking's
+ * audit trail had already recorded that the amount was being billed. The
+ * shortfall #3188 made findable would then have been findable only by somebody
+ * with no reason to look.
+ *
+ * The scope is the task alone; the booking and its payment are RELATED records
+ * rather than scope, exactly as on the booking-change scope, so this page shows
+ * the second ask's own operations and links rather than the whole booking's.
+ */
+async function getManualRefundTaskScope(localId: string, format: ClubFormat): Promise<XeroRecordScope | null> {
+  const task = await prisma.manualRefundTask.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      status: true,
+      amountCents: true,
+      booking: {
+        select: {
+          id: true,
+          checkIn: true,
+          checkOut: true,
+          payment: {
+            select: {
+              id: true,
+              amountCents: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!task) {
+    return null;
+  }
+
+  const rootRecord = createRecordReference(
+    "ManualRefundTask",
+    task.id,
+    `Booking review ${task.amountCents === null ? "(amount not set)" : formatCents(task.amountCents, format)} (${formatStatusLabel(task.status)})`,
+    "Booking Review"
+  );
+  const relatedRecords = [
+    createRecordReference(
+      "Booking",
+      task.booking.id,
+      `Booking ${formatStayDate(task.booking.checkIn, format)} - ${formatStayDate(task.booking.checkOut, format)}`,
+      "Booking"
+    ),
+  ];
+
+  if (task.booking.payment) {
+    relatedRecords.push(
+      createRecordReference(
+        "Payment",
+        task.booking.payment.id,
+        `Payment ${formatCents(task.booking.payment.amountCents, format)}`,
+        "Payment"
+      )
+    );
+  }
+
+  return {
+    rootRecord,
+    scopeRecords: [rootRecord],
+    relatedRecords,
+    backLink: {
+      href: buildLocalAdminUrl("Booking", task.booking.id) ?? adminHref("bookings"),
+      label: "Booking Activity",
+    },
+  };
+}
+
+async function getMemberSubscriptionScope(localId: string, yearEndMonth: number): Promise<XeroRecordScope | null> {
+  const subscription = await prisma.memberSubscription.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      seasonYear: true,
+      status: true,
+      member: {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+        },
+      },
+    },
+  });
+
+  if (!subscription) {
+    return null;
+  }
+
+  const rootRecord = createRecordReference(
+    "MemberSubscription",
+    subscription.id,
+    `Subscription ${seasonYearsLabel(subscription.seasonYear, yearEndMonth)} (${formatStatusLabel(subscription.status)})`,
+    "Subscription"
+  );
+  const relatedMember = createRecordReference(
+    "Member",
+    subscription.member.id,
+    `${subscription.member.firstName} ${subscription.member.lastName}`,
+    "Member"
+  );
+
+  return {
+    rootRecord,
+    scopeRecords: [rootRecord],
+    relatedRecords: [relatedMember],
+    backLink: {
+      href: `${adminHref("member-detail", { id: subscription.member.id })}`,
+      label: `${subscription.member.firstName} ${subscription.member.lastName}`,
+    },
+  };
+}
+
+async function getMembershipCancellationRequestScope(localId: string, format: ClubFormat): Promise<XeroRecordScope | null> {
+  const request = await prisma.membershipCancellationRequest.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      status: true,
+      submittedAt: true,
+      participants: {
+        orderBy: { createdAt: "asc" },
+        select: {
+          id: true,
+          status: true,
+          member: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!request) {
+    return null;
+  }
+
+  const rootRecord = createRecordReference(
+    "MembershipCancellationRequest",
+    request.id,
+    `Membership cancellation ${formatInstantDate(request.submittedAt, await readClubTimeZoneOutsideRequest(), format)} (${formatStatusLabel(request.status)})`,
+    "Membership Cancellation Request",
+  );
+  const participantRecords = request.participants.map((participant) =>
+    createRecordReference(
+      "MembershipCancellationRequestParticipant",
+      participant.id,
+      `${participant.member.firstName} ${participant.member.lastName} (${formatStatusLabel(participant.status)})`,
+      "Cancellation Participant",
+    )
+  );
+  const relatedMembers = request.participants.map((participant) =>
+    createRecordReference(
+      "Member",
+      participant.member.id,
+      `${participant.member.firstName} ${participant.member.lastName}`,
+      "Member",
+    )
+  );
+
+  return {
+    rootRecord,
+    scopeRecords: [rootRecord, ...participantRecords],
+    relatedRecords: relatedMembers,
+    backLink: {
+      href: `${adminHref("membership-cancellations")}?status=ALL`,
+      label: getAdminPage("membership-cancellations").label,
+    },
+  };
+}
+
+async function getMembershipCancellationParticipantScope(localId: string, format: ClubFormat): Promise<XeroRecordScope | null> {
+  const participant = await prisma.membershipCancellationRequestParticipant.findUnique({
+    where: { id: localId },
+    select: {
+      id: true,
+      status: true,
+      requestId: true,
+      request: {
+        select: {
+          id: true,
+          status: true,
+          submittedAt: true,
+        },
+      },
+      member: {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+        },
+      },
+    },
+  });
+
+  if (!participant) {
+    return null;
+  }
+
+  const rootRecord = createRecordReference(
+    "MembershipCancellationRequestParticipant",
+    participant.id,
+    `${participant.member.firstName} ${participant.member.lastName} cancellation (${formatStatusLabel(participant.status)})`,
+    "Cancellation Participant",
+  );
+  const requestRecord = createRecordReference(
+    "MembershipCancellationRequest",
+    participant.request.id,
+    `Membership cancellation ${formatInstantDate(participant.request.submittedAt, await readClubTimeZoneOutsideRequest(), format)} (${formatStatusLabel(participant.request.status)})`,
+    "Membership Cancellation Request",
+  );
+  const relatedMember = createRecordReference(
+    "Member",
+    participant.member.id,
+    `${participant.member.firstName} ${participant.member.lastName}`,
+    "Member",
+  );
+
+  return {
+    rootRecord,
+    scopeRecords: [rootRecord, requestRecord],
+    relatedRecords: [relatedMember],
+    backLink: {
+      href: `${adminHref("membership-cancellations")}?status=ALL`,
+      label: getAdminPage("membership-cancellations").label,
+    },
+  };
+}
+
+async function getXeroRecordScope(localModel: XeroLocalModel, localId: string, format: ClubFormat): Promise<XeroRecordScope | null> {
+  switch (localModel) {
+    case "Member":
+      return getMemberScope(localId, await resolveYearEndMonth());
+    case "Payment":
+      return getPaymentScope(localId, format);
+    case "Booking":
+      return getBookingScope(localId, format);
+    case "BookingModification":
+      return getBookingModificationScope(localId, format);
+    case "ManualRefundTask":
+      return getManualRefundTaskScope(localId, format);
+    case "MemberSubscription":
+      return getMemberSubscriptionScope(localId, await resolveYearEndMonth());
+    case "MembershipCancellationRequest":
+      return getMembershipCancellationRequestScope(localId, format);
+    case "MembershipCancellationRequestParticipant":
+      return getMembershipCancellationParticipantScope(localId, format);
+    default:
+      return null;
+  }
+}
+
+function toIsoString(value: Date | null): string | null {
+  return value ? value.toISOString() : null;
+}
+
+export async function getXeroRecordActivity(
+  localModel: XeroLocalModel,
+  localId: string,
+  format: ClubFormat,
+  limit = 25
+): Promise<XeroRecordActivityData | null> {
+  const scope = await getXeroRecordScope(localModel, localId, format);
+  if (!scope) {
+    return null;
+  }
+
+  const scopeRecords = dedupeRecordReferences(scope.scopeRecords);
+  const scopeLookup = new Map(
+    scopeRecords.map((record) => [`${record.localModel}:${record.localId}`, record])
+  );
+  const where = getScopeWhere(scopeRecords);
+
+  const [operations, operationCount, operationStatusCounts, links] = await Promise.all([
+    prisma.xeroSyncOperation.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    }),
+    prisma.xeroSyncOperation.count({ where }),
+    prisma.xeroSyncOperation.groupBy({
+      by: ["status"],
+      where,
+      _count: true,
+    }),
+    prisma.xeroObjectLink.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+    }),
+  ]);
+
+  const inboundEventTargets = Array.from(
+    new Map(
+      links
+        .flatMap((link) =>
+          inboundEventCategoriesForXeroObjectType(link.xeroObjectType).map(
+            (eventCategory) =>
+              [
+                `${eventCategory}:${link.xeroObjectId}`,
+                {
+                  eventCategory,
+                  resourceId: link.xeroObjectId,
+                },
+              ] as const,
+          ),
+        )
+    ).values()
+  );
+  const inboundEvents = inboundEventTargets.length
+    ? await prisma.xeroInboundEvent.findMany({
+        where: {
+          OR: inboundEventTargets.map((target) => ({
+            eventCategory: target.eventCategory,
+            resourceId: target.resourceId,
+          })),
+        },
+        orderBy: { createdAt: "desc" },
+        take: limit,
+      })
+    : [];
+
+  const summaryCounts = new Map(
+    operationStatusCounts.map((item) => [item.status, item._count])
+  );
+
+  // #2314: the record-activity panel renders these three sets of hrefs
+  // verbatim, so the organisation short code is applied here — once per call,
+  // off the 12-hour in-process organisation cache. Stored `xeroObjectUrl`
+  // values stay organisation-agnostic in the database (correct after a
+  // reconnect to a different Xero organisation) and are scoped at this point
+  // instead. A null short code degrades every link to the generic
+  // go.xero.com form; it never hides one.
+  const shortCode = await getXeroOrgShortCode();
+
+  const mappedOperations: XeroRecordActivityOperation[] = operations.map((operation) => {
+    const retryMeta = getXeroOperationRetryMeta(operation);
+    const scopeRecord =
+      operation.localModel && operation.localId
+        ? scopeLookup.get(`${operation.localModel}:${operation.localId}`)
+        : null;
+
+    return {
+      id: operation.id,
+      direction: operation.direction,
+      entityType: operation.entityType,
+      operationType: operation.operationType,
+      localModel: operation.localModel,
+      localId: operation.localId,
+      localUrl: buildLocalAdminUrl(operation.localModel, operation.localId),
+      localLabel: scopeRecord?.label ?? null,
+      status: operation.status,
+      idempotencyKey: operation.idempotencyKey,
+      correlationKey: operation.correlationKey,
+      attemptCount: operation.attemptCount,
+      replayable: operation.replayable,
+      lastErrorCode: operation.lastErrorCode,
+      lastErrorMessage: operation.lastErrorMessage,
+      requestPayload: operation.requestPayload,
+      responsePayload: operation.responsePayload,
+      xeroObjectType: operation.xeroObjectType,
+      xeroObjectId: operation.xeroObjectId,
+      xeroObjectNumber: operation.xeroObjectNumber,
+      xeroObjectUrl: applyXeroOrgShortCode(
+        operation.xeroObjectUrl ??
+          (operation.xeroObjectType && operation.xeroObjectId
+            ? buildXeroObjectUrl(operation.xeroObjectType, operation.xeroObjectId)
+            : null),
+        { shortCode },
+      ),
+      createdByMemberId: operation.createdByMemberId,
+      startedAt: toIsoString(operation.startedAt),
+      completedAt: toIsoString(operation.completedAt),
+      createdAt: operation.createdAt.toISOString(),
+      updatedAt: operation.updatedAt.toISOString(),
+      supported: retryMeta.supported,
+      reason: retryMeta.reason,
+    };
+  });
+
+  const mappedLinks: XeroRecordObjectLink[] = links
+    .map((link) => {
+      const scopeRecord = scopeLookup.get(`${link.localModel}:${link.localId}`);
+
+      return {
+        id: link.id,
+        localModel: link.localModel,
+        localId: link.localId,
+        localUrl: buildLocalAdminUrl(link.localModel, link.localId),
+        localLabel: scopeRecord?.label ?? null,
+        xeroObjectType: link.xeroObjectType,
+        xeroObjectId: link.xeroObjectId,
+        xeroObjectNumber: link.xeroObjectNumber,
+        xeroObjectUrl: applyXeroOrgShortCode(
+          link.xeroObjectUrl ??
+            buildXeroObjectUrl(link.xeroObjectType, link.xeroObjectId),
+          { shortCode },
+        ),
+        role: link.role,
+        active: link.active,
+        metadata: link.metadata,
+        createdAt: link.createdAt.toISOString(),
+        updatedAt: link.updatedAt.toISOString(),
+      };
+    })
+    .sort((left, right) => {
+      if (left.active !== right.active) {
+        return left.active ? -1 : 1;
+      }
+      return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+    });
+  const mappedInboundEvents: XeroRecordInboundEvent[] = inboundEvents.map((event) => ({
+    id: event.id,
+    source: event.source,
+    eventCategory: event.eventCategory,
+    eventType: event.eventType,
+    resourceId: event.resourceId,
+    correlationKey: event.correlationKey,
+    status: event.status,
+    errorMessage: event.errorMessage,
+    processedAt: toIsoString(event.processedAt),
+    createdAt: event.createdAt.toISOString(),
+    payload: event.payload,
+    xeroObjectUrl:
+      event.eventCategory && event.resourceId
+        ? buildXeroObjectUrl(event.eventCategory, event.resourceId, {
+            shortCode,
+          })
+        : null,
+    canReplay: canReplayXeroInboundEvent(event),
+  }));
+
+  return {
+    rootRecord: scope.rootRecord,
+    scopeRecords,
+    relatedRecords: dedupeRecordReferences(scope.relatedRecords),
+    summary: {
+      totalOperations: operationCount,
+      failedOperations: summaryCounts.get("FAILED") ?? 0,
+      pendingOperations: (summaryCounts.get("PENDING") ?? 0) + (summaryCounts.get("RUNNING") ?? 0),
+      partialOperations: summaryCounts.get("PARTIAL") ?? 0,
+      activeLinks: mappedLinks.filter((link) => link.active).length,
+    },
+    operations: mappedOperations,
+    links: mappedLinks,
+    inboundEvents: mappedInboundEvents,
+    backLink: scope.backLink,
+  };
+}

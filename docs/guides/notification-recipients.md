@@ -1,0 +1,194 @@
+# Recipients
+
+Audience: Operator
+
+## What it is
+
+A grid of your admin users, each with a set of checkboxes for the system
+alerts they personally receive — new bookings, payment failures, refund
+requests, Xero sync errors, the daily digest, and so on. It controls *who on the
+team* is emailed when an alert fires, per admin. Find it at
+**Admin → Setup & Configuration → Notifications & Email → Recipients**
+(`/admin/notification-recipients`). It has no direct sidebar entry — open it from
+the **Recipients** card on the Notifications & Email hub.
+
+Every admin user is listed, not just Full Admins: Booking Officers, Membership
+Officers, Treasurers and any custom access role your club has built all appear,
+with their role name under their email address.
+
+**Alerts follow the areas a role can edit.** Each alert belongs to one admin
+area, and an admin is only offered — and only ever sent — the alerts for the
+areas their access role can **edit**. A Booking Officer therefore starts with
+the booking alerts switched on and sees the finance and membership ones with
+their box greyed out and marked *Locked*; a Treasurer gets the money alerts; a Full Admin can edit
+every area, so they get everything, exactly as before.
+
+**There is no per-person override.** An alert outside an admin's areas cannot be
+switched on from this grid at all — the checkbox is greyed out and the save is
+refused. Widening the alerts one person receives means widening their access role
+in [Access Roles](access-roles.md), which is a deliberate trade-off: alerts are
+requests to act, so the people alerted are the people who can act. If you want
+someone told about refund appeals, give their role Finance edit access; if that
+is more power than you want to hand over, ask a Full Admin to forward the alert
+instead.
+
+Recipients are edited under the **support** ("Support & System") permission
+area: support **edit** can change them; a view-only support role sees the grid
+but cannot edit. Because the grid lists every admin user's name, email address
+and access role, seeing the grid at all also needs **Membership view** access or
+Support & System **edit** access — every built-in admin role that can open this
+page has one or the other, so this only affects a custom role you have built with
+support view on its own. Within an admin's own areas, new alert types default to **enabled**, so they
+receive everything for their areas until someone trims the list.
+
+Delivery Rules sit **upstream** of everything on this page. If
+[Delivery Rules](notification-rules.md) mute a template club-wide, nobody
+receives it however their boxes are ticked here.
+
+## When you'd use it
+
+- A committee member is being flooded with alerts they don't handle and wants
+  some switched off.
+- A new treasurer should start receiving payment-failure and Xero sync alerts.
+- You want one person (not the whole team) to own the daily digest.
+
+## Step-by-step
+
+### Adjust who receives which alert
+
+1. Open **Recipients**. Each admin user is a card of alert checkboxes; the
+   alerts outside their areas are greyed out and cannot be ticked.
+
+   ![Recipients: one card per admin user, each showing checkboxes for the system alert types they receive](../images/admin/admin-notification-recipients.png)
+
+2. Click **Edit** to make the checkboxes editable. Tick or untick each alert for
+   each admin.
+3. Click **Save Changes** (or **Cancel** to discard). Only the admins you
+   actually changed are written.
+
+## Settings reference
+
+Each admin card has one checkbox per alert type. The **Area** column is the
+permission area an admin's role must be able to **edit** before that alert is
+offered to them at all:
+
+| Alert | Area | Sent when |
+| --- | --- | --- |
+| New bookings | Bookings | A new booking is created or confirmed |
+| Payment failures | Finance | A booking payment fails; an expired internet banking hold needs attention because money may be paid against its invoice or Xero cannot read it (#3643); an expired hold is left for reconciliation by hand because its stay has started (#3663); a paid group's unpaid joiners were switched to paying for themselves mid-stay and the treasurer must collect by hand (#3672); or a card payment that went through after its booking was cancelled is held for a treasurer's approval (*Late payment held for approval*, once per payment; if nobody could receive it, the payments cron tries it again a day later while the item is still waiting, #3635) |
+| Pending deadlines | Bookings | Bookings approach their pending deadline (digest) |
+| Bookings bumped | Bookings | The pending-booking job releases a pending booking at its hold deadline because there is no longer room for its party, including a booking cancelled because its guests could not be confirmed (once per booking; counted in the Daily digest). If the job is interrupted before the alert goes out, or it could not be recorded for any officer, a later run sends it, so very rarely it arrives late or twice (#5407) |
+| Xero sync errors | Finance | Xero contact or invoice sync fails, or a refund the app does not yet note in Xero needs crediting by hand (#3949, until #4292), or a Xero call succeeds after its operation was resolved by hand, including a refund credit note the app did not record (#4374, #4426), or an organiser adjustment's credit note the app did not record after its job was reset (#4655), or one the app stopped allocating or paying against after its job was reset and resolved by hand (#4680), or a Xero object a stalled job made after it was reset and queued again, withdrawn or ended by another attempt, which only partly succeeded and was not recorded (#4686) |
+| Capacity warnings | Bookings | Occupancy is nearing full capacity |
+| Daily digest | Admin Overview | A daily summary of the previous 24 hours of admin alerts. Each alert counts once however many officers receive it, and two alerts with the same subject count as two (#5407) |
+| Waitlist offers | Bookings | A waitlist spot is offered to a member (sent once the member's offer email has gone). Also the **Waitlist email not sent** alert: a member's offer or offer-expired email could not be sent in time, or an offer lapsed before its email could ever be sent, so the member may not know; once per offer (#5433). Muting this preference mutes both |
+| Member requests | Membership | A member submits a family-group / linking request |
+| Booking change requests | Bookings | A member requests a change to a locked booking, or asks for a booking-policy exception |
+| Refund requests | Finance | A member submits a refund appeal |
+| Reported issues | Support & System | A logged-in user reports a site issue |
+| Public booking requests | Bookings | A non-member submits a public booking request |
+| Booking review required | Bookings | A booking needs admin review before confirmation |
+| Member delete requests | Membership | A hard-delete of a member is requested (two-admin rule) |
+| Maintenance reports | Lodge Operations | Somebody reports a physical fault at a lodge |
+| Central server version | Lodge Operations | Every day, inside the Daily digest, while syncing with the Alpine Central Server is paused because the server is on a different software version from this site. This is the one entry that reaches two audiences: the digest's own readers get it inside their digest, and a Lodge Operations editor who does not receive the digest gets a separate message, *Admin Server Version Paused* under [Email Messages](email-messages.md), carrying **only** this entry — never the digest's alert counts — with its own wording and its own delivery rule. Somebody in both groups gets one email, the digest |
+
+The food-order email (`food-order-placed`, fork triyder/AlpineClubBookingsNZ#121) is not in this grid
+either: it goes to the one address in the [Food Orders](food-orders.md)
+settings, not to an admin role, so it has no checkbox here. It can be muted
+under [Delivery Rules](notification-rules.md) like any other non-locked
+operational email.
+
+### Always-on alerts
+
+Twelve alerts are sent outside this grid. They have no checkbox anywhere and cannot
+be muted — not here, and not in [Delivery Rules](notification-rules.md), because
+their templates (`admin-email-failure`, `admin-late-capture-auto-refund`,
+`admin-late-capture-hand-back-conflict`, `admin-late-capture-refunded-outside-app`,
+`admin-unrecognised-stripe-payment`, `admin-unmatched-app-stripe-payment`,
+`admin-stripe-dispute`, `admin-second-instrument-settlement-conflict`,
+`admin-bank-transfer-settlement-figure`, `admin-duplicate-capture-kept`,
+`admin-superseded-capture-refused`) are locked to always-send:
+
+| Alert | Goes to | Sent when |
+| --- | --- | --- |
+| *An email to a member could not be sent* | Every admin whose role can **edit** Support & System | The system could not read a booking's "No emails" setting, so it withheld a member email rather than risk sending one that was meant to be held back |
+| *Email delivery permanently failed* | Every admin whose role can **edit** Support & System | A member email has used up its automatic retries and will not be retried |
+| *Payment refunded automatically — booking already deleted / already cancelled* | Every admin whose role can **edit** Finance | A member's payment landed after the booking had already been cancelled, so the charge was returned to them automatically. This happens for a booking's own payment and for a payment for a change to it, and the mail says which. Nothing failed and nothing is owed — the mail exists so the money movement is not invisible, and it names whether the booking was also deleted, in which case remaking it means charging the member again |
+| *Automatic refund withheld — already paid back by hand* / *Payment may have been refunded TWICE — reconcile* | Every admin whose role can **edit** Finance | Somebody had already marked a hand-back task for that payment as paid back, which records the refund in the ledger. The automatic refund was withheld so the member is not paid twice — or, if the hand-back was recorded at the exact moment the refund was going out, it went as well and the two have to be reconciled. This is the one mail that may be telling you money left the club twice, which is why it cannot be switched off either |
+| *Late payment refunded outside the app - check Xero* | Every admin whose role can **edit** Finance | A card payment that arrived after its booking was cancelled was refunded somewhere other than the app - in the Stripe dashboard, for example (#4170). The app has no record of that refund and raised no Xero credit note, because Xero never received the payment. Sent once per payment, and again by the nightly check if a send failed; money left the club with no record the app wrote, which is why it cannot be switched off |
+| *Stripe payment the app did not create - code it in Xero* | Every admin whose role can **edit** Finance | A payment succeeded on the club's Stripe account that the app did not create - a Stripe Payment Link, a Checkout page or a dashboard charge (#4532). There is no booking for it and nothing was sent to Xero, so the Stripe clearing account will not reconcile until somebody codes it. Sent once per payment; a send nobody received is retried when Stripe redelivers the payment's notification, and a copy one Finance editor missed while another got it is re-sent by the email retry job. No screen lists these payments, so the mail is the whole notice, which is why it cannot be switched off. See [Payments](payments.md#a-stripe-payment-the-app-did-not-create) |
+| *Booking card payment the app could not match - check it* | Every admin whose role can **edit** Finance | A card payment the app started for a booking went through in Stripe, but nothing the app holds on that booking matches it, so the booking was not marked paid and nothing was sent to Xero (#4624). A member was charged and the booking does not show it. Sent once per payment; a send nobody received is retried when Stripe redelivers the payment's notification, and a copy one Finance editor missed while another got it is re-sent by the email retry job. No screen lists these payments, which is why it cannot be switched off. See [Payments](payments.md#a-booking-card-payment-the-app-could-not-match) |
+| *Card payment disputed by the cardholder - respond in Stripe* / *Card payment dispute closed (won, lost...)* / *Lost card payment dispute now won - reverse the Xero loss entry* | Every admin whose role can **edit** Finance | A cardholder asked their bank to reverse a card payment, and Stripe has usually taken the amount and a dispute fee from the club's balance (#4911). The first mail says to respond in Stripe with evidence before Stripe's deadline; the second says how the dispute ended and, when it was lost, to record the loss and the fee in Xero by hand, because the app posts nothing to Xero for a dispute. A third goes only if a dispute already reported lost is later reported won: the money is back, so reverse that Xero entry. The app puts back on the queue every treasurer task dismissed for the loss, with the member's refund owed again, and the mail names each one, any it could not reopen and why, and any reduction made for the loss, which is owed to the member again (#5197). Each names the booking and who booked it, or says the app has no payment for the charge. While a dispute is open or lost, the app gives no card refund and no account credit for that payment. Each is sent once per dispute; a send nobody received is retried when Stripe redelivers the dispute's notification, and a copy one Finance editor missed while another got it is re-sent by the email retry job. A missed deadline loses the dispute, which is why it cannot be switched off |
+| *Booking may have been paid twice — card and Xero* | Every admin whose role can **edit** Finance | A card payment had already settled the booking (or settled it before it was cancelled), and Xero then reported its Internet Banking invoice paid as well. The bank payment is recorded and nothing was refunded or credited automatically, so the mail links the booking and the Xero invoice for a person to reconcile. The club may be holding the price twice, which is why it cannot be switched off |
+| *Bank transfer amount needs checking* | Every admin whose role can **edit** Finance | Xero reported a booking's bank-transfer invoice paid, and the app either kept the amount it had recorded instead of the cash the invoice collected (it could not tie that cash to this booking alone), or the cash is not what the booking owes (#3979). A wrong recorded amount sizes every later refund and credit, which is why it cannot be switched off. A send nobody received is retried by the Xero inbound job; a copy one Finance editor missed while another got it is re-sent by the email retry job |
+| *Booking may have been paid twice — check by hand* | Every admin whose role can **edit** Finance | A card payment arrived on a booking that was already paid while another payment on it still held money, and the app had no usable record of which payment settled the booking (paid before it kept one, or the recorded payment no longer holds money), so it kept the card payment and refunded nothing (#4211); or, on a booking paid with credit, at a zero total or by a group organiser, a card payment the app had never recorded arrived with no other payment holding money (#4285). At most once a day per payment while the payment repeats; a #4285 alert that could not be sent is retried until it is |
+| *Card payment on a replaced payment — not applied* | Every admin whose role can **edit** Finance | A card payment was taken on a payment that a later change to the booking had replaced, and it reached the booking's settlement, which refused it (#4300). The club's superseded-payment refund returns it (or holds it for a treasurer on a cancelled booking), and the booking was not marked paid with it, so on a live booking it still owes. Rare, because the payment pages and Stripe's notification divert such a payment first; at most once a day per payment while it repeats |
+
+The first two name the intended recipient's email address and the template that
+failed, so they are operational detail rather than routine notification. The refund
+notice is money moving without anybody deciding it, which is why a club cannot
+switch it off; it is the same event the **"Refunded automatically — nothing to pay
+back"** card on [Payments](payments.md) records. The fourth is the same money seen
+from the other side — a refund deliberately not sent, or one sent twice — and
+produces no card row at all, so the mail is the whole notice. The fifth is money
+that left by a route the app did not take, so neither a card row nor a Xero note
+follows it. The only way to change
+who receives one of these is to change who holds the access it is sent to — Support &
+System edit for the first two, Finance edit for the three refund notices, which for
+the built-in roles means the Full Admins and the Treasurer.
+
+If a club has nobody holding the area at all, the alert is not dropped: the refund
+notices fall back to Support & System editors, and then to the club's own support
+address — the one set in [Email Messages](email-messages.md), or the address in the
+club's configuration if none is set — so it can never be sent to nobody.
+
+Two things worth knowing about that fallback. It only happens when **no** role can
+edit Finance, and while it lasts a Support & System editor receives the member's
+name, stay dates, refunded amount and payment identifiers even if their role has no
+Finance access at all — reaching somebody is treated as better than reaching nobody,
+and each fallback step is logged. The fix is to give somebody Finance edit, which
+takes the notices back to the intended audience.
+
+Which means, out of the box:
+
+| Role | Receives by default |
+| --- | --- |
+| Full Admin | Every alert |
+| Booking Officer | All eight booking alerts, including booking change and exception requests |
+| Membership Officer | Member requests and member delete requests |
+| Treasurer | Payment failures, Xero sync errors, refund requests |
+| Read-only Admin, Content Manager | Nothing — they cannot action any alert |
+| Custom access role | Whatever its own editable areas cover |
+
+| Rule | Detail |
+| --- | --- |
+| Default | Within an admin's own areas, new alert types default to **enabled**; alerts outside their areas are never sent |
+| No override | An out-of-area alert cannot be enabled for an individual from this grid — change their access role instead |
+| Scope | Every **active** admin user who can sign in appears — Full Admins, scoped officers and custom roles alike. Deactivating an admin, or turning off their login, removes them from the grid and from every alert |
+| Upstream | [Delivery Rules](notification-rules.md) can mute a template club-wide; that wins over anything ticked here |
+| Save granularity | Only changed admins are PUT; unchanged cards are left untouched, and if one admin's save is refused the others still save |
+| Outside the grid | Two locked email-failure alerts go to Support & System editors, and the automatic-refund notice goes to Finance editors, regardless of anything ticked here — see *Always-on alerts* above |
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| The checkboxes won't tick | You haven't clicked **Edit**, or your role is support view-only | Click **Edit**; if still locked, request Support & System edit access |
+| An admin isn't listed | They are inactive, cannot sign in, or hold no admin access role | Give them an admin access role, and reactivate or re-enable their login in [Members](members.md) |
+| A committee member gets nothing | Every alert is unticked for them, or their role cannot edit any area that owns an alert | Tick the alerts they should own and Save; if the boxes are greyed out, widen their role in [Access Roles](access-roles.md) |
+| An alert is marked *Locked* and its box is greyed out | It belongs to an area their access role cannot edit. It cannot be ticked here for one person | Give the role edit access to that area in [Access Roles](access-roles.md), or assign the alert to someone who already has it |
+| Nobody receives a particular alert | It is muted club-wide upstream | Check [Delivery Rules](notification-rules.md) for that template |
+| Save failed with a permission error | The write route rejected a support-view session | Ask a full admin to make the change |
+| One admin's card would not save but the rest did | That admin's save was refused on its own — usually a stale page whose role has since changed | Reload the page and redo just that card |
+| The page opens but no admin cards are listed | Your role has Support & System view but no Membership view, so the roster is withheld | Ask a full admin to widen your access role, or to make the change for you |
+| Someone still gets email-failure or automatic-refund alerts with every box unticked | Those alerts are locked and follow area edit access — Support & System for the email-failure pair, Finance for the automatic-refund notice | Remove that area's edit access from their role, or accept them — see *Always-on alerts* |
+
+## Related links
+
+- Back to the [documentation hub](../README.md).
+- Hub: [Notifications & Email](notifications.md).
+- Sibling guides: [Delivery Rules](notification-rules.md),
+  [Email Messages](email-messages.md),
+  [Email Deliverability](email-deliverability.md).
+- Reference: admin roles and the admin team in [Members](members.md), and the
+  permission areas behind each alert in [Access Roles](access-roles.md).

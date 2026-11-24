@@ -1,0 +1,674 @@
+import type { EntranceFeeCategory } from "@prisma/client";
+import { readAdminGrantCreditNotePayload, XERO_OUTBOX_ADMIN_GRANT_CREDIT_NOTE_TYPE, type AdminGrantCreditNotePayload } from "@/lib/admin-grant-credit-note-payload";
+import { readOrganiserExtraAdjustmentPayload, XERO_OUTBOX_ORGANISER_EXTRA_ADJUSTMENT_TYPE, type OrganiserExtraAdjustmentPayload } from "@/lib/organiser-extra-adjustment-payload";
+import { asRecord, readNumber, readString } from "@/lib/xero-json";
+import { readCardRefundReversalInvoicePayload, XERO_OUTBOX_CARD_REFUND_REVERSAL_INVOICE_TYPE, type QueuedCardRefundReversalInvoiceOutboxPayload } from "@/lib/xero-card-refund-reversal-outbox";
+import {
+  parseRefundMethod, readModificationNoteWording, readRefundNoteWording,
+  type ModificationNoteWording, type RefundMethod, type RefundNoteWording,
+} from "@/lib/xero-refund-method";
+import { readKeptLateCaptureInvoicePayload, XERO_OUTBOX_KEPT_LATE_CAPTURE_INVOICE_TYPE, type QueuedKeptLateCaptureInvoiceOutboxPayload } from "@/lib/kept-late-capture-invoice-payload";
+import { readAdditionalCaptureReceiptPayload, XERO_OUTBOX_ADDITIONAL_CAPTURE_RECEIPT_TYPE, type QueuedAdditionalCaptureReceiptOutboxPayload } from "@/lib/additional-capture-receipt-payload";
+import { readOrganisationContactDetailsPayload, XERO_OUTBOX_ORGANISATION_CONTACT_DETAILS_TYPE, type OrganisationContactDetailsPayload } from "@/lib/organisation-contact-details-payload";
+export { XERO_OUTBOX_ADDITIONAL_CAPTURE_RECEIPT_TYPE }; // #3953: a change's card capture's own receipt
+export { XERO_OUTBOX_KEPT_LATE_CAPTURE_INVOICE_TYPE }; // #3635: a kept late capture's invoice (`xero-kept-late-capture-invoice.ts`)
+
+export const XERO_OUTBOX_ENTRANCE_FEE_TYPE = "ENTRANCE_FEE_INVOICE";
+export const XERO_OUTBOX_BOOKING_INVOICE_TYPE = "BOOKING_INVOICE";
+export const XERO_OUTBOX_BOOKING_INVOICE_UPDATE_TYPE = "BOOKING_INVOICE_UPDATE";
+export const XERO_OUTBOX_REFUND_CREDIT_NOTE_TYPE = "REFUND_CREDIT_NOTE";
+export const XERO_OUTBOX_ACCOUNT_CREDIT_NOTE_TYPE = "ACCOUNT_CREDIT_NOTE";
+export const XERO_OUTBOX_SUPPLEMENTARY_INVOICE_TYPE = "SUPPLEMENTARY_INVOICE";
+export const XERO_OUTBOX_MODIFICATION_CREDIT_NOTE_TYPE = "MODIFICATION_CREDIT_NOTE";
+export const XERO_OUTBOX_MODIFICATION_ACCOUNT_CREDIT_NOTE_TYPE = "MODIFICATION_ACCOUNT_CREDIT_NOTE";
+export const XERO_OUTBOX_CREDIT_NOTE_ALLOCATION_TYPE = "CREDIT_NOTE_ALLOCATION";
+// #1620: allocate the member's existing notes; this row is not itself one Xero call.
+export const XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE = "APPLIED_CREDIT_ALLOCATION";
+export const XERO_OUTBOX_APPLIED_CREDIT_DEALLOCATION_TYPE = "APPLIED_CREDIT_DEALLOCATION";
+export const XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CREDIT_NOTE_TYPE = "MEMBERSHIP_CANCELLATION_CREDIT_NOTE";
+export const XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CONTACT_TYPE = "MEMBERSHIP_CANCELLATION_CONTACT";
+export const XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_TYPE = "GROUP_SETTLEMENT_INVOICE";
+export const XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_VOID_TYPE = "GROUP_SETTLEMENT_INVOICE_VOID";
+export const XERO_OUTBOX_SUBSCRIPTION_INVOICE_TYPE = "MEMBERSHIP_SUBSCRIPTION_INVOICE";
+
+/** Pending-scan queue types (#1272). Later types are appended. REQUEUE, BACKFILL and inbound rows have none. */
+export const XERO_OUTBOX_QUEUE_TYPES = [
+  XERO_OUTBOX_ENTRANCE_FEE_TYPE,
+  XERO_OUTBOX_BOOKING_INVOICE_TYPE,
+  XERO_OUTBOX_BOOKING_INVOICE_UPDATE_TYPE,
+  XERO_OUTBOX_REFUND_CREDIT_NOTE_TYPE,
+  XERO_OUTBOX_ACCOUNT_CREDIT_NOTE_TYPE,
+  XERO_OUTBOX_SUPPLEMENTARY_INVOICE_TYPE,
+  XERO_OUTBOX_MODIFICATION_CREDIT_NOTE_TYPE,
+  XERO_OUTBOX_MODIFICATION_ACCOUNT_CREDIT_NOTE_TYPE,
+  XERO_OUTBOX_CREDIT_NOTE_ALLOCATION_TYPE,
+  XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE,
+  XERO_OUTBOX_APPLIED_CREDIT_DEALLOCATION_TYPE,
+  XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CREDIT_NOTE_TYPE,
+  XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CONTACT_TYPE,
+  XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_TYPE,
+  XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_VOID_TYPE,
+  XERO_OUTBOX_SUBSCRIPTION_INVOICE_TYPE,
+  XERO_OUTBOX_KEPT_LATE_CAPTURE_INVOICE_TYPE,
+  XERO_OUTBOX_CARD_REFUND_REVERSAL_INVOICE_TYPE, // #4369 (`INV-PAY-151`)
+  XERO_OUTBOX_ADDITIONAL_CAPTURE_RECEIPT_TYPE,
+  XERO_OUTBOX_ORGANISER_EXTRA_ADJUSTMENT_TYPE, // #4299 (`INV-PAY-148`)
+  XERO_OUTBOX_ADMIN_GRANT_CREDIT_NOTE_TYPE, // #4431
+  XERO_OUTBOX_ORGANISATION_CONTACT_DETAILS_TYPE, // #5245: a school's corrected email and phone
+] as const;
+
+interface QueuedEntranceFeeOutboxPayload {
+  queueType: typeof XERO_OUTBOX_ENTRANCE_FEE_TYPE;
+  category: EntranceFeeCategory;
+  itemCode: string | null;
+  feeAmountCents: number;
+  description?: string | null;
+}
+
+interface QueuedBookingInvoiceOutboxPayload {
+  queueType: typeof XERO_OUTBOX_BOOKING_INVOICE_TYPE;
+  bookingId: string;
+}
+
+interface QueuedBookingInvoiceUpdateOutboxPayload {
+  queueType: typeof XERO_OUTBOX_BOOKING_INVOICE_UPDATE_TYPE;
+  bookingId: string;
+  xeroInvoiceId?: string;
+}
+
+interface QueuedRefundCreditNoteOutboxPayload {
+  queueType: typeof XERO_OUTBOX_REFUND_CREDIT_NOTE_TYPE;
+  refundAmountCents: number;
+  // Cumulative refunded-cents watermark this note settles up to (#1162). Absent
+  // on payloads queued before per-delta refund notes existed.
+  watermarkCents?: number;
+  // How the money went back (`INV-PAY-101`, #3529): the wording on the note and
+  // the bank account its settling payment posts to. Absent on rows queued
+  // before the field existed; the executor then reads the payment's source.
+  refundMethod?: RefundMethod;
+  noteWording?: RefundNoteWording; // #3935 (`INV-PAY-116`): a review hand-back's cash answer.
+  // #3635: the late capture this note answers, and its refund's club day.
+  paymentIntentId?: string;
+  documentDate?: string;
+  paidAnotherWayTaskId?: string; creditsInvoiceId?: string; handBackTaskId?: string; cardRefundId?: string; // #3924 r7: the close it answers, the invoice it names; #4162: the hand-back it records; #4312: the card refund
+}
+
+interface QueuedAccountCreditNoteOutboxPayload {
+  queueType: typeof XERO_OUTBOX_ACCOUNT_CREDIT_NOTE_TYPE;
+  refundAmountCents: number;
+  memberCreditId?: string; // #4685: the credit the note is for; absent on rows queued before it
+}
+
+/** #4685: the account-credit note's own credit, read the same way from the queued and executed shapes. */
+export function readAccountCreditNoteCredit(payload: Record<string, unknown>): { memberCreditId?: string } {
+  const memberCreditId = readString(payload.memberCreditId);
+  return memberCreditId ? { memberCreditId } : {};
+}
+
+interface QueuedSupplementaryInvoiceOutboxPayload {
+  queueType: typeof XERO_OUTBOX_SUPPLEMENTARY_INVOICE_TYPE;
+  bookingId: string;
+  priceDiffCents: number;
+  changeFeeCents: number;
+  bookingModificationId?: string;
+  recordPayment?: boolean;
+  paymentIntentId?: string;
+  waitForConfirmedAdditionalPayment?: boolean;
+  /**
+   * THE SECOND ASK (#3193, epic #2797): this row is not the booking change's
+   * supplementary invoice - it is one settled review share's OWN small invoice,
+   * raised because the change's invoice had already left the queue and could not
+   * be raised to include it.
+   *
+   * Present means three things at once, which is why it is ONE field rather than
+   * three: the outbox row and the resulting `XeroObjectLink` anchor on this
+   * `ManualRefundTask` instead of the `BookingModification`, the Xero
+   * idempotency key is scoped to the task, and the invoice tells the member why
+   * they are being asked twice. Splitting them would let a caller take the
+   * anchor without the wording, or the wording without the anchor - and the
+   * anchor is the whole reason a second invoice cannot double-bill.
+   */
+  shortfallReviewTaskId?: string;
+}
+
+// `INV-PAY-101`: the wording on the note (`refundMethod`, absent on rows queued
+// before #3529, which the builder renders as the card refund they always were),
+// or `INV-PAY-017`'s unpaid-invoice clearing (#3535) — never both.
+type QueuedModificationCreditNoteOutboxPayload = {
+  queueType: typeof XERO_OUTBOX_MODIFICATION_CREDIT_NOTE_TYPE;
+  bookingId: string;
+  refundAmountCents: number;
+  bookingModificationId?: string;
+} & ModificationNoteWording;
+
+interface QueuedModificationAccountCreditNoteOutboxPayload {
+  queueType: typeof XERO_OUTBOX_MODIFICATION_ACCOUNT_CREDIT_NOTE_TYPE;
+  bookingId: string;
+  paymentId: string;
+  refundAmountCents: number;
+  bookingModificationId: string;
+}
+
+interface QueuedCreditNoteAllocationOutboxPayload {
+  queueType: typeof XERO_OUTBOX_CREDIT_NOTE_ALLOCATION_TYPE;
+  creditNoteId: string;
+  invoiceId: string;
+  amountCents: number;
+  role?: string;
+}
+
+interface QueuedAppliedCreditAllocationOutboxPayload {
+  queueType: typeof XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE;
+  bookingId: string;
+}
+interface QueuedAppliedCreditDeallocationOutboxPayload {
+  queueType: typeof XERO_OUTBOX_APPLIED_CREDIT_DEALLOCATION_TYPE;
+  bookingId: string;
+}
+
+interface QueuedMembershipCancellationCreditNoteOutboxPayload {
+  queueType: typeof XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CREDIT_NOTE_TYPE;
+  subscriptionId: string;
+  requestId: string;
+  participantId: string;
+}
+
+interface QueuedMembershipCancellationContactOutboxPayload {
+  queueType: typeof XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CONTACT_TYPE;
+  memberId: string;
+  requestId: string;
+  participantId: string;
+}
+
+interface QueuedGroupSettlementInvoiceOutboxPayload {
+  queueType: typeof XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_TYPE;
+  settlementId: string;
+}
+
+interface QueuedGroupSettlementInvoiceVoidOutboxPayload {
+  queueType: typeof XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_VOID_TYPE;
+  settlementId: string;
+  /**
+   * #3642: present on the VOID of an invoice the settlement ABANDONED while the
+   * group stayed live (the settlement's own pointer is already cleared). Absent
+   * on the cancellation VOID, which reads the invoice off the settlement.
+   */
+  xeroInvoiceId?: string;
+}
+
+// No charge id (`INV-INT-026`, #3971): the redactor blanked `chargeId`.
+interface QueuedSubscriptionInvoiceOutboxPayload {
+  queueType: typeof XERO_OUTBOX_SUBSCRIPTION_INVOICE_TYPE;
+}
+const SUBSCRIPTION_INVOICE_LOCAL_MODEL = "MembershipSubscriptionCharge";
+/** `INV-INT-026`: the charge is the row's anchor, never its stored payload. */
+export function subscriptionInvoiceChargeId(op: { localModel: string | null; localId: string | null }) {
+  return op.localModel === SUBSCRIPTION_INVOICE_LOCAL_MODEL ? op.localId : null;
+}
+/** #3994: the one shape of a queued subscription invoice row, for both enqueues. */
+export function subscriptionInvoiceOutboxRow(chargeId: string) {
+  return {
+    direction: "OUTBOUND", entityType: "INVOICE", operationType: "CREATE",
+    localModel: SUBSCRIPTION_INVOICE_LOCAL_MODEL, localId: chargeId,
+    queueType: XERO_OUTBOX_SUBSCRIPTION_INVOICE_TYPE,
+    requestPayload: { queueType: XERO_OUTBOX_SUBSCRIPTION_INVOICE_TYPE },
+  } as const;
+}
+
+export type QueuedOutboxPayload =
+  | OrganiserExtraAdjustmentPayload
+  | QueuedEntranceFeeOutboxPayload
+  | QueuedBookingInvoiceOutboxPayload
+  | QueuedBookingInvoiceUpdateOutboxPayload
+  | QueuedRefundCreditNoteOutboxPayload
+  | QueuedAccountCreditNoteOutboxPayload
+  | QueuedSupplementaryInvoiceOutboxPayload
+  | QueuedModificationCreditNoteOutboxPayload
+  | QueuedModificationAccountCreditNoteOutboxPayload
+  | QueuedCreditNoteAllocationOutboxPayload
+  | QueuedAppliedCreditAllocationOutboxPayload
+  | QueuedAppliedCreditDeallocationOutboxPayload
+  | QueuedMembershipCancellationCreditNoteOutboxPayload
+  | QueuedMembershipCancellationContactOutboxPayload
+  | QueuedGroupSettlementInvoiceOutboxPayload
+  | QueuedGroupSettlementInvoiceVoidOutboxPayload
+  | QueuedSubscriptionInvoiceOutboxPayload
+  | QueuedKeptLateCaptureInvoiceOutboxPayload
+  | QueuedCardRefundReversalInvoiceOutboxPayload
+  | QueuedAdditionalCaptureReceiptOutboxPayload
+  | AdminGrantCreditNotePayload
+  | OrganisationContactDetailsPayload;
+
+export interface QueuedOutboxExpectedOperation {
+  entityType: "INVOICE" | "CREDIT_NOTE" | "ALLOCATION" | "CONTACT" | "PAYMENT";
+  operationType: "CREATE" | "UPDATE" | "ALLOCATE";
+  localModels: ReadonlyArray<
+    | "Member"
+    | "Payment"
+    | "Booking"
+    | "BookingModification"
+    | "MemberSubscription"
+    | "MembershipCancellationRequestParticipant"
+    | "GroupBookingSettlement"
+    | "MembershipSubscriptionCharge"
+    | "MemberCreditNoteAllocation"
+    // #3193: a second-ask supplementary invoice anchors on the review task whose
+    // settled share it bills, so the claim guard has to accept that model or the
+    // row is skipped on every pass and never sent.
+    | "ManualRefundTask"
+    | "PaymentTransaction"
+    | "MemberCredit"
+    | "Organisation"
+  >;
+}
+
+function readEntranceFeeCategory(value: unknown): EntranceFeeCategory | null {
+  return value === "ADULT" ||
+    value === "FAMILY" ||
+    value === "YOUTH" ||
+    value === "CHILD"
+    ? value
+    : null;
+}
+
+export function readQueueType(value: unknown): string | null {
+  const payload = asRecord(value);
+  if (!payload) {
+    return null;
+  }
+
+  return readString(payload.queueType);
+}
+
+/**
+ * THE REQUEST A PENDING OUTBOX ROW MUST HOLD (#5228, `INV-INT-025`): a queued
+ * request the outbox can read, naming the row's own `queueType` column. The
+ * column never changes after enqueue, so the outbox builds its claim from it;
+ * this says whether the stored request can then be sent under that claim.
+ * Null for anything else - a handler's execution request (`invoices`,
+ * `creditNotes`, no `queueType`), a request for another queue type, one too
+ * incomplete to read, or a row with no outbox queue type. Every writer that
+ * puts an outbound row with a queue type back on PENDING checks the request it
+ * leaves there with this one reading (`docs/xero/ARCHITECTURE.md`).
+ */
+export function readQueuedOutboxRequestFor(
+  queueType: string | null,
+  requestPayload: unknown,
+): QueuedOutboxPayload | null {
+  if (!queueType || !(XERO_OUTBOX_QUEUE_TYPES as readonly string[]).includes(queueType)) return null;
+  const payload = readQueuedOutboxPayload(requestPayload);
+  return payload?.queueType === queueType ? payload : null;
+}
+
+export function readQueuedOutboxPayload(
+  value: unknown
+): QueuedOutboxPayload | null {
+  const payload = asRecord(value);
+  if (!payload) {
+    return null;
+  }
+
+  const queueType = readQueueType(value);
+  if (!queueType) {
+    return null;
+  }
+
+  if (queueType === XERO_OUTBOX_ORGANISER_EXTRA_ADJUSTMENT_TYPE) return readOrganiserExtraAdjustmentPayload(value);
+  if (queueType === XERO_OUTBOX_ADMIN_GRANT_CREDIT_NOTE_TYPE) return readAdminGrantCreditNotePayload(value);
+  if (queueType === XERO_OUTBOX_ORGANISATION_CONTACT_DETAILS_TYPE) return readOrganisationContactDetailsPayload(value);
+  if (queueType === XERO_OUTBOX_BOOKING_INVOICE_TYPE) {
+    const bookingId = readString(payload.bookingId);
+    return bookingId ? { queueType, bookingId } : null;
+  }
+
+  if (queueType === XERO_OUTBOX_BOOKING_INVOICE_UPDATE_TYPE) {
+    const bookingId = readString(payload.bookingId);
+    if (!bookingId) {
+      return null;
+    }
+
+    return {
+      queueType,
+      bookingId,
+      xeroInvoiceId: readString(payload.xeroInvoiceId) ?? undefined,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_REFUND_CREDIT_NOTE_TYPE) {
+    const refundAmountCents = readNumber(payload.refundAmountCents);
+    if (refundAmountCents === null) {
+      return null;
+    }
+
+    return {
+      queueType,
+      refundAmountCents,
+      watermarkCents: readNumber(payload.watermarkCents) ?? undefined,
+      refundMethod: parseRefundMethod(payload.refundMethod) ?? undefined,
+      noteWording: readRefundNoteWording(payload),
+      paymentIntentId: readString(payload.paymentIntentId) ?? undefined,
+      documentDate: readString(payload.documentDate) ?? undefined,
+      paidAnotherWayTaskId: readString(payload.paidAnotherWayTaskId) ?? undefined,
+      creditsInvoiceId: readString(payload.creditsInvoiceId) ?? undefined,
+      handBackTaskId: readString(payload.handBackTaskId) ?? undefined, cardRefundId: readString(payload.cardRefundId) ?? undefined,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_ACCOUNT_CREDIT_NOTE_TYPE) {
+    const refundAmountCents = readNumber(payload.refundAmountCents);
+    return refundAmountCents === null ? null : { queueType, refundAmountCents, ...readAccountCreditNoteCredit(payload) };
+  }
+
+  if (queueType === XERO_OUTBOX_SUPPLEMENTARY_INVOICE_TYPE) {
+    const bookingId = readString(payload.bookingId);
+    const priceDiffCents = readNumber(payload.priceDiffCents);
+    const changeFeeCents = readNumber(payload.changeFeeCents);
+
+    if (!bookingId || priceDiffCents === null || changeFeeCents === null) {
+      return null;
+    }
+
+    return {
+      queueType,
+      bookingId,
+      priceDiffCents,
+      changeFeeCents,
+      bookingModificationId:
+        readString(payload.bookingModificationId) ?? undefined,
+      recordPayment:
+        typeof payload.recordPayment === "boolean"
+          ? payload.recordPayment
+          : undefined,
+      paymentIntentId: readString(payload.paymentIntentId) ?? undefined,
+      waitForConfirmedAdditionalPayment:
+        typeof payload.waitForConfirmedAdditionalPayment === "boolean"
+          ? payload.waitForConfirmedAdditionalPayment
+          : undefined,
+      shortfallReviewTaskId:
+        readString(payload.shortfallReviewTaskId) ?? undefined,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_MODIFICATION_CREDIT_NOTE_TYPE) {
+    const bookingId = readString(payload.bookingId);
+    const refundAmountCents = readNumber(payload.refundAmountCents);
+
+    if (!bookingId || refundAmountCents === null) {
+      return null;
+    }
+
+    return {
+      queueType,
+      bookingId,
+      refundAmountCents,
+      bookingModificationId:
+        readString(payload.bookingModificationId) ?? undefined,
+      ...readModificationNoteWording(payload),
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_MODIFICATION_ACCOUNT_CREDIT_NOTE_TYPE) {
+    const bookingId = readString(payload.bookingId);
+    const paymentId = readString(payload.paymentId);
+    const refundAmountCents = readNumber(payload.refundAmountCents);
+    const bookingModificationId = readString(payload.bookingModificationId);
+
+    if (!bookingId || !paymentId || refundAmountCents === null || !bookingModificationId) {
+      return null;
+    }
+
+    return {
+      queueType,
+      bookingId,
+      paymentId,
+      refundAmountCents,
+      bookingModificationId,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_CREDIT_NOTE_ALLOCATION_TYPE) {
+    const creditNoteId = readString(payload.creditNoteId);
+    const invoiceId = readString(payload.invoiceId);
+    const amountCents = readNumber(payload.amountCents);
+
+    if (!creditNoteId || !invoiceId || amountCents === null) {
+      return null;
+    }
+
+    return {
+      queueType,
+      creditNoteId,
+      invoiceId,
+      amountCents,
+      role: readString(payload.role) ?? undefined,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE) {
+    const bookingId = readString(payload.bookingId);
+    return bookingId ? { queueType, bookingId } : null;
+  }
+  if (queueType === XERO_OUTBOX_APPLIED_CREDIT_DEALLOCATION_TYPE) {
+    const bookingId = readString(payload.bookingId);
+    return bookingId ? { queueType, bookingId } : null;
+  }
+
+  if (queueType === XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CREDIT_NOTE_TYPE) {
+    const subscriptionId = readString(payload.subscriptionId);
+    const requestId = readString(payload.requestId);
+    const participantId = readString(payload.participantId);
+
+    if (!subscriptionId || !requestId || !participantId) {
+      return null;
+    }
+
+    return {
+      queueType,
+      subscriptionId,
+      requestId,
+      participantId,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CONTACT_TYPE) {
+    const memberId = readString(payload.memberId);
+    const requestId = readString(payload.requestId);
+    const participantId = readString(payload.participantId);
+
+    if (!memberId || !requestId || !participantId) {
+      return null;
+    }
+
+    return {
+      queueType,
+      memberId,
+      requestId,
+      participantId,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_TYPE) {
+    const settlementId = readString(payload.settlementId);
+    if (!settlementId) {
+      return null;
+    }
+
+    return {
+      queueType,
+      settlementId,
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_VOID_TYPE) {
+    const settlementId = readString(payload.settlementId);
+    if (!settlementId) {
+      return null;
+    }
+    // #3642: the abandon VOID names its invoice. A present-but-unreadable id is
+    // refused rather than read as the cancellation VOID, which would void
+    // whatever the settlement points at now.
+    if (payload.xeroInvoiceId === undefined) {
+      return { queueType, settlementId };
+    }
+    const xeroInvoiceId = readString(payload.xeroInvoiceId);
+    if (!xeroInvoiceId) {
+      return null;
+    }
+    return { queueType, settlementId, xeroInvoiceId };
+  }
+
+  if (queueType === XERO_OUTBOX_SUBSCRIPTION_INVOICE_TYPE) return { queueType }; // #3971
+  if (queueType === XERO_OUTBOX_ADDITIONAL_CAPTURE_RECEIPT_TYPE) return readAdditionalCaptureReceiptPayload(value);
+  if (queueType === XERO_OUTBOX_CARD_REFUND_REVERSAL_INVOICE_TYPE) return readCardRefundReversalInvoicePayload(value);
+
+  if (queueType === XERO_OUTBOX_KEPT_LATE_CAPTURE_INVOICE_TYPE) return readKeptLateCaptureInvoicePayload(value);
+
+  if (queueType !== XERO_OUTBOX_ENTRANCE_FEE_TYPE) {
+    return null;
+  }
+
+  const category = readEntranceFeeCategory(payload.category);
+  const feeAmountCents = readNumber(payload.feeAmountCents);
+
+  if (!category || feeAmountCents === null) {
+    return null;
+  }
+
+  return {
+    queueType,
+    category,
+    itemCode:
+      payload.itemCode === null
+        ? null
+        : typeof payload.itemCode === "string"
+          ? payload.itemCode
+          : null,
+    feeAmountCents,
+    description: readString(payload.description) ?? null,
+  };
+}
+
+/**
+ * WHAT A QUEUED SUPPLEMENTARY INVOICE BILLS: `priceDiffCents + changeFeeCents`,
+ * the sum `createXeroSupplementaryInvoice` sends, read through the typed parser
+ * above (#3641 review round). `null` when the payload is not a readable
+ * supplementary invoice. The one reading, so the restate's "never lower" and the
+ * late capture's "does the capture cover it" cannot coerce the same row two ways.
+ */
+export function supplementaryInvoiceBilledCents(
+  requestPayload: unknown
+): number | null {
+  const payload = readQueuedOutboxPayload(requestPayload);
+  if (!payload || payload.queueType !== XERO_OUTBOX_SUPPLEMENTARY_INVOICE_TYPE) {
+    return null;
+  }
+  return payload.priceDiffCents + payload.changeFeeCents;
+}
+
+export function getQueuedOutboxExpectedOperation(
+  queueType: string | null
+): QueuedOutboxExpectedOperation {
+  if (queueType === XERO_OUTBOX_BOOKING_INVOICE_UPDATE_TYPE) {
+    return {
+      entityType: "INVOICE",
+      operationType: "UPDATE",
+      localModels: ["Payment"],
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_ADDITIONAL_CAPTURE_RECEIPT_TYPE) return { entityType: "PAYMENT", operationType: "CREATE", localModels: ["PaymentTransaction"] };
+  if (queueType === XERO_OUTBOX_ADMIN_GRANT_CREDIT_NOTE_TYPE) return { entityType: "CREDIT_NOTE", operationType: "CREATE", localModels: ["MemberCredit"] };
+  if (queueType === XERO_OUTBOX_ORGANISATION_CONTACT_DETAILS_TYPE) return { entityType: "CONTACT", operationType: "UPDATE", localModels: ["Organisation"] };
+  if (queueType === XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_VOID_TYPE) {
+    return {
+      entityType: "INVOICE",
+      operationType: "UPDATE",
+      localModels: ["GroupBookingSettlement"],
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CONTACT_TYPE) {
+    return {
+      entityType: "CONTACT",
+      operationType: "UPDATE",
+      localModels: ["MembershipCancellationRequestParticipant"],
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_CREDIT_NOTE_ALLOCATION_TYPE) {
+    return {
+      entityType: "ALLOCATION",
+      operationType: "ALLOCATE",
+      // "MemberCreditNoteAllocation" (#1620): the applied-credit engine anchors
+      // each per-note allocation op on its join row so multi-note allocations to
+      // one invoice do not collapse the (localModel, localId, role) enqueue dedup.
+      localModels: [
+        "Payment",
+        "Booking",
+        "BookingModification",
+        "MemberCreditNoteAllocation",
+      ],
+    };
+  }
+
+  if (queueType === XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE) {
+    // Orchestration op anchored on the booking's Payment. Reuses the ALLOCATION
+    // entity/op shape; dispatch routes by queueType, not by entity.
+    return {
+      entityType: "ALLOCATION",
+      operationType: "ALLOCATE",
+      localModels: ["Payment"],
+    };
+  }
+  if (queueType === XERO_OUTBOX_APPLIED_CREDIT_DEALLOCATION_TYPE) {
+    return {
+      entityType: "ALLOCATION",
+      operationType: "UPDATE",
+      localModels: ["Payment"],
+    };
+  }
+
+  if (
+    queueType === XERO_OUTBOX_ORGANISER_EXTRA_ADJUSTMENT_TYPE ||
+    queueType === XERO_OUTBOX_REFUND_CREDIT_NOTE_TYPE ||
+    queueType === XERO_OUTBOX_ACCOUNT_CREDIT_NOTE_TYPE ||
+    queueType === XERO_OUTBOX_MODIFICATION_CREDIT_NOTE_TYPE ||
+    queueType === XERO_OUTBOX_MODIFICATION_ACCOUNT_CREDIT_NOTE_TYPE ||
+    queueType === XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CREDIT_NOTE_TYPE
+  ) {
+    return {
+      entityType: "CREDIT_NOTE",
+      operationType: "CREATE",
+      localModels:
+        queueType === XERO_OUTBOX_ORGANISER_EXTRA_ADJUSTMENT_TYPE ||
+        queueType === XERO_OUTBOX_MODIFICATION_CREDIT_NOTE_TYPE ||
+        queueType === XERO_OUTBOX_MODIFICATION_ACCOUNT_CREDIT_NOTE_TYPE
+          ? ["Booking", "BookingModification"]
+          : queueType === XERO_OUTBOX_MEMBERSHIP_CANCELLATION_CREDIT_NOTE_TYPE
+            ? ["MemberSubscription"]
+            : ["Payment"],
+    };
+  }
+
+  return {
+    entityType: "INVOICE",
+    operationType: "CREATE",
+    localModels:
+      queueType === XERO_OUTBOX_BOOKING_INVOICE_TYPE
+        ? ["Payment"]
+        : queueType === XERO_OUTBOX_SUPPLEMENTARY_INVOICE_TYPE
+          ? // "ManualRefundTask" (#3193): a second-ask invoice for a review
+            // share the booking change's own invoice could not take anchors on
+            // that share's task, so one edit's asks never collide on one key.
+            ["Booking", "BookingModification", "ManualRefundTask"]
+          : queueType === XERO_OUTBOX_GROUP_SETTLEMENT_INVOICE_TYPE
+            ? ["GroupBookingSettlement"]
+            : queueType === XERO_OUTBOX_SUBSCRIPTION_INVOICE_TYPE
+              ? [SUBSCRIPTION_INVOICE_LOCAL_MODEL]
+            : queueType === XERO_OUTBOX_KEPT_LATE_CAPTURE_INVOICE_TYPE
+              ? // #3635: the approval task that owns the kept capture.
+                ["ManualRefundTask"]
+            : queueType === XERO_OUTBOX_CARD_REFUND_REVERSAL_INVOICE_TYPE ? ["Payment"] // #4369
+            : ["Member"],
+  };
+}

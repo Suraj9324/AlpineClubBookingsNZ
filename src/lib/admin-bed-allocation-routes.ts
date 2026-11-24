@@ -1,0 +1,124 @@
+import { NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
+import { isPrismaKnownUniqueConstraintError } from "@/lib/prisma-known-errors";
+import { isEffectiveModuleEnabled } from "@/lib/admin-modules";
+import { MODULE_DISABLED_ERROR_CODE } from "@/lib/api-error-message";
+import {
+  BedAllocationAdminError,
+} from "@/lib/bed-allocation-admin-contract";
+import { BedAllocationSettingsValidationError } from "@/lib/bed-allocation-settings";
+import { requireAdmin } from "@/lib/session-guards";
+import { transactionContendedResponse } from "@/lib/transaction-contended-response";
+
+async function requireBedAllocationPermission(
+  level: "view" | "edit",
+) {
+  const guard = await requireAdmin({ permission: { area: "bookings", level } });
+  if (!guard.ok) {
+    return { ok: false as const, response: guard.response };
+  }
+
+  if (!(await isEffectiveModuleEnabled("bedAllocation"))) {
+    // The status stays 404 — every `/api/admin/bed-allocation` address answers
+    // that way while the module is off, and the browser-facing page gate
+    // depends on it. What is added is the NAME of the refusal (#2931).
+    //
+    // 404 alone is ambiguous here and the ambiguity is deliberate:
+    // `moduleGatedNotFoundResponse` in `src/lib/session-guards.ts` answers an
+    // ANONYMOUS caller on this same gated path with the identical bare
+    // `{ error: "Not found" }`, so that one unauthenticated probe cannot read
+    // which optional modules a club runs. A screen inferring "module off" from
+    // the status therefore told an admin whose sign-in had expired to go and
+    // turn on a module — a wrong diagnosis, not merely an unhelpful one.
+    //
+    // This code is reachable ONLY past the `requireAdmin` call above, so it is
+    // set only for a caller already authenticated and permitted. The anonymous
+    // 404 still carries nothing and the probe still learns nothing.
+    return {
+      ok: false as const,
+      response: NextResponse.json(
+        { error: "Not found", code: MODULE_DISABLED_ERROR_CODE },
+        { status: 404 },
+      ),
+    };
+  }
+
+  return { ok: true as const, session: guard.session };
+}
+
+/** Bed-board/settings reads require the explicit bookings:view contract. */
+export function requireBedAllocationRead() {
+  return requireBedAllocationPermission("view");
+}
+
+/** Every allocation/settings/approval mutation requires bookings:edit. */
+export function requireBedAllocationWrite() {
+  return requireBedAllocationPermission("edit");
+}
+
+/** Semantic inventory read helper; D-R17 preserves bookings:view. */
+export function requireBedInventoryRead() {
+  return requireBedAllocationPermission("view");
+}
+
+/** Semantic inventory write helper; D-R17 preserves bookings:edit. */
+export function requireBedInventoryWrite() {
+  return requireBedAllocationPermission("edit");
+}
+
+export function bedAllocationErrorResponse(error: unknown) {
+  if (error instanceof BedAllocationSettingsValidationError) {
+    return NextResponse.json({ error: error.message }, { status: error.status });
+  }
+  if (error instanceof BedAllocationAdminError) {
+    return NextResponse.json({ error: error.message }, { status: error.status });
+  }
+  const contended = transactionContendedResponse(error, "Bed allocation transaction contended");
+  if (contended) return contended;
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (isPrismaKnownUniqueConstraintError(error)) {
+      return NextResponse.json(
+        { error: "A room or bed with that name already exists." },
+        { status: 409 },
+      );
+    }
+    if (error.code === "P2025") {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+    if (error.code === "P2003") {
+      // #2286: a HutLeaderAssignment_bedId_fkey violation means the bed is held
+      // for a custodian, not that it has allocation history — the generic
+      // message would steer the admin to "deactivate it instead", which the
+      // custodian guard also refuses, leaving them with no way forward. Tested
+      // first because the raw pg message names both tables.
+      const meta = error.meta as
+        | { field_name?: unknown; constraint?: unknown }
+        | undefined;
+      const text = [
+        error.message,
+        typeof meta?.field_name === "string" ? meta.field_name : "",
+        typeof meta?.constraint === "string" ? meta.constraint : "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (text.includes("hutleaderassignment")) {
+        return NextResponse.json(
+          {
+            error:
+              "This bed is held by a hut-leader assignment and cannot be deleted. Clear the bed on the Hut Leaders page first.",
+          },
+          { status: 409 },
+        );
+      }
+      return NextResponse.json(
+        { error: "Cannot delete a bed with allocation history; deactivate it instead." },
+        { status: 409 },
+      );
+    }
+  }
+
+  return NextResponse.json(
+    { error: "Bed allocation request failed" },
+    { status: 500 },
+  );
+}

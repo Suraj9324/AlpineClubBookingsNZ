@@ -1,0 +1,179 @@
+# Internet Banking
+
+Audience: Operator
+
+## What it is
+
+The settings for **Xero-invoiced Internet Banking payments** (bank transfers):
+whether beds are held while a payment is pending, how long that hold lasts, and
+the minimum lead time required before check-in. Find it at **Admin → Finance →
+Internet Banking** (`/admin/internet-banking`); the page's back-link goes to
+**Xero Setup** (`/admin/xero/setup`).
+
+Internet Banking is a **finance** permission area: finance view to read, finance
+**edit** to save. It depends on the Xero integration and the Internet Banking
+payments module — the page shows whether each is on.
+
+## When you'd use it
+
+- You want to offer (or stop offering) Internet Banking as a booking payment
+  method backed by a Xero invoice.
+- You need to change how long a bed is held while waiting for a bank transfer to
+  reconcile, or the minimum notice before check-in for an Internet Banking booking.
+
+## Step-by-step
+
+### Configure holds and lead time
+
+1. Go to **Admin → Finance → Internet Banking**. The badges show whether the
+   module is ready, Xero is on, and Internet Banking is on.
+
+   > This page only exists when the **Xero integration** and **Internet Banking
+   > payments** modules are both enabled (`src/config/feature-routes.ts`);
+   > otherwise the route returns *Not Found*. The demo seed leaves Xero off, so no
+   > screenshot is captured here.
+
+2. Tick **Hold beds while Internet Banking payment is pending** to confirm bookings
+   immediately and release them if Xero has not reconciled payment before the hold
+   expires.
+3. Set the **Hold duration** (1–30 days) and the **Minimum lead time before
+   check-in** (0–365 days), then click **Save Settings**.
+
+## Settings reference
+
+| Setting | What it controls | Default | Notes / constraints |
+| --- | --- | --- | --- |
+| Hold beds while Internet Banking payment is pending | Whether a bed is held pending reconciliation | from server | When on, bookings confirm immediately and release if unpaid at hold expiry |
+| Hold duration | How long a pending-payment hold lasts | from server | Integer 1–30 days |
+| Minimum lead time before check-in | Minimum notice for an Internet Banking booking | from server | Integer 0–365 days |
+
+When a held booking's hold expires unpaid, the payment cron cancels the booking,
+fails the pending payment, queues an invoice-clearing credit note, and emails the
+member — see the operational-Xero behaviour in
+[`ARCHITECTURE.md`](../ARCHITECTURE.md#operational-xero).
+
+**A hold that has started being paid is kept, not cancelled** (#3643). Before it
+releases a hold, the cron reads the booking's invoices from Xero. If Xero shows
+any payment against them — say $150 of a $300 invoice — the booking stays
+confirmed, its beds stay held, and admins get one **Internet banking hold needs
+attention** email with the booking reference, the invoice link, and what has
+been paid and what is still owing. Nothing is refunded or credited. Either wait
+for the member to pay the rest (the booking is marked paid once Xero shows the
+invoice fully paid), or cancel the booking in the app. The cancellation records
+the part payment as money received, applies the club's cancellation policy to
+it and returns the refundable share as account credit, and clears only what the
+invoice still owes with a credit note reading "Unpaid balance cleared - booking
+cancelled". The cancel dialog checks Xero the same way before you confirm, so
+the credit it shows is the credit the cancellation gives. If the booking belongs
+to an organisation, or Xero cannot give the amount paid exactly, the app cannot
+credit the payment: the email says so, an officer's cancel treats the booking as
+unpaid (no refund, no credit, invoice left open) and the treasurer is emailed to
+settle the payment by hand in Xero, and a member cancelling online is asked to
+contact the club. That cancel also puts one item with no amount in **Money to
+settle** on the admin payments page. Once you have settled the payment in Xero
+and cleared what the invoice still owes, close the item with a note saying what
+you did; the Xero repair tool then stops listing the booking for review.
+
+**The booking records what the invoice collected** (#3979). When Xero shows a
+booking's invoice paid, the app records the money the invoice actually took, so
+a booking whose price changed before its invoice was raised is settled at the
+new price, and its refunds and credits are sized from it. A credit note that
+lowers an invoice nobody has paid yet (*Invoice correction — nothing refunded*)
+is a price correction: a $300 invoice cut by $100 and paid $200 shows $200 paid
+and nothing refunded. If the app cannot be sure the payment belongs to this
+booking alone, it keeps the amount it had; either that, or a payment that is not
+what the booking owes, sends admins with finance edit access a **Bank transfer
+amount needs checking** email (it cannot be switched off) and puts a note on the
+booking's history.
+
+**Checking recorded bank-transfer amounts is an operator task.** After an
+upgrade that brings this change, ask whoever runs the club's booking system to
+run the settled-cash audit (`pnpm run payments:audit-ib-settled-cash`, see
+[MAINTENANCE.md](../MAINTENANCE.md#audit-bank-transfer-receipts-settled-at-a-stale-figure-3979)).
+It lists bookings settled at an old figure. There is no screen to correct one:
+the owner or a developer corrects the recorded amount and the refunded total
+together, in the database.
+
+If Xero shows the invoice **paid in full** but the app has not caught up, the
+email says so; the next Xero sync marks the booking paid. If the invoice
+**cannot be read** (Xero disconnected, down, or the invoice missing there), the
+hold is kept too and admins get one email. The cron keeps trying and releases the
+hold itself once Xero shows the invoice unpaid. If it still cannot be read seven
+days after the hold deadline, the hold is released and a second email goes out;
+the invoice-clearing credit note is only created once Xero can be read and shows
+the invoice still owes it. If the check-in date arrives first, the stay has
+started, so the hold is not cancelled at all: it is left for you to reconcile by
+hand, with one email saying so. The cron does not read Xero for a stay that has
+started, whatever the invoice shows.
+
+**An extra amount after a booking change.** The booking's confirmation shows
+what each issued supplementary invoice still owed when it was checked, with its
+own invoice number and bank-transfer instructions. A part payment or applied
+credit reduces that invoice's remaining amount; its original price increase is
+not presented as what remains due. **Check more invoices** reaches the rest
+when there are many, without combining observations from different checks into
+one total. If Xero cannot confirm an amount, or the invoice has not yet been
+issued, the page says so. A voided invoice may have a replacement: check Xero
+before treating its withdrawal as money waived. The group's combined invoice
+remains the organiser's responsibility.
+
+**Groups work the same way.** When an organiser pays for a group with one
+combined Internet Banking invoice and the settlement runs out of time while Xero
+cannot show that invoice, the group keeps its beds for up to seven days past the
+deadline, then is released. Once the check-in date of a group with an invoice
+arrives, the group is never released by the app, even if Xero shows the invoice
+unpaid or no longer has it: it is kept, and the treasurer gets one email, because the organiser may
+already have paid by bank transfer (#3635).
+
+The email goes to admins with the **payment failure** notification switched on.
+A send that fails is retried on the next run, including the email for a hold
+already released; one that reaches nobody (every address suppressed, for
+example) is tried again a day later, not every run.
+
+**When the organiser cancels a group they paid for.** Each joiner's refund is
+recorded in the app's ledger, and the club repays the organiser by bank
+transfer. A task appears in **Money to settle** on the
+[payments board](payments.md#pay-back-a-refund-for-a-cash-booking): it holds
+the total as each joiner's place is cancelled and lists their shares. The task
+is the record. Admins get the **Manual refund needed** email once the cancel
+has worked through the joiners; if it could not go out, a background job sends
+it later, and a task raised after the first was paid back gets its own email
+(#4042; details in [payments](payments.md#pay-back-a-refund-for-a-cash-booking)).
+
+**When a place in a group the organiser paid for costs more** (#4299). The app
+bills the organiser, not the joiner, on a separate Xero invoice for the extra
+and any late-change fee, and emails them the **Group Organiser Extra Invoice**
+message. Reconcile the organiser's bank transfer against that invoice in Xero as
+usual; the app reads the payment from Xero and records it on the joiner's
+place. If the place is later cut back or cancelled, the app waives what is
+still unpaid with a credit note (or voids an invoice nothing was paid on) and
+refunds the paid part at the cancellation policy's percentage through the
+organiser's refund task. If Xero shows the organiser's payment reversed after
+part of it was refunded, the app changes nothing and puts a task in **Xero
+Operations**: fix it in Xero, then choose **Resolve (fixed in Xero)**.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Everything is read-only ("… can view Internet Banking settings but cannot change them") | Your finance role is view-only | Ask a finance-edit admin |
+| The page shows **Xero off** / **Module Not Ready** | The Xero integration or Internet Banking module is off | Enable Xero and the Internet Banking module — see [`CONFIGURATION.md`](../../CONFIGURATION.md#module-controls-and-admin-modules) |
+| An expired hold was not cancelled and an **Internet banking hold needs attention** email arrived | Xero shows part (or all) of the invoice paid, or the invoice could not be read | Follow the email: wait for the rest, or cancel the booking in the app (the part payment is credited under the policy); reconnect Xero if it could not be read |
+| A member is told a payment "the club needs to settle by hand" stops them cancelling online | The booking has a payment recorded that the app cannot credit (an organisation's booking, or Xero could not give the amount exactly) | An officer cancels it; the treasurer is emailed to settle the payment in Xero |
+| A **Bank transfer amount needs checking** email arrived | The app kept the amount it had recorded (the payment could not be tied to this booking alone), or the member paid more or less than the booking owes (#3979) | Check the invoice in Xero. Refund or credit an overpayment, or collect a shortfall. If the recorded amount is wrong, the owner or a developer corrects it with the refunded total, in the database (see the settled-cash audit in MAINTENANCE.md) |
+| Cancelling says the booking's payment changed while it was being cancelled | A further payment reached Xero after the cancel checked it | Cancel again; it re-reads Xero |
+| Members aren't offered Internet Banking at checkout | The module is off, or the booking is inside the minimum lead time | Turn the module on and check the **Minimum lead time** value |
+| An admin alert says "Booking may have been paid twice — card and Xero" | A card payment had already settled the booking, and Xero then reported its Internet Banking invoice paid too (#3638). The bank payment is recorded; nothing was refunded | Check the invoice's payment in Xero: if it is separate money from the member, agree with them which payment to refund; if it is the card money matched to the invoice by hand, correct the match in Xero |
+| The same alert says the booking was "paid by card and later cancelled" | The booking was paid by card and cancelled, and a bank transfer then arrived against its Internet Banking invoice (#3638). The cancellation already settled the card payment; the bank payment is recorded and was not credited | Check the payment in Xero; if it is the member's money, return it or add it to their account credit |
+
+## Related links
+
+- Back to the [documentation hub](../README.md).
+- Feature hub: [Finance dashboard](../finance-dashboard/README.md), and the
+  [Xero subsystem](../xero/ARCHITECTURE.md).
+- Sibling guides: [Payments](payments.md), [Xero Sync](xero.md),
+  [Booking Messages](booking-messages.md).
+- Reference: [operational Xero](../ARCHITECTURE.md#operational-xero) and the
+  [payment and settlement](../invariants/payment-and-settlement.md) and
+  [booking dates and capacity](../invariants/booking-dates-and-capacity.md)
+  invariants.

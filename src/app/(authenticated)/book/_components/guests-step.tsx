@@ -1,0 +1,603 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { MemberGuestFindPanel } from "@/components/book/member-guest-find-panel";
+import { GuestForm, type GuestData } from "@/components/guest-form";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useClubFormat } from "@/components/club-format-provider";
+import {
+  getFamilyMemberBookingActionLabel,
+  getFamilyMemberBookingBlockMessage,
+} from "@/lib/family-booking";
+import { describeMemberGuestConsentBadge } from "@/lib/member-guest-consent-card";
+import type { MemberGuestCandidate } from "@/lib/member-guest-find";
+import { formatStayDate } from "@/lib/club-time";
+import {
+  describeMemberGuestWizardHelper,
+  memberGuestConsentPreviewColumns,
+} from "@/components/book/member-guest-preview";
+import { CapacityShortNotice } from "./capacity-short-notice";
+import { DependantIdentityResolution } from "@/components/book/dependant-identity-resolution";
+import type { OwnDependantCollision } from "@/lib/booking-dependant-identity";
+import { normalizePersonFullName } from "@/lib/person-name-normalization";
+import {
+  PROFILE_FAMILY_GROUP_RETURN_TO_BOOK,
+  type FamilyMember,
+  type GroupPaymentMode,
+  type PriceQuote,
+} from "@/components/book/booking-wizard-types";
+
+interface GuestsStepProps {
+  // NZ date-only lodge nights (#2474).
+  checkIn: string | null;
+  checkOut: string | null;
+  nights: number;
+  familyMembers: FamilyMember[];
+  guests: GuestData[];
+  /**
+   * The most guests this party may hold at the SELECTED lodge, or null for no
+   * ceiling (#2930). Null has two causes and one answer: the lodge has no
+   * configured capacity (0 beds by design, so a ceiling of zero would disable
+   * every control below at zero guests and strand a member the calendar has just
+   * invited onto the waitlist), or the availability check was refused and the
+   * denominator is simply unknown. Either way the server decides — the settled
+   * contract makes party-size capacity advisory rather than a client hard stop.
+   */
+  lodgeCapacity: number | null;
+  addFamilyMemberAsGuest: (fm: FamilyMember) => void;
+  showInviteFamilyGroupMembersLink: boolean;
+  handleGuestsChange: (nextGuests: GuestData[]) => void;
+  perGuestDatesEnabled: boolean;
+  handlePerGuestDatesEnabledChange: (enabled: boolean) => void;
+  multiDateRangesEnabled: boolean;
+  handleMultiDateRangesEnabledChange: (enabled: boolean) => void;
+  priceQuote: PriceQuote | null;
+  groupBookingsEnabled: boolean;
+  groupTrip: boolean;
+  setGroupTrip: (value: boolean) => void;
+  groupPaymentMode: GroupPaymentMode;
+  setGroupPaymentMode: (mode: GroupPaymentMode) => void;
+  setStep: (step: "dates" | "guests" | "review" | "pay") => void;
+  handleGuestsDone: () => void | Promise<void>;
+  priceLoading: boolean;
+  // "+ Add Member Guest" (MG3 #2308). `memberGuestEnabled` is the server's
+  // answer, not the browser's guess — see `MemberGuestConfig` in the wizard hook.
+  memberGuestEnabled: boolean;
+  memberGuestOpenSearchEnabled: boolean;
+  addMemberGuest: (candidate: MemberGuestCandidate) => void;
+  /**
+   * #3770: the finder stays closed until the family list has answered — the
+   * consent prediction (and the adult-supervision check that reads it) needs it.
+   */
+  familyMembersLoaded: boolean;
+  familyMembersLoadFailed: boolean;
+  retryFamilyMembersLoad: () => void;
+  memberGuestAddError: string | null;
+  /**
+   * Advisory per-night capacity for the party as it stands (#2930): the nights
+   * it will not fit on, and the sentence the member is shown about them.
+   *
+   * ADVISORY IS THE WHOLE POINT. This step used to REFUSE to continue when the
+   * range was full, which shut the only door to the waitlist: the offer arrives
+   * with the server's 409, and a party stopped here never sent the request that
+   * produces it. The step now says what to expect and lets the member go on.
+   *
+   * The wording is identical whether the lodge is full of bookings or held for
+   * one group — `/api/availability/check` reports a held night as a full lodge
+   * and sends no flag, so there is nothing here that could say otherwise
+   * (`INV-CAP-021`, ADR-001 decision 6).
+   */
+  capacityShortNights: string[];
+  capacityShortMessage: string | null;
+  /**
+   * #2721: every live exact collision between a typed guest name and one of the
+   * booker's OWN recorded dependants, with the two answers it can be given.
+   * Empty until `/api/members/family` has answered, and empty for every party
+   * that names nobody's dependant — which is nearly all of them.
+   */
+  dependantIdentityCollisions: OwnDependantCollision[];
+  declaredDependantMemberIds: string[];
+  bookCollidingGuestAsDependant: (
+    normalizedName: string,
+    familyMember: FamilyMember,
+  ) => void;
+  declareDependantDifferentPerson: (
+    collision: OwnDependantCollision,
+    dependantMemberId: string,
+  ) => void;
+  withdrawDependantDeclaration: (
+    collision: OwnDependantCollision,
+    dependantMemberId: string,
+  ) => void;
+}
+
+export function GuestsStep({
+  checkIn,
+  checkOut,
+  nights,
+  familyMembers,
+  guests,
+  lodgeCapacity,
+  addFamilyMemberAsGuest,
+  showInviteFamilyGroupMembersLink,
+  handleGuestsChange,
+  perGuestDatesEnabled,
+  handlePerGuestDatesEnabledChange,
+  multiDateRangesEnabled,
+  handleMultiDateRangesEnabledChange,
+  priceQuote,
+  groupBookingsEnabled,
+  groupTrip,
+  setGroupTrip,
+  groupPaymentMode,
+  setGroupPaymentMode,
+  setStep,
+  handleGuestsDone,
+  priceLoading,
+  memberGuestEnabled,
+  memberGuestOpenSearchEnabled,
+  addMemberGuest,
+  familyMembersLoaded,
+  familyMembersLoadFailed,
+  retryFamilyMembersLoad,
+  memberGuestAddError,
+  capacityShortNights,
+  capacityShortMessage,
+  dependantIdentityCollisions,
+  declaredDependantMemberIds,
+  bookCollidingGuestAsDependant,
+  declareDependantDifferentPerson,
+  withdrawDependantDeclaration,
+}: GuestsStepProps) {
+  const format = useClubFormat();
+  /** Derived once, so the three add-guest affordances cannot disagree. */
+  const atPartyCeiling = lodgeCapacity !== null && guests.length >= lodgeCapacity;
+  // The find panel opens INLINE, underneath the Guests heading (owner sign-off
+  // answer 3) — never a dialog.
+  const [findPanelOpen, setFindPanelOpen] = useState(false);
+  // Who the last add was about, so a refusal can be shown beneath a chip naming
+  // them (mockup panel 13) instead of floating above a blank search box. The
+  // panel closes on add and the server answers on the quote that follows, so by
+  // the time the refusal arrives the panel's own selection is gone (F9).
+  const [lastAddAttempt, setLastAddAttempt] = useState<MemberGuestCandidate | null>(
+    null,
+  );
+  // Focus has to go somewhere when the panel unmounts, or Escape drops it on the
+  // document body and a keyboard user is stranded at the top of the page (F5).
+  const findTriggerRef = useRef<HTMLButtonElement>(null);
+  const closeFindPanel = () => {
+    setFindPanelOpen(false);
+    findTriggerRef.current?.focus();
+  };
+  // A D-8 refusal comes back AFTER the panel has closed (the add is optimistic;
+  // the server answers on the quote that follows). Re-opening puts the one
+  // neutral sentence beside the person the booker was adding, which is where the
+  // signed-off mockup draws it — and is why the wizard clears its page-level
+  // banner for this one code instead of saying the same thing twice.
+  useEffect(() => {
+    if (memberGuestAddError) setFindPanelOpen(true);
+  }, [memberGuestAddError]);
+  // Tri-state for the "add as a non-member guest" fallback warning (#1942). The
+  // live quote only computes nonMemberHoldDecision once a non-member is already
+  // in the party, so the FIRST non-member add has no decision yet — warn
+  // conditionally in that case rather than omitting the consequence entirely:
+  //   - a non-member already in the party + quote says hold applies → "applies"
+  //   - a non-member already in the party + quote says it does not    → "none"
+  //   - no non-member in the party yet (decision unavailable)          → "conditional"
+  const partyHasNonMember = guests.some((g) => !g.isMember);
+  const holdPolicy: "applies" | "conditional" | "none" = !partyHasNonMember
+    ? "conditional"
+    : priceQuote?.nonMemberHoldDecision?.shouldBePending === true
+      ? "applies"
+      : "none";
+
+  // Active steer (#1942): a typed-in non-member guest whose first+last name
+  // matches one of THIS member's own family group members who can be booked as a
+  // linked member guest. Matching is case-insensitive and scoped strictly to the
+  // member's own family list. We suggest switching them to the member guest (bed
+  // held, member rate, no split) — a suggestion only, never a forced switch.
+  //
+  // THE NO-ENUMERATION RULE, STATED PRECISELY (rewritten by MG3, #2308). This
+  // comment used to assert as a repo-wide invariant that this screen shows
+  // "never other members' data — no enumeration". That became conditionally
+  // false the moment a club could turn open member search on, and a comment the
+  // code no longer honours is worse than no comment. The rule that actually
+  // holds is three separate statements:
+  //
+  //   1. NO ENUMERATION BY DEFAULT. Every club ships with the member-guest
+  //      module off; with it on, the finder resolves an EXACT email address the
+  //      booker already possesses and nothing else. Neither state lists members.
+  //   2. THE #1942 STEER BELOW IS ALWAYS FAMILY-ONLY, whatever any setting says.
+  //      It matches against `familyMembers` — this member's own family group,
+  //      already sent to this page for the quick-add row — and never against any
+  //      wider set. That is unconditional and must stay so.
+  //   3. THE MEMBER-GUEST FINDER ENUMERATES ONLY WHEN A CLUB HAS DELIBERATELY
+  //      TURNED OPEN SEARCH ON (`openMemberSearchEnabled`, default off). When it
+  //      is on the membership name list is browsable BY DESIGN — that is the
+  //      setting's whole purpose, the admin toggle says so in those words, and
+  //      the rate limits and audit trail make it slow and recorded rather than
+  //      impossible.
+  //
+  //   4. A NAME #2721 HAS A HARD QUESTION ABOUT IS NOT ALSO SOFT-SUGGESTED. An
+  //      own recorded dependant who is also in the booker's family group would
+  //      otherwise draw both affordances at once: an optional "add them as a
+  //      member guest instead" beside a block saying the booking cannot go on
+  //      until this exact name is resolved. Two controls for one decision, one
+  //      of them dismissable, is how a member ends up believing they answered.
+  //      The suggestion stands for every OTHER family match, unchanged.
+  const dependantCollisionNames = new Set(
+    dependantIdentityCollisions.map((collision) => collision.normalizedName),
+  );
+  //
+  // BOTH comparisons below go through `normalizePersonFullName` (#2721 review).
+  // The soft suggestion used to compare the two names by hand, four lines under
+  // the canonical call that suppresses it — and it worked only because the
+  // canonical rule happened to be LOOSER. Narrow or reshape that rule (fold a
+  // curly apostrophe, stop collapsing whitespace) and the hard question and the
+  // soft suggestion start answering different questions about the same two
+  // names, with nothing failing: a name could draw both affordances at once,
+  // which is exactly what rule 4 exists to prevent.
+  const memberSwitchSuggestions = guests
+    .map((guest, index) => ({
+      guest,
+      index,
+      key: normalizePersonFullName(guest.firstName, guest.lastName),
+    }))
+    .filter(({ guest, key }) => {
+      if (guest.isMember || guest.memberId) return false;
+      // `normalizePersonFullName` mints no key for a half-typed row, which is
+      // the same "not enough name to compare" test the two hand-written parts
+      // used to make separately.
+      if (!key) return false;
+      return !dependantCollisionNames.has(key);
+    })
+    .map(({ guest, index, key }) => {
+      const match = familyMembers.find(
+        (fm) =>
+          fm.canBeBooked !== false &&
+          !guests.some((g) => g.memberId === fm.id) &&
+          normalizePersonFullName(fm.firstName, fm.lastName) === key,
+      );
+      return match ? { index, guest, match } : null;
+    })
+    .filter(
+      (entry): entry is { index: number; guest: GuestData; match: FamilyMember } =>
+        entry !== null,
+    );
+
+  function switchGuestToMember(index: number, fm: FamilyMember) {
+    if (guests.some((g) => g.memberId === fm.id)) return;
+    const next = guests.map((g, i) =>
+      i === index
+        ? {
+            firstName: fm.firstName,
+            lastName: fm.lastName,
+            ageTier: fm.ageTier,
+            isMember: true,
+            memberId: fm.id,
+            // Preserve any per-guest stay range the member already set.
+            ...(perGuestDatesEnabled && g.stayStart && g.stayEnd
+              ? { stayStart: g.stayStart, stayEnd: g.stayEnd }
+              : {}),
+            // Preserve the guest's per-night selection (multi-date-range mode,
+            // #713) — switching to a member guest must not silently drop the
+            // nights they picked.
+            ...(g.nights ? { nights: g.nights } : {}),
+          }
+        : g,
+    );
+    handleGuestsChange(next);
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle headingLevel={2}>
+          Add Guests
+          {checkIn && checkOut && (
+            <span className="ml-2 text-sm font-normal text-muted-foreground">
+              {/* Lodge nights are CALENDAR DATES and take no zone (CT-4,
+                  #2870): the wizard carries `yyyy-MM-dd` end to end (#2474) and
+                  the kernel's formatter pins `UTC` over the encoding, so the
+                  projection is the identity for every club rather than only for
+                  one east of Greenwich. */}
+              {formatStayDate(checkIn, format)} -{" "}
+              {formatStayDate(checkOut, format)} ({nights} night{nights !== 1 ? "s" : ""})
+            </span>
+          )}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {familyMembers.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-sm font-medium text-muted-foreground">Quick add family members</p>
+            <div className="grid gap-2">
+              {familyMembers.map((fm) => {
+                const alreadyAdded = guests.some((g) => g.memberId === fm.id);
+                const blocked = fm.canBeBooked === false;
+                const label = fm.relationship === "self"
+                  ? `${fm.firstName} ${fm.lastName} (You)`
+                  : `${fm.firstName} ${fm.lastName} (${fm.ageTier})`;
+                const blockMessage = getFamilyMemberBookingBlockMessage(fm, {
+                  holdPolicy,
+                });
+                const actionLabel = getFamilyMemberBookingActionLabel(fm);
+                return (
+                  <div
+                    key={fm.id}
+                    className={blocked ? "rounded-md border border-warning-6 bg-warning-3 p-3" : ""}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        type="button"
+                        variant={alreadyAdded ? "secondary" : fm.relationship === "self" ? "default" : "outline"}
+                        size="sm"
+                        disabled={alreadyAdded || atPartyCeiling || blocked}
+                        onClick={() => addFamilyMemberAsGuest(fm)}
+                      >
+                        {alreadyAdded ? "\u2713 " : "+ "}
+                        {label}
+                      </Button>
+                      {blocked && actionLabel && (
+                        actionLabel === "Complete details" ? (
+                          <Button asChild variant="outline" size="sm">
+                            <Link href={PROFILE_FAMILY_GROUP_RETURN_TO_BOOK}>
+                              {actionLabel}
+                            </Link>
+                          </Button>
+                        ) : (
+                          <span className="text-xs font-medium text-warning-11">
+                            {actionLabel}
+                          </span>
+                        )
+                      )}
+                    </div>
+                    {blocked && blockMessage && (
+                      <p className="mt-2 text-sm text-warning-11">{blockMessage}</p>
+                    )}
+                    {blocked && fm.missingFields && fm.missingFields.length > 0 && (
+                      <p className="mt-1 text-xs text-warning-11">
+                        Missing: {fm.missingFields.join(", ")}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        {(showInviteFamilyGroupMembersLink || familyMembers.length > 0) && (
+          <div className="rounded-lg border border-dashed border-cat3-6 bg-cat3-3/50 p-4">
+            <p className="text-sm text-muted-foreground dark:text-muted-foreground">
+              Family member missing? Add or invite them in your User Profile &gt;
+              Family Group, then return here to quick add them at member rates.{" "}
+              <Link
+                href={PROFILE_FAMILY_GROUP_RETURN_TO_BOOK}
+                className="font-medium text-cat3-11 underline underline-offset-4 hover:text-cat3-11"
+              >
+                Open Family Group in your profile
+              </Link>
+              .
+            </p>
+          </div>
+        )}
+        <GuestForm
+          guests={guests}
+          onGuestsChange={handleGuestsChange}
+          maxGuests={lodgeCapacity}
+          headerActions={
+            memberGuestEnabled ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  ref={findTriggerRef}
+                  type="button"
+                  variant={findPanelOpen ? "secondary" : "outline"}
+                  size="sm"
+                  disabled={atPartyCeiling || !familyMembersLoaded}
+                  onClick={() => setFindPanelOpen((open) => !open)}
+                >
+                  + Add Member Guest
+                </Button>
+                {!familyMembersLoaded &&
+                  (familyMembersLoadFailed ? (
+                    <span className="text-sm text-muted-foreground" role="status">
+                      We couldn&apos;t load your family list.{" "}
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0"
+                        onClick={retryFamilyMembersLoad}
+                      >
+                        Try again
+                      </Button>
+                    </span>
+                  ) : (
+                    <span className="text-sm text-muted-foreground" role="status">
+                      Loading your family…
+                    </span>
+                  ))}
+              </div>
+            ) : null
+          }
+          belowHeader={
+            memberGuestEnabled && findPanelOpen && familyMembersLoaded ? (
+              <MemberGuestFindPanel
+                openSearchEnabled={memberGuestOpenSearchEnabled}
+                existingMemberIds={guests
+                  .map((g) => g.memberId)
+                  .filter((id): id is string => Boolean(id))}
+                atCapacity={atPartyCeiling}
+                addError={memberGuestAddError}
+                refusedCandidate={memberGuestAddError ? lastAddAttempt : null}
+                onAdd={(candidate) => {
+                  setLastAddAttempt(candidate);
+                  addMemberGuest(candidate);
+                  closeFindPanel();
+                }}
+                onCancel={closeFindPanel}
+              />
+            ) : null
+          }
+          renderGuestHelper={(guest) => describeMemberGuestWizardHelper(guest)}
+          renderGuestBadge={(guest) => {
+            const columns = memberGuestConsentPreviewColumns(guest);
+            if (!columns) return null;
+            const badge = describeMemberGuestConsentBadge({
+              guest: { memberId: guest.memberId ?? null, ...columns },
+              // The booking WIZARD's warmer, name-bearing vocabulary — owner
+              // sign-off answer 1, produced by the shared badge function's third
+              // audience rather than by a copy of its wording here.
+              audience: "WIZARD",
+              targetFirstName: guest.firstName,
+            });
+            if (!badge) return null;
+            return (
+              <span
+                className={
+                  badge.tone === "pending"
+                    ? "rounded-md border border-warning-6 bg-warning-3 px-2 py-0.5 text-xs font-semibold text-warning-11"
+                    : badge.tone === "ok"
+                      ? "rounded-md border border-success-6 bg-success-3 px-2 py-0.5 text-xs font-semibold text-success-11"
+                      : "rounded-md border border-danger-6 bg-danger-3 px-2 py-0.5 text-xs font-semibold text-danger-11"
+                }
+              >
+                {badge.label}
+              </span>
+            );
+          }}
+          bookingCheckIn={checkIn ?? undefined}
+          bookingCheckOut={checkOut ?? undefined}
+          perGuestDatesEnabled={perGuestDatesEnabled}
+          onPerGuestDatesEnabledChange={handlePerGuestDatesEnabledChange}
+          multiDateRangesEnabled={multiDateRangesEnabled}
+          onMultiDateRangesEnabledChange={handleMultiDateRangesEnabledChange}
+          nightlyPriceForGuest={(guestIndex, nightKey) => {
+            const g = priceQuote?.guests[guestIndex];
+            if (!g?.perNightCents || !g?.nightDates) return null;
+            const idx = g.nightDates.findIndex(
+              (d) => d.slice(0, 10) === nightKey,
+            );
+            // `null` is this callback's own "no price to show" answer, and it
+            // is the right one for a per-night vector shorter than the night
+            // list too: the quote's two halves carry no declared length
+            // relation, and a holed vector has already reached this system
+            // once (#2800). Showing nothing beats showing somebody else's
+            // night's price (#2801).
+            return idx >= 0 ? (g.perNightCents[idx] ?? null) : null;
+          }}
+        />
+        <DependantIdentityResolution
+          collisions={dependantIdentityCollisions}
+          declaredDependantMemberIds={declaredDependantMemberIds}
+          familyMembers={familyMembers}
+          partyMemberIds={guests
+            .map((guest) => guest.memberId)
+            .filter((memberId): memberId is string => Boolean(memberId))}
+          holdPolicy={holdPolicy}
+          onBookAsDependant={bookCollidingGuestAsDependant}
+          onDeclareDifferentPerson={declareDependantDifferentPerson}
+          onWithdrawDeclaration={withdrawDependantDeclaration}
+        />
+        {memberSwitchSuggestions.length > 0 && (
+          <div className="space-y-2 rounded-md border border-cat3-6 bg-cat3-3/60 p-4">
+            <p className="text-sm font-medium text-cat3-11">
+              Add these as member guests instead?
+            </p>
+            {memberSwitchSuggestions.map(({ index, match }) => (
+              <div
+                key={`${match.id}-${index}`}
+                className="flex flex-col gap-2 text-sm text-cat3-11 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <span>
+                  <strong>
+                    {match.firstName} {match.lastName}
+                  </strong>{" "}
+                  is in your family group. Adding them as a linked member guest
+                  holds a bed at member rates now — no provisional hold.
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => switchGuestToMember(index, match)}
+                >
+                  Add as member guest
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+        {groupBookingsEnabled && (
+          <div className="space-y-3 rounded-md border border-border p-4">
+            <label className="flex items-center gap-2 text-sm font-medium cursor-pointer">
+              <input
+                type="checkbox"
+                checked={groupTrip}
+                onChange={(e) => setGroupTrip(e.target.checked)}
+                className="rounded border-border"
+              />
+              Make this a group trip
+            </label>
+            <p className="text-sm text-muted-foreground">
+              Others can join this trip with their own booking via a link
+              you share after you confirm.
+            </p>
+            {groupTrip && (
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                  <input
+                    type="radio"
+                    name="groupPaymentMode"
+                    checked={groupPaymentMode === "EACH_PAYS_OWN"}
+                    onChange={() => setGroupPaymentMode("EACH_PAYS_OWN")}
+                  />
+                  Each person pays their own beds
+                </label>
+                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                  <input
+                    type="radio"
+                    name="groupPaymentMode"
+                    checked={groupPaymentMode === "ORGANISER_PAYS"}
+                    onChange={() => setGroupPaymentMode("ORGANISER_PAYS")}
+                  />
+                  You pay for everyone (settle one combined bill)
+                </label>
+              </div>
+            )}
+          </div>
+        )}
+        {capacityShortMessage ? (
+          <CapacityShortNotice
+            headline="These dates are full for a party this size."
+            message={capacityShortMessage}
+            shortNights={capacityShortNights}
+          >
+            Nothing is booked or charged by continuing, and no payment method is
+            needed for a waitlist place.
+          </CapacityShortNotice>
+        ) : null}
+        <div className="flex justify-between pt-4">
+          <Button variant="outline" onClick={() => setStep("dates")}>
+            Back
+          </Button>
+          {/*
+            Disabled only for an empty party or an in-flight quote (#2930). A
+            full range is NOT a reason to disable it — that block is what made
+            the waitlist unreachable.
+          */}
+          <Button onClick={handleGuestsDone} disabled={priceLoading || guests.length === 0}>
+            {priceLoading
+              ? "Calculating price..."
+              : capacityShortMessage
+                ? "Continue to waitlist"
+                : "Continue"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}

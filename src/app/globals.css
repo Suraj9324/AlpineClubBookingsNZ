@@ -1,0 +1,1521 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  /* #2257 — a DEDICATED placeholder ink, so placeholder text can be retuned
+     without dragging every muted label, caption and helper line with it. It is
+     `inline`, like every entry in this block, so `placeholder:text-placeholder-
+     foreground` compiles to `var(--placeholder-foreground)` and re-resolves
+     inside `.app-theme-scope` / `.website-theme` / `.dark` instead of freezing
+     `:root`'s value. See the token blocks below for why the VALUE matches
+     `--muted-foreground` and the distinction is carried by italics. */
+  --color-placeholder-foreground: var(--placeholder-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-brand-gold: var(--brand-gold);
+  --color-brand-charcoal: var(--brand-charcoal);
+  --color-brand-deep: var(--brand-deep);
+  --color-brand-ridge: var(--brand-ridge);
+  --color-brand-mist: var(--brand-mist);
+  --color-brand-snow: var(--brand-snow);
+  --color-brand-safety: var(--brand-safety);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-muted: var(--success-muted);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-muted: var(--warning-muted);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-info-muted: var(--info-muted);
+  --color-danger: var(--danger);
+  --color-danger-foreground: var(--danger-foreground);
+  --color-danger-muted: var(--danger-muted);
+  /* #2218 P4 — the legacy per-value accent hue pairs (--hue-orange/teal/indigo/
+     purple/emerald, #156) are GONE. Every categorical chip now uses the generated
+     cat1..cat6 scales; cat6 supplied the 6th distinguisher the booking column
+     needed, so nothing consumes --hue-* any more. */
+  /* #2188 P2 — generated 12-step SEMANTIC (success/warning/info/danger) and
+     CATEGORICAL (cat1..cat5) scales exposed as consumable utilities, completing
+     the plan-lock's "the numbered steps stay exposed for the tail" clause that
+     P1 shipped only for charts. Each maps to a `--<scale>-<step>` custom prop
+     resolved from the render-time `--gen-<scale>-<step>` substrate (see the
+     .app-theme-scope blocks below). Neutral steps are intentionally NOT exposed
+     — neutrals stay on the shadcn role tokens. */
+  --color-success-1: var(--success-1, #f5f9f6);
+  --color-success-2: var(--success-2, #eff5f0);
+  --color-success-3: var(--success-3, #dff0e3);
+  --color-success-4: var(--success-4, #cfead5);
+  --color-success-5: var(--success-5, #c0e6c9);
+  --color-success-6: var(--success-6, #ade1ba);
+  --color-success-7: var(--success-7, #94dba8);
+  --color-success-8: var(--success-8, #68cd88);
+  --color-success-9: var(--success-9, #1f9d55);
+  --color-success-10: var(--success-10, #009049);
+  --color-success-11: var(--success-11, #007130);
+  --color-success-12: var(--success-12, #042711);
+  --color-warning-1: var(--warning-1, #f9f7f5);
+  --color-warning-2: var(--warning-2, #fef2e0);
+  --color-warning-3: var(--warning-3, #fee9b2);
+  --color-warning-4: var(--warning-4, #ffdf92);
+  --color-warning-5: var(--warning-5, #ffd46e);
+  --color-warning-6: var(--warning-6, #ffc85c);
+  --color-warning-7: var(--warning-7, #f5bd55);
+  --color-warning-8: var(--warning-8, #e7a720);
+  --color-warning-9: var(--warning-9, #e5a50a);
+  --color-warning-10: var(--warning-10, #d99a00);
+  --color-warning-11: var(--warning-11, #815100);
+  --color-warning-12: var(--warning-12, #2d1c00);
+  --color-info-1: var(--info-1, #f7f8f9);
+  --color-info-2: var(--info-2, #f0f4fa);
+  --color-info-3: var(--info-3, #e4ebf8);
+  --color-info-4: var(--info-4, #d5e3fc);
+  --color-info-5: var(--info-5, #c7dbff);
+  --color-info-6: var(--info-6, #b7d3ff);
+  --color-info-7: var(--info-7, #a6c7ff);
+  --color-info-8: var(--info-8, #89b3ff);
+  --color-info-9: var(--info-9, #2563eb);
+  --color-info-10: var(--info-10, #2057d1);
+  --color-info-11: var(--info-11, #194fc9);
+  --color-info-12: var(--info-12, #041a4d);
+  --color-danger-1: var(--danger-1, #faf7f6);
+  --color-danger-2: var(--danger-2, #f9f1f0);
+  --color-danger-3: var(--danger-3, #f9e5e2);
+  --color-danger-4: var(--danger-4, #ffd7d1);
+  --color-danger-5: var(--danger-5, #ffcac2);
+  --color-danger-6: var(--danger-6, #ffbeb5);
+  --color-danger-7: var(--danger-7, #ffafa3);
+  --color-danger-8: var(--danger-8, #f99488);
+  --color-danger-9: var(--danger-9, #dc2626);
+  --color-danger-10: var(--danger-10, #cc0615);
+  --color-danger-11: var(--danger-11, #b70000);
+  --color-danger-12: var(--danger-12, #450000);
+  --color-cat1-1: var(--cat1-1, #f7f7fa);
+  --color-cat1-2: var(--cat1-2, #f3f3fb);
+  --color-cat1-3: var(--cat1-3, #e9e9fa);
+  --color-cat1-4: var(--cat1-4, #dfdfff);
+  --color-cat1-5: var(--cat1-5, #d7d5ff);
+  --color-cat1-6: var(--cat1-6, #cecbff);
+  --color-cat1-7: var(--cat1-7, #c1bcff);
+  --color-cat1-8: var(--cat1-8, #aea4ff);
+  --color-cat1-9: var(--cat1-9, #7c5cff);
+  --color-cat1-10: var(--cat1-10, #704df0);
+  --color-cat1-11: var(--cat1-11, #5b3ac8);
+  --color-cat1-12: var(--cat1-12, #1f0856);
+  --color-cat2-1: var(--cat2-1, #f5f8f9);
+  --color-cat2-2: var(--cat2-2, #eef5f8);
+  --color-cat2-3: var(--cat2-3, #d8eff5);
+  --color-cat2-4: var(--cat2-4, #c6eaf4);
+  --color-cat2-5: var(--cat2-5, #b4e3f1);
+  --color-cat2-6: var(--cat2-6, #a2dded);
+  --color-cat2-7: var(--cat2-7, #8ad4e8);
+  --color-cat2-8: var(--cat2-8, #59c5df);
+  --color-cat2-9: var(--cat2-9, #189ab4);
+  --color-cat2-10: var(--cat2-10, #008da7);
+  --color-cat2-11: var(--cat2-11, #006881);
+  --color-cat2-12: var(--cat2-12, #00252f);
+  --color-cat3-1: var(--cat3-1, #faf7f8);
+  --color-cat3-2: var(--cat3-2, #f9f1f5);
+  --color-cat3-3: var(--cat3-3, #f9e3ee);
+  --color-cat3-4: var(--cat3-4, #f9d7e8);
+  --color-cat3-5: var(--cat3-5, #f6cce2);
+  --color-cat3-6: var(--cat3-6, #f4c1db);
+  --color-cat3-7: var(--cat3-7, #f0b2d3);
+  --color-cat3-8: var(--cat3-8, #e698c2);
+  --color-cat3-9: var(--cat3-9, #d6409f);
+  --color-cat3-10: var(--cat3-10, #c73192);
+  --color-cat3-11: var(--cat3-11, #a40074);
+  --color-cat3-12: var(--cat3-12, #42002b);
+  --color-cat4-1: var(--cat4-1, #f8f7f6);
+  --color-cat4-2: var(--cat4-2, #fbf1eb);
+  --color-cat4-3: var(--cat4-3, #fee5d7);
+  --color-cat4-4: var(--cat4-4, #ffd8b8);
+  --color-cat4-5: var(--cat4-5, #ffcca2);
+  --color-cat4-6: var(--cat4-6, #ffc096);
+  --color-cat4-7: var(--cat4-7, #fcb589);
+  --color-cat4-8: var(--cat4-8, #f09d6a);
+  --color-cat4-9: var(--cat4-9, #e8730c);
+  --color-cat4-10: var(--cat4-10, #dc6600);
+  --color-cat4-11: var(--cat4-11, #a03300);
+  --color-cat4-12: var(--cat4-12, #351500);
+  --color-cat5-1: var(--cat5-1, #f7f8f4);
+  --color-cat5-2: var(--cat5-2, #f2f5ec);
+  --color-cat5-3: var(--cat5-3, #e6f0ce);
+  --color-cat5-4: var(--cat5-4, #daeab4);
+  --color-cat5-5: var(--cat5-5, #d0e49e);
+  --color-cat5-6: var(--cat5-6, #c7de8b);
+  --color-cat5-7: var(--cat5-7, #bbd472);
+  --color-cat5-8: var(--cat5-8, #a5c33f);
+  --color-cat5-9: var(--cat5-9, #8aa614);
+  --color-cat5-10: var(--cat5-10, #7f9a00);
+  --color-cat5-11: var(--cat5-11, #516600);
+  --color-cat5-12: var(--cat5-12, #1b2400);
+  /* #2218 P4 — the SIXTH categorical scale (teal, H≈183). Added so the booking
+     status column has a 6th distinguisher (WAITLIST_OFFERED) and the last
+     legacy --hue-* accent pair could retire. Default light-step fallbacks. */
+  --color-cat6-1: var(--cat6-1, #f3f9f8);
+  --color-cat6-2: var(--cat6-2, #ebf6f4);
+  --color-cat6-3: var(--cat6-3, #d2f3ec);
+  --color-cat6-4: var(--cat6-4, #bbefe5);
+  --color-cat6-5: var(--cat6-5, #a6eade);
+  --color-cat6-6: var(--cat6-6, #92e5d6);
+  --color-cat6-7: var(--cat6-7, #78dccd);
+  --color-cat6-8: var(--cat6-8, #3ccdba);
+  --color-cat6-9: var(--cat6-9, #14b8a6);
+  --color-cat6-10: var(--cat6-10, #00ac9a);
+  --color-cat6-11: var(--cat6-11, #006d5f);
+  --color-cat6-12: var(--cat6-12, #002822);
+  /* #2189 P3 — fixed-seed KIOSK tokens (epic #2181 A5/J4). The kiosk /
+     wall-display surfaces are the deliberately literalist, glare-proof,
+     NON-brand-following exception: authored ONCE from the fixed kiosk seed
+     (PINS.kiosk — near-black page, neutral grey ramp, #7dd3fc accent), so they
+     are club- AND mode-independent. Each utility consumes the real `--kiosk-*`
+     custom prop declared on `:root` below, with the derived fixed value as the
+     static fallback. Values are pinned against `buildKioskTokens()` by
+     kiosk-token-contract.test.ts (R9 fallback-pin), never copied literals. */
+  --color-kiosk-page: var(--kiosk-page, #0a0a0b);
+  --color-kiosk-card: var(--kiosk-card, #222);
+  --color-kiosk-inset: var(--kiosk-inset, #292929);
+  --color-kiosk-chip: var(--kiosk-chip, #3a3a3a);
+  --color-kiosk-hover: var(--kiosk-hover, #484848);
+  --color-kiosk-border: var(--kiosk-border, #484848);
+  --color-kiosk-border-muted: var(--kiosk-border-muted, #292929);
+  --color-kiosk-fg: var(--kiosk-fg, #eee);
+  --color-kiosk-muted-fg: var(--kiosk-muted-fg, #b4b4b4);
+  --color-kiosk-faint-fg: var(--kiosk-faint-fg, #6e6e6e);
+  --color-kiosk-accent: var(--kiosk-accent, #7dd3fc);
+  --color-kiosk-accent-hover: var(--kiosk-accent-hover, #72c8f1);
+  --color-kiosk-accent-active: var(--kiosk-accent-active, #6ac0e8);
+  --color-kiosk-accent-fg: var(--kiosk-accent-fg, #092531);
+  --color-kiosk-accent-bg: var(--kiosk-accent-bg, #002637);
+  --color-kiosk-accent-border: var(--kiosk-accent-border, #005074);
+  --color-kiosk-danger-bg: var(--kiosk-danger-bg, #3d120f);
+  --color-kiosk-danger-fg: var(--kiosk-danger-fg, #ff9083);
+  --color-kiosk-danger-border: var(--kiosk-danger-border, #7f221d);
+  --color-kiosk-danger-solid: var(--kiosk-danger-solid, #dc2626);
+  --color-kiosk-danger-solid-fg: var(--kiosk-danger-solid-fg, #ffffff);
+  --color-kiosk-success-bg: var(--kiosk-success-bg, #122819);
+  --color-kiosk-success-fg: var(--kiosk-success-fg, #5ecf84);
+  --color-kiosk-success-border: var(--kiosk-success-border, #15562e);
+  --color-kiosk-success-solid: var(--kiosk-success-solid, #1f9d55);
+  --color-kiosk-success-solid-fg: var(--kiosk-success-solid-fg, #202020);
+  --color-kiosk-success-solid-hover: var(--kiosk-success-solid-hover, #3ab067);
+  --color-kiosk-success-solid-active: var(--kiosk-success-solid-active, #51c379);
+  --color-kiosk-warning-bg: var(--kiosk-warning-bg, #2b200b);
+  --color-kiosk-warning-fg: var(--kiosk-warning-fg, #e2a93d);
+  --color-kiosk-warning-border: var(--kiosk-warning-border, #5d430e);
+  --color-kiosk-warning-solid: var(--kiosk-warning-solid, #e5a50a);
+  --color-kiosk-warning-solid-fg: var(--kiosk-warning-solid-fg, #202020);
+  --color-kiosk-orange-bg: var(--kiosk-orange-bg, #311c0e);
+  --color-kiosk-orange-fg: var(--kiosk-orange-fg, #f89a58);
+  --color-kiosk-orange-border: var(--kiosk-orange-border, #6b3917);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans:
+    ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-heading: var(--website-heading-font, var(--font-sans));
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+:root {
+  --radius: 0.625rem;
+  /* Generic "Aotearoa" default brand palette (#1807): glacial-teal primary,
+     deep bush-green cool-stone neutrals, terracotta safety. These must stay in
+     lockstep with DEFAULT_CLUB_THEME_VALUES in src/lib/club-theme-schema.ts so
+     the static app chrome and the DB default agree for a fresh fork. A fork's
+     own brand colour lives only in its deployment's ClubTheme DB row. */
+  --brand-gold: #57b3ab;
+  --brand-charcoal: #21362b;
+  --brand-deep: #17231c;
+  --brand-ridge: #5c6f66;
+  --brand-mist: #d4ddd7;
+  --brand-snow: #f5f8f6;
+  --brand-safety: #b04d28;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  /* #2257 (D7/D12) — placeholder ink. Andy reported that grey example text
+     inside a field "looks like a field is already filled in", so a placeholder
+     must be visibly NOT-CONTENT.
+
+     The obvious move — make it lighter than `--muted-foreground` — is NOT
+     available, and that is a deliberate finding rather than an oversight.
+     Placeholder text is text, so WCAG 1.4.3 applies to it, and every
+     `--muted-foreground` in this stylesheet already sits ON the 4.5:1 floor:
+     `:root`'s oklch(0.556) is ~4.5:1 on white, and the app scope's value is
+     produced by `deriveAppMutedForeground`, which steps BACK toward the
+     foreground until it just clears 4.5:1. There is no headroom to spend.
+
+     So the value tracks `--muted-foreground` and the "not content" signal is
+     carried by ITALICS instead (`placeholder:italic` on the primitives), which
+     costs no contrast and works for the colour-blind and in high-contrast
+     modes. The token still exists as a real seam: a fork that wants a different
+     placeholder ink retunes this one line per scope, with no effect on the muted
+     labels/captions that `--muted-foreground` also paints.
+
+     It must be RESTATED in every scope that restates `--muted-foreground`
+     (`.dark`, `.website-theme`, `.app-theme-scope`, `.dark .app-theme-scope`):
+     a custom property containing `var()` is substituted on the element that
+     DECLARES it and then inherits as that fixed value, so a single `:root`
+     declaration would freeze the base palette everywhere. */
+  --placeholder-foreground: var(--muted-foreground);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  /* #4466 — red-700, not red-600. `text-destructive` is the app's error ink
+     (inline field errors, alert boxes, destructive menu items), and red-600
+     measured below WCAG 4.5:1 on the surfaces it lands on: 4.47:1 on the app
+     page (#f6f8f7), 4.31:1 on a hovered menu item, 3.74:1 inside its own
+     `bg-destructive/10` alert box. red-700 clears every one of them (lowest
+     4.97:1, on the --accent hover surface) and lifts the solid button's
+     white label from 4.57:1 to 6.15:1.
+     #4563 — red-800, the light `--danger` value, not red-700. An error box
+     laid on a grey panel (`bg-destructive/10` inside `bg-muted`, as the
+     booking-request release confirmation is) read 4.49:1 at red-700, and
+     4.40:1 on `--danger-muted`. red-800 clears every surface in every box
+     alpha, and light mode now uses one error red, as dark mode does since
+     #4553. Restated in `.website-theme` below; `destructive-contrast-contract`
+     measures both from this file. */
+  --destructive: var(--danger);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+  /* Semantic status tokens (#1801). `--success` / `--warning` are the accessible
+     text/accent colours; `-muted` are the subtle tinted backgrounds; `-foreground`
+     is text ON the solid accent. Light values equal the previous badge Tailwind
+     pairings (green-100/800, yellow-100/800) so light mode is unchanged; the `.dark`
+     block re-tints them to match the dark colored-callout remap. These are NEW,
+     additive tokens — they do NOT alter the default palette (a separate #1807). */
+  --success: #166534;
+  --success-foreground: #ffffff;
+  --success-muted: #dcfce7;
+  --warning: #854d0e;
+  --warning-foreground: #ffffff;
+  --warning-muted: #fef9c3;
+  /* Semantic status tokens continued (#1804 StatusChip). `--info` is the calm
+     blue used for in-progress / neutral-informational states (waitlisted,
+     processing, review, finance viewer); `--danger` is a dark-adaptable red for
+     terminal-negative states (cancelled, failed, overdue). Both follow the #1801
+     structure (accent text / -foreground on solid / -muted tinted background) so
+     the StatusChip renders one uniform muted-chip family across all five tones.
+     `--danger` is added rather than reusing the solid `--destructive` pair because
+     that pair was only 2.63:1 in dark mode (red-on-red) and would fail WCAG AA in a
+     status chip (#4553 has since pointed the dark `--destructive` pair at this
+     one). Light values equal the previous red/blue badge Tailwind pairings
+     (blue-800/100, red-800/100); the `.dark` block re-tints to the existing
+     colored-callout dark tones (hue 250 / 27). All pairs clear WCAG AA (measured
+     with club-theme-schema.ts contrastRatio: info 7.15/7.37, danger 6.80/7.06,
+     -foreground on solid >= 8.3). NEW, additive tokens — no default palette hex is
+     altered. */
+  --info: #1e40af;
+  --info-foreground: #ffffff;
+  --info-muted: #dbeafe;
+  --danger: #991b1b;
+  --danger-foreground: #ffffff;
+  --danger-muted: #fee2e2;
+  /* #2218 P4 — legacy --hue-* accent pairs removed; categorical chips use cat1..cat6. */
+}
+
+/* Screen-only (#2146). Print is always ink on white paper, so the dark ramp is
+   excluded from it entirely and :root's light values stand. This covers the
+   tokens the .app-theme-scope light block does NOT restate — --destructive,
+   the semantic --success/--warning/--info/--danger pairs, and the --hue-*
+   pairs — which would otherwise print a light accent onto white. */
+@media not print {
+  .dark {
+    /* Dark mode is a LAYERED NEUTRAL GREY ramp (#1247), not pure-black: the page,
+       cards/popovers, and secondary surfaces each sit a perceptible step apart, and
+       borders are lifted to a clearly visible mid-grey. Values are tuned against the
+       WCAG contrast helpers in club-theme-schema.ts:
+         - --foreground on --card 13.98:1, on --background 17.34:1 (text >= 4.5:1)
+         - --border vs --card 3.01:1, vs --background 3.73:1 (non-text >= 3:1)
+         - --card vs --background 1.24:1 (visible surface separation)
+       Kiosk pages use literal slate-* classes, so this token change leaves their
+       dark rendering unchanged. */
+    --background: oklch(0.2 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.28 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.28 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.985 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.32 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.32 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    /* #2257 — restated per scope; see the `:root` note. */
+    --placeholder-foreground: var(--muted-foreground);
+    --accent: oklch(0.32 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    /* #4553 — dark mode's error ink is the dark `--danger` red. The old pair
+       (red-900 oklch(0.396 0.141 25.723) under a red-500 foreground) put
+       `text-destructive` at 1.23–1.80:1 on the dark surfaces and its own
+       foreground on it at 2.63:1. The `--danger` tone clears 4.5:1 on every
+       dark surface, including the `bg-destructive/10` and `/5` alert boxes on
+       them (lowest 5.68:1, a /10 box on `--danger-muted`), and its near-black
+       foreground reads 10.24:1 on it. Pinned from this block by
+       `destructive-contrast-contract.test.ts`. A `var()` resolves here, on the
+       element that declares it, so `.dark` must also declare `--danger`. */
+    --destructive: var(--danger);
+    --destructive-foreground: var(--danger-foreground);
+    --border: oklch(0.55 0 0);
+    --input: oklch(0.55 0 0);
+    --ring: oklch(0.55 0 0);
+    --chart-1: oklch(0.488 0.243 264.376);
+    --chart-2: oklch(0.696 0.17 162.48);
+    --chart-3: oklch(0.769 0.188 70.08);
+    --chart-4: oklch(0.627 0.265 303.9);
+    --chart-5: oklch(0.645 0.246 16.439);
+    --sidebar: oklch(0.24 0 0);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: oklch(0.488 0.243 264.376);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.32 0 0);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(0.55 0 0);
+    --sidebar-ring: oklch(0.55 0 0);
+    /* Semantic status tokens (#1801) — dark re-tint mirrors the colored-callout
+       remap tones (green hue 150, amber hue 75): muted bg oklch(0.33 0.05 h) and
+       accent/text oklch(0.84 0.11 h), which clears >= 5.8:1 text-on-muted (the same
+       ratio documented for the family-text remap below); solid-accent foreground is
+       near-black. */
+    --success: oklch(0.84 0.11 150);
+    --success-foreground: oklch(0.2 0 0);
+    --success-muted: oklch(0.33 0.05 150);
+    --warning: oklch(0.84 0.11 75);
+    --warning-foreground: oklch(0.2 0 0);
+    --warning-muted: oklch(0.33 0.05 75);
+    /* Semantic status tokens continued (#1804) — dark re-tint follows the
+       colored-callout remap structure (muted bg oklch(0.33 0.05 h), accent/text
+       oklch(0.84 0.11 h), near-black solid foreground), matching the same ratios
+       documented for the family-text remap. `--danger` hue 27 mirrors the existing
+       red callout tone; `--info` hue 250 is NOT an existing callout tone (blue
+       callout is 262) — it is held byte-identical to the sibling Alert lane (#1802)
+       so the two lanes' additive `--info*` blocks de-dupe trivially at merge.
+       info 7.37:1, danger 7.06:1 text-on-muted. */
+    --info: oklch(0.84 0.11 250);
+    --info-foreground: oklch(0.2 0 0);
+    --info-muted: oklch(0.33 0.05 250);
+    --danger: oklch(0.84 0.11 27);
+    --danger-foreground: oklch(0.2 0 0);
+    --danger-muted: oklch(0.33 0.05 27);
+    /* #2218 P4 — legacy --hue-* dark pairs removed; categorical chips use cat1..cat6. */
+  }
+}
+
+.website-theme {
+  --website-heading-font: var(--font-website-heading, var(--font-sans));
+  --font-sans: var(--font-website-body, ui-sans-serif, system-ui, sans-serif);
+  /* #2217 (theme burndown) — the website role tokens are migrated OFF the
+     `--brand-*` shims and the srgb-mix recipes and ONTO the GENERATED substrate
+     steps. The literals below are the DEFAULT palette's resolved light-mode hexes
+     (a static, no-stylesheet fallback); at render time `buildClubThemeCss`
+     injects a `.website-theme` block whose `serializeWebsiteRoleTokens()` output
+     overrides these per-club by source order (see `src/lib/theme/app-tokens.ts`,
+     `WEBSITE_ROLE_ALIASES`). The BRANDED look is preserved deliberately: a light
+     page (neutral-1), a GOLD (accent-9) primary/ring, and a DARK charcoal
+     (neutral-12) nav. `--destructive*` stay fixed, not brand-derived (`--destructive` is `var(--danger)`).
+     Pinned against the resolver in `app-theme-layout-contract.test.ts` so the
+     CSS literals and the derivation cannot drift. */
+  --background: #f6f8f7;
+  --foreground: #1c211d;
+  --card: #f6f8f7;
+  --card-foreground: #1c211d;
+  --popover: #f6f8f7;
+  --popover-foreground: #1c211d;
+  --primary: #57b3ab;
+  --primary-foreground: #1c211d;
+  --secondary: #e9ebe9;
+  --secondary-foreground: #1c211d;
+  --muted: #e9ebe9;
+  --muted-foreground: #595e5a;
+  /* #2257 — restated per scope; see the `:root` note. */
+  --placeholder-foreground: var(--muted-foreground);
+  --accent: #e0e3e1;
+  --accent-foreground: #1c211d;
+  /* #4466, #4563 — the AA error ink; see the `:root` note. */
+  --destructive: var(--danger);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: #d0d3d0;
+  --input: #c5c8c5;
+  --ring: #57b3ab;
+  --sidebar: #1c211d;
+  --sidebar-foreground: #f6f8f7;
+  --sidebar-primary: #57b3ab;
+  --sidebar-primary-foreground: #1c211d;
+  --sidebar-accent: #595e5a;
+  --sidebar-accent-foreground: #f6f8f7;
+  --sidebar-border: #595e5a;
+  --sidebar-ring: #57b3ab;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+.website-mobile-menu {
+  /* #2217 — dark mobile menu chrome: charcoal → neutral-12, snow → neutral-1
+     (default-palette resolved fallbacks; the injected `.website-theme` block's
+     `--sidebar`/`--sidebar-foreground` do not reach here, so these carry the
+     dark nav directly). */
+  --background: #1c211d;
+  --foreground: #f6f8f7;
+  background: #1c211d;
+  color: #f6f8f7;
+}
+
+.website-theme :is(h1, h2, h3, h4, [data-website-heading="true"]) {
+  font-family: var(--website-heading-font);
+  letter-spacing: -0.035em;
+}
+
+.website-theme :is(h1, h2, h3) {
+  text-wrap: balance;
+}
+
+.website-theme :is(p, li) {
+  text-wrap: pretty;
+}
+
+.wysiwyg-align-left {
+  text-align: left;
+}
+
+.wysiwyg-align-center {
+  text-align: center;
+}
+
+.wysiwyg-align-right {
+  text-align: right;
+}
+
+@theme inline {
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+}
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* A11y baseline (#1801): honour the OS "reduce motion" preference by collapsing
+   animations/transitions to near-instant and disabling smooth scroll for users
+   who opt out. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@layer components {
+  .app-brand-mark {
+    @apply inline-flex items-center justify-center rounded-full bg-brand-gold text-brand-charcoal;
+  }
+
+  .app-nav-link-active {
+    @apply bg-brand-gold text-brand-charcoal;
+  }
+
+  .app-step-active {
+    @apply rounded-full bg-brand-gold px-2 py-0.5 font-semibold text-brand-charcoal;
+  }
+
+  .app-button-brand {
+    @apply inline-flex items-center justify-center rounded-md bg-brand-gold px-4 py-2 text-sm font-medium text-brand-charcoal shadow-sm transition-shadow hover:shadow-md;
+  }
+
+  .app-callout-brand {
+    @apply rounded-md border border-brand-gold bg-card text-card-foreground;
+  }
+
+  .app-chip-brand {
+    @apply inline-flex items-center gap-1.5 rounded-md bg-brand-gold px-3 py-1.5 text-sm font-medium text-brand-charcoal transition-shadow hover:shadow-md;
+  }
+
+  /* Charcoal-on-snow keeps AA contrast under both shipped theme presets;
+     gold is themable to mid-luminance colours that small caps can't survive. */
+  .website-eyebrow {
+    @apply inline-flex items-center rounded-full bg-brand-charcoal px-3 py-1 text-[0.7rem] font-semibold uppercase tracking-[0.24em] text-brand-snow shadow-sm;
+  }
+
+  .website-link {
+    @apply font-medium text-brand-charcoal underline decoration-brand-gold/70 decoration-2 underline-offset-4 transition-colors hover:text-brand-deep hover:decoration-brand-safety;
+  }
+
+  .website-legal-copy {
+    @apply space-y-10 leading-7 text-brand-deep;
+  }
+
+  .website-legal-copy h2 {
+    @apply mb-3 font-heading text-xl font-bold text-brand-charcoal;
+  }
+
+  .website-legal-copy h3 {
+    @apply mt-6 mb-2 font-heading text-lg font-semibold text-brand-charcoal;
+  }
+
+  .website-legal-copy strong {
+    @apply text-brand-charcoal;
+  }
+
+  .website-legal-copy a {
+    @apply font-medium text-brand-charcoal underline decoration-brand-gold/70 decoration-2 underline-offset-4 transition-colors hover:text-brand-deep hover:decoration-brand-safety;
+  }
+
+  .website-legal-copy ul {
+    @apply mt-3 list-disc space-y-2 pl-6;
+  }
+
+  .website-legal-copy ol {
+    @apply mt-3 list-decimal space-y-2 pl-6;
+  }
+
+  /* Native <details>/<summary> FAQ accordion items (#992). The default
+     disclosure marker is kept as the expand/collapse affordance. */
+  .website-legal-copy details {
+    @apply mt-3 rounded-xl border border-brand-ridge/20 bg-brand-mist/25 px-4 py-3;
+  }
+
+  .website-legal-copy summary {
+    @apply cursor-pointer font-heading text-lg font-semibold text-brand-charcoal marker:text-brand-gold;
+  }
+
+  .website-legal-copy details[open] > summary {
+    @apply mb-2;
+  }
+
+  .website-legal-callout {
+    @apply mt-4 rounded-2xl border border-brand-ridge/20 bg-brand-mist/45 p-5;
+  }
+
+  .website-data-table {
+    @apply w-full overflow-hidden rounded-2xl border border-brand-ridge/20 text-sm;
+  }
+
+  .website-data-table thead {
+    @apply bg-brand-mist/55;
+  }
+
+  .website-data-table th {
+    @apply px-4 py-3 text-left font-semibold text-brand-charcoal;
+  }
+
+  .website-data-table td {
+    @apply px-4 py-3 text-brand-deep;
+  }
+
+  .website-data-table tbody tr {
+    @apply border-t border-brand-ridge/20;
+  }
+}
+
+.app-theme-scope {
+  /* The public utility, authenticated, and admin layouts inject the saved
+     app-safe ClubTheme stylesheet.
+     Existing brand fields deliberately supply both the public website and app:
+     gold is the app accent, and deep/ridge/mist/snow form the neutral ramp. The
+     semantic success/warning/info/danger tokens remain the curated values declared
+     on :root/.dark above and are intentionally not overridden here (#1808).
+
+     #2187 P1 — the RESTYLE wire-up. Each core token now resolves from the
+     GENERATED substrate that `buildClubThemeAppCss` emits at render time
+     (`--gen-<token>`, see `src/lib/theme/app-tokens.ts`), with a static
+     default-palette fallback for the no-stylesheet case. The fallbacks are the
+     resolved default-seed values — pinned against the derivation in
+     `app-theme-layout-contract.test.ts` so the two cannot drift. `--accent`
+     (neutral-4) is one band off `--muted`/`--secondary` (neutral-3): the
+     structural fix for the seven hover-dead #2144 buttons. */
+  --background: var(--gen-background, #f2f4f2);
+  --foreground: var(--gen-foreground, #1c211d);
+  --card: var(--gen-card, #f6f8f7);
+  --card-foreground: var(--gen-card-foreground, #1c211d);
+  --popover: var(--gen-popover, #f6f8f7);
+  --popover-foreground: var(--gen-popover-foreground, #1c211d);
+  --primary: var(--gen-primary, #57b3ab);
+  --primary-foreground: var(--gen-primary-foreground, #1c211d);
+  --secondary: var(--gen-secondary, #e9ebe9);
+  --secondary-foreground: var(--gen-secondary-foreground, #1c211d);
+  --muted: var(--gen-muted, #e9ebe9);
+  /* #2145 — `muted` is a SEMANTIC ROLE, so it must not alias `--foreground`.
+     It used to be `var(--brand-deep)`, byte-identical to `--foreground`, which
+     made every `text-muted-foreground` label across the admin and finance
+     surfaces render as primary-weight text. The value is now derived from the
+     brand palette by `deriveAppMutedForeground` in
+     `src/lib/club-theme-schema.ts`: 70% `--brand-deep` + 30% `--brand-snow`
+     (i.e. mostly foreground, softened toward the surface — NOT 70% toward
+     snow), then stepped BACK toward `--brand-deep` until it clears WCAG AA
+     4.5:1 against every light surface muted text can land on: `--brand-snow`
+     (`--background`/`--card`/`--popover`), `--brand-mist`
+     (`--muted`/`--secondary`), `--accent` (neutral-4, the #2144 hover surface,
+     one band darker than `--brand-mist` and checked in its own right), and the
+     four curated `*-muted` panel fills declared on `:root` above, which #1808
+     deliberately leaves out of this scope and which therefore do NOT move with
+     the brand palette.
+     NOT checked, deliberately: `--border`/`--input`. They are hairline tokens,
+     not text backgrounds — see APP_MUTED_FOREGROUND_EXCLUDED_SURFACES.
+     It is computed in TypeScript and injected as a solid colour rather than
+     written here as a `color-mix()` on purpose: a mix is unmeasurable from the
+     contrast gate, which is exactly why every other app TEXT token in this
+     block stays a solid brand endpoint. The literal fallback below is the
+     derivation of DEFAULT_CLUB_THEME_VALUES and applies only when no ClubTheme
+     stylesheet is injected; it is pinned in app-theme-layout-contract.test.ts
+     so the two cannot drift. */
+  --muted-foreground: var(--app-muted-foreground, #5a635e);
+  /* #2257 — restated per scope; see the `:root` note. Tracking the DERIVED
+     muted tone (rather than a literal) keeps the placeholder ink on the same
+     measured-AA value the contrast gate already checks for this scope. */
+  --placeholder-foreground: var(--muted-foreground);
+  --accent: var(--gen-accent, #e0e3e1);
+  --accent-foreground: var(--gen-accent-foreground, #1c211d);
+  --app-accent-text: var(--gen-app-accent-text, #1c211d);
+  /* These structural boundaries resolve from the substrate neutral ramp:
+     --border = neutral-6, --input/--ring = neutral-10 (J1 pin). */
+  --border: var(--gen-border, #d0d3d0);
+  --input: var(--gen-input, #767c78);
+  --ring: var(--gen-ring, #767c78);
+  --chart-1: var(--gen-chart-1, #7c5cff);
+  --chart-2: var(--gen-chart-2, #189ab4);
+  --chart-3: var(--gen-chart-3, #d6409f);
+  --chart-4: var(--gen-chart-4, #e8730c);
+  --chart-5: var(--gen-chart-5, #8aa614);
+  /* D13 light sidebar surfaces from neutral steps 1–4. */
+  --sidebar: var(--gen-sidebar, #f6f8f7);
+  --sidebar-foreground: var(--gen-sidebar-foreground, #1c211d);
+  --sidebar-primary: var(--gen-sidebar-primary, #57b3ab);
+  --sidebar-primary-foreground: var(--gen-sidebar-primary-foreground, #1c211d);
+  --sidebar-accent: var(--gen-sidebar-accent, #e9ebe9);
+  --sidebar-accent-foreground: var(--gen-sidebar-accent-foreground, #1c211d);
+  --sidebar-border: var(--gen-sidebar-border, #e0e3e1);
+  --sidebar-ring: var(--gen-sidebar-ring, #767c78);
+  /* #2188 P2 — generated SEMANTIC + CATEGORICAL step scales (light). Each
+     consumes its render-time `--gen-<scale>-<step>` with the shipped default
+     seed's derived value as the no-stylesheet fallback (pinned against
+     buildAppThemeTokens in app-theme-layout-contract.test.ts). */
+  --success-1: var(--gen-success-1, #f5f9f6);
+  --success-2: var(--gen-success-2, #eff5f0);
+  --success-3: var(--gen-success-3, #dff0e3);
+  --success-4: var(--gen-success-4, #cfead5);
+  --success-5: var(--gen-success-5, #c0e6c9);
+  --success-6: var(--gen-success-6, #ade1ba);
+  --success-7: var(--gen-success-7, #94dba8);
+  --success-8: var(--gen-success-8, #68cd88);
+  --success-9: var(--gen-success-9, #1f9d55);
+  --success-10: var(--gen-success-10, #009049);
+  --success-11: var(--gen-success-11, #007130);
+  --success-12: var(--gen-success-12, #042711);
+  --warning-1: var(--gen-warning-1, #f9f7f5);
+  --warning-2: var(--gen-warning-2, #fef2e0);
+  --warning-3: var(--gen-warning-3, #fee9b2);
+  --warning-4: var(--gen-warning-4, #ffdf92);
+  --warning-5: var(--gen-warning-5, #ffd46e);
+  --warning-6: var(--gen-warning-6, #ffc85c);
+  --warning-7: var(--gen-warning-7, #f5bd55);
+  --warning-8: var(--gen-warning-8, #e7a720);
+  --warning-9: var(--gen-warning-9, #e5a50a);
+  --warning-10: var(--gen-warning-10, #d99a00);
+  --warning-11: var(--gen-warning-11, #815100);
+  --warning-12: var(--gen-warning-12, #2d1c00);
+  --info-1: var(--gen-info-1, #f7f8f9);
+  --info-2: var(--gen-info-2, #f0f4fa);
+  --info-3: var(--gen-info-3, #e4ebf8);
+  --info-4: var(--gen-info-4, #d5e3fc);
+  --info-5: var(--gen-info-5, #c7dbff);
+  --info-6: var(--gen-info-6, #b7d3ff);
+  --info-7: var(--gen-info-7, #a6c7ff);
+  --info-8: var(--gen-info-8, #89b3ff);
+  --info-9: var(--gen-info-9, #2563eb);
+  --info-10: var(--gen-info-10, #2057d1);
+  --info-11: var(--gen-info-11, #194fc9);
+  --info-12: var(--gen-info-12, #041a4d);
+  --danger-1: var(--gen-danger-1, #faf7f6);
+  --danger-2: var(--gen-danger-2, #f9f1f0);
+  --danger-3: var(--gen-danger-3, #f9e5e2);
+  --danger-4: var(--gen-danger-4, #ffd7d1);
+  --danger-5: var(--gen-danger-5, #ffcac2);
+  --danger-6: var(--gen-danger-6, #ffbeb5);
+  --danger-7: var(--gen-danger-7, #ffafa3);
+  --danger-8: var(--gen-danger-8, #f99488);
+  --danger-9: var(--gen-danger-9, #dc2626);
+  --danger-10: var(--gen-danger-10, #cc0615);
+  --danger-11: var(--gen-danger-11, #b70000);
+  --danger-12: var(--gen-danger-12, #450000);
+  --cat1-1: var(--gen-cat1-1, #f7f7fa);
+  --cat1-2: var(--gen-cat1-2, #f3f3fb);
+  --cat1-3: var(--gen-cat1-3, #e9e9fa);
+  --cat1-4: var(--gen-cat1-4, #dfdfff);
+  --cat1-5: var(--gen-cat1-5, #d7d5ff);
+  --cat1-6: var(--gen-cat1-6, #cecbff);
+  --cat1-7: var(--gen-cat1-7, #c1bcff);
+  --cat1-8: var(--gen-cat1-8, #aea4ff);
+  --cat1-9: var(--gen-cat1-9, #7c5cff);
+  --cat1-10: var(--gen-cat1-10, #704df0);
+  --cat1-11: var(--gen-cat1-11, #5b3ac8);
+  --cat1-12: var(--gen-cat1-12, #1f0856);
+  --cat2-1: var(--gen-cat2-1, #f5f8f9);
+  --cat2-2: var(--gen-cat2-2, #eef5f8);
+  --cat2-3: var(--gen-cat2-3, #d8eff5);
+  --cat2-4: var(--gen-cat2-4, #c6eaf4);
+  --cat2-5: var(--gen-cat2-5, #b4e3f1);
+  --cat2-6: var(--gen-cat2-6, #a2dded);
+  --cat2-7: var(--gen-cat2-7, #8ad4e8);
+  --cat2-8: var(--gen-cat2-8, #59c5df);
+  --cat2-9: var(--gen-cat2-9, #189ab4);
+  --cat2-10: var(--gen-cat2-10, #008da7);
+  --cat2-11: var(--gen-cat2-11, #006881);
+  --cat2-12: var(--gen-cat2-12, #00252f);
+  --cat3-1: var(--gen-cat3-1, #faf7f8);
+  --cat3-2: var(--gen-cat3-2, #f9f1f5);
+  --cat3-3: var(--gen-cat3-3, #f9e3ee);
+  --cat3-4: var(--gen-cat3-4, #f9d7e8);
+  --cat3-5: var(--gen-cat3-5, #f6cce2);
+  --cat3-6: var(--gen-cat3-6, #f4c1db);
+  --cat3-7: var(--gen-cat3-7, #f0b2d3);
+  --cat3-8: var(--gen-cat3-8, #e698c2);
+  --cat3-9: var(--gen-cat3-9, #d6409f);
+  --cat3-10: var(--gen-cat3-10, #c73192);
+  --cat3-11: var(--gen-cat3-11, #a40074);
+  --cat3-12: var(--gen-cat3-12, #42002b);
+  --cat4-1: var(--gen-cat4-1, #f8f7f6);
+  --cat4-2: var(--gen-cat4-2, #fbf1eb);
+  --cat4-3: var(--gen-cat4-3, #fee5d7);
+  --cat4-4: var(--gen-cat4-4, #ffd8b8);
+  --cat4-5: var(--gen-cat4-5, #ffcca2);
+  --cat4-6: var(--gen-cat4-6, #ffc096);
+  --cat4-7: var(--gen-cat4-7, #fcb589);
+  --cat4-8: var(--gen-cat4-8, #f09d6a);
+  --cat4-9: var(--gen-cat4-9, #e8730c);
+  --cat4-10: var(--gen-cat4-10, #dc6600);
+  --cat4-11: var(--gen-cat4-11, #a03300);
+  --cat4-12: var(--gen-cat4-12, #351500);
+  --cat5-1: var(--gen-cat5-1, #f7f8f4);
+  --cat5-2: var(--gen-cat5-2, #f2f5ec);
+  --cat5-3: var(--gen-cat5-3, #e6f0ce);
+  --cat5-4: var(--gen-cat5-4, #daeab4);
+  --cat5-5: var(--gen-cat5-5, #d0e49e);
+  --cat5-6: var(--gen-cat5-6, #c7de8b);
+  --cat5-7: var(--gen-cat5-7, #bbd472);
+  --cat5-8: var(--gen-cat5-8, #a5c33f);
+  --cat5-9: var(--gen-cat5-9, #8aa614);
+  --cat5-10: var(--gen-cat5-10, #7f9a00);
+  --cat5-11: var(--gen-cat5-11, #516600);
+  --cat5-12: var(--gen-cat5-12, #1b2400);
+  --font-sans: var(
+    --font-website-body,
+    var(
+      --font-theme-inter,
+      ui-sans-serif,
+      system-ui,
+      sans-serif,
+      "Apple Color Emoji",
+      "Segoe UI Emoji"
+    )
+  );
+  --font-heading: var(
+    --font-website-heading,
+    var(--font-theme-league-spartan, var(--font-sans))
+  );
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+/* Screen-only (#2146): on paper the app scope keeps the light block above, so
+   every descendant token (notably --card-foreground, which Card sets directly
+   and therefore beat the print block's inherited colour) resolves light. */
+@media not print {
+  .dark .app-theme-scope {
+    /* #2187 P1 — F1 substrate rewrite. The dark core-token block resolves onto
+       the GENERATED DARK substrate steps (`--gen-<token>-dark`, emitted at
+       render time by `buildClubThemeAppCss`) with a static default-palette
+       fallback: NO legacy brand-shim reference remains here (grep-proof F1). This
+       is substrate, not a P2 remap shim — P2's remap-deletion grep carves the
+       neutral/callout remaps out separately. `--accent` (neutral-4) stays one
+       band off `--muted`/`--secondary` (neutral-3) in dark too. Sidebar tokens
+       are D13; `--ring`/`--input` are the neutral-10 pin. */
+    --background: var(--gen-background-dark, #1b1d1c);
+    --foreground: var(--gen-foreground-dark, #eceeed);
+    --card: var(--gen-card-dark, #151716);
+    --card-foreground: var(--gen-card-foreground-dark, #eceeed);
+    --popover: var(--gen-popover-dark, #151716);
+    --popover-foreground: var(--gen-popover-foreground-dark, #eceeed);
+    --primary: var(--gen-primary-dark, #57b3ab);
+    --primary-foreground: var(--gen-primary-foreground-dark, #1c211d);
+    --secondary: var(--gen-secondary-dark, #232524);
+    --secondary-foreground: var(--gen-secondary-foreground-dark, #eceeed);
+    --muted: var(--gen-muted-dark, #232524);
+    /* #2145, the dark half of the derived muted role — a measured-AA solid tone,
+       kept OFF the substrate neutral ramp on purpose (a raw neutral-11 is not
+       gate-measurable). The light block above restates `--muted-foreground`, so
+       excluding this block from print leaves the LIGHT derived tone standing on
+       paper — the #2146 pairing invariant is preserved. */
+    --muted-foreground: var(--app-muted-foreground-dark, #b3b8b5);
+    /* #2257 — restated per scope; see the `:root` note. */
+    --placeholder-foreground: var(--muted-foreground);
+    --accent: var(--gen-accent-dark, #292c2a);
+    --accent-foreground: var(--gen-accent-foreground-dark, #eceeed);
+    --app-accent-text: var(--gen-app-accent-text-dark, #eceeed);
+    --border: var(--gen-border-dark, #383b39);
+    --input: var(--gen-input-dark, #757d76);
+    --ring: var(--gen-ring-dark, #757d76);
+    --chart-1: var(--gen-chart-1-dark, #7c5cff);
+    --chart-2: var(--gen-chart-2-dark, #189ab4);
+    --chart-3: var(--gen-chart-3-dark, #d6409f);
+    --chart-4: var(--gen-chart-4-dark, #e8730c);
+    --chart-5: var(--gen-chart-5-dark, #8aa614);
+    --sidebar: var(--gen-sidebar-dark, #151716);
+    --sidebar-foreground: var(--gen-sidebar-foreground-dark, #eceeed);
+    --sidebar-primary: var(--gen-sidebar-primary-dark, #57b3ab);
+    --sidebar-primary-foreground: var(--gen-sidebar-primary-foreground-dark, #1c211d);
+    --sidebar-accent: var(--gen-sidebar-accent-dark, #232524);
+    --sidebar-accent-foreground: var(--gen-sidebar-accent-foreground-dark, #eceeed);
+    --sidebar-border: var(--gen-sidebar-border-dark, #292c2a);
+    --sidebar-ring: var(--gen-sidebar-ring-dark, #757d76);
+    /* #2188 P2 — generated SEMANTIC + CATEGORICAL step scales (dark). */
+    --success-1: var(--gen-success-1-dark, #121813);
+    --success-2: var(--gen-success-2-dark, #171f19);
+    --success-3: var(--gen-success-3-dark, #142a1a);
+    --success-4: var(--gen-success-4-dark, #0d341b);
+    --success-5: var(--gen-success-5-dark, #0c3b1e);
+    --success-6: var(--gen-success-6-dark, #0e4624);
+    --success-7: var(--gen-success-7-dark, #14562e);
+    --success-8: var(--gen-success-8-dark, #247040);
+    --success-9: var(--gen-success-9-dark, #1f9d55);
+    --success-10: var(--gen-success-10-dark, #009049);
+    --success-11: var(--gen-success-11-dark, #5dce83);
+    --success-12: var(--gen-success-12-dark, #c0ffd0);
+    --warning-1: var(--gen-warning-1-dark, #191611);
+    --warning-2: var(--gen-warning-2-dark, #211c14);
+    --warning-3: var(--gen-warning-3-dark, #2e230e);
+    --warning-4: var(--gen-warning-4-dark, #3c2700);
+    --warning-5: var(--gen-warning-5-dark, #442c00);
+    --warning-6: var(--gen-warning-6-dark, #4d3502);
+    --warning-7: var(--gen-warning-7-dark, #5d430f);
+    --warning-8: var(--gen-warning-8-dark, #7a5917);
+    --warning-9: var(--gen-warning-9-dark, #e5a50a);
+    --warning-10: var(--gen-warning-10-dark, #d99a00);
+    --warning-11: var(--gen-warning-11-dark, #e1a83b);
+    --warning-12: var(--gen-warning-12-dark, #ffebc8);
+    --info-1: var(--gen-info-1-dark, #101623);
+    --info-2: var(--gen-info-2-dark, #141c2d);
+    --info-3: var(--gen-info-3-dark, #0f224a);
+    --info-4: var(--gen-info-4-dark, #0c275e);
+    --info-5: var(--gen-info-5-dark, #0e2c6c);
+    --info-6: var(--gen-info-6-dark, #14347a);
+    --info-7: var(--gen-info-7-dark, #1e428f);
+    --info-8: var(--gen-info-8-dark, #2e59b6);
+    --info-9: var(--gen-info-9-dark, #2563eb);
+    --info-10: var(--gen-info-10-dark, #315dba);
+    --info-11: var(--gen-info-11-dark, #87b4fe);
+    --info-12: var(--gen-info-12-dark, #ddefff);
+    --danger-1: var(--gen-danger-1-dark, #1d1413);
+    --danger-2: var(--gen-danger-2-dark, #261817);
+    --danger-3: var(--gen-danger-3-dark, #401511);
+    --danger-4: var(--gen-danger-4-dark, #530b0a);
+    --danger-5: var(--gen-danger-5-dark, #5f0c0a);
+    --danger-6: var(--gen-danger-6-dark, #6b1513);
+    --danger-7: var(--gen-danger-7-dark, #7f221d);
+    --danger-8: var(--gen-danger-8-dark, #a62e29);
+    --danger-9: var(--gen-danger-9-dark, #dc2626);
+    --danger-10: var(--gen-danger-10-dark, #b63d36);
+    --danger-11: var(--gen-danger-11-dark, #fe8f82);
+    --danger-12: var(--gen-danger-12-dark, #ffe2dc);
+    --cat1-1: var(--gen-cat1-1-dark, #151424);
+    --cat1-2: var(--gen-cat1-2-dark, #1b192f);
+    --cat1-3: var(--gen-cat1-3-dark, #231a4d);
+    --cat1-4: var(--gen-cat1-4-dark, #2b1667);
+    --cat1-5: var(--gen-cat1-5-dark, #301b73);
+    --cat1-6: var(--gen-cat1-6-dark, #392580);
+    --cat1-7: var(--gen-cat1-7-dark, #463196);
+    --cat1-8: var(--gen-cat1-8-dark, #5d45bf);
+    --cat1-9: var(--gen-cat1-9-dark, #7c5cff);
+    --cat1-10: var(--gen-cat1-10-dark, #704df0);
+    --cat1-11: var(--gen-cat1-11-dark, #aea6fe);
+    --cat1-12: var(--gen-cat1-12-dark, #ebeaff);
+    --cat2-1: var(--gen-cat2-1-dark, #0f181b);
+    --cat2-2: var(--gen-cat2-2-dark, #141f21);
+    --cat2-3: var(--gen-cat2-3-dark, #0a2931);
+    --cat2-4: var(--gen-cat2-4-dark, #00323d);
+    --cat2-5: var(--gen-cat2-5-dark, #003945);
+    --cat2-6: var(--gen-cat2-6-dark, #004250);
+    --cat2-7: var(--gen-cat2-7-dark, #005161);
+    --cat2-8: var(--gen-cat2-8-dark, #006b80);
+    --cat2-9: var(--gen-cat2-9-dark, #189ab4);
+    --cat2-10: var(--gen-cat2-10-dark, #338b9f);
+    --cat2-11: var(--gen-cat2-11-dark, #53c4de);
+    --cat2-12: var(--gen-cat2-12-dark, #c6f7ff);
+    --cat3-1: var(--gen-cat3-1-dark, #1c1318);
+    --cat3-2: var(--gen-cat3-2-dark, #271720);
+    --cat3-3: var(--gen-cat3-3-dark, #39172b);
+    --cat3-4: var(--gen-cat3-4-dark, #4a1035);
+    --cat3-5: var(--gen-cat3-5-dark, #54143d);
+    --cat3-6: var(--gen-cat3-6-dark, #5f1d46);
+    --cat3-7: var(--gen-cat3-7-dark, #722755);
+    --cat3-8: var(--gen-cat3-8-dark, #963571);
+    --cat3-9: var(--gen-cat3-9-dark, #d6409f);
+    --cat3-10: var(--gen-cat3-10-dark, #c73092);
+    --cat3-11: var(--gen-cat3-11-dark, #fc82d1);
+    --cat3-12: var(--gen-cat3-12-dark, #ffdff6);
+    --cat4-1: var(--gen-cat4-1-dark, #1b1512);
+    --cat4-2: var(--gen-cat4-2-dark, #231a15);
+    --cat4-3: var(--gen-cat4-3-dark, #341f11);
+    --cat4-4: var(--gen-cat4-4-dark, #461e02);
+    --cat4-5: var(--gen-cat4-5-dark, #4f2402);
+    --cat4-6: var(--gen-cat4-6-dark, #592d0c);
+    --cat4-7: var(--gen-cat4-7-dark, #6b3917);
+    --cat4-8: var(--gen-cat4-8-dark, #8d4c20);
+    --cat4-9: var(--gen-cat4-9-dark, #e8730c);
+    --cat4-10: var(--gen-cat4-10-dark, #db6700);
+    --cat4-11: var(--gen-cat4-11-dark, #f79957);
+    --cat4-12: var(--gen-cat4-12-dark, #ffe6d2);
+    --cat5-1: var(--gen-cat5-1-dark, #151810);
+    --cat5-2: var(--gen-cat5-2-dark, #1b1e16);
+    --cat5-3: var(--gen-cat5-3-dark, #222715);
+    --cat5-4: var(--gen-cat5-4-dark, #272f0c);
+    --cat5-5: var(--gen-cat5-5-dark, #2d3608);
+    --cat5-6: var(--gen-cat5-6-dark, #344006);
+    --cat5-7: var(--gen-cat5-7-dark, #414f08);
+    --cat5-8: var(--gen-cat5-8-dark, #576817);
+    --cat5-9: var(--gen-cat5-9-dark, #8aa614);
+    --cat5-10: var(--gen-cat5-10-dark, #7f9a00);
+    --cat5-11: var(--gen-cat5-11-dark, #a5c242);
+    --cat5-12: var(--gen-cat5-12-dark, #e5f7b8);
+  }
+}
+
+/* Filled brand controls keep the editable accent with its gated charcoal
+   foreground. Light-mode text-primary and focus rings use the dedicated dark
+   accent role instead of placing a mid-luminance accent directly on snow. A
+   charcoal inset boundary keeps solid accent controls/occupancy fills distinct
+   from the light surface; dark mode can rely on the gated gold-on-deep pair. */
+.app-theme-scope
+  :is(
+    .text-primary,
+    .text-brand-gold,
+    [class~="hover:text-primary"]:hover,
+    .group:hover [class~="group-hover:text-primary"]
+  ):not(.website-theme *) {
+  color: var(--app-accent-text);
+}
+
+.app-theme-scope :is(.bg-primary, .bg-brand-gold):not(.website-theme *) {
+  outline: 1px solid var(--brand-charcoal);
+  outline-offset: -1px;
+}
+
+/* Screen-only (#2146). This one assigns no colour, so the earlier revision of
+   the print contract test (which only probed for literal colour values) let it
+   through — but it still made the SAME page print differently depending on the
+   operator's theme: a printed `bg-primary` chip kept its charcoal hairline in
+   light mode and lost it in dark. Print renders the light palette, so it must
+   also render the light palette's outline. The contract test now flags ANY
+   `.dark`-gated rule reachable from print media unless every value it assigns
+   is a `var(--token)` that self-heals against the light `:root`. */
+@media not print {
+  .dark
+    .app-theme-scope
+    :is(.bg-primary, .bg-brand-gold):not(.website-theme *) {
+    outline: none;
+  }
+}
+
+/* A native outline is independent of Tailwind's ring opacity and component
+   opacity, so filled Button/Checkbox variants retain a visible keyboard focus
+   boundary. The ring token is a gated page-foreground endpoint in each mode. */
+.app-theme-scope
+  :where(
+    a,
+    button,
+    input,
+    select,
+    textarea,
+    [role="button"],
+    [role="checkbox"],
+    [role="link"],
+    [tabindex]
+  ):focus-visible:not(.website-theme *) {
+  outline: 2px solid var(--ring) !important;
+  outline-offset: 2px !important;
+}
+
+/* App headings pick up --font-heading (League Spartan when loaded). Specificity is
+   (0,1,1); the earlier .website-theme heading rule is (0,2,0), so a website-themed
+   subtree nested in an app scope (e.g. the site-style preview) keeps its own
+   heading font regardless of source order. */
+.app-theme-scope :is(h1, h2, h3, h4) {
+  font-family: var(--font-heading);
+}
+
+/* Tabular figures for aligned numeric/data contexts (#1801): tables get them by
+   default, and .tabular-figures opts any money/count/date cell in. */
+.app-theme-scope table {
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-figures {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Recharts draws gridlines/axes/ticks as SVG presentation attributes, where CSS
+   var() does not resolve — so the finance TrendChart's structural lines and tick
+   labels are themed here with real CSS rules that follow the light/dark tokens
+   (#1801). CSS declarations override the component's literal fallback attrs. Kept
+   scoped to .finance-trend-chart to match the single named file; a broader
+   `.app-theme-scope .recharts-*` sweep for every chart is a follow-up. */
+.finance-trend-chart .recharts-cartesian-grid line {
+  stroke: var(--border);
+}
+
+.finance-trend-chart
+  :is(.recharts-cartesian-axis-line, .recharts-cartesian-axis-tick-line) {
+  stroke: var(--border);
+}
+
+.finance-trend-chart
+  :is(
+    .recharts-cartesian-axis-tick-value,
+    .recharts-cartesian-axis-tick-value tspan
+  ) {
+  fill: var(--muted-foreground);
+}
+
+/* #4466 — every Recharts legend, app-wide. Recharts writes each legend label's
+   colour as an INLINE style set to its series colour, and the categorical
+   series hues are mark colours, not text colours: on white the cat3 magenta
+   reads 4.12:1, the cat1 indigo 4.34:1 and the success green 3.49:1, all under
+   WCAG 1.4.3. The swatch beside each label keeps the series colour, so the key
+   still matches the marks; only the words move to the text ink. `!important`
+   is what outranks an inline style, and it is scoped to the one class Recharts
+   gives the label. */
+.recharts-legend-item-text {
+  color: var(--foreground) !important;
+}
+
+/* A6 candidate-ii card treatment (#2187 J8): the shadcn Card surface — `bg-card`
+   plus Tailwind's base `shadow` utility (see `src/components/ui/card.tsx`) —
+   renders the pinned J8 elevation shadow, emitted per club as `--gen-card-shadow`
+   / `--gen-card-shadow-dark` by `buildClubThemeAppCss` with the shipped default
+   as the static fallback. Setting `box-shadow` outright REPLACES Tailwind's
+   `.shadow` composite, so exactly one shadow renders (the J8 one), not two. Keyed
+   on `.bg-card` so popovers/dialogs/menus (`bg-popover`/`bg-background`,
+   `shadow-md`/`shadow-lg`) are untouched. This light rule applies on screen AND
+   print (a printed card keeps the light shadow — same #2146 handling as the dark
+   deepening below); the dark rule is screen-only, so print falls back to this
+   light J8 shadow. `.reports-print-card` / lodge print resets still drop it
+   entirely with `box-shadow: none !important`. Pinned in
+   app-theme-layout-contract.test.ts. */
+.app-theme-scope .bg-card.shadow:not(.website-theme *) {
+  box-shadow: var(--gen-card-shadow, 0 1px 2px 0 #040a054a, 0 1px 3px 0 #020b037b);
+}
+
+/* Screen-only (#2146): the deepened dark shadow is a literal value, so it cannot
+   resolve back to light on paper. A printed report keeps the light shadow (and
+   the print block drops it entirely on report cards). */
+@media not print {
+  .dark
+    .app-theme-scope
+    :is(.shadow, .shadow-sm, .shadow-md, .shadow-lg, .shadow-xl) {
+    --tw-shadow-color: rgb(0 0 0 / 0.45);
+  }
+
+  /* J8 dark card shadow (#2187). Screen-only, so a printed card falls back to the
+     light J8 shadow declared above — the same #2146 rule the `--tw-shadow-color`
+     deepening follows. Replaces Tailwind's `.shadow` composite outright, so
+     exactly one (the J8 dark) shadow renders on the app Card. */
+  .dark .app-theme-scope .bg-card.shadow:not(.website-theme *) {
+    box-shadow: var(--gen-card-shadow-dark, 0 1px 2px 0 #00000066, 0 1px 3px 0 #000000a6);
+  }
+}
+
+/* Fixed-seed kiosk tokens (#2189 P3, epic #2181 A5/J4). This standalone,
+   mode-agnostic block REPLACES the old #1249 light-mode kiosk readability remap
+   (the `.app-theme-scope` kiosk block gated on the absence of `.dark`). That
+   remap existed only because the kiosk was authored in literal dark slate/colour
+   utilities that turned unreadable under the LIGHT palette, so it re-mapped them
+   to light tiers whenever the document was not in dark mode. The kiosk is now
+   authored directly on these fixed `--kiosk-*` tokens, so it renders IDENTICALLY
+   whether or not the document carries the dark class — which is correct: the
+   kiosk is a glare-proof wall display whose appearance must NOT depend on the
+   operator's theme toggle. Mode invariance is the whole point, so these tokens
+   are deliberately un-gated (declared once on `:root`, no light/dark variant),
+   and the literal-keyed light-mode override is no longer needed. The values are
+   the A5 fixed kiosk seed's derived set (near-black page, neutral grey tiers,
+   `#7dd3fc` accent, kiosk-context status hues); every literal here is pinned
+   against `buildKioskTokens()` by kiosk-token-contract.test.ts (R9 fallback-pin),
+   so the CSS and the derivation cannot drift. The kiosk surface paints its page
+   background/foreground through the `bg-kiosk-page` / `text-kiosk-fg` utilities on
+   its root elements, not from this block. */
+:root {
+  --kiosk-page: #0a0a0b;
+  --kiosk-card: #222;
+  --kiosk-inset: #292929;
+  --kiosk-chip: #3a3a3a;
+  --kiosk-hover: #484848;
+  --kiosk-border: #484848;
+  --kiosk-border-muted: #292929;
+  --kiosk-fg: #eee;
+  --kiosk-muted-fg: #b4b4b4;
+  --kiosk-faint-fg: #6e6e6e;
+  --kiosk-accent: #7dd3fc;
+  --kiosk-accent-hover: #72c8f1;
+  --kiosk-accent-active: #6ac0e8;
+  --kiosk-accent-fg: #092531;
+  --kiosk-accent-bg: #002637;
+  --kiosk-accent-border: #005074;
+  --kiosk-danger-bg: #3d120f;
+  --kiosk-danger-fg: #ff9083;
+  --kiosk-danger-border: #7f221d;
+  --kiosk-danger-solid: #dc2626;
+  --kiosk-danger-solid-fg: #ffffff;
+  --kiosk-success-bg: #122819;
+  --kiosk-success-fg: #5ecf84;
+  --kiosk-success-border: #15562e;
+  --kiosk-success-solid: #1f9d55;
+  --kiosk-success-solid-fg: #202020;
+  --kiosk-success-solid-hover: #3ab067;
+  --kiosk-success-solid-active: #51c379;
+  --kiosk-warning-bg: #2b200b;
+  --kiosk-warning-fg: #e2a93d;
+  --kiosk-warning-border: #5d430e;
+  --kiosk-warning-solid: #e5a50a;
+  --kiosk-warning-solid-fg: #202020;
+  --kiosk-orange-bg: #311c0e;
+  --kiosk-orange-fg: #f89a58;
+  --kiosk-orange-border: #6b3917;
+}
+
+.pswp__thumbnail-carousel-wrap {
+  position: absolute;
+  left: 50%;
+  bottom: 0.9rem;
+  z-index: 35;
+  width: min(94vw, 36rem);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.pswp__thumbnail-carousel {
+  display: flex;
+  gap: 0.45rem;
+  overflow-x: auto;
+  padding: 0.45rem 0.6rem;
+  border-radius: 9999px;
+  background: rgb(17 24 39 / 0.6);
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+}
+
+.pswp__thumbnail-carousel::-webkit-scrollbar {
+  display: none;
+}
+
+.pswp__thumbnail-carousel-item {
+  flex: 0 0 auto;
+  width: 3.1rem;
+  height: 2.2rem;
+  overflow: hidden;
+  border: 2px solid transparent;
+  border-radius: 0.6rem;
+  opacity: 0.7;
+  transition:
+    opacity 0.2s ease,
+    border-color 0.2s ease,
+    transform 0.2s ease;
+}
+
+.pswp__thumbnail-carousel-item:hover {
+  opacity: 1;
+  transform: translateY(-1px);
+}
+
+.pswp__thumbnail-carousel-item.is-active {
+  /* Track the brand accent instead of a hardcoded Tokoroa gold (#1807). The
+     PhotoSwipe lightbox portals to <body>, so this inherits :root's
+     --brand-gold (the generic default teal), not the .website-theme override. */
+  border-color: var(--brand-gold);
+  opacity: 1;
+}
+
+.pswp__thumbnail-carousel-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+@media (min-width: 768px) and (max-width: 1023.98px) {
+  .pswp__thumbnail-carousel-wrap {
+    bottom: 1.1rem;
+    width: min(92vw, 44rem);
+  }
+
+  .pswp__thumbnail-carousel {
+    gap: 0.55rem;
+    padding: 0.55rem 0.75rem;
+  }
+
+  .pswp__thumbnail-carousel-item {
+    width: 3.7rem;
+    height: 2.6rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .pswp__thumbnail-carousel-wrap {
+    bottom: 1.35rem;
+    width: min(90vw, 52rem);
+  }
+
+  .pswp__thumbnail-carousel {
+    gap: 0.65rem;
+    padding: 0.6rem 0.85rem;
+  }
+
+  .pswp__thumbnail-carousel-item {
+    width: 4.25rem;
+    height: 2.95rem;
+  }
+}
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 12mm;
+  }
+
+  /* Print is ink on white paper, so it always renders the LIGHT palette (#2146).
+     Every `.dark` token block and the literal dark callout remap are excluded
+     from print media above, which is what makes descendant-set tokens such as
+     Card's own `text-card-foreground` resolve light instead of losing to an
+     inherited `!important` on the print root. next-themes also writes
+     `color-scheme` as an INLINE style on <html>, and an inline style outranks any
+     non-important rule, so pinning it light here needs the one `!important` —
+     otherwise the UA paints dark form controls and default surfaces on paper. */
+  :root {
+    color-scheme: light !important;
+  }
+
+  /* Kiosk family on paper (#2189 P3, NOTE B). ON SCREEN the kiosk is
+     mode-invariant near-black; ON PAPER that is an ink flood, and the roster-setup
+     wizard is realistically printed. So for print the neutral SURFACE + text
+     `--kiosk-*` tokens flip to a light paper palette (page/card → white, insets →
+     light grey, rules → mid grey, foregrounds → ink); every `bg-kiosk-*` /
+     `text-kiosk-*` utility then resolves light with no per-element print rules. The
+     status + accent tokens deliberately KEEP their tints — small self-consistent
+     badges/buttons/callouts, not a flood. Not `.dark`-gated, so this sits outside
+     the self-healing print contract. Kept as its own `:root` so the color-scheme
+     pin above stays a clean single-declaration rule. */
+  :root {
+    --kiosk-page: #ffffff;
+    --kiosk-card: #ffffff;
+    --kiosk-inset: #f4f4f5;
+    --kiosk-chip: #e9e9ec;
+    --kiosk-hover: #e4e4e7;
+    --kiosk-border: #c4c4c8;
+    --kiosk-border-muted: #e0e0e3;
+    --kiosk-fg: #18181b;
+    --kiosk-muted-fg: #52525b;
+    --kiosk-faint-fg: #6b6b73;
+  }
+
+  aside,
+  nav,
+  .print\:hidden {
+    display: none !important;
+  }
+
+  html,
+  body {
+    background: white !important;
+  }
+
+  body {
+    color: #0f172a !important;
+  }
+
+  main {
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    overflow: visible !important;
+  }
+
+  button,
+  select,
+  input[type="date"] {
+    display: none !important;
+  }
+
+  .reports-print-root {
+    width: 100% !important;
+    margin: 0 !important;
+    color: #0f172a !important;
+  }
+
+  .reports-print-section {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .reports-print-section + .reports-print-section {
+    break-before: page;
+    page-break-before: always;
+  }
+
+  .reports-print-card {
+    border: 1px solid #cbd5e1 !important;
+    box-shadow: none !important;
+    background: white !important;
+  }
+
+  .reports-print-root .recharts-responsive-container,
+  .reports-print-root .recharts-wrapper,
+  .reports-print-root .recharts-surface {
+    max-width: 100% !important;
+  }
+
+  .reports-print-root .recharts-legend-wrapper {
+    position: static !important;
+    width: 100% !important;
+  }
+
+  .reports-print-root .recharts-cartesian-axis-tick-value tspan,
+  .reports-print-root .recharts-text tspan {
+    fill: #334155 !important;
+  }
+
+  /* Lodge instructions: print each document on its own page so a hut
+     leader can pin the sheets up separately in the lodge. */
+  .lodge-instructions-print-root {
+    width: 100% !important;
+    margin: 0 !important;
+    color: #0f172a !important;
+  }
+
+  .lodge-instructions-print-section {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .lodge-instructions-print-section + .lodge-instructions-print-section {
+    break-before: page;
+    page-break-before: always;
+  }
+}
+
+/* Message board text colours (epic #2992; owner request, 25 Aug 2026).
+
+   The composer marks coloured text with these classes rather than inline
+   styles -- one spelling that survives sanitising on every side of the wire,
+   and one place a club's own theme CSS can override the palette. `.dark`
+   re-tints each towards its lighter shade so the same post reads on both
+   grounds; black flips to near-white because it IS the strong-text colour,
+   not a decoration. */
+.post_message_black { color: #000000; }
+.post_message_red { color: #b42318; }
+.post_message_orange { color: #b54708; }
+.post_message_green { color: #067647; }
+.post_message_blue { color: #175cd3; }
+.post_message_purple { color: #6941c6; }
+.post_message_grey { color: #475467; }
+/* @media not print, per the #2146 contract: print always renders the light
+   palette, so a page printed from dark mode must not carry near-white text
+   onto white paper. The print-light-palette test fails any .dark rule
+   reachable from print. */
+@media not print {
+  .dark .post_message_black { color: #f2f4f7; }
+  .dark .post_message_red { color: #f97066; }
+  .dark .post_message_orange { color: #fd853a; }
+  .dark .post_message_green { color: #32d583; }
+  .dark .post_message_blue { color: #528bff; }
+  .dark .post_message_purple { color: #9b8afb; }
+  .dark .post_message_grey { color: #98a2b3; }
+}

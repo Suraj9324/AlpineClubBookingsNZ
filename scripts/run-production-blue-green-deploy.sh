@@ -1,0 +1,4295 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ---------------------------------------------------------------------------
+# Readers shared by the wrapper and the engine, and the live-site role check
+# ---------------------------------------------------------------------------
+#
+# Sourced, not defined here (#4980), so First Bootstrap's role gate
+# (scripts/check-environment-role.sh) runs the same code this script runs at
+# step 3 rather than a copy. Resolved from this file's own location, which holds
+# in the source repository (the wrapper) and in the `git archive` workspace the
+# engine re-enters from, because both are checkouts of the whole tree.
+DEPLOY_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# shellcheck source=scripts/lib/compose-env-file.sh
+. "$DEPLOY_SCRIPT_LIB_DIR/compose-env-file.sh"
+# shellcheck source=scripts/lib/environment-role-check.sh
+. "$DEPLOY_SCRIPT_LIB_DIR/environment-role-check.sh"
+
+# The Caddy image helpers below are deploy-only, not `.env` readers, so they stay
+# in this file rather than the shared library; they are at file level because
+# both the wrapper (slot seeding) and the engine (Caddy validation) call them.
+
+# Extract only the requested image; a compose render can contain secrets.
+compose_service_image_ref() {
+  printf '%s\n' "$1" | awk -v service="$2" '
+    /^[^[:space:]]/ { in_services = ($0 == "services:"); in_service = 0; next }
+    in_services && /^  [^[:space:]]/ { in_service = ($0 == "  " service ":"); next }
+    in_service && /^    image:/ {
+      sub(/^    image:[[:space:]]*/, "")
+      gsub(/^["\047]|["\047]$/, "")
+      print
+      # Keep consuming input: exiting early can SIGPIPE printf on a large render.
+      in_service = 0
+    }
+  '
+}
+
+resolve_caddy_image_ref() {
+  local rendered="${RESOLVED_COMPOSE_CONFIG:-}"
+  local image_ref
+
+  # Slot seeding runs in the wrapper before the engine's canonical render.
+  # Resolve from the prepared workspace with the engine's image overrides.
+  if [ -z "$rendered" ]; then
+    rendered="$(
+      cd "$WORKSPACE" &&
+      APP_IMAGE="$APP_IMAGE" MIGRATE_IMAGE="$MIGRATE_IMAGE" \
+        docker compose --project-name "$COMPOSE_PROJECT_NAME" --profile "*" config 2>/dev/null
+    )" || return 1
+  fi
+  image_ref="$(compose_service_image_ref "$rendered" "$CADDY_SERVICE")" || return 1
+  [[ "$image_ref" =~ ^[^[:space:]@]+@sha256:[a-fA-F0-9]{64}$ ]] || return 1
+  printf '%s' "$image_ref"
+}
+
+run_production_wrapper() {
+WRAPPER_MODE="${1:-deploy}"
+DEFAULT_SOURCE_REPO="$HOME/AlpineClubBookingsNZ"
+if [[ ! -d "$DEFAULT_SOURCE_REPO" && -d "$HOME/AlpineClubBookingsNZ" ]]; then
+  DEFAULT_SOURCE_REPO="$HOME/AlpineClubBookingsNZ"
+fi
+SOURCE_REPO="${SOURCE_REPO:-$DEFAULT_SOURCE_REPO}"
+DEPLOY_REF="${DEPLOY_REF:-origin/main}"
+FETCH_LATEST="${FETCH_LATEST:-1}"
+DEPLOY_WORKSPACE_ROOT="${DEPLOY_WORKSPACE_ROOT:-$HOME/tacbookings-deployments}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(basename "$SOURCE_REPO" | tr '[:upper:]' '[:lower:]')}"
+SYNC_SOURCE_REPO_AFTER_DEPLOY="${SYNC_SOURCE_REPO_AFTER_DEPLOY:-1}"
+PRUNE_STALE_DEPLOY_WORKSPACES="${PRUNE_STALE_DEPLOY_WORKSPACES:-1}"
+# Resolved in `resolve_image_refs`: the shell environment, then the source
+# repository's .env, then the upstream defaults. Left empty here so an operator
+# who set neither can be told which source the deploy ended up using.
+GHCR_APP_IMAGE_REPOSITORY="${GHCR_APP_IMAGE_REPOSITORY:-}"
+GHCR_MIGRATE_IMAGE_REPOSITORY="${GHCR_MIGRATE_IMAGE_REPOSITORY:-}"
+UPSTREAM_GHCR_APP_IMAGE_REPOSITORY="ghcr.io/thatskiff33/alpineclubbookingsnz-app"
+UPSTREAM_GHCR_MIGRATE_IMAGE_REPOSITORY="ghcr.io/thatskiff33/alpineclubbookingsnz-migrate"
+APP_IMAGE="${APP_IMAGE:-}"
+MIGRATE_IMAGE="${MIGRATE_IMAGE:-}"
+ALLOW_UNPUBLISHED_DEPLOY_COMMIT="${ALLOW_UNPUBLISHED_DEPLOY_COMMIT:-0}"
+UNPUBLISHED_DEPLOY_COMMIT_REASON="${UNPUBLISHED_DEPLOY_COMMIT_REASON:-}"
+ALLOW_UNTAGGED_DEPLOY_COMMIT="${ALLOW_UNTAGGED_DEPLOY_COMMIT:-0}"
+UNTAGGED_DEPLOY_COMMIT_REASON="${UNTAGGED_DEPLOY_COMMIT_REASON:-}"
+
+ACTIVE_UPSTREAM_FILE_REL="deploy/caddy/tacbookings-active.caddy"
+CADDY_CONFIG_CONTAINER_PATH="/etc/caddy/Caddyfile"
+CADDY_DEPLOY_CONTAINER_PATH="/etc/caddy/deploy"
+CADDY_CONFIG_VOLUME_SUFFIX="caddy_config"
+CRON_SERVICE="app"
+BLUE_SERVICE="app_blue"
+GREEN_SERVICE="app_green"
+CADDY_SERVICE="caddy"
+READINESS_PATH="/api/health/ready"
+WORKSPACE=""
+RESOLVED_REF=""
+
+step() {
+  printf "\n[%s] %s\n" "$1" "$2"
+}
+
+info() {
+  printf "  %s\n" "$1"
+}
+
+warn() {
+  printf "  WARNING: %s\n" "$1"
+}
+
+fail() {
+  trap - ERR
+  # Name the mode that failed. `--build-and-push-images` attempts no deploy
+  # at all, and at 2am "Production blue/green wrapper failed" reads as
+  # "production is mid-deploy" - the most alarming possible reading of a
+  # build that never touched the running site.
+  if [ "$WRAPPER_MODE" = "build-and-push-images" ]; then
+    printf "\nHost image build failed. No deploy was attempted and the running site is untouched.\n" >&2
+  else
+    printf "\nProduction blue/green wrapper failed.\n" >&2
+  fi
+  if [ -n "$WORKSPACE" ]; then
+    printf "Workspace preserved at %s\n" "$WORKSPACE" >&2
+  fi
+}
+
+trap fail ERR
+
+require_command() {
+  local command_name="$1"
+  command -v "$command_name" >/dev/null 2>&1 || {
+    echo "Missing required command: $command_name" >&2
+    return 1
+  }
+}
+
+env_flag_is_true() {
+  case "$1" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+source_repo_is_clean() {
+  [ -z "$(git -C "$SOURCE_REPO" status --short --untracked-files=normal)" ]
+}
+
+write_active_upstream_file() {
+  local primary_service="$1"
+  local fallback_service="${2:-}"
+  local destination="$WORKSPACE/$ACTIVE_UPSTREAM_FILE_REL"
+  local temp_file
+
+  temp_file="$(mktemp "${destination}.XXXXXX")"
+  {
+    echo "reverse_proxy {"
+    echo "  lb_policy first"
+    echo "  lb_try_duration 10s"
+    echo "  fail_duration 30s"
+    # One transient upstream error must not eject a healthy colour (#3293).
+    # `max_fails` defaults to 1, so a single reset took the serving colour out
+    # for the whole `fail_duration` and moved live traffic onto the fallback —
+    # the cron leader, which runs a deliberately smaller connection pool.
+    echo "  max_fails 3"
+    echo "  health_uri ${READINESS_PATH}"
+    echo "  health_interval 10s"
+    echo "  health_timeout 5s"
+    # Caddy must give up a pooled connection BEFORE the app closes it (#3293).
+    # The app holds idle connections for KEEP_ALIVE_TIMEOUT (docker-compose.yml,
+    # 65s); Caddy's undeclared default was 2 minutes, so it reused connections
+    # the app had already closed and a reuse landing on that boundary was reset.
+    # A reset POST/PUT cannot be replayed by Caddy's transport, so it reached the
+    # browser as a bare 502 and every admin form showed its generic save error.
+    # The app reads the LAST X-Forwarded-For value as the visitor (getClientIp,
+    # src/lib/rate-limit.ts). Set it to Caddy's resolved client IP rather than
+    # appending Caddy's peer: behind a TLS-terminating proxy (CADDY_TLS_MODE=local,
+    # deploy/caddy/tls-local.caddy) the peer is the proxy, and every visitor would
+    # share one rate-limit bucket. With Caddy at the edge the two are the same.
+    echo "  header_up X-Forwarded-For {client_ip}"
+    echo "  transport http {"
+    echo "    keepalive 30s"
+    echo "  }"
+    if [ -n "$fallback_service" ] && [ "$fallback_service" != "$primary_service" ]; then
+      printf '  to %s:3000 %s:3000\n' "$primary_service" "$fallback_service"
+    else
+      printf '  to %s:3000\n' "$primary_service"
+    fi
+    echo "}"
+  } >"$temp_file"
+  mv "$temp_file" "$destination"
+}
+
+resolve_ref() {
+  if env_flag_is_true "$FETCH_LATEST"; then
+    info "Fetching latest origin/main in $SOURCE_REPO"
+    git -C "$SOURCE_REPO" fetch --prune origin main
+  fi
+
+  RESOLVED_REF="$(git -C "$SOURCE_REPO" rev-parse "${DEPLOY_REF}^{commit}")"
+  info "Resolved ${DEPLOY_REF} to commit ${RESOLVED_REF}"
+}
+
+# Production may only run a commit that exists somewhere other than this disk.
+#
+# A release built by hand on the deploy host from a local branch cannot be
+# rebuilt from the repository, cannot be reviewed, and silently invalidates the
+# next release's documented preconditions - the pending-migration list, the
+# ledger rows, the upgrade notes are all computed against a commit nobody else
+# has. It has happened, and nothing in this script noticed.
+#
+# `git branch -r --contains` answers the only question that matters: is this
+# commit reachable from at least one REMOTE branch. A local branch, a detached
+# HEAD or a tag that was never pushed all answer "no".
+#
+# The override exists because host-building from a local branch is legitimate
+# during a registry outage. It just has to be a decision somebody recorded, so
+# it takes a written reason as well as the flag - the same shape as
+# ALLOW_BREAKING_BLUE_GREEN_MIGRATIONS and DEPLOY_WARMUP_ENABLED.
+validate_deploy_commit_is_published() {
+  local remote_branches
+  local branch_on_remote
+  local remote_ref
+  local remote_name
+  local branch_name
+  local live_branch=""
+  local remote_answered=0
+
+  remote_branches="$(git -C "$SOURCE_REPO" branch -r --contains "$RESOLVED_REF" --format '%(refname:short)' 2>/dev/null || true)"
+
+  # A remote-tracking ref is a LOCAL CACHE, and the fetch above is refspec
+  # scoped (`--prune origin main`), which prunes only what it fetched. So
+  # `origin/feature`, deleted on the remote months ago, survives on this disk
+  # and would answer "published" for a commit no remote holds - measured in a
+  # scratch repo, not assumed. Confirm with the remote itself.
+  #
+  # But a remote that cannot be REACHED must not turn into a refusal: a GitHub
+  # outage is not a reason to block a deploy whose commit really is pushed. So
+  # an unreachable remote downgrades to a warning, while a remote that answers
+  # and does not have the branch is treated as the stale ref it is.
+  while IFS= read -r remote_ref; do
+    [ -n "$remote_ref" ] || continue
+    case "$remote_ref" in
+      *" -> "*|*"->"*) continue ;;
+    esac
+    remote_name="${remote_ref%%/*}"
+    branch_name="${remote_ref#*/}"
+    [ -n "$branch_name" ] && [ "$branch_name" != "$remote_ref" ] || continue
+    if branch_on_remote="$(git -C "$SOURCE_REPO" ls-remote --heads "$remote_name" "$branch_name" 2>/dev/null)"; then
+      remote_answered=1
+      if [ -n "$branch_on_remote" ]; then
+        live_branch="$remote_ref"
+        break
+      fi
+    fi
+  done <<EOF
+$remote_branches
+EOF
+
+  if [ -n "$live_branch" ]; then
+    info "Deploy commit ${RESOLVED_REF} is published on ${live_branch}, confirmed against the remote."
+    return 0
+  fi
+
+  if [ -n "$(printf '%s' "$remote_branches" | tr -d '[:space:]')" ] && [ "$remote_answered" = "0" ]; then
+    warn "Could not reach any remote to confirm that ${RESOLVED_REF} is still published."
+    warn "This host's remote-tracking refs say it is, and those refs can be stale. Proceeding on that basis."
+    return 0
+  fi
+
+  if ! env_flag_is_true "$ALLOW_UNPUBLISHED_DEPLOY_COMMIT"; then
+    echo "Deploy commit ${RESOLVED_REF} exists on no remote branch of ${SOURCE_REPO} that the remote still has." >&2
+    echo "Production would then be running code that only this disk holds: it could not be rebuilt from the repository, reviewed, or reasoned about by the next release." >&2
+    echo "Push the commit, or set ALLOW_UNPUBLISHED_DEPLOY_COMMIT=1 together with a non-empty UNPUBLISHED_DEPLOY_COMMIT_REASON explaining why." >&2
+    return 1
+  fi
+
+  if [ -z "$UNPUBLISHED_DEPLOY_COMMIT_REASON" ]; then
+    echo "ALLOW_UNPUBLISHED_DEPLOY_COMMIT is set, but UNPUBLISHED_DEPLOY_COMMIT_REASON is empty." >&2
+    echo "Deploying a commit no remote holds is a decision that has to be recorded. Set UNPUBLISHED_DEPLOY_COMMIT_REASON to the reason." >&2
+    return 1
+  fi
+
+  warn "DEPLOYING AN UNPUBLISHED COMMIT. ${RESOLVED_REF} exists on no remote branch."
+  warn "Reason given: ${UNPUBLISHED_DEPLOY_COMMIT_REASON}"
+  warn "Push this commit as soon as the reason no longer holds, or the next release's preconditions are computed against a commit nobody else has."
+}
+
+# A release tag, spelled once for this script: a strict `vX.Y.Z`, the same
+# pattern as RELEASE_TAG in scripts/release/release-version.mjs (which
+# cut-release.mjs re-exports as parseReleaseTag), so the tool that cuts a
+# release and the deploy that demands one cannot disagree about what a release
+# is. `deploy-release-tag-guard-script-contract.test.ts` runs both over the
+# same names. Bash's `=~` anchors to the whole string, never to a line.
+is_release_tag_name() {
+  [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+}
+
+# Production runs a published release, not whatever `main` was that day (#4978).
+#
+# #4465 wrote "every production deploy runs a tagged release" into the guides
+# and built `release:cut`, but nothing here enforced it, and months of `main`
+# could reach production with no release to name, report against or roll back
+# to. So the deploy itself refuses a commit that no release tag points at, with
+# the same flag-plus-written-reason override as the published-commit check
+# above.
+#
+# A release tag here means exactly what `release:cut publish` creates: an
+# ANNOTATED tag named like `v0.13.2`, as origin has it. Three things follow:
+#
+# - The answer comes from `git ls-remote --tags origin`, never from this clone's
+#   own tags, so a tag made on the deploy host and never pushed does not count.
+# - Only an annotated tag has a peeled `refs/tags/<name>^{}` line, and that line
+#   carries the COMMIT the tag points at (the unpeeled line carries the tag
+#   object's own id). Matching the peeled line against RESOLVED_REF therefore
+#   refuses a lightweight tag and a tag on a different commit in one test.
+# - The existing fetch (`--prune origin main`) is left alone: widening it to
+#   tags would change the stale-ref behaviour described above.
+#
+# An unreachable origin REFUSES, unlike the published-commit check, which
+# downgrades to a warning. That check can fall back on remote-tracking refs a
+# fetch once wrote; this one has no trustworthy local answer, because a local
+# tag is exactly what it exists to distrust. During an outage the override with
+# a reason gets the deploy through, and the reason is on record.
+validate_deploy_commit_is_release_tag() {
+  local remote_tags
+  local object_id
+  local ref
+  local tag_name
+  local release_tags=""
+  local refusal
+
+  local ls_remote_status=0
+  local ls_remote_error_file
+  local ls_remote_error
+
+  # git's stderr goes to its own file, so stdout stays pure ls-remote output
+  # and a failure can still show git's own reason (no such remote, an
+  # authentication failure, a network outage).
+  ls_remote_error_file="$(mktemp)"
+  remote_tags="$(git -C "$SOURCE_REPO" ls-remote --tags origin 'refs/tags/v*' 2>"$ls_remote_error_file")" \
+    || ls_remote_status=$?
+  ls_remote_error="$(cat "$ls_remote_error_file")"
+  rm -f "$ls_remote_error_file"
+
+  if [ "$ls_remote_status" -eq 0 ]; then
+    while IFS=$'\t' read -r object_id ref; do
+      case "$ref" in
+        'refs/tags/'*'^{}') ;;
+        *) continue ;;
+      esac
+      [ "$object_id" = "$RESOLVED_REF" ] || continue
+      tag_name="${ref#refs/tags/}"
+      tag_name="${tag_name%'^{}'}"
+      is_release_tag_name "$tag_name" || continue
+      release_tags="${release_tags:+${release_tags}, }${tag_name}"
+    done <<EOF
+$remote_tags
+EOF
+
+    if [ -n "$release_tags" ]; then
+      info "Deploy commit ${RESOLVED_REF} is release ${release_tags}, confirmed against origin."
+      return 0
+    fi
+    refusal="Deploy commit ${RESOLVED_REF} is not a release: no annotated vX.Y.Z tag on origin points at it."
+  else
+    refusal="Could not reach origin to confirm that deploy commit ${RESOLVED_REF} is a release, and a tag on this host alone does not count. git said: ${ls_remote_error//$'\n'/ }"
+  fi
+
+  if ! env_flag_is_true "$ALLOW_UNTAGGED_DEPLOY_COMMIT"; then
+    echo "$refusal" >&2
+    echo "Production runs published releases, so a club can say which version it is on and roll back to the one before." >&2
+    echo "Deploy a release (git fetch origin tag vX.Y.Z, then DEPLOY_REF=vX.Y.Z), or set ALLOW_UNTAGGED_DEPLOY_COMMIT=1 together with a non-empty UNTAGGED_DEPLOY_COMMIT_REASON explaining why." >&2
+    return 1
+  fi
+
+  if [ -z "$UNTAGGED_DEPLOY_COMMIT_REASON" ]; then
+    echo "$refusal" >&2
+    echo "ALLOW_UNTAGGED_DEPLOY_COMMIT is set, but UNTAGGED_DEPLOY_COMMIT_REASON is empty." >&2
+    echo "Deploying a commit that is not a release is a decision that has to be recorded. Set UNTAGGED_DEPLOY_COMMIT_REASON to the reason." >&2
+    return 1
+  fi
+
+  warn "DEPLOYING A COMMIT THAT IS NOT A RELEASE. ${refusal}"
+  warn "Reason given: ${UNTAGGED_DEPLOY_COMMIT_REASON}"
+  warn "Cut and deploy a release as soon as the reason no longer holds (pnpm run release:cut, DEPLOYMENT.md)."
+}
+
+# Where each image repository came from: the shell environment, the source
+# repository's .env, or the upstream default. A fork publishes its images under
+# its own owner, so a fork operator sets these once — and `.env` is where every
+# other deployment value already lives, so it is honoured here too. The deploy
+# says which source won, because a default silently pointing at the upstream
+# registry is exactly how a fork's deploy fails at step 9 with "not found".
+resolve_image_repository() {
+  local key="$1"
+  local env_value="$2"
+  local upstream_default="$3"
+  local file_value
+
+  # The value goes to stdout for the caller's substitution; the provenance
+  # note goes to stderr so it reaches the operator rather than the variable.
+  if [ -n "$env_value" ]; then
+    printf '%s\n' "$env_value"
+    info "$key: from the shell environment" >&2
+    return 0
+  fi
+  # Compose's own grammar (`compose_env_file_value`, file level): quotes
+  # removed, `export KEY=` honoured, the LAST duplicate wins. Step 2 of either
+  # wrapper mode has already refused a source repository without a .env.
+  file_value="$(compose_env_file_value "$key" "$SOURCE_REPO/.env")"
+  if [ -n "$file_value" ]; then
+    printf '%s\n' "$file_value"
+    info "$key: from $SOURCE_REPO/.env" >&2
+    return 0
+  fi
+  printf '%s\n' "$upstream_default"
+  info "$key: not set in the environment or .env; using the upstream default" >&2
+}
+
+resolve_image_refs() {
+  if [ -z "$APP_IMAGE" ] && [ -z "$MIGRATE_IMAGE" ]; then
+    GHCR_APP_IMAGE_REPOSITORY="$(resolve_image_repository GHCR_APP_IMAGE_REPOSITORY "$GHCR_APP_IMAGE_REPOSITORY" "$UPSTREAM_GHCR_APP_IMAGE_REPOSITORY")"
+    GHCR_MIGRATE_IMAGE_REPOSITORY="$(resolve_image_repository GHCR_MIGRATE_IMAGE_REPOSITORY "$GHCR_MIGRATE_IMAGE_REPOSITORY" "$UPSTREAM_GHCR_MIGRATE_IMAGE_REPOSITORY")"
+    APP_IMAGE="${GHCR_APP_IMAGE_REPOSITORY}:${RESOLVED_REF}"
+    MIGRATE_IMAGE="${GHCR_MIGRATE_IMAGE_REPOSITORY}:${RESOLVED_REF}"
+  elif [ -z "$APP_IMAGE" ] || [ -z "$MIGRATE_IMAGE" ]; then
+    echo "APP_IMAGE and MIGRATE_IMAGE must both be set when overriding deployment images." >&2
+    return 1
+  fi
+
+  info "App image: $APP_IMAGE"
+  info "Migration image: $MIGRATE_IMAGE"
+}
+
+create_workspace() {
+  mkdir -p "$DEPLOY_WORKSPACE_ROOT"
+  WORKSPACE="$(mktemp -d "$DEPLOY_WORKSPACE_ROOT/${COMPOSE_PROJECT_NAME}-XXXXXX")"
+
+  info "Creating clean deploy workspace at $WORKSPACE"
+  git -C "$SOURCE_REPO" archive "$RESOLVED_REF" | tar -xf - -C "$WORKSPACE"
+
+  cp "$SOURCE_REPO/.env" "$WORKSPACE/.env"
+  chmod 600 "$WORKSPACE/.env"
+}
+
+validate_source_repo_state() {
+  local branch
+
+  branch="$(git -C "$SOURCE_REPO" rev-parse --abbrev-ref HEAD)"
+  if [ "$branch" != "main" ]; then
+    echo "Source repository must be on main before deploy. Current branch: $branch" >&2
+    return 1
+  fi
+
+  if ! source_repo_is_clean; then
+    echo "Source repository must be clean on main before deploy, including no untracked files." >&2
+    return 1
+  fi
+}
+
+get_service_container_id() {
+  local service="$1"
+
+  docker compose \
+    --project-name "$COMPOSE_PROJECT_NAME" \
+    -f "$SOURCE_REPO/docker-compose.yml" \
+    ps -q "$service" 2>/dev/null || true
+}
+
+get_live_caddy_deploy_mount_source() {
+  local caddy_cid
+  local mount_source
+
+  caddy_cid="$(get_service_container_id "$CADDY_SERVICE")"
+  if [ -z "$caddy_cid" ]; then
+    return 1
+  fi
+
+  mount_source="$(
+    docker inspect "$caddy_cid" \
+      --format "{{range .Mounts}}{{if eq .Destination \"$CADDY_DEPLOY_CONTAINER_PATH\"}}{{println .Source}}{{end}}{{end}}"
+  )"
+  mount_source="${mount_source%$'\n'}"
+  if [ -z "$mount_source" ]; then
+    return 1
+  fi
+
+  printf '%s' "$mount_source"
+}
+
+seed_active_upstream_from_live_bind_mount() {
+  local mount_source
+  local source_file
+  local destination
+
+  if ! mount_source="$(get_live_caddy_deploy_mount_source)"; then
+    return 1
+  fi
+  source_file="${mount_source}/${ACTIVE_UPSTREAM_FILE_REL##*/}"
+  destination="$WORKSPACE/$ACTIVE_UPSTREAM_FILE_REL"
+
+  if [ -f "$source_file" ]; then
+    cp "$source_file" "$destination"
+    info "Copied live active upstream file from $source_file"
+    return 0
+  fi
+
+  return 1
+}
+
+infer_active_service_from_caddy_autosave() {
+  local volume_name="${COMPOSE_PROJECT_NAME}_${CADDY_CONFIG_VOLUME_SUFFIX}"
+  local active_service
+  local caddy_image_ref
+
+  # Cheap volume check first: a host with no Caddy volume skips the compose render.
+  docker volume inspect "$volume_name" >/dev/null 2>&1 || return 1
+  caddy_image_ref="$(resolve_caddy_image_ref)" || return 1
+
+  active_service="$(
+    docker run --rm \
+      -v "${volume_name}:/config:ro" \
+      "$caddy_image_ref" \
+      sh -lc "if [ -f /config/caddy/autosave.json ]; then grep -oE 'app(_(blue|green))?:3000' /config/caddy/autosave.json | head -n1 | cut -d: -f1; fi" \
+      2>/dev/null || true
+  )"
+  active_service="${active_service%$'\n'}"
+
+  case "$active_service" in
+    "$CRON_SERVICE"|"$BLUE_SERVICE"|"$GREEN_SERVICE")
+      printf '%s' "$active_service"
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+infer_active_service_from_running_colors() {
+  local blue_cid
+  local green_cid
+  local blue_running=0
+  local green_running=0
+
+  blue_cid="$(get_service_container_id "$BLUE_SERVICE")"
+  green_cid="$(get_service_container_id "$GREEN_SERVICE")"
+
+  if [ -n "$blue_cid" ] && [ "$(docker inspect -f '{{.State.Status}}' "$blue_cid")" = "running" ]; then
+    blue_running=1
+  fi
+
+  if [ -n "$green_cid" ] && [ "$(docker inspect -f '{{.State.Status}}' "$green_cid")" = "running" ]; then
+    green_running=1
+  fi
+
+  if [ "$blue_running" = "1" ] && [ "$green_running" = "0" ]; then
+    printf '%s' "$BLUE_SERVICE"
+    return 0
+  fi
+
+  if [ "$green_running" = "1" ] && [ "$blue_running" = "0" ]; then
+    printf '%s' "$GREEN_SERVICE"
+    return 0
+  fi
+
+  return 1
+}
+
+seed_active_upstream_file() {
+  local active_service
+
+  if seed_active_upstream_from_live_bind_mount; then
+    return 0
+  fi
+
+  if active_service="$(infer_active_service_from_caddy_autosave)"; then
+    if [ "$active_service" = "$CRON_SERVICE" ]; then
+      write_active_upstream_file "$CRON_SERVICE"
+    else
+      write_active_upstream_file "$active_service" "$CRON_SERVICE"
+    fi
+    info "Reconstructed active upstream file from Caddy autosave state: $active_service"
+    return 0
+  fi
+
+  if active_service="$(infer_active_service_from_running_colors)"; then
+    write_active_upstream_file "$active_service" "$CRON_SERVICE"
+    info "Reconstructed active upstream file from running color services: $active_service"
+    return 0
+  fi
+
+  warn "Unable to infer the live upstream state. Keeping the archived default active upstream file."
+}
+
+run_deploy() {
+  info "Running low-level blue/green deploy from $WORKSPACE"
+  (
+    cd "$WORKSPACE"
+    PROJECT_DIR="$WORKSPACE" \
+    COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" \
+    APP_IMAGE="$APP_IMAGE" \
+    MIGRATE_IMAGE="$MIGRATE_IMAGE" \
+    DEPLOY_COMMIT_SHA="$RESOLVED_REF" \
+    DEPLOY_COMMIT_OBSERVED_AT="$(git -C "$SOURCE_REPO" show -s --format=%cI "$RESOLVED_REF")" \
+    ./scripts/run-production-blue-green-deploy.sh --internal-blue-green-deploy
+  )
+}
+
+sync_source_repo_to_deployed_commit() {
+  local current_ref
+
+  if ! env_flag_is_true "$SYNC_SOURCE_REPO_AFTER_DEPLOY"; then
+    info "Skipping source repository sync because SYNC_SOURCE_REPO_AFTER_DEPLOY=${SYNC_SOURCE_REPO_AFTER_DEPLOY}."
+    return 0
+  fi
+
+  validate_source_repo_state
+  current_ref="$(git -C "$SOURCE_REPO" rev-parse HEAD)"
+  if [ "$current_ref" = "$RESOLVED_REF" ]; then
+    info "Source repository is already at the deployed commit."
+    return 0
+  fi
+
+  git -C "$SOURCE_REPO" fetch --prune origin main
+  git -C "$SOURCE_REPO" merge --ff-only "$RESOLVED_REF"
+  info "Updated $SOURCE_REPO to deployed commit ${RESOLVED_REF}."
+}
+
+prune_stale_deploy_workspaces() {
+  local live_mount_source=""
+  local live_workspace=""
+  local candidate
+  local removed_any=0
+
+  if ! env_flag_is_true "$PRUNE_STALE_DEPLOY_WORKSPACES"; then
+    info "Skipping deploy workspace cleanup because PRUNE_STALE_DEPLOY_WORKSPACES=${PRUNE_STALE_DEPLOY_WORKSPACES}."
+    return 0
+  fi
+
+  if [ ! -d "$DEPLOY_WORKSPACE_ROOT" ]; then
+    return 0
+  fi
+
+  if ! live_mount_source="$(get_live_caddy_deploy_mount_source)"; then
+    warn "Unable to identify the live deploy workspace from Caddy. Preserving existing deploy workspaces."
+    return 0
+  fi
+  live_workspace="$(dirname "$(dirname "$live_mount_source")")"
+
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if [ "$candidate" = "$live_workspace" ] || [ "$candidate" = "$WORKSPACE" ]; then
+      continue
+    fi
+
+    rm -rf "$candidate"
+    info "Removed stale deploy workspace: $candidate"
+    removed_any=1
+  done < <(find "$DEPLOY_WORKSPACE_ROOT" -maxdepth 1 -mindepth 1 -type d -name "${COMPOSE_PROJECT_NAME}-*")
+
+  if [ "$removed_any" = "0" ]; then
+    info "No stale deploy workspaces to remove."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Host image build (--build-and-push-images)
+# ---------------------------------------------------------------------------
+#
+# Building the images by hand on the deploy host is a legitimate thing to do -
+# a depleted CI budget, a registry outage, a fork whose Actions are off - and
+# until now it was done with a bare `docker compose build`, which exports none
+# of the build args the CI path passes. The image then carries no release
+# identifier, so the pre-cutover warm-up gate cannot confirm it warmed the
+# release being deployed and can only warn (`resolve_expected_release`), and the
+# public website's per-release CSP nonce falls back to a per-BUILD seed.
+#
+# This mode is the supported way to do it: the same build args, from the same
+# clean `git archive` workspace the deploy uses, on a commit that has already
+# passed the published-commit check above - and the identifier is read back OUT
+# of the built image BEFORE anything is pushed, because a build arg that never
+# reached the runtime stage is exactly the failure this mode exists to close and
+# it is invisible from the outside.
+
+build_application_images_from_workspace() {
+  local observed_at
+
+  # Read from the SOURCE repository, which has `.git`; the workspace is a
+  # `git archive` extraction and has none. That asymmetry is the latent break
+  # `prepare_application_images` carries, and passing the values in is the fix
+  # for both paths.
+  observed_at="$(git -C "$SOURCE_REPO" show -s --format=%cI "$RESOLVED_REF")"
+
+  info "Building $APP_IMAGE and $MIGRATE_IMAGE from $WORKSPACE."
+  (
+    cd "$WORKSPACE"
+    GIT_COMMIT_SHA="$RESOLVED_REF" \
+    KNOWLEDGE_BUNDLE_OBSERVED_AT="$observed_at" \
+    RELEASE_ID="$RESOLVED_REF" \
+    COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" \
+    APP_IMAGE="$APP_IMAGE" \
+    MIGRATE_IMAGE="$MIGRATE_IMAGE" \
+    docker compose --profile migrate build --pull app migrate
+  )
+}
+
+verify_built_image_carries_release_id() {
+  local observed
+
+  observed="$(docker run --rm --entrypoint sh "$APP_IMAGE" -lc 'printf %s "${RELEASE_ID:-}"')"
+  if [ "$observed" != "$RESOLVED_REF" ]; then
+    echo "The built app image does not carry the expected release identifier." >&2
+    echo "Expected RELEASE_ID=${RESOLVED_REF} in the image's runtime environment; read '${observed}'." >&2
+    echo "Nothing has been pushed. A RELEASE_ID that does not reach the runtime stage leaves the warm-up gate unable to confirm which release it warmed, and the public website's CSP nonce on a per-build seed." >&2
+    return 1
+  fi
+
+  info "The built app image reports RELEASE_ID=${RESOLVED_REF} from its own runtime environment."
+}
+
+push_application_images() {
+  local image_ref
+
+  for image_ref in "$APP_IMAGE" "$MIGRATE_IMAGE"; do
+    case "$image_ref" in
+      *:local)
+        echo "Refusing to push ${image_ref}: a ':local' tag is a local-build placeholder, not a release." >&2
+        return 1
+        ;;
+    esac
+  done
+
+  docker push "$APP_IMAGE"
+  docker push "$MIGRATE_IMAGE"
+  info "Pushed $APP_IMAGE and $MIGRATE_IMAGE."
+}
+
+if [ "$WRAPPER_MODE" = "build-and-push-images" ]; then
+  echo "====================================================="
+  echo "  AlpineClubBookingsNZ: Host Image Build And Push"
+  echo "====================================================="
+
+  step "1/6" "Validating host prerequisites"
+  require_command git
+  require_command docker
+  require_command tar
+  require_command mktemp
+  require_command cp
+  require_command chmod
+  require_command mkdir
+  info "Required host commands are available."
+
+  step "2/6" "Validating source repository"
+  [ -d "$SOURCE_REPO" ] || {
+    echo "Source repository not found: $SOURCE_REPO" >&2
+    return 1
+  }
+  git -C "$SOURCE_REPO" rev-parse --is-inside-work-tree >/dev/null
+  [ -f "$SOURCE_REPO/.env" ] || {
+    echo "Source repository is missing .env: $SOURCE_REPO/.env" >&2
+    return 1
+  }
+  validate_source_repo_state
+  info "Source repository contract looks valid."
+
+  step "3/6" "Resolving build commit and image references"
+  resolve_ref
+  validate_deploy_commit_is_published
+  validate_deploy_commit_is_release_tag
+  resolve_image_refs
+
+  # Said BEFORE the build, not after the push. A production host is logged
+  # into GHCR with a `read:packages` token by documented policy, which is
+  # right for a host that only pulls - and which makes the final
+  # `docker push` the first thing that fails, after a full `next build` on a
+  # small server. There is no cheap, credential-helper-agnostic way to test
+  # push access without pushing, so this states the requirement up front
+  # rather than probing for it.
+  warn "This mode pushes images. A production host is normally logged in to the registry with a read-only token; if this run ends in 'denied: permission_denied', log in with a token that has write:packages and run it again."
+
+  step "4/6" "Creating clean build workspace"
+  create_workspace
+
+  step "5/6" "Building images with the release identifier"
+  build_application_images_from_workspace
+
+  step "6/6" "Verifying the release identifier reached the image, then pushing"
+  verify_built_image_carries_release_id
+  push_application_images
+
+  # Nothing bind-mounts a build workspace, so unlike a deploy workspace it is
+  # removed on success.
+  rm -rf "$WORKSPACE"
+  WORKSPACE=""
+
+  echo
+  # Print the commit that was built, not the bare command: that would resolve
+  # origin/main, which may be a different commit whose images were never built
+  # and which the release-tag check refuses (#4978).
+  echo "Built and pushed ${RESOLVED_REF}. Deploy exactly this commit with:"
+  echo "  DEPLOY_REF=${RESOLVED_REF} ./scripts/run-production-blue-green-deploy.sh"
+  return 0
+fi
+
+echo "====================================================="
+echo "  AlpineClubBookingsNZ: Production Blue/Green Deploy Wrapper"
+echo "====================================================="
+
+step "1/8" "Validating host prerequisites"
+require_command git
+require_command docker
+require_command tar
+require_command mktemp
+require_command cp
+require_command chmod
+require_command mkdir
+require_command basename
+require_command dirname
+require_command find
+require_command rm
+info "Required host commands are available."
+
+step "2/8" "Validating source repository"
+[ -d "$SOURCE_REPO" ] || {
+  echo "Source repository not found: $SOURCE_REPO" >&2
+  exit 1
+}
+git -C "$SOURCE_REPO" rev-parse --is-inside-work-tree >/dev/null
+[ -f "$SOURCE_REPO/.env" ] || {
+  echo "Source repository is missing .env: $SOURCE_REPO/.env" >&2
+  exit 1
+}
+[ -f "$SOURCE_REPO/docker-compose.yml" ] || {
+  echo "Source repository is missing docker-compose.yml" >&2
+  exit 1
+}
+validate_source_repo_state
+info "Source repository contract looks valid."
+
+step "3/8" "Resolving deploy commit and image references"
+resolve_ref
+# Before the workspace is built, so a commit no remote holds never reaches a
+# `git archive`, an image build, or the database.
+validate_deploy_commit_is_published
+# The same ordering for the release-tag check: an untagged commit is refused,
+# unless the operator records why, before any image is resolved (#4978).
+validate_deploy_commit_is_release_tag
+resolve_image_refs
+
+step "4/8" "Creating deployment workspace"
+create_workspace
+
+step "5/8" "Preserving live Caddy upstream state"
+seed_active_upstream_file
+
+step "6/8" "Executing blue/green deploy"
+run_deploy
+
+step "7/8" "Syncing source repository to the deployed commit"
+sync_source_repo_to_deployed_commit
+
+step "8/8" "Cleaning stale deploy workspaces"
+prune_stale_deploy_workspaces
+
+echo
+echo "Deploy workspace: $WORKSPACE"
+echo "This workspace remains in place because the live Caddy container bind-mounts it."
+}
+
+run_internal_blue_green_deploy() {
+DEFAULT_PROJECT_DIR="$HOME/AlpineClubBookingsNZ"
+if [[ ! -d "$DEFAULT_PROJECT_DIR" && -d "$HOME/AlpineClubBookingsNZ" ]]; then
+  DEFAULT_PROJECT_DIR="$HOME/AlpineClubBookingsNZ"
+fi
+PROJECT_DIR="${PROJECT_DIR:-$DEFAULT_PROJECT_DIR}"
+HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-180}"
+# How long each in-container read verify_internal_health makes -- readiness, then
+# /api/deploy/runtime-status -- keeps retrying a container that is not yet
+# answering 200, at steps 14 and 15, before the cutover (#3965). Step 17, after
+# the switch, always makes a single attempt. See poll_service_endpoint. Checked
+# at step 3 against the range below, which the give-up message also quotes, so
+# the two cannot disagree (INV-SSOT). Read from the deploy shell only.
+DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS="${DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS:-60}"
+DEPLOY_INTERNAL_READ_TIMEOUT_MIN_SECONDS=0
+DEPLOY_INTERNAL_READ_TIMEOUT_MAX_SECONDS=600
+# The pause between attempts in every poll loop here: wait_for_health,
+# wait_for_url, verify_cron_registration and poll_service_endpoint. One value,
+# so the loops cannot drift apart (#3965, INV-SSOT).
+DEPLOY_POLL_INTERVAL_SECONDS=2
+PRUNE_UNTIL="${PRUNE_UNTIL:-12h}"
+FORCE_NO_CACHE="${FORCE_NO_CACHE:-0}"
+SKIP_APP_IMAGE_BUILD="${SKIP_APP_IMAGE_BUILD:-0}"
+APP_IMAGE="${APP_IMAGE:-}"
+MIGRATE_IMAGE="${MIGRATE_IMAGE:-}"
+BLUE_GREEN_DRAIN_SECONDS="${BLUE_GREEN_DRAIN_SECONDS:-30}"
+ALLOW_BREAKING_BLUE_GREEN_MIGRATIONS="${ALLOW_BREAKING_BLUE_GREEN_MIGRATIONS:-0}"
+BLUE_GREEN_MIGRATION_OVERRIDE_REASON="${BLUE_GREEN_MIGRATION_OVERRIDE_REASON:-}"
+BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED="${BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED:-0}"
+# KEPT IN THIS SHELL, TAKEN OUT OF EVERY CHILD'S ENVIRONMENT (#4027). The value
+# above is the operator's acknowledgement, for THIS deploy's migration validator,
+# that the old app and every worker are stopped; the validator is handed it
+# explicitly in validate_pending_migrations_blue_green_safe. Since #3964
+# docker-compose.yml also passes the SAME NAME to every app container, where it
+# means something else: the app's lasting acknowledgement that no pre-#3413
+# runtime remains, which opens the pending-school-adult gate. Compose prefers a
+# shell value over .env, so left exported, a windowed deploy's shell `1` reached
+# the new colour and the cron leader and could open that gate with nobody
+# deciding to (with PENDING_SCHOOL_ADULTS_ENABLED=1 already in .env, as the
+# runbook once said to set it).
+#
+# NOT refused on disagreement, as APP_ENVIRONMENT_ROLE and
+# PENDING_SCHOOL_ADULTS_ENABLED are (step 3): the shell and
+# .env copies legitimately differ on every windowed deploy that is not #3413's
+# activation (shell 1 for the window, .env empty), so a refusal would block the
+# very deploys the shell value exists for. Instead it stops being exported, and
+# every `docker compose` this script runs reads the containers' copy from .env
+# alone. `export -n` rather than `unset`, because this shell still needs it.
+export -n BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED
+MIGRATION_SAFETY_LEDGER="${MIGRATION_SAFETY_LEDGER:-docs/BLUE_GREEN_MIGRATION_SAFETY.tsv}"
+
+# The deploy guard's lock timeout (#3377). NO VALUE is declared here, and after
+# the review of the first version no FILE is parsed for one either: the script
+# asks Compose what the migrate service will actually receive. The floor below
+# is a typo guard, and the ceiling is derived from the web slots' own
+# `pool_timeout` at check time. The checks live in
+# `validate_migration_lock_timeout_contract`.
+#
+# The floor is NOT the measured minimum: the repository's whole migration
+# history, replayed against an empty PostgreSQL with `log_lock_waits` on, logged
+# no lock wait over about a millisecond. It is here to catch a value typed with
+# a digit missing, which would turn the guard into a deploy that always fails.
+MIGRATION_LOCK_TIMEOUT_MIN_MS=100
+# Named in the refusal so an operator is handed the wiring to restore rather
+# than a description of it. It is what docker-compose.yml ships; an overlay may
+# legitimately supply the same bound differently, which is why the check reads
+# the RESOLVED value and this string is only ever advice.
+MIGRATION_LOCK_TIMEOUT_OPTION_HINT='options=-c%20lock_timeout%3D${MIGRATION_LOCK_TIMEOUT_MS:-<ms>}'
+MIGRATION_LOCK_TIMEOUT_MS_EFFECTIVE=""
+
+# Pre-cutover warm-up gate (#2566). The defaults are the owner's: bounded
+# concurrency of three, and a tolerance of at most ONE failed non-critical CMS page
+# AND at most 10% of those discovered — both conditions, so a club with fewer than
+# ten published pages tolerates none. Widening either is allowed and logged; it is
+# never silent. DEPLOY_WARMUP_SERVICES defaults to the target colour plus the cron
+# leader (see `warmup_services`).
+DEPLOY_WARMUP_ENABLED="${DEPLOY_WARMUP_ENABLED:-1}"
+DEPLOY_WARMUP_OVERRIDE_REASON="${DEPLOY_WARMUP_OVERRIDE_REASON:-}"
+DEPLOY_WARMUP_SERVICES="${DEPLOY_WARMUP_SERVICES:-}"
+DEPLOY_WARMUP_CONCURRENCY="${DEPLOY_WARMUP_CONCURRENCY:-3}"
+DEPLOY_WARMUP_REQUEST_TIMEOUT_SECONDS="${DEPLOY_WARMUP_REQUEST_TIMEOUT_SECONDS:-20}"
+DEPLOY_WARMUP_TOTAL_TIMEOUT_SECONDS="${DEPLOY_WARMUP_TOTAL_TIMEOUT_SECONDS:-240}"
+DEPLOY_WARMUP_MAX_FAILED_CMS_ROUTES="${DEPLOY_WARMUP_MAX_FAILED_CMS_ROUTES:-1}"
+DEPLOY_WARMUP_MAX_FAILED_CMS_PERCENT="${DEPLOY_WARMUP_MAX_FAILED_CMS_PERCENT:-10}"
+DEPLOY_WARMUP_PATH="/api/deploy/warmup"
+DEPLOY_WARMUP_VERDICT_SENTINEL="WARMUP-GATE-VERDICT"
+
+POSTGRES_SERVICE="postgres"
+CRON_SERVICE="app"
+CADDY_SERVICE="caddy"
+MIGRATE_SERVICE="migrate"
+BLUE_SERVICE="app_blue"
+GREEN_SERVICE="app_green"
+ACTIVE_UPSTREAM_FILE_REL="deploy/caddy/tacbookings-active.caddy"
+READINESS_PATH="/api/health/ready"
+DEPLOY_RUNTIME_STATUS_PATH="/api/deploy/runtime-status"
+# What every container running app code must SAY IT PARSED out of
+# APP_ENVIRONMENT_ROLE (ENV-SAFETY 1 #3034, epic #2986; INV-CONFIG-003).
+#
+# THE DECLARATION KIND AND NOT THE EFFECTIVE ROLE, and the difference is the
+# reason this is safe to assert at all: a correctly declared production
+# installation whose administrator has switched the safer override on legitimately
+# RESOLVES non-production, so asserting the resolved role would refuse a
+# legitimate release. The declaration is the half a deployment owns.
+#
+# It is asserted from the CONTAINER's own self-report rather than from .env,
+# because those are different questions. The step-3 preflight validates the FILE;
+# the containers receive whatever Compose RESOLVED, and Compose prefers a value
+# exported in the invoking shell over the env file and takes the LAST duplicate
+# line rather than the first. The preflight refuses those shapes it can see, but a
+# gate that is only right while it models Compose's precedence and dotenv grammar
+# correctly is one Compose release away from being wrong — so the value is re-read
+# from the process that actually got it, at step 14, with the old colour still
+# serving and nothing switched.
+#
+# And it is read by ASKING THE APPLICATION (/api/deploy/runtime-status), not by
+# parsing the container's environment in shell. A second parser is a second thing
+# to drift; see get_service_runtime_payload for the review that measured exactly
+# that.
+EXPECTED_ENVIRONMENT_ROLE_DECLARATION="production"
+# Set by `require_environment_role_env_key` once it has validated the .env.
+VALIDATED_ENVIRONMENT_ROLE=""
+
+SHADOW_DATABASE_NAME="tacbookings_shadow_validate_$$"
+SHADOW_DATABASE_CREATED=0
+ACTIVE_SERVICE=""
+TARGET_SERVICE=""
+SWITCHED_TRAFFIC=0
+EXTERNAL_HEALTH_VERIFIED=0
+
+# Where a deploy that died after migrating leaves its record, and the state that
+# record is written from. See `write_deploy_failure_record`.
+DEPLOY_FAILURE_RECORD_DIR="${DEPLOY_FAILURE_RECORD_DIR:-$HOME/tacbookings-deploy-failures}"
+MIGRATE_STEP_REACHED=0
+PENDING_MIGRATION_NAMES=""
+CURRENT_DEPLOY_STEP="before the first step"
+
+step() {
+  # The step label is recorded as well as printed, so a failure record can name
+  # the step the deploy died on without twenty separate assignments to keep in
+  # sync with twenty step lines.
+  CURRENT_DEPLOY_STEP="$1 $2"
+  printf "\n[%s] %s\n" "$1" "$2"
+}
+
+info() {
+  printf "  %s\n" "$1"
+}
+
+warn() {
+  printf "  WARNING: %s\n" "$1"
+}
+
+print_failure_context() {
+  if [ -d "$PROJECT_DIR" ]; then
+    cd "$PROJECT_DIR" || return 0
+    docker compose ps || true
+    echo
+    if [ -n "$TARGET_SERVICE" ]; then
+      docker compose logs "$TARGET_SERVICE" --tail 120 || true
+      echo
+    fi
+    docker compose logs "$CRON_SERVICE" --tail 120 || true
+    echo
+    docker compose logs "$CADDY_SERVICE" --tail 60 || true
+    echo
+    docker compose logs "$POSTGRES_SERVICE" --tail 60 || true
+  fi
+}
+
+rollback_traffic_if_needed() {
+  if [ "$SWITCHED_TRAFFIC" != "1" ] || [ "$EXTERNAL_HEALTH_VERIFIED" = "1" ] || [ -z "$ACTIVE_SERVICE" ]; then
+    return 0
+  fi
+
+  if [ ! -f "$PROJECT_DIR/$ACTIVE_UPSTREAM_FILE_REL" ]; then
+    return 0
+  fi
+
+  cd "$PROJECT_DIR" || return 0
+  warn "Restoring Caddy upstream to ${ACTIVE_SERVICE} after deployment failure."
+  write_active_upstream_file "$ACTIVE_SERVICE" "$CRON_SERVICE"
+  reload_caddy >/dev/null 2>&1 || true
+}
+
+# A deploy that dies from the migrate step onward leaves a record on disk.
+#
+# From step 13 the database may no longer match either release, and the only
+# account of what happened is the operator's terminal - which is not a record.
+# There is no log file (the wrapper runs the engine with no `tee`), and the next
+# person to look is doing it at 2am, possibly not the same person.
+#
+# TWO THINGS ABOUT THIS ARE LOAD-BEARING, and both were review findings rather
+# than design:
+#
+# It selects on `started_at`, NEVER on `finished_at`. A migration that fails
+# part-way through leaves its row with a `started_at` and a NULL `finished_at`.
+# A `finished_at` filter therefore reports "nothing applied" in precisely the
+# case where the schema most likely DID move, which is the one case the record
+# exists for.
+#
+# And "the database could not be reached" is its own state, never folded into
+# "nothing started". Collapsing them writes a reassuring artefact in the worst
+# case there is - a database that is down, or unreachable, after a migration was
+# attempted against it.
+write_deploy_failure_record() {
+  local record_path
+  local migration_state
+  local started_output
+  local traffic_state
+  local release_attempted
+
+  if [ "$MIGRATE_STEP_REACHED" != "1" ]; then
+    return 0
+  fi
+
+  release_attempted="$(resolve_expected_release 2>/dev/null || true)"
+  release_attempted="${release_attempted:-unidentifiable}"
+
+  if started_output="$(query_started_migrations 2>/dev/null)"; then
+    if [ -z "$(trim_whitespace "$started_output")" ]; then
+      migration_state="NONE STARTED. No migration pending at the start of this deploy has a started_at row, so the schema is very likely untouched."
+    else
+      migration_state="$(printf 'STARTED (a row with a NULL finished_at means that migration did NOT complete):\n%s' "$started_output")"
+    fi
+  else
+    migration_state="UNKNOWN. The database could not be reached, so whether a migration started could NOT be determined. This is not the same as nothing having happened - treat the schema as possibly changed and check it before retrying or rolling back."
+  fi
+
+  # This has to describe what `rollback_traffic_if_needed` ACTUALLY does, not
+  # what the switch flag alone suggests. It returns early once the new colour
+  # has been verified healthy from outside, so a failure at a later step leaves
+  # the new colour serving with no restore attempted - and telling an operator
+  # a restore is in progress when it is not is worse than telling them nothing.
+  if [ "$SWITCHED_TRAFFIC" = "1" ] && [ "$EXTERNAL_HEALTH_VERIFIED" = "1" ]; then
+    traffic_state="YES, AND IT STAYS THERE. Caddy is pointed at ${TARGET_SERVICE}, which was verified healthy from outside, so no restore is attempted. ${TARGET_SERVICE} is serving."
+  elif [ "$SWITCHED_TRAFFIC" = "1" ]; then
+    traffic_state="YES. Caddy was pointed at ${TARGET_SERVICE}. The script attempts to restore ${ACTIVE_SERVICE}; confirm which colour is serving before doing anything else."
+  else
+    traffic_state="NO, NOT BY THE SCRIPT'S OWN ACCOUNTING. ${ACTIVE_SERVICE:-The previous colour} should still be serving - but if the deploy died between writing the upstream file and recording the switch, the file on disk may already name ${TARGET_SERVICE:-the target colour}. Read ${ACTIVE_UPSTREAM_FILE_REL} before acting."
+  fi
+
+  mkdir -p "$DEPLOY_FAILURE_RECORD_DIR" 2>/dev/null || {
+    warn "Could not create $DEPLOY_FAILURE_RECORD_DIR, so no failure record was written."
+    return 0
+  }
+  record_path="${DEPLOY_FAILURE_RECORD_DIR}/deploy-failure-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"
+
+  {
+    echo "# Blue/green deploy failed after the migrate step"
+    echo
+    echo "- Failed at (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "- Died on step: ${CURRENT_DEPLOY_STEP}"
+    echo "- Release attempted: ${release_attempted}"
+    echo "- App image: ${APP_IMAGE:-local build}"
+    echo "- Migration image: ${MIGRATE_IMAGE:-local build}"
+    echo "- Project directory: ${PROJECT_DIR}"
+    echo "- Previous colour: ${ACTIVE_SERVICE:-unknown}"
+    echo "- Target colour: ${TARGET_SERVICE:-unknown}"
+    echo "- Traffic moved: ${traffic_state}"
+    echo
+    echo "## Migrations pending when this deploy began"
+    echo
+    if [ -z "$(trim_whitespace "$PENDING_MIGRATION_NAMES")" ]; then
+      echo "None."
+    else
+      printf '%s' "$PENDING_MIGRATION_NAMES" | grep -v '^[[:space:]]*$' | sed 's/^/- /'
+    fi
+    echo
+    echo "## What the database says about them"
+    echo
+    printf '%s\n' "$migration_state"
+    echo
+    echo "## Before retrying"
+    echo
+    echo "Read docs/BLUE_GREEN_MIGRATION_POLICY.md and this release's row in"
+    echo "docs/BLUE_GREEN_MIGRATION_SAFETY.tsv. A migration that started and did not"
+    echo "finish may have left the schema between the two releases; a windowed"
+    echo "migration additionally means the previous colour cannot serve correctly."
+  } >"$record_path" 2>/dev/null || {
+    warn "Could not write the failure record to $record_path."
+    return 0
+  }
+
+  warn "Deploy failed after the migrate step. Record written to: ${record_path}"
+}
+
+# The migrations this deploy was about to apply, as the database now reports
+# them. Selected on `started_at` for the reason given above; `finished_at` is
+# reported as a VALUE so a NULL is visible rather than being a filter that hides
+# the row entirely.
+query_started_migrations() {
+  local in_list=""
+  local name
+
+  while IFS= read -r name; do
+    name="$(trim_whitespace "$name")"
+    [ -n "$name" ] || continue
+    in_list="${in_list}${in_list:+,}'${name}'"
+  done <<EOF
+$PENDING_MIGRATION_NAMES
+EOF
+
+  if [ -z "$in_list" ]; then
+    printf ''
+    return 0
+  fi
+
+  # Bounded, because this runs on the failure path BEFORE the traffic
+  # restore. A database that is hanging rather than refusing - which is a
+  # state a half-applied migration can leave it in - would otherwise hold the
+  # restore open indefinitely while the script tried to write a record about
+  # it. A timeout costs the record's migration section, which then reads
+  # UNKNOWN; the alternative costs the rollback. `timeout` is coreutils and
+  # present on any host this runs on, but it is used only when it exists,
+  # because degrading to no record beats degrading to no deploy.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 30 docker compose exec -T "$POSTGRES_SERVICE" \
+      psql -U tac -d tacbookings -Atqc \
+      "SELECT migration_name || ' | started_at=' || COALESCE(started_at::text, 'NULL') || ' | finished_at=' || COALESCE(finished_at::text, 'NULL') || ' | rolled_back_at=' || COALESCE(rolled_back_at::text, 'NULL') FROM \"_prisma_migrations\" WHERE started_at IS NOT NULL AND migration_name IN (${in_list}) ORDER BY started_at"
+    return $?
+  fi
+
+  docker compose exec -T "$POSTGRES_SERVICE" \
+    psql -U tac -d tacbookings -Atqc \
+    "SELECT migration_name || ' | started_at=' || COALESCE(started_at::text, 'NULL') || ' | finished_at=' || COALESCE(finished_at::text, 'NULL') || ' | rolled_back_at=' || COALESCE(rolled_back_at::text, 'NULL') FROM \"_prisma_migrations\" WHERE started_at IS NOT NULL AND migration_name IN (${in_list}) ORDER BY started_at"
+}
+
+fail() {
+  trap - ERR
+  # Written BEFORE the traffic restore, so the record describes the state the
+  # deploy actually failed in rather than the state the restore left behind.
+  write_deploy_failure_record || true
+  rollback_traffic_if_needed
+  printf "\nBlue/green deployment failed.\n" >&2
+  print_failure_context
+}
+
+drop_shadow_database() {
+  if [ "$SHADOW_DATABASE_CREATED" != "1" ] || [ ! -d "$PROJECT_DIR" ]; then
+    return 0
+  fi
+
+  cd "$PROJECT_DIR" || return 0
+  if [ -n "$(docker compose ps -q "$POSTGRES_SERVICE" 2>/dev/null || true)" ]; then
+    docker compose exec -T "$POSTGRES_SERVICE" \
+      psql -U tac -d postgres -v ON_ERROR_STOP=1 \
+      -c "DROP DATABASE IF EXISTS ${SHADOW_DATABASE_NAME};" >/dev/null 2>&1 || true
+  fi
+
+  SHADOW_DATABASE_CREATED=0
+}
+
+trap fail ERR
+trap 'drop_shadow_database; rm -f "${CADDY_VALIDATION_ENV_FILE:-}"' EXIT
+
+get_env_file_value() {
+  local key="$1"
+
+  awk -F= -v key="$key" '
+    /^[[:space:]]*#/ { next }
+    $1 == key {
+      value = substr($0, index($0, "=") + 1)
+      sub(/[[:space:]]+#.*$/, "", value)
+      print value
+      exit
+    }
+  ' .env
+}
+
+require_command() {
+  local command_name="$1"
+  command -v "$command_name" >/dev/null 2>&1 || {
+    echo "Missing required command: $command_name" >&2
+    return 1
+  }
+}
+
+require_env_key() {
+  local key="$1"
+  local value
+
+  value="$(trim_whitespace "$(get_env_file_value "$key")")"
+  if [ -z "$value" ]; then
+    echo "Missing required .env entry: $key" >&2
+    return 1
+  fi
+}
+
+# One `environment:` entry of one service, out of the canonical YAML that
+# `docker compose config` renders.
+#
+# ANCHORED BY STRUCTURE, NOT BY A TEXT MATCH, and that is the whole point of it.
+# The render also carries the top-level `x-app-environment` anchor, and that
+# block holds a DATABASE_URL of its own -- the WEB slots' one, which has no lock
+# timeout on it. A grep for the key finds that one too, and four services'
+# besides; picking the wrong one is precisely the failure this rewrite removes.
+#
+# Compose's output is generated rather than hand-written: no comments, no blank
+# lines inside a mapping, and two spaces per level. So the four levels below are
+# exact -- `services:` at column 0, the service name at two, its keys at four,
+# and its environment entries at six -- and a line at any other depth cannot be
+# mistaken for one of them.
+#
+# READS TO THE END (#4416): the first match is kept, but awk never exits early.
+# An early `exit` closed the pipe while `printf` was still writing a large
+# render, and under `pipefail` its SIGPIPE turned a found value into a failure.
+compose_service_environment_value() {
+  local rendered="$1"
+  local service="$2"
+  local key="$3"
+
+  compose_service_environment_entries "$rendered" "$service" | awk -v key="$key" '
+    BEGIN { prefix = key ":" }
+    !found && index($0, prefix) == 1 {
+      value = substr($0, length(prefix) + 1)
+      sub(/^[[:space:]]+/, "", value)
+      found = 1
+    }
+    END { if (found) print value }
+  '
+}
+
+# Every `environment:` entry of one service, as `KEY: value` lines exactly as
+# the render spells them (a value may still carry YAML's quotes). The structural
+# walk `compose_service_environment_value` reads one key from, and what
+# `validate_caddy_contract` hands its validation container whole (#4275).
+compose_service_environment_entries() {
+  local rendered="$1"
+  local service="$2"
+
+  printf '%s\n' "$rendered" | awk -v service="$service" '
+    /^[^[:space:]]/ {
+      in_services = ($0 == "services:"); in_service = 0; in_env = 0; next
+    }
+    in_services && /^  [^[:space:]]/ {
+      in_service = ($0 == "  " service ":"); in_env = 0; next
+    }
+    in_service && /^    [^[:space:]]/ {
+      in_env = ($0 == "    environment:"); next
+    }
+    in_env && /^      [^[:space:]]/ { print substr($0, 7) }
+  '
+}
+
+# One scalar as `docker compose config` writes it, decoded to the value the
+# container receives (#4276 review): whitespace and one layer of quotes off;
+# inside double quotes the YAML escapes `\"` and `\\`, inside single quotes
+# `''`; then the render's `$$` (Compose's escape for a literal `$`) back to `$`.
+# Other YAML escapes (`\n`, `\t`, `\uXXXX`) are left as written: none of the
+# settings this script reads is expected to hold a control character, and a
+# value left encoded is refused or compared as written, never silently widened.
+compose_render_scalar() {
+  local raw
+  local value
+
+  raw="$(trim_whitespace "$1")"
+  value="$(strip_matching_quotes "$raw")"
+  if [ "$value" != "$raw" ]; then
+    case "$raw" in
+      \"*) value="$(printf '%s' "$value" | sed -E 's/\\(["\\])/\1/g')" ;;
+      *) value="${value//\'\'/\'}" ;;
+    esac
+  fi
+  printf '%s' "${value//\$\$/\$}"
+}
+
+# One value as the service's container would receive it: read from the render
+# step 3 took (`render_resolved_compose_config`), decoded as above.
+# Compose has already applied the shell's precedence over `.env`, `.env`'s own
+# grammar and every `${VAR:-default}`, so this is the value the app parses —
+# not the file's line, which can be overridden, defaulted or quoted (#4275).
+resolved_service_env_value() {
+  local service="$1"
+  local key="$2"
+
+  compose_render_scalar "$(
+    compose_service_environment_value "$RESOLVED_COMPOSE_CONFIG" "$service" "$key"
+  )"
+}
+
+# Every item of one service's rendered `command:` list, one per line, as the
+# render spells it. Postgres takes its `-c NAME=value` settings from here.
+compose_service_command_items() {
+  local rendered="$1"
+  local service="$2"
+
+  printf '%s\n' "$rendered" | awk -v service="$service" '
+    /^[^[:space:]]/ {
+      in_services = ($0 == "services:"); in_service = 0; in_command = 0; next
+    }
+    in_services && /^  [^[:space:]]/ {
+      in_service = ($0 == "  " service ":"); in_command = 0; next
+    }
+    in_command && /^     *- / { item = $0; sub(/^ *- /, "", item); print item; next }
+    in_service && /^    [^[:space:]]/ {
+      in_command = ($0 == "    command:"); next
+    }
+  '
+}
+
+# The Compose model every step-3 check reads, rendered ONCE (#3377, #4275).
+#
+# `docker compose config` resolves the overlay list, the project `.env`, the
+# shell environment and `${VAR:-default}` interpolation exactly as every later
+# `docker compose` call in this deploy will, so a value read from it is the one
+# the container receives. The `--profile` makes the migrate service present, as
+# at step 13. The render holds secrets (DB_PASSWORD inside every DATABASE_URL);
+# it stays in this unexported variable and is never echoed.
+RESOLVED_COMPOSE_CONFIG=""
+render_resolved_compose_config() {
+  local stderr_file
+
+  stderr_file="$(mktemp)"
+  if ! RESOLVED_COMPOSE_CONFIG="$(docker compose --profile "$MIGRATE_SERVICE" config 2>"$stderr_file")"; then
+    cat "$stderr_file" >&2
+    rm -f "$stderr_file"
+    RESOLVED_COMPOSE_CONFIG=""
+    echo "Could not render the Docker Compose configuration, so the values the containers" >&2
+    echo "would receive (the migrate container's lock timeout, the email transport, Caddy's" >&2
+    echo "TLS mode, Postgres's max_connections) are unknown. Refusing to deploy rather than" >&2
+    echo "assume them (#3377, #4275)." >&2
+    return 1
+  fi
+  rm -f "$stderr_file"
+}
+
+# The lock_timeout a connection made with this URL would run under, or nothing.
+#
+# Never echo the URL this is handed, here or in any caller: it carries
+# DB_PASSWORD. Only the extracted setting is safe to put in a refusal.
+database_url_lock_timeout_setting() {
+  local url="$1"
+  local options
+
+  # The `options=` query parameter's raw value, to the next `&` or the end.
+  options="$(printf '%s' "$url" | sed -nE 's/.*[?&]options=([^&[:space:]]*).*/\1/p')"
+  if [ -z "$options" ]; then
+    return 0
+  fi
+
+  # What libpq is actually handed. `%20` and `+` are both a space inside a query
+  # value and `%3D` is the equals sign, either case of hex digit.
+  #
+  # The leading `.*` is greedy ON PURPOSE: PostgreSQL applies the LAST `-c` for
+  # a setting given twice, so the last is the one that decides the behaviour.
+  # The captured token is `[^[:space:]]+` rather than digits because
+  # `lock_timeout=5s` is legal PostgreSQL and means five SECONDS -- capturing
+  # only the digits would silently read it as five milliseconds. Handing the
+  # whole token to the integer check refuses it by name instead.
+  printf '%s' "$options" |
+    sed -e 's/+/ /g' -e 's/%20/ /g' -e 's/%3[Dd]/=/g' |
+    sed -nE 's/.*-c[[:space:]]*lock_timeout=([^[:space:]]+).*/\1/p'
+}
+
+# The ceiling the migration bound has to stay under, in milliseconds.
+#
+# THE CEILING HAS ONE HOME AND IT IS NOT THIS SCRIPT (INV-SSOT). It was a
+# hard-coded 9000 here while `MIGRATION_LOCK_TIMEOUT_CEILING_MS` in
+# src/lib/__tests__/helpers/migration-lock-timeout-config.ts derived 10000 from
+# the same underlying fact -- so the two disagreed about the rule as well as the
+# number, and raising `pool_timeout` would have moved one and not the other.
+# Both now read the one input: the web slots' own `pool_timeout`.
+#
+# Why that is the ceiling. A reader blocked behind the migration's ACCESS
+# EXCLUSIVE request holds its Prisma pool connection while it waits, so once
+# `connection_limit` requests are queued every further one is refused with
+# Prisma P2024 after `pool_timeout`. At or past that point the serving colour is
+# already failing member requests and the guard cannot fire in time to prevent
+# anything, so it would be decoration.
+#
+# The LOWER of the two colours, because whichever is serving is the one whose
+# members see the errors, and a deploy does not get to choose which that is.
+migration_lock_timeout_ceiling_ms() {
+  local rendered="$1"
+  local service
+  local url
+  local seconds
+  local lowest=""
+
+  for service in "$BLUE_SERVICE" "$GREEN_SERVICE"; do
+    url="$(compose_service_environment_value "$rendered" "$service" DATABASE_URL)"
+    seconds="$(printf '%s' "$url" | sed -nE 's/.*[?&]pool_timeout=([0-9]+).*/\1/p')"
+    if [ -z "$seconds" ]; then
+      return 1
+    fi
+    if [ -z "$lowest" ] || [ "$seconds" -lt "$lowest" ]; then
+      lowest="$seconds"
+    fi
+  done
+
+  if [ -z "$lowest" ] || [ "$lowest" -le 0 ]; then
+    return 1
+  fi
+
+  printf '%s' "$((lowest * 1000))"
+}
+
+# The deploy guard's lock timeout, refused rather than assumed (#3377).
+#
+# Eighty rows of docs/BLUE_GREEN_MIGRATION_SAFETY.tsv end their lock-impact plan
+# with "let the deploy guard stop on lock timeout". This function is what makes
+# that sentence true on the host: it refuses to deploy at all if the bound that
+# migrations will actually run under has gone missing, or if the value in force
+# would remove the guard instead of relaxing it.
+#
+# WHY IT ASKS COMPOSE INSTEAD OF READING FILES. The first version read the
+# shipped default out of docker-compose.yml with a `sed` and resolved overrides
+# with `get_env_file_value`. Every way that can be wrong turned out to be
+# reachable, and each one leaves the deploy PRINTING a bound the container never
+# receives -- which is worse than no guard, by the same argument the ledger rows
+# make about a named-but-absent mitigation:
+#
+#   - The `sed` was anchored to none of `DATABASE_URL:`, the migrate block, or a
+#     line not commented out, and took the first match. A commented-out example
+#     above the live setting was therefore preferred to it -- and the 45-line
+#     comment this rewrite replaced made that a likely edit, not a contrived one.
+#   - Compose does not read only docker-compose.yml. `COMPOSE_FILE` in the
+#     project `.env` on the deployment host names an overlay as well, and a
+#     `docker-compose.override.yml` is merged with no configuration at all.
+#     Either can take the option off the migrate service without the tracked
+#     file changing at all, and the script passes no `-f` to say otherwise.
+#   - `get_env_file_value` misses an indented line, an `export ` prefix and
+#     spaces around the `=`, and takes the FIRST duplicate where Compose takes
+#     the LAST. This repository measured all four against real Compose in #3034
+#     and fixed them for one key only; routing a safety-critical value through
+#     the reader that was left broken put `MIGRATION_LOCK_TIMEOUT_MS=0` -- the
+#     single value this exists to refuse -- back within reach.
+#
+# `docker compose config` resolves the overlay list, the project `.env`, the
+# shell environment and `${VAR:-default}` interpolation exactly as the step-13
+# `docker compose run` will. Asking it is the only way the contract "the value
+# checked here is the value the migrate container receives" is true rather than
+# aspirational, and all three failures above stop existing rather than being
+# patched one at a time.
+#
+# It still runs at step 3, before anything is pulled. The render
+# (`render_resolved_compose_config`, shared since #4275 with the email, Caddy and
+# Postgres checks) needs `docker compose` (step 2) and a `.env` carrying
+# DB_PASSWORD, which `validate_env_contract` has just required; its `--profile`
+# is what makes the migrate service present at all, exactly as at step 13.
+#
+# Two failures it exists to catch, and both are silent without it:
+#   - no lock_timeout on the connection migrations run on. Every migration then
+#     waits forever again and no deploy output says so.
+#   - MIGRATION_LOCK_TIMEOUT_MS=0. PostgreSQL reads 0 as "wait forever", not as
+#     "unset", so the most natural way to write "turn this off" is also the most
+#     dangerous, and it looks like a configured value in every log.
+validate_migration_lock_timeout_contract() {
+  local rendered="$RESOLVED_COMPOSE_CONFIG"
+  local url
+  local value
+  local ceiling_ms
+  local max_ms
+
+  # Rendered once at step 3 by `render_resolved_compose_config`, which refuses
+  # the deploy itself when Compose cannot render.
+  if [ -z "$rendered" ]; then
+    echo "No resolved Compose configuration was rendered, so the lock timeout the migrate" >&2
+    echo "container would run under is unknown. Refusing to deploy rather than assume one (#3377)." >&2
+    return 1
+  fi
+
+  url="$(compose_service_environment_value "$rendered" "$MIGRATE_SERVICE" DATABASE_URL)"
+  if [ -z "$url" ]; then
+    echo "The resolved Compose configuration has no DATABASE_URL on the '${MIGRATE_SERVICE}' service," >&2
+    echo "so nothing at all can be said about the lock timeout migrations would run under (#3377)." >&2
+    return 1
+  fi
+
+  value="$(database_url_lock_timeout_setting "$url")"
+  if [ -z "$value" ]; then
+    echo "The '${MIGRATE_SERVICE}' service's RESOLVED DATABASE_URL carries no lock_timeout." >&2
+    echo "Every migration would wait forever for a lock it cannot get, which is the outage the" >&2
+    echo "blue/green safety ledger says this deploy is protected from." >&2
+    echo "Restore '${MIGRATION_LOCK_TIMEOUT_OPTION_HINT}' on that URL. If docker-compose.yml still" >&2
+    echo "has it, check every overlay Compose is merging (COMPOSE_FILE in .env, and any" >&2
+    echo "docker-compose.override.yml): an overlay can remove it without that file changing (#3377)." >&2
+    return 1
+  fi
+
+  if ! ceiling_ms="$(migration_lock_timeout_ceiling_ms "$rendered")"; then
+    echo "Could not read a pool_timeout from both web colours in the resolved Compose" >&2
+    echo "configuration, so the ceiling the migration lock timeout has to stay under cannot be" >&2
+    echo "derived. Refusing to deploy rather than fall back to a number typed here (#3377)." >&2
+    return 1
+  fi
+  max_ms=$((ceiling_ms - 1))
+
+  require_integer_setting_in_range MIGRATION_LOCK_TIMEOUT_MS "$value" \
+    "$MIGRATION_LOCK_TIMEOUT_MIN_MS" "$max_ms" \
+    "0 means wait forever to PostgreSQL rather than unset, and at the web slots' pool_timeout (${ceiling_ms}ms) a blocked table is already refusing member requests with Prisma P2024, so the guard could not fire in time to prevent anything" \
+    || return 1
+
+  MIGRATION_LOCK_TIMEOUT_MS_EFFECTIVE="$value"
+}
+
+require_one_of_env_keys() {
+  local label="$1"
+  shift
+
+  local key
+  local value
+  for key in "$@"; do
+    value="$(trim_whitespace "$(get_env_file_value "$key")")"
+    if [ -n "$value" ]; then
+      return 0
+    fi
+  done
+
+  echo "Missing required .env entry: $label" >&2
+  return 1
+}
+
+# The one placeholder rule, for a value read from .env or from the render.
+value_looks_like_placeholder() {
+  printf '%s' "$1" | grep -Eqi '(^<.*>$|placeholder|changeme|example\.com)'
+}
+
+require_non_placeholder_env_key() {
+  local key="$1"
+  local value
+
+  require_env_key "$key"
+  value="$(trim_whitespace "$(get_env_file_value "$key")")"
+
+  if value_looks_like_placeholder "$value"; then
+    echo ".env entry appears to be a placeholder and must be replaced: $key" >&2
+    return 1
+  fi
+}
+
+# A key the app treats as OPTIONAL — absent or blank means "feature off" — but
+# which must not be left holding a placeholder if it is set at all. Until this
+# helper the preflight demanded LEGACY_DASHBOARD_EXPORT_TOKEN unconditionally,
+# while .env.example and CONFIGURATION.md both say to leave it empty to disable
+# the bridge, so a club that never ran the legacy export could not deploy.
+require_optional_non_placeholder_env_key() {
+  local key="$1"
+  local value
+
+  value="$(trim_whitespace "$(get_env_file_value "$key")")"
+  if [ -z "$value" ]; then
+    return 0
+  fi
+  if value_looks_like_placeholder "$value"; then
+    echo ".env entry appears to be a placeholder and must be replaced or left empty: $key" >&2
+    return 1
+  fi
+}
+
+# CADDY_TLS_MODE selects `deploy/caddy/tls-<mode>.caddy` from the Caddyfile's
+# global options (DEPLOYMENT.md, "Behind a TLS-terminating proxy"). Read as the
+# caddy service would receive it — docker-compose.yml defaults it to acme, and a
+# shell export beats .env — because that is what the Caddyfile's import sees.
+# Only the two snippet files exist, so anything else would stop Caddy at step 17,
+# after the migration; it is refused here instead.
+require_resolved_caddy_tls_mode() {
+  local value
+
+  value="$(resolved_service_env_value "$CADDY_SERVICE" CADDY_TLS_MODE)"
+  case "$value" in
+    acme|local) return 0 ;;
+    *)
+      echo "CADDY_TLS_MODE must be 'acme' (Caddy is the public edge) or 'local' (behind a TLS-terminating proxy); Docker Compose would hand the '${CADDY_SERVICE}' service '$(printable_deploy_value "$value")'. Set it in .env." >&2
+      return 1
+      ;;
+  esac
+}
+
+# CADDY_WWW_REDIRECT and CADDY_LEGACY_ROUTES each select an on/off pair of
+# snippets in deploy/caddy (#4981), exactly as CADDY_TLS_MODE does, so any
+# other value would stop Caddy at step 17 on a missing import; refused here,
+# read as the caddy service would receive it.
+require_resolved_caddy_switch() {
+  local key="$1"
+  local purpose="$2"
+  local value
+
+  value="$(resolved_service_env_value "$CADDY_SERVICE" "$key")"
+  case "$value" in
+    on|off) return 0 ;;
+    *)
+      echo "$key must be 'on' or 'off' ($purpose); Docker Compose would hand the '${CADDY_SERVICE}' service '$(printable_deploy_value "$value")'. Set it in .env." >&2
+      return 1
+      ;;
+  esac
+}
+
+# With CADDY_LEGACY_ROUTES=on, Caddy forwards /finance-legacy* to
+# CADDY_FINANCE_LEGACY_UPSTREAM (deploy/caddy/legacy-routes-on.caddy). It has
+# no usable default: docker-compose.yml hands Caddy the sentinel below when
+# .env does not set it, which Caddy rejects, and this check refuses the
+# sentinel, an empty value and anything that is not one host:port first.
+CADDY_FINANCE_LEGACY_UPSTREAM_UNSET="set-CADDY_FINANCE_LEGACY_UPSTREAM-for-legacy-routes:none"
+require_resolved_caddy_legacy_upstream() {
+  local mode
+  local value
+
+  mode="$(resolved_service_env_value "$CADDY_SERVICE" CADDY_LEGACY_ROUTES)"
+  [ "$mode" = "on" ] || return 0
+  value="$(resolved_service_env_value "$CADDY_SERVICE" CADDY_FINANCE_LEGACY_UPSTREAM)"
+  if [ -z "$value" ] || [ "$value" = "$CADDY_FINANCE_LEGACY_UPSTREAM_UNSET" ]; then
+    echo "CADDY_LEGACY_ROUTES=on needs CADDY_FINANCE_LEGACY_UPSTREAM: the legacy finance dashboard's host:port as Caddy reaches it (for example 10.0.0.5:8501), set in .env. It has no default. Set CADDY_LEGACY_ROUTES=off if this club runs no legacy dashboard." >&2
+    return 1
+  fi
+  # A hostname or IPv4 address and a port: no scheme, path, space, second
+  # upstream or bracketed IPv6 literal. The first three would change what the
+  # snippet's directive means; an IPv6 literal is refused (with the reason in
+  # the message) so the accepted shape stays this one narrow pattern, and a
+  # dashboard reachable only by IPv6 is given a hostname instead.
+  if ! [[ "$value" =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]]; then
+    echo "CADDY_FINANCE_LEGACY_UPSTREAM must be one host:port, a hostname or IPv4 address then a port, such as 10.0.0.5:8501 (no scheme, path or IPv6 literal; use a hostname for an IPv6-only dashboard); '$(printable_deploy_value "$value")' is not. Set it in .env." >&2
+    return 1
+  fi
+}
+
+# In local mode Caddy believes the client address a trusted proxy forwards, so
+# the proxies it trusts are an explicit setting (#4275): CADDY_TRUSTED_PROXIES,
+# the address or CIDR of the proxy in front, as the caddy service would receive
+# it. Unused in acme mode, which never imports tls-local.caddy.
+#
+# It has no usable default. docker-compose.yml hands Caddy the sentinel below
+# when .env does not set it, which Caddy rejects as an address, so a Caddy
+# recreated by hand without the setting stops instead of trusting nothing;
+# this check refuses the sentinel and an empty value first, with the reason.
+# Each entry must be a plain IP address or CIDR, never a whole address family
+# (any `/0`), and never `private_ranges`: the setting exists to name the proxy.
+CADDY_TRUSTED_PROXIES_UNSET="set-CADDY_TRUSTED_PROXIES-for-local-mode"
+require_resolved_caddy_trusted_proxies() {
+  local mode
+  local value
+  local entry
+  local -a entries=()
+
+  mode="$(resolved_service_env_value "$CADDY_SERVICE" CADDY_TLS_MODE)"
+  [ "$mode" = "local" ] || return 0
+  value="$(resolved_service_env_value "$CADDY_SERVICE" CADDY_TRUSTED_PROXIES)"
+  if [ -z "$value" ] || [ "$value" = "$CADDY_TRUSTED_PROXIES_UNSET" ]; then
+    echo "CADDY_TLS_MODE=local needs CADDY_TRUSTED_PROXIES: the address or CIDR of the proxy in front of Caddy (for example 10.0.0.2/32), set in .env. It has no default: the setting exists to name the one proxy Caddy should believe. See DEPLOYMENT.md, \"Client IPs behind the proxy\"." >&2
+    return 1
+  fi
+  read -r -a entries <<< "$value"
+  for entry in "${entries[@]}"; do
+    if [ "$entry" = "private_ranges" ]; then
+      echo "CADDY_TRUSTED_PROXIES must name the proxy in front of Caddy, not private_ranges, which trusts every private address: the setting exists to make that trust explicit. Set the proxy's address or CIDR in .env." >&2
+      return 1
+    fi
+    case "$entry" in
+      *[!0-9A-Fa-f:./]*)
+        echo "CADDY_TRUSTED_PROXIES entries must be IP addresses or CIDRs separated by spaces; '$(printable_deploy_value "$entry")' is not. Set it in .env." >&2
+        return 1
+        ;;
+    esac
+    case "$entry" in
+      */*)
+        if [ -z "$(printf '%s' "${entry##*/}" | tr -d '0')" ]; then
+          echo "CADDY_TRUSTED_PROXIES must name the proxy in front of Caddy, not every address ($(printable_deploy_value "$entry")). Set it in .env." >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
+}
+
+# NOTE: require_boolean_env_key / require_positive_integer_env_key /
+# env_key_is_true were removed with the BACKUP_ENABLED / BACKUP_RETENTION_DAYS
+# preflight (#2095) — backup config is DB-backed now and no other .env key needs
+# them. Reintroduce them if a future boolean/integer .env key appears.
+
+warn_legacy_xero_env() {
+  # Xero credentials moved to encrypted, DB-backed storage (#2079). The legacy
+  # XERO_* env vars are ignored by the app now; warn (never fail) so operators
+  # know to remove them from .env after re-entering credentials in-app.
+  local key
+  local value
+  for key in XERO_CLIENT_ID XERO_CLIENT_SECRET XERO_REDIRECT_URI XERO_ENCRYPTION_KEY XERO_WEBHOOK_KEY; do
+    value="$(trim_whitespace "$(get_env_file_value "$key")")"
+    if [ -n "$value" ]; then
+      warn "Legacy $key is set but no longer used — Xero credentials are configured in-app now (#2079). Remove it from .env."
+    fi
+  done
+}
+
+warn_legacy_stripe_env() {
+  # Stripe credentials moved to encrypted, DB-backed storage (#2082). The legacy
+  # STRIPE_* env vars (including the NEXT_PUBLIC_ publishable key, now delivered
+  # at runtime from the store) are ignored by the app now; warn (never fail) so
+  # operators know to remove them after re-entering credentials in-app.
+  local key
+  local value
+  for key in STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY; do
+    value="$(trim_whitespace "$(get_env_file_value "$key")")"
+    if [ -n "$value" ]; then
+      warn "Legacy $key is set but no longer used — Stripe credentials are configured in-app now (#2082). Remove it from .env."
+    fi
+  done
+}
+
+warn_legacy_backup_env() {
+  # Backup configuration moved to encrypted, DB-backed storage (#2095). The
+  # legacy BACKUP_ENABLED / BACKUP_S3_* / BACKUP_RETENTION_DAYS /
+  # BACKUP_RESTORE_VALIDATION_URL env vars are ignored by the app now; warn
+  # (never fail) so operators know to remove them after migrating config in-app
+  # at Admin → Backups. BACKUP_CRON_SCHEDULE is deliberately NOT listed — it is
+  # cron-leader timing and legitimately stays in the environment.
+  local key
+  local value
+  for key in BACKUP_ENABLED BACKUP_S3_BUCKET BACKUP_S3_REGION BACKUP_S3_ACCESS_KEY_ID BACKUP_S3_SECRET_ACCESS_KEY BACKUP_RETENTION_DAYS BACKUP_RESTORE_VALIDATION_URL; do
+    value="$(trim_whitespace "$(get_env_file_value "$key")")"
+    if [ -n "$value" ]; then
+      warn "Legacy $key is set but no longer used — backup configuration is managed in-app now (#2095). Remove it from .env."
+    fi
+  done
+}
+
+working_tree_is_clean() {
+  [ -z "$(git status --short --untracked-files=normal)" ]
+}
+
+extract_url_host() {
+  local url="$1"
+  printf '%s' "$url" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/:?#]+).*$#\1#'
+}
+
+require_http_url_env_key() {
+  local key="$1"
+  local value
+
+  require_non_placeholder_env_key "$key"
+  value="$(trim_whitespace "$(get_env_file_value "$key")")"
+
+  if ! printf '%s' "$value" | grep -Eq '^https?://[^[:space:]]+$'; then
+    echo ".env entry must be a valid http(s) URL: $key" >&2
+    return 1
+  fi
+}
+
+# A gate value the app compares EXACTLY must reach the containers from .env
+# alone (#4027).
+#
+#   require_exported_value_matches_env_file KEY
+#
+# The same shell-versus-.env treatment `require_environment_role_env_key` gives
+# APP_ENVIRONMENT_ROLE, for a key with no case-folding: Compose prefers a value
+# exported in the invoking shell over .env, so a stale export left in the
+# deploy's shell, a systemd unit or a rehearsal script would hand the containers
+# a value nobody wrote in .env, and the runbook's "edit .env, then re-run the
+# deploy" would not be the only way to change it. A shell value that differs
+# from what Compose would resolve from .env — including one exported while .env
+# is silent, or an empty one beside a non-empty .env value — is refused, with
+# both named. Once they agree it is unset, so .env is the only source.
+#
+# Compared byte for byte, not trimmed or case-folded, because the app reads
+# these with `=== "1"` (src/lib/pending-school-adults-gate.ts): ` 1` in the
+# shell and `1` in .env would open different gates. The .env side is read with
+# Compose's own rules (`compose_env_file_value`: every assignment shape,
+# last-wins, unquoted). An unset shell variable is not a disagreement, because
+# Compose then reads .env.
+require_exported_value_matches_env_file() {
+  local key="$1"
+  local exported
+  local in_env_file
+
+  if [ -z "${!key+x}" ]; then
+    return 0
+  fi
+  exported="${!key}"
+  in_env_file="$(compose_env_file_value "$key")" || return 1
+
+  if [ "$exported" != "$in_env_file" ]; then
+    echo "$key disagrees between this shell and .env, and Docker Compose would" >&2
+    echo "hand the containers the SHELL value. Refusing rather than deploying the" >&2
+    echo "one you did not write in .env." >&2
+    echo "  exported in this shell: '$(printable_deploy_value "$exported")'" >&2
+    echo "  in .env:                '$(printable_deploy_value "$in_env_file")'" >&2
+    echo "Run 'unset $key' in this shell (and remove it from whatever exported" >&2
+    echo "it), set the value you want in .env, then re-run. .env is the only" >&2
+    echo "supported place for it: see docs/PRODUCTION_UPGRADE_RUNBOOK.md (#3413)." >&2
+    return 1
+  fi
+
+  unset "$key"
+}
+
+# Says so when the shell's validator acknowledgement will not reach the app
+# (#4027).
+#
+# `export -n` above keeps BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED out of every
+# container, which is the fix. But an operator who exported `1` for a window and
+# has not put it in .env might expect the #3413 gate's acknowledgement to be on.
+# This prints a line, at step 3 of 20, saying the shell value is for the migration
+# validator only and the app reads .env. It runs here rather than beside the
+# `export -n` because that runs before the deploy has changed into the project
+# directory and before these readers are defined.
+#
+# INFORMATION ONLY, and the one place the .env copy is read. The value read here
+# goes into a message and nowhere else, and never into the validator's decision:
+# `old-runtimes-stopped-ack-source-contract.test.ts` allows this read only inside
+# this function.
+note_shell_stopped_ack_is_validator_only() {
+  local app_copy
+
+  if [ "$BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED" != "1" ]; then
+    return 0
+  fi
+  app_copy="$(compose_env_file_value BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED)" || return 1
+  if [ "$app_copy" = "1" ]; then
+    return 0
+  fi
+
+  info "BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED=1 is set in this shell but not in .env."
+  info "The shell value is for the migration validator only. The app reads .env alone,"
+  info "so the #3413 pending-school-adult gate and its cleanup stay off. To switch them"
+  info "on, see docs/PRODUCTION_UPGRADE_RUNBOOK.md, the #3413 section."
+}
+
+require_domain_matches_url() {
+  local key="$1"
+  local domain="$2"
+  local value
+  local host
+
+  value="$(trim_whitespace "$(get_env_file_value "$key")")"
+  host="$(extract_url_host "$value")"
+
+  if [ "$host" != "$domain" ] && [ "$host" != "www.$domain" ] && [ "www.$host" != "$domain" ]; then
+    echo "$key host must match DOMAIN. Expected $domain or www.$domain, got $host" >&2
+    return 1
+  fi
+}
+
+require_safe_database_password() {
+  local key
+  local value
+
+  # APP_DB_PASSWORD and MIGRATION_DB_PASSWORD are the optional least-privilege
+  # role passwords (#4453); docker-compose.yml interpolates them into the same
+  # DATABASE_URL values, unencoded, when they are set. `%` is refused too: an
+  # unencoded `%` is percent-decoded into a different password. The character
+  # set is the one `CONNECTION_STRING_UNSAFE_PASSWORD` in
+  # src/lib/database-roles.ts refuses; database-roles-password-charset.test.ts
+  # pins the two equal.
+  for key in DB_PASSWORD APP_DB_PASSWORD MIGRATION_DB_PASSWORD; do
+    value="$(trim_whitespace "$(get_env_file_value "$key")")"
+    if printf '%s' "$value" | grep -Eq '[@/:?#%[:space:]]'; then
+      echo "$key contains URL-unsafe characters for the DATABASE_URL values in docker-compose.yml" >&2
+      echo "Use a password without @ / : ? # % or whitespace (a hex secret: openssl rand -hex 24)." >&2
+      return 1
+    fi
+  done
+}
+
+# The same shell-versus-.env check for a value that carries a password, such as a
+# connection string (#4453 review N1). It says only THAT the two differ: the
+# generic helper above prints both values, which here would put the password in
+# the deploy log.
+require_exported_secret_matches_env_file() {
+  local key="$1"
+  local exported
+  local in_env_file
+
+  if [ -z "${!key+x}" ]; then
+    return 0
+  fi
+  exported="${!key}"
+  in_env_file="$(compose_env_file_value "$key")" || return 1
+
+  if [ "$exported" != "$in_env_file" ]; then
+    echo "$key disagrees between this shell and .env, and Docker Compose would" >&2
+    echo "hand the containers the SHELL value. Refusing rather than deploying the" >&2
+    echo "one you did not write in .env. (Neither value is shown: it holds a password.)" >&2
+    echo "Run 'unset $key' in this shell (and remove it from whatever exported" >&2
+    echo "it), set the value you want in .env, then re-run." >&2
+    return 1
+  fi
+
+  unset "$key"
+}
+
+# The least-privilege database roles (#4453) are switched on together or not at
+# all. With APP_DB_USER alone, the next migration would create its tables as the
+# superuser, invisible to the application role (and to the nightly pg_dump it
+# runs), and the audit retention job would fail every night with "permission
+# denied". MIGRATION_DB_USER alone is harmless and allowed.
+require_least_privilege_roles_complete() {
+  local key
+  local app_user
+  local migration_user
+  local retention_url
+
+  for key in APP_DB_USER MIGRATION_DB_USER; do
+    require_exported_value_matches_env_file "$key"
+  done
+  # Step 2 of the DEPLOYMENT.md roles procedure has the operator export the two
+  # role passwords; one left exported and since changed in .env would reach the
+  # containers instead of the .env value (#4453 review). Checked only when set.
+  for key in APP_DB_PASSWORD MIGRATION_DB_PASSWORD AUDIT_RETENTION_DATABASE_URL; do
+    require_exported_secret_matches_env_file "$key"
+  done
+
+  app_user="$(trim_whitespace "$(get_env_file_value APP_DB_USER)")"
+  [ -n "$app_user" ] || return 0
+  migration_user="$(trim_whitespace "$(get_env_file_value MIGRATION_DB_USER)")"
+  retention_url="$(trim_whitespace "$(get_env_file_value AUDIT_RETENTION_DATABASE_URL)")"
+  if [ -z "$migration_user" ] || [ -z "$retention_url" ]; then
+    echo "APP_DB_USER is set, so MIGRATION_DB_USER and AUDIT_RETENTION_DATABASE_URL must be set too (#4453)." >&2
+    echo "Set all three (DEPLOYMENT.md \"Least-privilege database roles\"), or unset APP_DB_USER to keep the single superuser." >&2
+    return 1
+  fi
+}
+
+# The email transport, checked against what each app service would RECEIVE
+# (#4275) — the rule `resolveEmailDeliveryConfigFromEnv` (src/lib/email-delivery.ts)
+# applies at boot. Until #4275 the preflight demanded the AWS SES keys
+# unconditionally, so a club relaying through its own SMTP provider could not
+# deploy; and a first cut read the .env file, which is not what the app sees:
+# docker-compose.yml defaults USE_AWS_SES to true, so `USE_SMTP_RELAY=true` alone
+# passed that check and then the app refused two enabled providers, and a shell
+# export could override what was checked. Reading the render takes Compose's
+# defaults, its precedence and its unquoting as given.
+#
+# Exactly one flag true; all three empty is the app's legacy AWS SES default; a
+# flag set with none true is refused. Relay and capture read the same four
+# EMAIL_SERVER_* settings; capture is refused unless the role gate above
+# validated a non-production installation, which this script never deploys, so
+# a capture mailbox stops the deploy at step 3 instead of at the health check.
+#
+# ENGINE-SECTION ONLY. Everything between the file-level readers and
+# `run_internal_blue_green_deploy` is nested inside `run_production_wrapper`,
+# which the `--internal-blue-green-deploy` re-entry never calls, so the
+# wrapper's `env_flag_is_true` does not exist in this process. The flag test is
+# therefore defined here: only `true` and `false`, case-insensitively, as the
+# app's `parseBooleanFlag` reads them — `yes` is an error there, so it is here.
+email_flag_is_true() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    true) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_email_flag_is_boolean() {
+  local service="$1" name="$2" value="$3"
+  case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+    ""|true|false) return 0 ;;
+    *)
+      echo "${name} must be true or false; Docker Compose would hand the '${service}' service '$(printable_deploy_value "$value")'" >&2
+      return 1
+      ;;
+  esac
+}
+
+# A setting the selected provider needs: present and not a placeholder, as the
+# service would receive it.
+require_resolved_service_value() {
+  local service="$1" key="$2" value
+
+  value="$(resolved_service_env_value "$service" "$key")"
+  if [ -z "$value" ]; then
+    echo "${key} is empty in what Docker Compose would hand the '${service}' service; set it in .env" >&2
+    return 1
+  fi
+  if value_looks_like_placeholder "$value"; then
+    echo "${key} appears to be a placeholder in what Docker Compose would hand the '${service}' service, and must be replaced in .env" >&2
+    return 1
+  fi
+}
+
+require_resolved_email_transport_for_service() {
+  local service="$1"
+  local use_ses use_relay use_capture enabled_count=0 key
+
+  # Trimmed after decoding, as the app's parseBooleanFlag trims: a quoted
+  # `" true "` reaches the container with its spaces.
+  use_ses="$(trim_whitespace "$(resolved_service_env_value "$service" USE_AWS_SES)")"
+  use_relay="$(trim_whitespace "$(resolved_service_env_value "$service" USE_SMTP_RELAY)")"
+  use_capture="$(trim_whitespace "$(resolved_service_env_value "$service" USE_LOCAL_CAPTURE)")"
+  require_email_flag_is_boolean "$service" USE_AWS_SES "$use_ses" || return 1
+  require_email_flag_is_boolean "$service" USE_SMTP_RELAY "$use_relay" || return 1
+  require_email_flag_is_boolean "$service" USE_LOCAL_CAPTURE "$use_capture" || return 1
+  if email_flag_is_true "$use_ses"; then enabled_count=$((enabled_count + 1)); fi
+  if email_flag_is_true "$use_relay"; then enabled_count=$((enabled_count + 1)); fi
+  if email_flag_is_true "$use_capture"; then enabled_count=$((enabled_count + 1)); fi
+
+  if [ "$enabled_count" -gt 1 ]; then
+    echo "Only one of USE_AWS_SES, USE_SMTP_RELAY and USE_LOCAL_CAPTURE may be true; Docker Compose would hand the '${service}' service USE_AWS_SES=$(printable_deploy_value "$use_ses"), USE_SMTP_RELAY=$(printable_deploy_value "$use_relay"), USE_LOCAL_CAPTURE=$(printable_deploy_value "$use_capture")" >&2
+    echo "docker-compose.yml defaults USE_AWS_SES to true, so a club on an SMTP relay sets USE_AWS_SES=false in .env as well as USE_SMTP_RELAY=true." >&2
+    return 1
+  fi
+  if [ "$enabled_count" -eq 0 ] && [ -n "${use_ses}${use_relay}${use_capture}" ]; then
+    echo "Exactly one email provider flag must be true (USE_AWS_SES, USE_SMTP_RELAY or USE_LOCAL_CAPTURE); Docker Compose would hand the '${service}' service none that is true" >&2
+    return 1
+  fi
+
+  if email_flag_is_true "$use_relay" || email_flag_is_true "$use_capture"; then
+    if email_flag_is_true "$use_capture" && [ "$VALIDATED_ENVIRONMENT_ROLE" != "non-production" ]; then
+      echo "USE_LOCAL_CAPTURE=true is refused on the club's live site (APP_ENVIRONMENT_ROLE=$(printable_deploy_value "${VALIDATED_ENVIRONMENT_ROLE:-unvalidated}")): a capture mailbox would accept every message and deliver none" >&2
+      return 1
+    fi
+    for key in EMAIL_SERVER_HOST EMAIL_SERVER_PORT EMAIL_SERVER_USER EMAIL_SERVER_PASSWORD; do
+      require_resolved_service_value "$service" "$key" || return 1
+    done
+    return 0
+  fi
+
+  # USE_AWS_SES=true, or all three empty (the app's legacy default).
+  for key in SMTP_HOST SMTP_PORT AWS_SES_ACCESS_KEY_ID AWS_SES_SECRET_ACCESS_KEY SES_SNS_TOPIC_ARN; do
+    require_resolved_service_value "$service" "$key" || return 1
+  done
+}
+
+# Every service that runs the app opens a transport: the cron leader and both
+# colours. An overlay can give one of them a different value, so each is read.
+validate_resolved_email_transport() {
+  local service
+
+  for service in "$CRON_SERVICE" "$BLUE_SERVICE" "$GREEN_SERVICE"; do
+    require_resolved_email_transport_for_service "$service" || return 1
+  done
+}
+
+# Postgres's `max_connections`, as the postgres service's command would carry it
+# (#4275). POSTGRES_MAX_CONNECTIONS is interpolated into a `-c` argument, so
+# Compose accepts any string — `abc` included — and PostgreSQL refuses it only
+# when the container is recreated at step 11, after images are pulled. A value
+# that is a number but not above the pools the resolved model can open together
+# breaks the documented budget (DEPLOYMENT.md, "Connection pool sizing": sum of
+# pools plus non-pool consumers <= max_connections), so the floor is that sum
+# plus one, derived from the render rather than restated. The ceiling is a typo
+# guard: an extra digit on 80 asks a container sized for tens of backends for
+# hundreds more. No `max_connections` in the command at all is PostgreSQL's own
+# default and is left alone.
+POSTGRES_MAX_CONNECTIONS_MAX=1000
+validate_resolved_postgres_max_connections() {
+  local item value="" found=0 service url limit pools=0 reason
+
+  while IFS= read -r item; do
+    item="$(compose_render_scalar "$item")"
+    case "$item" in
+      max_connections=*) value="${item#max_connections=}"; found=1 ;;
+    esac
+  done <<< "$(compose_service_command_items "$RESOLVED_COMPOSE_CONFIG" "$POSTGRES_SERVICE")"
+  if [ "$found" = "0" ]; then
+    return 0
+  fi
+
+  for service in "$BLUE_SERVICE" "$GREEN_SERVICE" "$CRON_SERVICE" "$MIGRATE_SERVICE"; do
+    url="$(compose_service_environment_value "$RESOLVED_COMPOSE_CONFIG" "$service" DATABASE_URL)"
+    limit="$(printf '%s' "$url" | sed -nE 's/.*[?&]connection_limit=([0-9]+).*/\1/p')"
+    # Base 10 explicitly: `connection_limit=08` is eight, not an octal error.
+    pools=$((pools + 10#${limit:-0}))
+  done
+
+  reason="the resolved pools can open ${pools} connections together (DEPLOYMENT.md, Connection pool sizing), and PostgreSQL refuses anything it cannot parse only once the postgres container is recreated; set POSTGRES_MAX_CONNECTIONS in .env"
+  if ! printf '%s' "$value" | grep -Eq '^[0-9]+$'; then
+    echo "POSTGRES_MAX_CONNECTIONS must be a whole number between $((pools + 1)) and ${POSTGRES_MAX_CONNECTIONS_MAX}: ${reason}. Got: $(printable_deploy_value "$value")" >&2
+    return 1
+  fi
+  require_integer_setting_in_range POSTGRES_MAX_CONNECTIONS "$value" \
+    "$((pools + 1))" "$POSTGRES_MAX_CONNECTIONS_MAX" "$reason" \
+    || return 1
+}
+
+validate_host_contract() {
+  require_command docker
+  require_command curl
+  require_command awk
+  require_command sed
+  require_command grep
+  require_command find
+  require_command mktemp
+
+  docker compose version >/dev/null
+  docker buildx version >/dev/null
+}
+
+validate_env_contract() {
+  local domain
+
+  if [ ! -f .env ]; then
+    echo "Deployment requires a .env file in $PROJECT_DIR" >&2
+    return 1
+  fi
+
+  require_non_placeholder_env_key DB_PASSWORD
+  require_safe_database_password
+  require_least_privilege_roles_complete
+  require_non_placeholder_env_key DOMAIN
+  require_http_url_env_key NEXTAUTH_URL
+  require_one_of_env_keys "AUTH_SECRET or NEXTAUTH_SECRET" AUTH_SECRET NEXTAUTH_SECRET
+  require_non_placeholder_env_key CRON_SECRET
+  # Is this the club's live site or a copy (ENV-SAFETY 1 #3034, epic #2986)?
+  # Refused here, in the step-3 preflight, rather than discovered after cutover —
+  # see the helper's own comment for why an undeclared upgrade must abort.
+  require_environment_role_env_key
+  # The #3413 admissions gate reads this inside the containers; it must come from
+  # .env, never from a shell export Compose would prefer (#4027). Its companion,
+  # BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED, is kept out of every child's
+  # environment where the script sets its default, for the reason given there.
+  require_exported_value_matches_env_file PENDING_SCHOOL_ADULTS_ENABLED
+  note_shell_stopped_ack_is_validator_only
+  # Stripe credentials moved to encrypted, DB-backed storage (#2082) — no longer
+  # required (or read) from .env. Legacy vars are warned about below.
+  # The email transport's provider keys and CADDY_TLS_MODE are checked after
+  # this, against the resolved Compose model (`validate_resolved_*`, #4275).
+  require_non_placeholder_env_key EMAIL_FROM
+  # Optional: blank disables the legacy export bridge (CONFIGURATION.md).
+  require_optional_non_placeholder_env_key LEGACY_DASHBOARD_EXPORT_TOKEN
+  # Backup configuration moved to the encrypted, DB-backed store in-app (#2095):
+  # BACKUP_ENABLED / BACKUP_RETENTION_DAYS / BACKUP_S3_* / BACKUP_RESTORE_VALIDATION_URL
+  # are no longer read from .env, so they are not validated here — only warned
+  # about below. BACKUP_CRON_SCHEDULE legitimately stays env-driven (cron-leader
+  # timing) and defaults to "0 3 * * *" when unset.
+
+  domain="$(trim_whitespace "$(get_env_file_value DOMAIN)")"
+  require_domain_matches_url NEXTAUTH_URL "$domain"
+
+  warn_legacy_xero_env
+  warn_legacy_stripe_env
+  warn_legacy_backup_env
+}
+
+using_prebuilt_images() {
+  [ -n "$APP_IMAGE" ] || [ -n "$MIGRATE_IMAGE" ]
+}
+
+validate_image_reference_contract() {
+  local image_ref
+
+  if ! using_prebuilt_images; then
+    return 0
+  fi
+
+  if [ -z "$APP_IMAGE" ] || [ -z "$MIGRATE_IMAGE" ]; then
+    echo "APP_IMAGE and MIGRATE_IMAGE must both be set when deploying prebuilt images." >&2
+    return 1
+  fi
+
+  for image_ref in "$APP_IMAGE" "$MIGRATE_IMAGE"; do
+    if ! printf '%s\n' "$image_ref" | grep -Eq '^[^[:space:]]+(:[^[:space:]]+|@sha256:[[:xdigit:]]{64})$'; then
+      echo "APP_IMAGE and MIGRATE_IMAGE must be tagged or digest-pinned image references without whitespace." >&2
+      return 1
+    fi
+  done
+
+  info "Using prebuilt app image: $APP_IMAGE"
+  info "Using prebuilt migration image: $MIGRATE_IMAGE"
+}
+
+validate_repo_contract() {
+  [ -f docker-compose.yml ] || {
+    echo "docker-compose.yml not found in $PROJECT_DIR" >&2
+    return 1
+  }
+
+  [ -f Dockerfile ] || {
+    echo "Dockerfile not found in $PROJECT_DIR" >&2
+    return 1
+  }
+
+  [ -f Caddyfile ] || {
+    echo "Caddyfile not found in $PROJECT_DIR" >&2
+    return 1
+  }
+
+  [ -f "$ACTIVE_UPSTREAM_FILE_REL" ] || {
+    echo "Active upstream file not found at $ACTIVE_UPSTREAM_FILE_REL" >&2
+    return 1
+  }
+
+  [ -f prisma/schema.prisma ] || {
+    echo "Prisma schema not found at prisma/schema.prisma" >&2
+    return 1
+  }
+
+  [ -d prisma/migrations ] || {
+    echo "Prisma migrations directory not found at prisma/migrations" >&2
+    return 1
+  }
+
+  [ -x scripts/validate-blue-green-migrations.sh ] || {
+    echo "Blue/green migration safety validator not found or not executable at scripts/validate-blue-green-migrations.sh" >&2
+    return 1
+  }
+
+  [ -f "$MIGRATION_SAFETY_LEDGER" ] || {
+    echo "Blue/green migration safety ledger not found at $MIGRATION_SAFETY_LEDGER" >&2
+    return 1
+  }
+}
+
+# Caddy validates the Caddyfile with the caddy service's WHOLE resolved
+# environment (#4275), not DOMAIN alone: the Caddyfile imports
+# `tls-{$CADDY_TLS_MODE:acme}.caddy` (and the CADDY_WWW_REDIRECT and
+# CADDY_LEGACY_ROUTES snippets) and reads CADDY_TRUSTED_PROXIES, MEET_HOST
+# and the rest, so validating without them checked the acme configuration on a
+# local-mode installation and left a broken local one to fail at step 17, after
+# the migration. Read from the step-3 render, so a shell export and every
+# Compose default apply here exactly as they will to the running container.
+CADDY_VALIDATION_ENV_FILE=""
+validate_caddy_contract() {
+  local caddy_image_ref
+  if ! caddy_image_ref="$(resolve_caddy_image_ref)"; then
+    echo "Unable to resolve a digest-pinned Caddy image from Compose; refusing Caddy validation" >&2
+    return 1
+  fi
+  local domain
+  local entry
+  local status=0
+
+  domain="$(resolved_service_env_value "$CADDY_SERVICE" DOMAIN)"
+  if [ -z "$domain" ]; then
+    echo "DOMAIN is empty in what Docker Compose would hand the '${CADDY_SERVICE}' service; set DOMAIN in .env" >&2
+    return 1
+  fi
+  if ! grep -Fq "$domain" Caddyfile && ! grep -Fq '{$DOMAIN}' Caddyfile; then
+    echo "DOMAIN=$domain does not appear in Caddyfile and Caddyfile does not use the {\$DOMAIN} placeholder" >&2
+    return 1
+  fi
+
+  # Through a file, not `-e` arguments a process listing would show: created
+  # mode 600 (umask in the substitution's subshell), removed on every return
+  # here and by the EXIT trap if the deploy is interrupted mid-validation.
+  CADDY_VALIDATION_ENV_FILE="$(umask 077 && mktemp)"
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    printf '%s=%s\n' "${entry%%:*}" "$(compose_render_scalar "${entry#*:}")" >> "$CADDY_VALIDATION_ENV_FILE"
+  done <<< "$(compose_service_environment_entries "$RESOLVED_COMPOSE_CONFIG" "$CADDY_SERVICE")"
+
+  if docker run --rm \
+    --env-file "$CADDY_VALIDATION_ENV_FILE" \
+    -v "$PROJECT_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" \
+    -v "$PROJECT_DIR/deploy/caddy:/etc/caddy/deploy:ro" \
+    "$caddy_image_ref" \
+    caddy validate --config /etc/caddy/Caddyfile >/dev/null; then
+    status=0
+  else
+    status=$?
+  fi
+  rm -f "$CADDY_VALIDATION_ENV_FILE"
+  CADDY_VALIDATION_ENV_FILE=""
+  return "$status"
+}
+
+wait_for_health() {
+  local service="$1"
+  local timeout="$2"
+  local cid
+  local status
+  local waited=0
+
+  cid="$(docker compose ps -q "$service")"
+  if [ -z "$cid" ]; then
+    echo "No container found for service: $service" >&2
+    return 1
+  fi
+
+  while true; do
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")"
+    if [ "$status" = "healthy" ] || [ "$status" = "running" ]; then
+      return 0
+    fi
+
+    if [ "$status" = "exited" ] || [ "$status" = "dead" ]; then
+      echo "Service $service entered state: $status" >&2
+      return 1
+    fi
+
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "Timed out waiting for $service to become healthy" >&2
+      docker compose ps "$service" >&2 || true
+      return 1
+    fi
+
+    sleep "$DEPLOY_POLL_INTERVAL_SECONDS"
+    waited=$((waited + DEPLOY_POLL_INTERVAL_SECONDS))
+  done
+}
+
+wait_for_url() {
+  local url="$1"
+  local timeout="$2"
+  local waited=0
+
+  while true; do
+    if curl -fsS "$url" >/dev/null; then
+      return 0
+    fi
+
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "Timed out waiting for URL to respond successfully: $url" >&2
+      return 1
+    fi
+
+    sleep "$DEPLOY_POLL_INTERVAL_SECONDS"
+    waited=$((waited + DEPLOY_POLL_INTERVAL_SECONDS))
+  done
+}
+
+drain_previous_connections() {
+  local drain_seconds="$1"
+
+  if ! printf '%s' "$drain_seconds" | grep -Eq '^[0-9]+$'; then
+    echo "BLUE_GREEN_DRAIN_SECONDS must be a non-negative integer" >&2
+    return 1
+  fi
+
+  if [ "$drain_seconds" -eq 0 ]; then
+    info "Skipping connection drain wait because BLUE_GREEN_DRAIN_SECONDS=0."
+    return 0
+  fi
+
+  info "Allowing ${drain_seconds}s for in-flight requests on the previous service to drain."
+  sleep "$drain_seconds"
+}
+
+maybe_pull_latest() {
+  local branch
+
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    info "Not a Git checkout. Skipping git pull."
+    return
+  fi
+
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  if [ "$branch" != "main" ]; then
+    echo "Deployment must run from main. Current branch: $branch" >&2
+    return 1
+  fi
+
+  if ! working_tree_is_clean; then
+    echo "Deployment requires a clean working tree on main, including no untracked files." >&2
+    return 1
+  fi
+
+  info "Pulling latest code from origin/main..."
+  git pull --ff-only origin main
+  info "Deploying commit $(git rev-parse --short HEAD)."
+}
+
+prepare_application_images() {
+  local cron_image_ref
+  local target_image_ref
+  local migrate_image_ref
+
+  if using_prebuilt_images; then
+    info "Pulling prebuilt application images from the registry."
+    docker compose pull "$CRON_SERVICE" "$TARGET_SERVICE" "$MIGRATE_SERVICE"
+    return 0
+  fi
+
+  if [ "$SKIP_APP_IMAGE_BUILD" = "1" ]; then
+    cron_image_ref="$(get_service_image_ref "$CRON_SERVICE")"
+    target_image_ref="$(get_service_image_ref "$TARGET_SERVICE")"
+    migrate_image_ref="$(get_service_image_ref "$MIGRATE_SERVICE")"
+    info "Skipping app image build because SKIP_APP_IMAGE_BUILD=1."
+    info "Reusing images: ${cron_image_ref}, ${target_image_ref}, ${migrate_image_ref}"
+    return 0
+  fi
+
+  # AID-3 (#2372): stamp the deployed-code knowledge bundle with the verified
+  # commit SHA + observed-at. `.git` is absent from the Docker build context, so
+  # the in-builder generator reads these from build args that compose forwards
+  # from the environment (docker-compose.yml). Exported here from the clean,
+  # ff-only main checkout this deploy is building.
+  #
+  # THE WORKSPACE HAS NO `.git`. The wrapper builds it with `git archive`, so a
+  # bare `git rev-parse HEAD` here fails and `set -e` aborts the deploy with no
+  # explanation of why. That was unreachable only for as long as the wrapper
+  # always supplied a prebuilt image; it is reachable the moment anybody sets
+  # SKIP_APP_IMAGE_BUILD=0 with no APP_IMAGE, which is the documented recovery
+  # path. So the values are taken from the caller when it passed them, from git
+  # when there really is a checkout (bootstrap and staging run this script from
+  # a working tree), and otherwise the deploy is refused with the remedy named.
+  if [ -n "${DEPLOY_COMMIT_SHA:-}" ]; then
+    GIT_COMMIT_SHA="$DEPLOY_COMMIT_SHA"
+    KNOWLEDGE_BUNDLE_OBSERVED_AT="${DEPLOY_COMMIT_OBSERVED_AT:-}"
+  elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_COMMIT_SHA="$(git rev-parse HEAD)"
+    KNOWLEDGE_BUNDLE_OBSERVED_AT="$(git show -s --format=%cI HEAD)"
+  else
+    echo "Cannot stamp the image with the deployed commit: $PROJECT_DIR is not a Git checkout." >&2
+    echo "A deploy workspace is created with 'git archive' and has no .git, so the commit cannot be read here." >&2
+    echo "Build the images on the host with './scripts/run-production-blue-green-deploy.sh --build-and-push-images' and deploy the pushed tags, or export DEPLOY_COMMIT_SHA (and DEPLOY_COMMIT_OBSERVED_AT) before running this engine." >&2
+    return 1
+  fi
+  # #2352 D1: the same commit, as the release identifier the public website's
+  # fixed CSP nonce is derived from. Baked into the image as a build arg rather
+  # than passed at runtime, so every process of this release computes the same
+  # nonce and a page one of them stored still hydrates when another serves it.
+  # The nonce is a digest of this value, so the SHA itself is never published.
+  RELEASE_ID="$GIT_COMMIT_SHA"
+  export GIT_COMMIT_SHA KNOWLEDGE_BUNDLE_OBSERVED_AT RELEASE_ID
+  info "Stamping deployed-code knowledge bundle with commit ${GIT_COMMIT_SHA:0:12}."
+
+  if [ "$FORCE_NO_CACHE" = "1" ]; then
+    docker compose build --pull --no-cache "$CRON_SERVICE" "$TARGET_SERVICE" "$MIGRATE_SERVICE"
+  else
+    docker compose build --pull "$CRON_SERVICE" "$TARGET_SERVICE" "$MIGRATE_SERVICE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Protecting the previous release's rollback images from this deploy's own prune
+# ---------------------------------------------------------------------------
+#
+# Rollback here means routing Caddy back to the previous colour (DEPLOYMENT.md
+# -> "Rollback"). That needs the previous release's IMAGES still on the host,
+# and this script's own `prune` was evicting them: step 18 removes the inactive
+# colour's container, which leaves the old image referenced by nothing, and step
+# 20 then prunes it. The deploy reported success and the rollback it documents
+# had become impossible.
+#
+# A stopped placeholder container is the hold. `prune` never removes an image a
+# container references, running or not.
+#
+# PIN THE IMAGE ID, NOT THE TAG. In local-build mode the running colour's image
+# is the mutable `<project>-app:local`, and this deploy's own build re-tags that
+# name onto the NEW image. A hold written against the tag therefore protects the
+# image being deployed, lets the real rollback image fall dangling into the
+# prune, and reports it retained - worse than no hold, because it is a hold that
+# lies. `docker inspect --format '{{.Image}}'` on the RUNNING CONTAINER answers
+# with the immutable id, which is the whole point of reading it there.
+ROLLBACK_HOLD_LABEL="nz.alpineclub.deploy.rollback-image-hold"
+ROLLBACK_HOLD_NAME_PREFIX="tacbookings-rollback-hold-"
+ROLLBACK_IMAGE_IDS=""
+
+rollback_hold_container_name() {
+  local image_id="$1"
+
+  printf '%s%s' "$ROLLBACK_HOLD_NAME_PREFIX" "${image_id#sha256:}"
+}
+
+capture_rollback_image_ids() {
+  local service
+  local container_id
+  local container_ids
+  local image_id
+
+  ROLLBACK_IMAGE_IDS=""
+  for service in "$ACTIVE_SERVICE" "$CRON_SERVICE"; do
+    [ -n "$service" ] || continue
+    # `-a`, deliberately: STOPPED containers count. The moment this guard
+    # matters most is an operator running the deploy to recover from an
+    # incident, with the site already down - and `ps -q` reports nothing then,
+    # so the previous release's image would look unreferenced and the prune
+    # would take exactly the image the rollback needs. A stopped container
+    # still names the image it was created from, which is the whole question.
+    container_ids="$(docker compose ps -a -q "$service" 2>/dev/null || true)"
+    [ -n "$container_ids" ] || continue
+    while IFS= read -r container_id; do
+      [ -n "$container_id" ] || continue
+      image_id="$(docker inspect --format '{{.Image}}' "$container_id" 2>/dev/null || true)"
+      [ -n "$image_id" ] || continue
+      case " $ROLLBACK_IMAGE_IDS " in
+        *" $image_id "*) continue ;;
+      esac
+      ROLLBACK_IMAGE_IDS="${ROLLBACK_IMAGE_IDS}${ROLLBACK_IMAGE_IDS:+ }${image_id}"
+    done <<EOF
+$container_ids
+EOF
+  done
+
+  if [ -z "$ROLLBACK_IMAGE_IDS" ]; then
+    info "No app containers exist for this project, so there is no previous release for the prune to evict."
+    return 0
+  fi
+
+  for image_id in $ROLLBACK_IMAGE_IDS; do
+    info "Rollback image to protect: ${image_id}"
+  done
+}
+
+release_stale_rollback_holds() {
+  local keep=""
+  local image_id
+  local name
+
+  # An empty capture means this deploy learned NOTHING about what needs
+  # protecting - not that nothing does. Falling through would compute an empty
+  # keep-list and remove every hold on the host, which is this guard inverted
+  # into the exact damage it exists to prevent: the last good deploy's hold
+  # destroyed, and the image pruned behind it. Release nothing instead.
+  if [ -z "$ROLLBACK_IMAGE_IDS" ]; then
+    info "No rollback image was identified, so no existing hold is released."
+    return 0
+  fi
+
+  for image_id in $ROLLBACK_IMAGE_IDS; do
+    keep="${keep} $(rollback_hold_container_name "$image_id")"
+  done
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case "${keep} " in
+      *" ${name} "*) continue ;;
+    esac
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  done < <(docker ps -a --filter "label=$ROLLBACK_HOLD_LABEL" --format '{{.Names}}' 2>/dev/null || true)
+}
+
+hold_rollback_images() {
+  local image_id
+  local holder
+
+  release_stale_rollback_holds
+
+  for image_id in $ROLLBACK_IMAGE_IDS; do
+    holder="$(rollback_hold_container_name "$image_id")"
+    if docker container inspect "$holder" >/dev/null 2>&1; then
+      continue
+    fi
+    if docker create --name "$holder" --label "$ROLLBACK_HOLD_LABEL=1" \
+      --entrypoint /bin/true "$image_id" >/dev/null 2>&1; then
+      info "Holding rollback image ${image_id} with placeholder container ${holder}."
+    else
+      warn "Unable to hold rollback image ${image_id}. A prune may remove it and make rollback to the previous release impossible."
+    fi
+  done
+}
+
+run_prune_command() {
+  local success_message="$1"
+  local failure_message="$2"
+  shift 2
+
+  if "$@" >/dev/null; then
+    info "$success_message"
+  else
+    warn "$failure_message"
+  fi
+}
+
+prune_stale_docker_assets() {
+  local phase="$1"
+
+  info "Reclaiming Docker disk space (${phase}) using resources older than $PRUNE_UNTIL."
+  run_prune_command \
+    "Cleared unused BuildKit cache older than $PRUNE_UNTIL." \
+    "Unable to clear unused BuildKit cache older than $PRUNE_UNTIL. Continuing." \
+    docker buildx prune -af --filter "until=$PRUNE_UNTIL"
+  # THREE PRUNES, NOT `docker system prune`, and the split is the guard rather
+  # than tidiness. `system prune` removes stopped containers BEFORE images and
+  # applies `until` to that pass too, so a short PRUNE_UNTIL sweeps the
+  # placeholder containers moments before the image pass they exist to guard -
+  # silently, and the deploy still reports the images retained. Split into
+  # separate passes the ORDER is ours: containers first, then the holds are
+  # (re-)created, then images. No value of PRUNE_UNTIL can reach between them.
+  run_prune_command \
+    "Pruned unused Docker containers older than $PRUNE_UNTIL." \
+    "Unable to prune unused Docker containers older than $PRUNE_UNTIL. Continuing." \
+    docker container prune -f --filter "until=$PRUNE_UNTIL"
+  hold_rollback_images
+  run_prune_command \
+    "Pruned unused Docker networks older than $PRUNE_UNTIL." \
+    "Unable to prune unused Docker networks older than $PRUNE_UNTIL. Continuing." \
+    docker network prune -f --filter "until=$PRUNE_UNTIL"
+  run_prune_command \
+    "Pruned unused Docker images older than $PRUNE_UNTIL." \
+    "Unable to prune unused Docker images older than $PRUNE_UNTIL. Continuing." \
+    docker image prune -af --filter "until=$PRUNE_UNTIL"
+}
+
+get_service_image_ref() {
+  local service="$1"
+  local rendered
+  local image_ref
+
+  # Compose owns project-name normalization, .env precedence and explicit
+  # image overrides. --images also lists dependencies, so read this service's
+  # image field from the canonical render, never the first image in that list.
+  if ! rendered="$(docker compose --profile "*" config -- "$service")"; then
+    echo "Unable to resolve image for service $service: Compose configuration failed" >&2
+    return 1
+  fi
+  image_ref="$(compose_service_image_ref "$rendered" "$service")" || return 1
+  if [ -z "$image_ref" ]; then
+    echo "Unable to resolve image for service $service: Compose returned no image" >&2
+    return 1
+  fi
+  docker image inspect "$image_ref" >/dev/null 2>&1 || {
+    echo "Unable to inspect image: $image_ref" >&2
+    return 1
+  }
+
+  printf '%s' "$image_ref"
+}
+
+validate_runtime_image_contract() {
+  local app_image_ref
+
+  app_image_ref="$(get_service_image_ref "$TARGET_SERVICE")"
+  if [ -z "$app_image_ref" ]; then
+    echo "Unable to resolve image for service: $TARGET_SERVICE" >&2
+    return 1
+  fi
+
+  docker run --rm --entrypoint sh "$app_image_ref" -lc '
+    test -f /app/server.js &&
+    test -d /app/.next/static &&
+    test -d /app/public &&
+    command -v node >/dev/null &&
+    command -v wget >/dev/null
+  ' >/dev/null
+
+  # Backups are configured in-app now (#2095), so the image must ALWAYS be
+  # backup-capable — the enabled switch and S3 destination live in the DB and can
+  # be turned on at runtime with no redeploy. Gating these checks on a (now
+  # unread) BACKUP_ENABLED env var would silently skip them once operators follow
+  # the docs and remove the var, shipping an image that cannot back up. So the
+  # pg_dump and AWS CLI presence checks are unconditional.
+  docker run --rm --entrypoint sh "$app_image_ref" -lc 'command -v pg_dump >/dev/null' >/dev/null || {
+    echo "The app image does not contain pg_dump, which the in-app backup job requires" >&2
+    return 1
+  }
+
+  docker run --rm --entrypoint sh "$app_image_ref" -lc 'command -v aws >/dev/null' >/dev/null || {
+    echo "The app image does not contain the AWS CLI, which durable (S3) backups require" >&2
+    return 1
+  }
+}
+
+verify_postgres_query() {
+  local result
+
+  result="$(docker compose exec -T "$POSTGRES_SERVICE" psql -U tac -d tacbookings -Atqc 'SELECT 1')"
+  if [ "$result" != "1" ]; then
+    echo "Postgres smoke query failed" >&2
+    return 1
+  fi
+}
+
+create_shadow_database() {
+  docker compose exec -T "$POSTGRES_SERVICE" \
+    psql -U tac -d postgres -v ON_ERROR_STOP=1 \
+    -c "DROP DATABASE IF EXISTS ${SHADOW_DATABASE_NAME};" \
+    -c "CREATE DATABASE ${SHADOW_DATABASE_NAME};" >/dev/null
+
+  SHADOW_DATABASE_CREATED=1
+}
+
+validate_prisma_schema_matches_migrations() {
+  local db_password
+  local diff_output
+  local shadow_database_url
+
+  db_password="$(trim_whitespace "$(get_env_file_value DB_PASSWORD)")"
+  create_shadow_database
+  shadow_database_url="postgresql://tac:${db_password}@postgres:5432/${SHADOW_DATABASE_NAME}"
+
+  if ! diff_output="$(
+    docker compose --profile "$MIGRATE_SERVICE" run --rm \
+      -e SHADOW_DATABASE_URL="$shadow_database_url" \
+      "$MIGRATE_SERVICE" \
+      ./node_modules/.bin/prisma migrate diff \
+      --exit-code \
+      --from-migrations prisma/migrations \
+      --to-schema prisma/schema.prisma 2>&1
+  )"; then
+    printf '%s\n' "$diff_output" >&2
+    echo "Prisma schema does not match the committed migration history." >&2
+    echo "Create and commit the missing migration before deploying." >&2
+    return 1
+  fi
+
+  drop_shadow_database
+}
+
+# After the migrate, with the least-privilege roles on (#4453): every relation in
+# schema public must be owned by the migration role and readable by the
+# application role. Anything else (a table a superuser created by hand, a
+# rollback.sql run as the operator, a migration that ran before the switch) is
+# invisible to the app and to its nightly pg_dump, so refuse before the new
+# colour starts. An extension's own relations (pg_buffercache, PostGIS) are left
+# out, as provisioning leaves them with their owner. The SQL is ONE definition:
+# `DEPLOY_GRANTS_CHECK_SQL` in src/lib/database-roles.ts, which
+# deploy-database-roles-script-contract.test.ts pins this copy equal to. A view the app could write through is refused too: a new view
+# gets the default table grants, and DML through a view runs with its owner's
+# rights, so it must be narrowed to SELECT first. So is an append-only relation
+# (`APPEND_ONLY_RELATIONS`: BookingLedgerLine, AuditLog, the member-money
+# journal, and Stripe balance-transaction evidence) the app could change beyond INSERT: UPDATE, DELETE, TRUNCATE, TRIGGER,
+# REFERENCES or a column UPDATE. The fix is a re-run of `db:provision-roles --apply`. The SQL
+# between the markers is run as shipped by database-roles.realdb.test.ts.
+verify_least_privilege_role_grants() {
+  local app_user
+  local migration_user
+  local check_sql
+  local offending
+
+  app_user="$(trim_whitespace "$(get_env_file_value APP_DB_USER)")"
+  [ -n "$app_user" ] || return 0
+  migration_user="$(trim_whitespace "$(get_env_file_value MIGRATION_DB_USER)")"
+
+  # BEGIN least-privilege-grants-check
+  check_sql="$(cat <<'SQL'
+SELECT coalesce(string_agg(c.relname, ', ' ORDER BY c.relname), '')
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p', 'v', 'm')
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_depend d
+    WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+  )
+  AND (pg_catalog.pg_get_userbyid(c.relowner) <> :'migration_role'
+       OR NOT pg_catalog.has_table_privilege(:'app_role', c.oid, 'SELECT')
+       OR (c.relkind IN ('v', 'm')
+           AND pg_catalog.has_table_privilege(:'app_role', c.oid, 'INSERT, UPDATE, DELETE'))
+       OR (c.relname IN ('BookingLedgerLine', 'AuditLog', 'MemberMoneyEvent', 'MemberMoneyJournal', 'MemberMoneyLine', 'MemberMoneyObligation', 'MemberMoneyApplication', 'MemberMoneySourceLink', 'MemberMoneySourcePosting', 'MemberMoneyRefundReservation', 'MemberMoneyRefundReservationRelease', 'MemberMoneyExportManifest', 'MemberMoneyExportCoverage', 'MemberMoneyExportCoverageRelease', 'StripeBalanceTransactionEvidence')
+           AND (pg_catalog.has_table_privilege(:'app_role', c.oid, 'UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES')
+                OR pg_catalog.has_any_column_privilege(:'app_role', c.oid, 'UPDATE'))));
+SQL
+)"
+  # END least-privilege-grants-check
+
+  if ! offending="$(
+    printf '%s\n' "$check_sql" |
+      docker compose exec -T "$POSTGRES_SERVICE" psql -U tac -d tacbookings \
+        -v ON_ERROR_STOP=1 -v migration_role="$migration_user" -v app_role="$app_user" -Atq -f -
+  )"; then
+    echo "Could not check the least-privilege role grants after the migrate (does each role exist?)." >&2
+    return 1
+  fi
+  if [ -n "$offending" ]; then
+    echo "After the migrate, these relations fail the least-privilege grants check: $offending" >&2
+    echo "Each one is not owned by $migration_user, not readable by $app_user, a view $app_user could write through, or an append-only relation (BookingLedgerLine, AuditLog, the member-money journal) $app_user could change beyond INSERT." >&2
+    echo "Re-run 'pnpm run db:provision-roles --apply' as the operator (DEPLOYMENT.md \"Least-privilege database roles\"), then deploy again." >&2
+    return 1
+  fi
+}
+
+verify_prisma_migration_status() {
+  local status_output
+
+  if ! status_output="$(
+    docker compose --profile "$MIGRATE_SERVICE" run --rm \
+      "$MIGRATE_SERVICE" \
+      ./node_modules/.bin/prisma migrate status 2>&1
+  )"; then
+    printf '%s\n' "$status_output" >&2
+    echo "Prisma migration status check failed after migrate deploy." >&2
+    return 1
+  fi
+}
+
+list_pending_migration_sql_files() {
+  local applied_migrations_file
+  local migration_table_exists
+  local migration_sql_paths
+  local migration_name
+  local migration_sql_path
+  local applied_status
+
+  if ! applied_migrations_file="$(mktemp)"; then
+    echo "INV-OPS-002: Could not prepare pending migration discovery; refusing deploy." >&2
+    return 1
+  fi
+  if ! migration_table_exists="$(
+    docker compose exec -T "$POSTGRES_SERVICE" \
+      psql -U tac -d tacbookings -Atqc \
+      "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '_prisma_migrations')" 2>/dev/null
+  )"; then
+    rm -f "$applied_migrations_file"
+    echo "INV-OPS-002: Could not read migration table existence; restore database access before retrying." >&2
+    return 1
+  fi
+
+  case "$migration_table_exists" in
+    t)
+      if ! docker compose exec -T "$POSTGRES_SERVICE" \
+        psql -U tac -d tacbookings -Atqc \
+        "SELECT migration_name FROM \"_prisma_migrations\" WHERE finished_at IS NOT NULL ORDER BY finished_at" \
+        >"$applied_migrations_file" 2>/dev/null; then
+        rm -f "$applied_migrations_file"
+        echo "INV-OPS-002: Could not read applied migrations; restore database access before retrying." >&2
+        return 1
+      fi
+      ;;
+    f) ;;
+    *)
+      rm -f "$applied_migrations_file"
+      echo "INV-OPS-002: Invalid migration table existence result; refusing unknown pending migrations." >&2
+      return 1
+      ;;
+  esac
+
+  # Capture and check the producer BEFORE parsing: process substitution hides
+  # its exit status, even when mapfile/read succeeds (#4071).
+  if ! migration_sql_paths="$(find prisma/migrations -mindepth 2 -maxdepth 2 -name migration.sql | sort)"; then
+    rm -f "$applied_migrations_file"
+    echo "INV-OPS-002: Could not enumerate migration files; repair the migration directory before retrying." >&2
+    return 1
+  fi
+  while IFS= read -r migration_sql_path; do
+    [ -n "$migration_sql_path" ] || continue
+    migration_name="${migration_sql_path%/migration.sql}"
+    migration_name="${migration_name##*/}"
+    if grep -Fxq "$migration_name" "$applied_migrations_file"; then
+      continue
+    else
+      applied_status=$?
+      if [ "$applied_status" -ne 1 ]; then
+        rm -f "$applied_migrations_file"
+        echo "INV-OPS-002: Could not compare applied migrations; refusing unknown pending migrations." >&2
+        return 1
+      fi
+    fi
+    printf '%s\n' "$migration_sql_path"
+  done <<< "$migration_sql_paths"
+
+  rm -f "$applied_migrations_file"
+}
+
+validate_pending_migrations_blue_green_safe() {
+  local pending_sql_files=()
+  local pending_sql_file
+  local pending_output
+  local windowed_report
+
+  PENDING_WINDOWED_MIGRATIONS=unknown
+  if ! pending_output="$(list_pending_migration_sql_files)"; then
+    echo "INV-OPS-002: Pending migration discovery failed; no app-database migration will run." >&2
+    return 1
+  fi
+  if [ -n "$pending_output" ]; then
+    mapfile -t pending_sql_files <<< "$pending_output"
+  fi
+
+  # Remembered for the failure record: the names this deploy was about to apply,
+  # captured here because after `migrate deploy` runs they are no longer pending
+  # and nothing else in the script can reconstruct the list.
+  PENDING_MIGRATION_NAMES=""
+  for pending_sql_file in "${pending_sql_files[@]+"${pending_sql_files[@]}"}"; do
+    PENDING_MIGRATION_NAMES="${PENDING_MIGRATION_NAMES}$(basename "$(dirname "$pending_sql_file")")"$'\n'
+  done
+
+  if [ "${#pending_sql_files[@]}" -eq 0 ]; then
+    PENDING_WINDOWED_MIGRATIONS=0
+    info "No pending Prisma migrations detected."
+    return 0
+  fi
+
+  # INV-SSOT-001: only the validator classifies the pending set. The suffix
+  # preserves its final newline so extra/empty report lines cannot be trimmed
+  # into a valid answer by command substitution.
+  if ! windowed_report="$(
+    ALLOW_BREAKING_BLUE_GREEN_MIGRATIONS="$ALLOW_BREAKING_BLUE_GREEN_MIGRATIONS" \
+      BLUE_GREEN_MIGRATION_OVERRIDE_REASON="$BLUE_GREEN_MIGRATION_OVERRIDE_REASON" \
+      BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED="$BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED" \
+      MIGRATION_SAFETY_LEDGER="$MIGRATION_SAFETY_LEDGER" \
+      ./scripts/validate-blue-green-migrations.sh --report-windowed "${pending_sql_files[@]}" && printf '.'
+  )"; then
+    echo "INV-OPS-002: Pending migration safety validation failed; refusing deploy." >&2
+    return 1
+  fi
+  case "$windowed_report" in
+    $'0\n.') PENDING_WINDOWED_MIGRATIONS=0 ;;
+    $'1\n.') PENDING_WINDOWED_MIGRATIONS=1 ;;
+    *)
+      echo "INV-SSOT-001: Invalid pending-windowed report from migration validator; refusing deploy." >&2
+      return 1
+      ;;
+  esac
+}
+
+verify_windowed_migration_runtime_drained() {
+  local service
+  local container_ids
+  local container_id
+  local running
+  local client_count
+
+  case "${PENDING_WINDOWED_MIGRATIONS:-unknown}" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      echo "INV-OPS-002: Pending-windowed status is unknown; refusing app-database migration." >&2
+      return 1
+      ;;
+  esac
+  if [ "$BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED" != "1" ]; then
+    echo "INV-OPS-002: Windowed migration requires the deploy-shell BLUE_GREEN_OLD_APP_AND_WORKERS_STOPPED=1 acknowledgement after the offline window is established." >&2
+    return 1
+  fi
+
+  # Include stopped containers and every replica, not just the first or the
+  # active colour. A paused container still has State.Running=true.
+  for service in "$CRON_SERVICE" "$BLUE_SERVICE" "$GREEN_SERVICE"; do
+    if ! container_ids="$(docker compose ps --all --quiet "$service" 2>/dev/null)"; then
+      echo "INV-OPS-002: Could not enumerate ${service} containers; verify Docker access and keep the offline window before retrying." >&2
+      return 1
+    fi
+    [ -n "$container_ids" ] || continue
+    while IFS= read -r container_id; do
+      if [[ ! "$container_id" =~ ^[a-fA-F0-9]+$ ]]; then
+        echo "INV-OPS-002: Invalid container enumeration for ${service}; refusing windowed migration." >&2
+        return 1
+      fi
+      if ! running="$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null && printf '.')"; then
+        echo "INV-OPS-002: Could not inspect ${service} container state; verify all replicas are stopped before retrying." >&2
+        return 1
+      fi
+      case "$running" in
+        false.|$'false\n.') ;;
+        true.|$'true\n.')
+          echo "INV-OPS-002: ${service} has a running container. Stop every app/web replica and worker, then retry within the offline window." >&2
+          return 1
+          ;;
+        *)
+          echo "INV-OPS-002: Invalid running state for ${service}; refusing windowed migration." >&2
+          return 1
+          ;;
+      esac
+    done <<< "$container_ids"
+  done
+
+  # All users and all states, including idle admin/external clients. Only this
+  # checking session, background processes and other databases are excluded.
+  if ! client_count="$(docker compose exec -T "$POSTGRES_SERVICE" \
+    psql -U tac -d tacbookings -Atqc \
+    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND backend_type = 'client backend' AND pid <> pg_backend_pid()" 2>/dev/null && printf '.')"; then
+    echo "INV-OPS-002: Could not read app-database client count; restore database access and verify the offline window before retrying." >&2
+    return 1
+  fi
+  # Preserve output through command substitution, then remove only the suffix
+  # and one normal psql line ending. Extra lines are malformed, even if blank.
+  client_count="${client_count%.}"
+  client_count="${client_count%$'\n'}"
+  if [[ ! "$client_count" =~ ^[0-9]+$ ]]; then
+    echo "INV-OPS-002: Invalid app-database client count; refusing windowed migration." >&2
+    return 1
+  fi
+  # Avoid arithmetic conversion/overflow: only a string consisting of zeroes
+  # represents zero, however large a valid count might be.
+  if [[ ! "$client_count" =~ ^0+$ ]]; then
+    echo "INV-OPS-002: App database still has ${client_count} other client backend(s), including idle clients. Disconnect all app, worker, admin and external clients before retrying." >&2
+    return 1
+  fi
+  info "Windowed migration drain verified: all app/web containers stopped or absent; zero other app-database clients. Maintain the offline window until the new runtime is ready; these checks are snapshots."
+}
+
+assert_readiness_payload_healthy() {
+  local source="$1"
+  local payload="$2"
+
+  if ! printf '%s' "$payload" | grep -q '"status":"healthy"'; then
+    echo "$source health payload did not report healthy: $payload" >&2
+    return 1
+  fi
+
+  if ! printf '%s' "$payload" | grep -q '"db":{"status":"ok"'; then
+    echo "$source health payload did not report db ok: $payload" >&2
+    return 1
+  fi
+
+  if ! printf '%s' "$payload" | grep -q '"config":{"status":"ok"'; then
+    echo "$source readiness payload did not report config ok: $payload" >&2
+    return 1
+  fi
+}
+
+assert_runtime_identity() {
+  local source="$1"
+  local payload="$2"
+  local expected_role="$3"
+  local expected_cron_enabled="$4"
+  local expected_environment_role="${5:-}"
+
+  if [ -n "$expected_role" ] && ! printf '%s' "$payload" | grep -q "\"role\":\"${expected_role}\""; then
+    echo "$source runtime payload did not report role=${expected_role}: $payload" >&2
+    return 1
+  fi
+
+  if [ -n "$expected_cron_enabled" ] && ! printf '%s' "$payload" | grep -q "\"cronEnabled\":${expected_cron_enabled}"; then
+    echo "$source runtime payload did not report cronEnabled=${expected_cron_enabled}: $payload" >&2
+    return 1
+  fi
+
+  # The DECLARATION this container parsed for itself (ENV-SAFETY 1 #3034). Empty
+  # expectation means "not checked", the same convention the two assertions above
+  # use, so a caller that has nothing to compare against is not silently green.
+  if [ -n "$expected_environment_role" ] && ! printf '%s' "$payload" | grep -q "\"environmentRole\":\"${expected_environment_role}\""; then
+    echo "$source did not report environmentRole=${expected_environment_role}: $payload" >&2
+    echo "That is what THIS CONTAINER parsed out of APP_ENVIRONMENT_ROLE, which is" >&2
+    echo "not necessarily what .env says: Docker Compose prefers a value exported" >&2
+    echo "in the invoking shell over the env file, and takes the LAST duplicate" >&2
+    echo "line rather than the first." >&2
+    echo "A container reporting non-production would hold back every real member's" >&2
+    echo "email and, once Xero containment lands, rewrite the email addresses on" >&2
+    echo "the club's real accounting contacts. absent or invalid resolves UNKNOWN," >&2
+    echo "which holds back member email and Xero writes until it is declared." >&2
+    echo "Refusing before the cutover. Run 'unset APP_ENVIRONMENT_ROLE' in this" >&2
+    echo "shell, and check .env holds exactly one APP_ENVIRONMENT_ROLE=production." >&2
+    return 1
+  fi
+}
+
+curl_with_cron_secret_header() {
+  local url="$1"
+  local cron_secret="$2"
+
+  {
+    printf 'url = "%s"\n' "$url"
+    printf 'header = "x-cron-secret: %s"\n' "$cron_secret"
+    printf 'fail\n'
+    printf 'silent\n'
+    printf 'show-error\n'
+  } | curl --config -
+}
+
+get_expected_runtime_role() {
+  local service="$1"
+
+  case "$service" in
+    "$CRON_SERVICE")
+      echo "cron-leader"
+      ;;
+    "$BLUE_SERVICE")
+      echo "web-blue"
+      ;;
+    "$GREEN_SERVICE")
+      echo "web-green"
+      ;;
+    *)
+      echo "$service"
+      ;;
+  esac
+}
+
+get_expected_cron_enabled() {
+  local service="$1"
+
+  if [ "$service" = "$CRON_SERVICE" ]; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+get_service_runtime_payload() {
+  local service="$1"
+
+  # THE APPLICATION'S OWN ANSWER, asked of the container from inside it.
+  #
+  # THIS DELIBERATELY RE-IMPLEMENTS NOTHING. It used to parse
+  # APP_ENVIRONMENT_ROLE in shell, mirroring readEnvironmentRoleDeclaration() --
+  # and a second review lens showed why that was the wrong shape rather than
+  # merely under-tested: it built six mutants of that snippet and FIVE survived
+  # the source-text assertions guarding it, four of them making a container that
+  # declares `non-production` report `production` so the deploy proceeded. A
+  # duplicated parser pinned by greps is a parser that drifts, and pre-cutover it
+  # was the SOLE witness -- the application`s own parse was only asserted after
+  # the cutover, by verify_external_health.
+  #
+  # So the pre-cutover witness is now the same endpoint the post-cutover check
+  # uses, /api/deploy/runtime-status, whose environmentRole comes from
+  # readEnvironmentRoleDeclaration() itself. There is no second implementation
+  # left to disagree, and this class of finding cannot recur. The contract test
+  # asserts that no shell-side kind mapping comes back.
+  #
+  # THE SECRET NEVER LEAVES THE CONTAINER. CRON_SECRET is already in the app
+  # environment (docker-compose.yml), so the request is authorised from inside
+  # rather than by interpolating the secret into a `docker compose exec` argument
+  # list, where it would be readable in the host`s process table. That is the same
+  # care `verify_external_health` takes by feeding curl its header on stdin. The
+  # trailing `1` asks read_service_endpoint_once to send it.
+  #
+  # REACHABLE AT THIS POINT, but not necessarily READY (#3965). Steps 14 and 15
+  # run `up -d --force-recreate` then wait_for_health, and the container`s own
+  # healthcheck polls /api/health/ready on this exact loopback address, so the
+  # server was answering moments before this runs. The route is force-dynamic and
+  # touches no database. Even so, the 7 Oct 2026 deploy died at step 15 on this
+  # read with nothing printed, and a hand check moments later passed, so the read
+  # goes through poll_service_endpoint, which retries it for a bounded time and
+  # says why it gave up.
+  #
+  # ONE DELIBERATE BEHAVIOUR CHANGE, which is a correctness gain: cronEnabled now
+  # comes from the application`s rule (CRON_ENABLED lowercased must equal "true")
+  # rather than from a permissive shell case list that also accepted 1/yes/on. A
+  # deployment setting CRON_ENABLED=1 would have the app run NO cron while the old
+  # shell parse reported cron enabled, so the deploy would have passed a
+  # cron-leader that does nothing. Every documented value is true or false
+  # (CONFIGURATION.md, .env.staging.example), so this refuses nothing that was
+  # ever documented, and where the two differ the application is right.
+  poll_service_endpoint "$service" "$DEPLOY_RUNTIME_STATUS_PATH" 1
+}
+
+# The readiness answer, asked of the container from inside it, through the same
+# bounded retry as the runtime status (#3965). No secret: the route needs none,
+# and a secret is not sent where it is not needed.
+get_service_readiness_payload() {
+  local service="$1"
+
+  poll_service_endpoint "$service" "$READINESS_PATH" 0
+}
+
+# Seconds on the clock poll_service_endpoint measures its deadline against. A
+# function rather than a bare $SECONDS so the contract test can drive a clock
+# that advances only when it says so; in a deploy it is always bash's own.
+deploy_clock_seconds() {
+  printf '%s' "$SECONDS"
+}
+
+# What Docker says about a service's container, as one line, for a read that got
+# no HTTP answer at all. A `docker compose exec` into a container that is killed
+# or restarted mid-read exits 137 with no output, and `restart: unless-stopped`
+# brings it back seconds later, so without this line the restart is invisible
+# (#3965). `ps -a` so an exited container is still found. Never fails.
+describe_service_container_state() {
+  local service="$1"
+  local cid=""
+  local state=""
+
+  cid="$(docker compose ps -a -q "$service" 2>/dev/null | head -n 1)" || cid=""
+  if [ -z "$cid" ]; then
+    printf '%s' "no container found for ${service}"
+    return 0
+  fi
+  state="$(docker inspect -f '{{.State.Status}} restarts={{.RestartCount}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' "$cid" 2>/dev/null)" || state=""
+  printf '%s' "${state:-state unreadable}"
+}
+
+# What stopping here means for traffic, which depends on WHERE the read failed.
+# verify_internal_health runs at steps 14 and 15, before the cutover, and again
+# at step 17, after Caddy has been switched (#3965 review).
+#
+# The first blue/green deploy is different on both sides of the switch: Caddy
+# pointed at the cron leader itself (`app`), and step 15 recreated that very
+# container on the new release. So before the switch a step-15 failure leaves
+# the new release behind Caddy, and after it a rollback lands on that same
+# recreated `app` rather than on the previous release.
+describe_internal_read_stop() {
+  local service="${1:-}"
+
+  if [ "${SWITCHED_TRAFFIC:-0}" = "1" ] && [ "${ACTIVE_SERVICE:-}" = "$CRON_SERVICE" ]; then
+    echo "This is the check after the traffic switch: Caddy already points at ${TARGET_SERVICE:-the new colour}. The deploy now fails, and its failure handling points Caddy back at ${CRON_SERVICE}. On this first blue/green deploy ${CRON_SERVICE} was recreated on the new release at step 15, so the rollback lands on the release that just failed, not on the previous one." >&2
+  elif [ "${SWITCHED_TRAFFIC:-0}" = "1" ]; then
+    echo "This is the check after the traffic switch: Caddy already points at ${TARGET_SERVICE:-the new colour}. The deploy now fails, and its failure handling tries to point Caddy back at ${ACTIVE_SERVICE:-the previous colour}, which serves only if it is still running." >&2
+  elif [ -n "$service" ] && [ "$service" = "$CRON_SERVICE" ] && [ "${ACTIVE_SERVICE:-}" = "$CRON_SERVICE" ]; then
+    echo "Traffic has not been switched, so the deploy stops before the cutover. But Caddy points at ${CRON_SERVICE}, and this step has just recreated ${CRON_SERVICE} on the new release, so the previous release is not serving: whatever answers now is the new release that failed this check." >&2
+  else
+    echo "Traffic has not been switched, so the deploy stops before the cutover. Caddy still points at ${ACTIVE_SERVICE:-the previous colour}, which serves only if it is still running: in a windowed deploy, where the old app and workers were stopped first, nothing is serving until the deploy is re-run." >&2
+  fi
+}
+
+# Asks one path on a service's own loopback until it answers HTTP 200, and prints
+# the body (#3965). Used for both in-container reads verify_internal_health makes.
+#
+# BOUNDED BY A DEADLINE, NOT BY COUNTING PAUSES. The bound is
+# DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS from the first attempt, measured on a clock, so
+# the time an attempt itself takes counts against it. Each attempt waits at most
+# INTERNAL_READ_REQUEST_TIMEOUT_MS for a reply, and the last attempt can start up
+# to one pause before the deadline, so a read gives up at most about ten seconds
+# after its bound. A bound of 0 means one attempt and no retry, and after the
+# traffic switch (step 17) the bound is always 0.
+#
+# LOUD ON EVERY FAILED ATTEMPT. Each one prints a line to stderr naming the HTTP
+# status, or the `docker compose exec` exit code and the container's state, so a
+# restart mid-read is seen even when a later attempt succeeds.
+#
+# NOT EVERY ANSWER IS WORTH WAITING FOR. An empty CRON_SECRET, and HTTP 401, 403
+# or 404, are configuration -- the wrong secret, or a route this image does not
+# have -- not a container still starting, so they stop at once.
+#
+# SAFE UNDER `set -Eeuo pipefail` AND THE ERR TRAP. Each attempt runs as the
+# left-hand side of `||`, so a failed attempt neither exits the script nor fires
+# `fail`; only the give-up returns non-zero. Callers take that return as
+# `x="$(poll_service_endpoint ...)" || return 1`: without the `||`, errtrace
+# fires the trap inside the command substitution as well as in the caller, so
+# `fail` runs twice -- two failure records, the first one's output captured into
+# the variable rather than printed.
+poll_service_endpoint() {
+  local service="$1"
+  local path="$2"
+  local send_cron_secret="$3"
+  local timeout="$DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS"
+  local attempt_word
+  local deadline
+  local now
+  local attempts=0
+  local rc
+  local response
+  local status
+  local body
+  local last_result=""
+  local last_body=""
+
+  # After the traffic switch (step 17) members are already being sent to this
+  # container, so a failing read must hand over to the rollback at once rather
+  # than retry while they get errors: one attempt, as before #3965.
+  if [ "${SWITCHED_TRAFFIC:-0}" = "1" ]; then
+    timeout=0
+  fi
+  deadline=$(( $(deploy_clock_seconds) + timeout ))
+
+  while true; do
+    attempts=$((attempts + 1))
+    rc=0
+    response="$(read_service_endpoint_once "$service" "$path" "$send_cron_secret")" || rc=$?
+
+    if [ "$rc" -eq "$RUNTIME_STATUS_NO_SECRET_EXIT" ]; then
+      # The container has said why on stderr. Waiting cannot fix configuration.
+      echo "CRON_SECRET reaches the container from .env through docker-compose.yml; set it there and re-run the deploy." >&2
+      describe_internal_read_stop "$service"
+      return 1
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+      # First line is the HTTP status (000 when no HTTP response came back), the
+      # rest is the body (or the client error's name and code for 000).
+      status="${response%%$'\n'*}"
+      if [ "$status" = "$response" ]; then
+        body=""
+      else
+        body="${response#*$'\n'}"
+      fi
+      case "$status" in
+        200)
+          printf '%s' "$body"
+          return 0
+          ;;
+        401|403|404)
+          echo "Internal ${service}: ${path} answered HTTP ${status}. That is configuration -- the wrong secret, or a route this image does not have -- not a container still starting, so the deploy does not wait for it." >&2
+          echo "Response body: ${body:0:2000}" >&2
+          describe_internal_read_stop "$service"
+          return 1
+          ;;
+        000)
+          last_result="no HTTP response (${body})"
+          last_body=""
+          ;;
+        *)
+          last_result="HTTP ${status}"
+          last_body="$body"
+          ;;
+      esac
+    else
+      last_result="docker compose exec exited ${rc} with no HTTP answer; container: $(describe_service_container_state "$service")"
+      last_body=""
+    fi
+
+    now="$(deploy_clock_seconds)"
+    if [ "$now" -ge "$deadline" ]; then
+      attempt_word="attempts"
+      if [ "$attempts" -eq 1 ]; then
+        attempt_word="attempt"
+      fi
+      echo "Internal ${service}: ${path} did not answer HTTP 200 within ${timeout}s (${attempts} ${attempt_word})." >&2
+      echo "Last result: ${last_result}" >&2
+      if [ -n "$last_body" ]; then
+        echo "Last response body: ${last_body:0:2000}" >&2
+      fi
+      describe_internal_read_stop "$service"
+      if [ "${SWITCHED_TRAFFIC:-0}" = "1" ]; then
+        echo "After the traffic switch this read is tried once, whatever DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS says, so the rollback starts at once." >&2
+      else
+        echo "To wait longer, set DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS (${DEPLOY_INTERNAL_READ_TIMEOUT_MIN_SECONDS}-${DEPLOY_INTERNAL_READ_TIMEOUT_MAX_SECONDS}) in the shell that runs the deploy; it is not read from .env." >&2
+      fi
+      return 1
+    fi
+
+    echo "  Internal ${service}: ${path} attempt ${attempts}: ${last_result}; asking again in ${DEPLOY_POLL_INTERVAL_SECONDS}s." >&2
+    sleep "$DEPLOY_POLL_INTERVAL_SECONDS"
+  done
+}
+
+# One GET of a path on a service's own loopback, from inside the container.
+#
+# Prints the HTTP status on the first line and the response body after it, and
+# exits 0 whenever the request was MADE, whatever came back: a non-200 is for
+# poll_service_endpoint to retry or report, not for this to swallow. A request
+# that got no HTTP response at all (connection refused, timeout) prints status
+# 000 with the client error's name and code as the body. When asked to send the
+# cron secret and the container has none, exits RUNTIME_STATUS_NO_SECRET_EXIT,
+# having said why on stderr.
+#
+# The request is made by `node`, which the app image runs as its server, rather
+# than by busybox wget: busybox wget (v1.37 in node:24.17-alpine) has no
+# --content-on-error, so on a non-2xx status it writes no body at all, and the
+# body is half of what an operator needs when a read gives up (#3965).
+#
+# On a client error it prints only the error's name and its cause's code, never
+# the message: undici quotes an invalid header VALUE in its message, and the one
+# header this sends is the cron secret.
+#
+# The path, exit status, secret flag and request timeout are passed as positional
+# arguments rather than interpolated into the single-quoted script, so no quoting
+# of a host variable happens inside it. The secret is read from the container's
+# own environment, never from an argument.
+RUNTIME_STATUS_NO_SECRET_EXIT=3
+INTERNAL_READ_REQUEST_TIMEOUT_MS=5000
+read_service_endpoint_once() {
+  local service="$1"
+  local path="$2"
+  local send_cron_secret="$3"
+
+  docker compose exec -T "$service" /bin/sh -c '
+if [ "$3" = "1" ] && [ -z "${CRON_SECRET:-}" ]; then
+  echo "CRON_SECRET is empty inside this container, so the deploy cannot ask the application which role and which environment role it is running." >&2
+  exit "$2"
+fi
+node - "http://127.0.0.1:3000$1" "$3" "$4" <<"NODE"
+const [url, sendCronSecret, timeoutMs] = process.argv.slice(2);
+const headers = sendCronSecret === "1" ? { "x-cron-secret": process.env.CRON_SECRET } : {};
+fetch(url, { headers, signal: AbortSignal.timeout(Number(timeoutMs)) })
+  .then(async (response) => {
+    process.stdout.write(response.status + "\n" + (await response.text()));
+  })
+  .catch((error) => {
+    const name = (error && error.name) || "Error";
+    const code = error && error.cause && error.cause.code;
+    process.stdout.write("000\n" + name + (code ? " (" + code + ")" : ""));
+  });
+NODE
+' sh "$path" "$RUNTIME_STATUS_NO_SECRET_EXIT" "$send_cron_secret" "$INTERNAL_READ_REQUEST_TIMEOUT_MS"
+}
+
+assert_logs_contain_any() {
+  local logs="$1"
+  local description="$2"
+  shift 2
+
+  local pattern
+  for pattern in "$@"; do
+    if printf '%s\n' "$logs" | grep -Fq "$pattern"; then
+      return 0
+    fi
+  done
+
+  echo "App startup log is missing all expected lines for ${description}." >&2
+  printf 'Expected one of:\n' >&2
+  for pattern in "$@"; do
+    printf '  - %s\n' "$pattern" >&2
+  done
+  return 1
+}
+
+verify_internal_health() {
+  local service="$1"
+  local expected_role
+  local expected_cron_enabled
+  local payload
+  local runtime_payload
+
+  expected_role="$(get_expected_runtime_role "$service")"
+  expected_cron_enabled="$(get_expected_cron_enabled "$service")"
+  # Both reads are retried and explain themselves when they give up (#3965), and
+  # both take `|| return 1` so a give-up fires the ERR trap once, here, rather
+  # than once inside the command substitution as well (see poll_service_endpoint).
+  payload="$(get_service_readiness_payload "$service")" || return 1
+  assert_readiness_payload_healthy "Internal ${service}" "$payload"
+  runtime_payload="$(get_service_runtime_payload "$service")" || return 1
+  assert_runtime_identity "Internal ${service}" "$runtime_payload" "$expected_role" "$expected_cron_enabled" "$EXPECTED_ENVIRONMENT_ROLE_DECLARATION"
+}
+
+verify_external_health() {
+  local service="$1"
+  local domain
+  local expected_role
+  local expected_cron_enabled
+  local payload
+  local runtime_payload
+  local runtime_url
+  local url
+
+  domain="$(trim_whitespace "$(get_env_file_value DOMAIN)")"
+  expected_role="$(get_expected_runtime_role "$service")"
+  expected_cron_enabled="$(get_expected_cron_enabled "$service")"
+  url="https://${domain}${READINESS_PATH}"
+  wait_for_url "$url" "$HEALTH_TIMEOUT_SECONDS"
+  payload="$(curl -fsS "$url")"
+  assert_readiness_payload_healthy "External" "$payload"
+
+  runtime_url="https://${domain}${DEPLOY_RUNTIME_STATUS_PATH}"
+  runtime_payload="$(
+    curl_with_cron_secret_header \
+      "$runtime_url" \
+      "$(trim_whitespace "$(get_env_file_value CRON_SECRET)")"
+  )"
+  assert_runtime_identity "External deploy runtime status" "$runtime_payload" "$expected_role" "$expected_cron_enabled" "$EXPECTED_ENVIRONMENT_ROLE_DECLARATION"
+}
+
+verify_cron_registration() {
+  local logs=""
+  local pattern
+  local missing=""
+  local waited=0
+  local timeout="${CRON_REGISTRATION_TIMEOUT_SECONDS:-60}"
+  local patterns=(
+    "Scheduled booking and public-request cron cycle"
+    "Scheduled database backup"
+    "Scheduled data pruning"
+    "Scheduled draft cleanup"
+    "Scheduled pending deadline alerts"
+    "Scheduled check-in reminders"
+    "Scheduled capacity warnings"
+    "Scheduled admin daily digest"
+    "Scheduled email retry"
+    "Scheduled complete bookings"
+    "Scheduled hut leader auto-assign"
+    "Scheduled age-up check"
+    "Scheduled credit reconciliation"
+  )
+
+  while true; do
+    logs="$(docker compose logs "$CRON_SERVICE" --tail 200)"
+    missing=""
+    for pattern in "${patterns[@]}"; do
+      if ! printf '%s\n' "$logs" | grep -Fq "$pattern"; then
+        missing="$pattern"
+        break
+      fi
+    done
+
+    if [ -z "$missing" ]; then
+      break
+    fi
+
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "App startup log is missing expected cron registration after ${timeout}s: $missing" >&2
+      return 1
+    fi
+
+    sleep "$DEPLOY_POLL_INTERVAL_SECONDS"
+    waited=$((waited + DEPLOY_POLL_INTERVAL_SECONDS))
+  done
+
+  assert_logs_contain_any \
+    "$logs" \
+    "finance sync registration" \
+    "Scheduled daily finance sync"
+
+  assert_logs_contain_any \
+    "$logs" \
+    "waitlist processor registration" \
+    "Scheduled waitlist processor"
+
+  assert_logs_contain_any \
+    "$logs" \
+    "Xero membership refresh registration" \
+    "Scheduled Xero membership safety-net refresh" \
+    "Xero membership refresh disabled by XERO_ENABLE_DAILY_MEMBERSHIP_REFRESH"
+}
+
+# --------------------------------------------------------------------------
+# Pre-cutover warm-up gate (#2566, owner decision Option 4)
+#
+# The gate itself lives in the application (`src/app/api/deploy/warmup/route.ts`)
+# and runs INSIDE the container it is warming, for three reasons set out in that
+# file's header: the process that stores each page is then the process that
+# answered, so warming the wrong colour is structurally impossible; untrusted CMS
+# paths never touch a shell; and the tiered rules are unit-testable TypeScript
+# rather than bash.
+#
+# This function's whole job is therefore to ask, print what came back, and refuse
+# to cut over on anything that is not an acceptable verdict — including an
+# unreadable answer.
+# --------------------------------------------------------------------------
+
+# Defined here rather than reused from the wrapper on purpose: the wrapper's
+# `env_flag_is_true` lives INSIDE `run_production_wrapper`, and the internal engine
+# runs as a separate invocation of this script, so that definition does not exist in
+# this shell. Calling it would fail at the gate with "command not found" — i.e. it
+# would block every deploy — which is the fail-closed direction but for the wrong
+# reason.
+warmup_gate_is_enabled() {
+  case "$DEPLOY_WARMUP_ENABLED" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# One numeric warm-up setting, checked against the SAME range the endpoint enforces.
+#
+# The range is mirrored here rather than left to the endpoint for a plain operational
+# reason: the endpoint answers HTTP 400 with the offending parameter named in the body,
+# and the warm-up gate asks it with busybox `wget` (run_warmup_gate), which on a
+# non-2xx status writes no body at all. The endpoint now also answers the text form with a readable
+# `blocked` report, so the reason survives either way — but catching it HERE means the
+# operator is told which setting is wrong before a container is even asked, and the
+# ranges cannot drift unnoticed because the argument list reads like the endpoint's.
+#
+# Ranges as at src/app/api/deploy/warmup/route.ts:
+#   concurrency 1-8, requestTimeoutSeconds 1-120, totalTimeoutSeconds 5-1800,
+#   maxFailedCmsRoutes 0-100, maxFailedCmsPercent 0-100.
+require_integer_setting_in_range() {
+  local name="$1"
+  local value="$2"
+  local min="$3"
+  local max="$4"
+  # Optional, and it is the difference between a refusal an operator can act on
+  # and one they have to go and read the script to understand. Callers that pass
+  # nothing keep the bare bound, which is all a warm-up tunable needs.
+  local reason="${5:-}"
+  local magnitude
+
+  if ! printf '%s' "$value" | grep -Eq '^[0-9]+$'; then
+    echo "${name} must be a non-negative integer. Got: ${value}" >&2
+    return 1
+  fi
+
+  # WELL-SHAPED IS NOT THE SAME AS COMPARABLE, and the gap between them let an
+  # unbounded value through this function entirely (#3377 review). `[ x -lt y ]`
+  # on a digit string wider than a signed 64-bit integer does not answer the
+  # question: it writes "integer expression expected" and exits **2**. Exit 2 is
+  # not "out of range" — it is false, so BOTH halves of the `||` below were false
+  # and the value was ACCEPTED. Measured with twenty digits: the deploy then ran
+  # on to the step that uses the setting and died there, after images had been
+  # pulled, which is the whole cost the step-3 placement exists to avoid.
+  #
+  # Leading zeros are stripped first so the guard is about magnitude rather than
+  # typing: `0500` is five hundred, not a suspiciously wide number. Eighteen
+  # digits is comfortably inside what every shell here compares in, and no
+  # setting this function guards is within ten orders of magnitude of it.
+  magnitude="$(printf '%s' "$value" | sed 's/^0*//')"
+  if [ "${#magnitude}" -gt 18 ]; then
+    echo "${name} is too large for this script to compare (${#magnitude} digits). It must be between ${min} and ${max}. Got: ${value}" >&2
+    return 1
+  fi
+
+  if [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+    if [ -n "$reason" ]; then
+      echo "${name} must be between ${min} and ${max}: ${reason}. Got: ${value}" >&2
+    else
+      echo "${name} must be between ${min} and ${max} (the warm-up endpoint refuses anything else). Got: ${value}" >&2
+    fi
+    return 1
+  fi
+}
+
+validate_warmup_settings() {
+  local services
+
+  # `|| return 1` on each, rather than leaning on the script's `set -e`: this function
+  # is the one place a mistyped setting is caught, and its refusal should be readable in
+  # the source rather than a property of a shell option set 1,400 lines earlier.
+  require_integer_setting_in_range DEPLOY_WARMUP_CONCURRENCY "$DEPLOY_WARMUP_CONCURRENCY" 1 8 || return 1
+  require_integer_setting_in_range DEPLOY_WARMUP_REQUEST_TIMEOUT_SECONDS "$DEPLOY_WARMUP_REQUEST_TIMEOUT_SECONDS" 1 120 || return 1
+  require_integer_setting_in_range DEPLOY_WARMUP_TOTAL_TIMEOUT_SECONDS "$DEPLOY_WARMUP_TOTAL_TIMEOUT_SECONDS" 5 1800 || return 1
+  require_integer_setting_in_range DEPLOY_WARMUP_MAX_FAILED_CMS_ROUTES "$DEPLOY_WARMUP_MAX_FAILED_CMS_ROUTES" 0 100 || return 1
+  require_integer_setting_in_range DEPLOY_WARMUP_MAX_FAILED_CMS_PERCENT "$DEPLOY_WARMUP_MAX_FAILED_CMS_PERCENT" 0 100 || return 1
+
+  # Assigned first so `warmup_services`'s own refusal is not swallowed by the `for`
+  # list, which discards a command substitution's exit status.
+  services="$(warmup_services)" || return 1
+
+  local service
+  for service in $services; do
+    case "$service" in
+      "$CRON_SERVICE"|"$BLUE_SERVICE"|"$GREEN_SERVICE") ;;
+      *)
+        echo "DEPLOY_WARMUP_SERVICES may only name app services (${CRON_SERVICE}, ${BLUE_SERVICE}, ${GREEN_SERVICE}). Got: ${service}" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+# Every web instance that can serve public traffic after this deploy, and so every
+# instance with its own page store to fill.
+#
+# The default is the target colour AND the cron leader, which is not belt and
+# braces: `write_active_upstream_file` lists the cron leader as the SECOND
+# upstream (`to <target>:3000 app:3000`), so Caddy serves public pages from it
+# whenever the target fails its health probe. A warm target beside a cold
+# fallback would hand the worst page loads of the release to exactly the moment
+# the site is already struggling. The owner's decision anticipates this under
+# "Future scaling": warm every instance separately, because one instance's
+# in-memory store says nothing about another's.
+# An EMPTY resolved list is refused rather than accepted, and that refusal is the
+# point of the loop below. `[ -n "$DEPLOY_WARMUP_SERVICES" ]` is true for a value that
+# is only whitespace — the shape a command substitution that produced nothing leaves
+# behind — and printing it verbatim then word-split to nothing, so both callers
+# iterated zero times, the gate returned success, and the deploy cut over having asked
+# not one question about the release. It is the only path where this gate could report
+# a pass without proving anything, and it printed nothing an operator would notice.
+warmup_services() {
+  local resolved=""
+  local service
+
+  if [ -n "$DEPLOY_WARMUP_SERVICES" ]; then
+    for service in $DEPLOY_WARMUP_SERVICES; do
+      resolved="${resolved:+$resolved }$service"
+    done
+  else
+    resolved="$TARGET_SERVICE $CRON_SERVICE"
+  fi
+
+  if [ -z "$resolved" ]; then
+    echo "DEPLOY_WARMUP_SERVICES resolved to no services, so the warm-up gate would prove nothing about this release. Name the app services to warm, or unset it for the default (${TARGET_SERVICE} and ${CRON_SERVICE})." >&2
+    return 1
+  fi
+
+  printf '%s' "$resolved"
+}
+
+# The release identifier the gate should expect to find in the container it warms.
+#
+# A registry deploy pins both images by commit SHA, so the tag IS the expectation.
+# A digest-pinned reference is deliberately not used: the digest is not the commit,
+# and passing it would produce a false mismatch and block a good deploy. The local
+# build path falls back to the checked-out commit, which is what
+# `prepare_application_images` exports as RELEASE_ID for that path anyway.
+resolve_expected_release() {
+  local tag
+
+  # The host-build recovery path this PR unblocks runs the engine from a
+  # workspace with no `.git`, and passes the commit in DEPLOY_COMMIT_SHA.
+  # Without this the gate warns it cannot identify the release, and the failure
+  # record says "unidentifiable", while the answer sits in a variable.
+  if [ -n "${DEPLOY_COMMIT_SHA:-}" ]; then
+    printf '%s' "$DEPLOY_COMMIT_SHA"
+    return 0
+  fi
+
+  if [ -n "$APP_IMAGE" ] && [ "${APP_IMAGE#*@}" = "$APP_IMAGE" ]; then
+    tag="${APP_IMAGE##*:}"
+    if printf '%s' "$tag" | grep -Eq '^[0-9a-fA-F]{7,64}$'; then
+      printf '%s' "$tag"
+      return 0
+    fi
+  fi
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git rev-parse HEAD
+    return 0
+  fi
+
+  printf ''
+}
+
+# Warnings that must outlive the step they were printed in.
+#
+# The owner's decision asks for a deploy that completed with a tolerated failure to be
+# "clearly labelled" and for the failure to be "visible to the operator completing the
+# deployment". Printing it once at step 16 of 20 does not achieve that: four more steps,
+# a container table and 80 lines of application logs scroll past before the completion
+# banner, there is no log file (the wrapper runs the engine with no `tee`), and the
+# operator's terminal is the only record. So each warning is accumulated here and
+# re-printed AFTER the banner, and the banner itself names the state.
+WARMUP_WARNINGS=""
+
+record_warmup_warning() {
+  if [ -z "$WARMUP_WARNINGS" ]; then
+    WARMUP_WARNINGS="$1"
+    return 0
+  fi
+
+  # `printf` rather than a literal newline inside the expansion: a `}` at column zero
+  # inside a string reads like the end of the function to a human and to anything that
+  # extracts a function body by line.
+  WARMUP_WARNINGS="$(printf '%s\n%s' "$WARMUP_WARNINGS" "$1")"
+}
+
+# Accumulates every line of one report's WARNINGS block, whatever the verdict was.
+#
+# Keying the accumulator on the verdict alone lost warnings that arrive with a plain
+# `pass`, and `evaluateWarmup` returns exactly that in several real cases
+# (`src/lib/deploy/warmup-evaluate.ts`): the configured Book Now target unpublished
+# between discovery and warming, a published CMS page unpublished the same way, a Book
+# Now setting the gate could not read, an image carrying no release identifier, a
+# deploy that could not say which release to expect, and a tolerance the operator
+# widened. Each of those is a thing the operator has to act on, and each of them
+# scrolled off screen with the step 16 report.
+#
+# Fed from a HERE-DOCUMENT rather than a pipe on purpose: `record_warmup_warning`
+# assigns a global, and a `while` loop on the right of a pipe runs in a subshell, so
+# every line would be recorded into a copy that is discarded at the closing `done`.
+record_gate_warnings() {
+  local service="$1"
+  local warnings="$2"
+  local line
+
+  if [ -z "$warnings" ]; then
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      record_warmup_warning "${service}: warm-up warning — ${line}"
+    fi
+  done <<EOF
+$warnings
+EOF
+}
+
+# Re-prints the accumulated warnings and returns 0 when there were any, so the caller
+# can label the completion banner rather than guess.
+print_deploy_warning_summary() {
+  if [ -z "$WARMUP_WARNINGS" ]; then
+    return 1
+  fi
+
+  echo
+  echo "============================================"
+  echo "  DEPLOY COMPLETED WITH WARNINGS"
+  echo "============================================"
+  printf '%s\n' "$WARMUP_WARNINGS" | while IFS= read -r line; do
+    printf '  ! %s\n' "$line"
+  done
+  echo
+  echo "  Do not close this deploy out until each line above is recorded on a"
+  echo "  follow-up issue. The full warm-up summary is at step 16 of 20 above."
+  echo "============================================"
+  return 0
+}
+
+warmup_gate_url() {
+  local expected_release="$1"
+  local url
+
+  url="http://127.0.0.1:3000${DEPLOY_WARMUP_PATH}?format=text"
+  url="${url}&concurrency=${DEPLOY_WARMUP_CONCURRENCY}"
+  url="${url}&requestTimeoutSeconds=${DEPLOY_WARMUP_REQUEST_TIMEOUT_SECONDS}"
+  url="${url}&totalTimeoutSeconds=${DEPLOY_WARMUP_TOTAL_TIMEOUT_SECONDS}"
+  url="${url}&maxFailedCmsRoutes=${DEPLOY_WARMUP_MAX_FAILED_CMS_ROUTES}"
+  url="${url}&maxFailedCmsPercent=${DEPLOY_WARMUP_MAX_FAILED_CMS_PERCENT}"
+  if [ -n "$expected_release" ]; then
+    url="${url}&expectedRelease=${expected_release}"
+  fi
+
+  printf '%s' "$url"
+}
+
+# Runs the gate against one service and returns non-zero unless the verdict allows
+# a cutover.
+#
+# The cron secret is read INSIDE the container, from the environment the app
+# already has, so it never appears in a host process list — the same concern
+# `curl_with_cron_secret_header` addresses for the external check. Only the URL is
+# passed in, and every value in it has been validated as an integer or a hex commit
+# id above, so there is nothing to escape and no shell expansion of untrusted data.
+run_warmup_gate_for_service() {
+  local service="$1"
+  local expected_release="$2"
+  local url
+  local exec_timeout
+  local report
+  local stderr_file
+  local verdict
+  local skipped_reason
+  local failed_paths
+  local gate_warnings
+
+  url="$(warmup_gate_url "$expected_release")"
+  # The container-side deadline must expire first, so a slow release produces a
+  # readable report rather than a severed exec.
+  exec_timeout=$((DEPLOY_WARMUP_TOTAL_TIMEOUT_SECONDS + 60))
+  stderr_file="$(mktemp)"
+
+  info "Warming ${service} directly (bounded to ${DEPLOY_WARMUP_CONCURRENCY} requests at a time)."
+
+  if ! report="$(
+    docker compose exec -T \
+      -e "WARMUP_GATE_URL=$url" \
+      -e "WARMUP_GATE_TIMEOUT=$exec_timeout" \
+      "$service" \
+      /bin/sh -lc 'wget -O - -T "$WARMUP_GATE_TIMEOUT" --header="x-cron-secret: $CRON_SECRET" "$WARMUP_GATE_URL"' \
+      2>"$stderr_file"
+  )"; then
+    printf '%s\n' "$report"
+    cat "$stderr_file" >&2
+    rm -f "$stderr_file"
+    echo "The warm-up gate on ${service} could not be read, so nothing has been proved about this release. Refusing to switch traffic." >&2
+    return 1
+  fi
+
+  rm -f "$stderr_file"
+  printf '%s\n' "$report"
+
+  # The sentinel line, read through the one constant so the script and the report
+  # renderer cannot drift. Last occurrence wins, and an absent line is refused
+  # below rather than treated as a pass.
+  # `|| true` is load-bearing under `set -o pipefail`: a report with no sentinel
+  # makes grep exit non-zero, and without this the assignment would abort the
+  # deploy with no explanation instead of reaching the "no readable verdict"
+  # message below. The refusal is the same either way; the operator's information
+  # is not.
+  verdict="$(
+    printf '%s\n' "$report" |
+      grep -F "${DEPLOY_WARMUP_VERDICT_SENTINEL}:" |
+      tail -n 1 |
+      awk '{print $2}' || true
+  )"
+
+  # The failed addresses out of the summary's FAILED ROUTES block, so the end-of-deploy
+  # warning names them rather than pointing at scrolled-off output. Each such line is
+  # `    ! /path [tier] kind — detail`; a WARNINGS line also begins `    ! ` but never
+  # with an address, which is what the `/` and the following ` [` select on.
+  failed_paths="$(
+    printf '%s\n' "$report" |
+      sed -n 's|^[[:space:]]*![[:space:]]*\(/[^[:space:]]*\)[[:space:]]\[.*|\1|p' |
+      tr '\n' ' ' |
+      sed 's/[[:space:]]*$//' || true
+  )"
+
+  # Every line of the report's WARNINGS block, read out of the report rather than
+  # inferred from the verdict. The block runs from the `WARNINGS (n):` header to the
+  # blank line the renderer puts before the next block
+  # (`src/lib/deploy/warmup-report.ts`), and each line inside it is `    ! <text>`.
+  gate_warnings="$(
+    printf '%s\n' "$report" |
+      awk '
+        /^[[:space:]]*WARNINGS \(/ { in_block = 1; next }
+        in_block && /^[[:space:]]*$/ { in_block = 0; next }
+        in_block { sub(/^[[:space:]]*![[:space:]]*/, ""); print }
+      ' || true
+  )"
+
+  case "$verdict" in
+    pass)
+      if [ -n "$gate_warnings" ]; then
+        # A pass is still a pass — but it is not a clean one, and the reasons above
+        # are repeated after the completion banner rather than left to scroll away.
+        warn "Warm-up gate passed on ${service} with warnings. The cutover proceeds; each warning above is repeated after the completion banner and needs recording before this deploy is closed out."
+      else
+        info "Warm-up gate passed on ${service}."
+      fi
+      ;;
+    pass-with-warning)
+      warn "Warm-up gate passed on ${service} WITH WARNINGS. The deployment is completing with a known non-critical page failure — record the failed path above and file (or link) a follow-up issue for it before closing this deploy out."
+      record_warmup_warning "${service}: passed WITH WARNINGS — a non-critical published page failed. Failed path(s): ${failed_paths:-see the step 16 summary above}. File or link a follow-up issue before closing this deploy out."
+      ;;
+    skipped)
+      skipped_reason="$(printf '%s\n' "$report" | sed -n 's/^[[:space:]]*SKIPPED: //p' | head -n 1 || true)"
+      warn "Warm-up gate skipped on ${service}: ${skipped_reason:-no reason reported}"
+      record_warmup_warning "${service}: the warm-up gate was SKIPPED, so this cutover is unverified — ${skipped_reason:-no reason reported}"
+      ;;
+    blocked)
+      echo "The warm-up gate BLOCKED the cutover on ${service}. See the blocked reasons above." >&2
+      return 1
+      ;;
+    *)
+      echo "The warm-up gate on ${service} returned no readable verdict (expected a '${DEPLOY_WARMUP_VERDICT_SENTINEL}: ...' line). Refusing to switch traffic." >&2
+      return 1
+      ;;
+  esac
+
+  # After the case and outside it, so this cannot be keyed on the verdict again: the
+  # reasons the gate reported are carried to the end of the deploy for every verdict
+  # that reaches here, `pass` included.
+  record_gate_warnings "$service" "$gate_warnings"
+}
+
+run_warmup_gate() {
+  local expected_release
+  local service
+  local services
+
+  if ! warmup_gate_is_enabled; then
+    if [ -z "$DEPLOY_WARMUP_OVERRIDE_REASON" ]; then
+      echo "DEPLOY_WARMUP_ENABLED=${DEPLOY_WARMUP_ENABLED} disables the pre-cutover warm-up gate, which requires a written justification." >&2
+      echo "Set DEPLOY_WARMUP_OVERRIDE_REASON to the reason this deploy may cut over unwarmed, or leave the gate enabled." >&2
+      return 1
+    fi
+
+    warn "================================================================"
+    warn "PRE-CUTOVER WARM-UP GATE DISABLED for this deploy."
+    warn "Reason: ${DEPLOY_WARMUP_OVERRIDE_REASON}"
+    warn "Nothing has verified that the new release renders its public pages or"
+    warn "populates its page cache. The first visitor to each page pays a cold"
+    warn "render, and a broken public page will reach members rather than this log."
+    warn "================================================================"
+    record_warmup_warning "The pre-cutover warm-up gate was DISABLED for this deploy (reason given: ${DEPLOY_WARMUP_OVERRIDE_REASON}). Nothing verified that this release serves its public pages."
+    return 0
+  fi
+
+  validate_warmup_settings || return 1
+
+  expected_release="$(resolve_expected_release)"
+  if [ -z "$expected_release" ]; then
+    warn "Could not determine which commit this deploy is releasing, so the gate cannot confirm it warmed the intended release."
+    record_warmup_warning "The gate could not confirm it warmed the intended release: this deploy could not determine which commit it is releasing."
+  fi
+
+  # Assigned first so an empty resolution refuses the deploy instead of being silently
+  # iterated zero times. See `warmup_services`.
+  services="$(warmup_services)" || return 1
+
+  for service in $services; do
+    # Explicit rather than relying on `set -e` to abort the run: this is the refusal
+    # that stops a bad release reaching members, so it is spelled out here.
+    run_warmup_gate_for_service "$service" "$expected_release" || return 1
+  done
+}
+
+get_active_service() {
+  local file="$PROJECT_DIR/$ACTIVE_UPSTREAM_FILE_REL"
+
+  if [ ! -f "$file" ]; then
+    echo "$CRON_SERVICE"
+    return 0
+  fi
+
+  if grep -Fq "${BLUE_SERVICE}:3000" "$file"; then
+    echo "$BLUE_SERVICE"
+    return 0
+  fi
+
+  if grep -Fq "${GREEN_SERVICE}:3000" "$file"; then
+    echo "$GREEN_SERVICE"
+    return 0
+  fi
+
+  echo "$CRON_SERVICE"
+}
+
+choose_target_service() {
+  local active_service="$1"
+
+  if [ "$active_service" = "$BLUE_SERVICE" ]; then
+    echo "$GREEN_SERVICE"
+  else
+    echo "$BLUE_SERVICE"
+  fi
+}
+
+write_active_upstream_file() {
+  local primary_service="$1"
+  local fallback_service="${2:-}"
+  local destination="$PROJECT_DIR/$ACTIVE_UPSTREAM_FILE_REL"
+  local temp_file
+
+  temp_file="$(mktemp "${destination}.XXXXXX")"
+  {
+    echo "reverse_proxy {"
+    echo "  lb_policy first"
+    echo "  lb_try_duration 10s"
+    echo "  fail_duration 30s"
+    # One transient upstream error must not eject a healthy colour (#3293).
+    # `max_fails` defaults to 1, so a single reset took the serving colour out
+    # for the whole `fail_duration` and moved live traffic onto the fallback —
+    # the cron leader, which runs a deliberately smaller connection pool.
+    echo "  max_fails 3"
+    echo "  health_uri ${READINESS_PATH}"
+    echo "  health_interval 10s"
+    echo "  health_timeout 5s"
+    # Caddy must give up a pooled connection BEFORE the app closes it (#3293).
+    # The app holds idle connections for KEEP_ALIVE_TIMEOUT (docker-compose.yml,
+    # 65s); Caddy's undeclared default was 2 minutes, so it reused connections
+    # the app had already closed and a reuse landing on that boundary was reset.
+    # A reset POST/PUT cannot be replayed by Caddy's transport, so it reached the
+    # browser as a bare 502 and every admin form showed its generic save error.
+    # The app reads the LAST X-Forwarded-For value as the visitor (getClientIp,
+    # src/lib/rate-limit.ts). Set it to Caddy's resolved client IP rather than
+    # appending Caddy's peer: behind a TLS-terminating proxy (CADDY_TLS_MODE=local,
+    # deploy/caddy/tls-local.caddy) the peer is the proxy, and every visitor would
+    # share one rate-limit bucket. With Caddy at the edge the two are the same.
+    echo "  header_up X-Forwarded-For {client_ip}"
+    echo "  transport http {"
+    echo "    keepalive 30s"
+    echo "  }"
+    if [ -n "$fallback_service" ] && [ "$fallback_service" != "$primary_service" ]; then
+      printf '  to %s:3000 %s:3000\n' "$primary_service" "$fallback_service"
+    else
+      printf '  to %s:3000\n' "$primary_service"
+    fi
+    echo "}"
+  } >"$temp_file"
+  mv "$temp_file" "$destination"
+}
+
+restore_previous_upstream_file() {
+  local previous_upstream_contents="$1"
+  local destination="$PROJECT_DIR/$ACTIVE_UPSTREAM_FILE_REL"
+  printf '%s\n' "$previous_upstream_contents" >"$destination"
+}
+
+reload_caddy() {
+  local attempts="${1:-10}"
+  local delay_seconds="${2:-1}"
+  local attempt=1
+
+  while [ "$attempt" -le "$attempts" ]; do
+    if docker compose exec -T "$CADDY_SERVICE" \
+      caddy reload --address 127.0.0.1:2019 --config /etc/caddy/Caddyfile >/dev/null; then
+      return 0
+    fi
+
+    if [ "$attempt" -lt "$attempts" ]; then
+      sleep "$delay_seconds"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  echo "Timed out waiting for the Caddy admin endpoint to accept reloads on 127.0.0.1:2019" >&2
+  return 1
+}
+
+stop_if_running() {
+  local service="$1"
+
+  if [ -n "$(docker compose ps -q "$service" 2>/dev/null || true)" ]; then
+    docker compose stop "$service" >/dev/null
+  fi
+}
+
+remove_service_container_if_present() {
+  local service="$1"
+
+  if [ -n "$(docker compose ps -a -q "$service" 2>/dev/null || true)" ]; then
+    docker compose rm -fs "$service" >/dev/null
+  fi
+}
+
+cleanup_inactive_web_services() {
+  local service
+
+  for service in "$BLUE_SERVICE" "$GREEN_SERVICE"; do
+    if [ "$service" = "$TARGET_SERVICE" ]; then
+      continue
+    fi
+
+    if [ -n "$(docker compose ps -a -q "$service" 2>/dev/null || true)" ]; then
+      remove_service_container_if_present "$service"
+      info "Removed inactive web service container: ${service}"
+    fi
+  done
+}
+
+remove_compose_orphans() {
+  docker compose up -d --remove-orphans \
+    "$POSTGRES_SERVICE" \
+    "$CRON_SERVICE" \
+    "$TARGET_SERVICE" \
+    "$CADDY_SERVICE" >/dev/null
+}
+
+echo "============================================"
+echo "  AlpineClubBookingsNZ: Blue/Green Deploy Script"
+echo "============================================"
+
+cd "$PROJECT_DIR"
+
+ACTIVE_SERVICE="$(get_active_service)"
+TARGET_SERVICE="$(choose_target_service "$ACTIVE_SERVICE")"
+
+step "1/20" "Refreshing code (if appropriate)"
+maybe_pull_latest
+
+step "2/20" "Validating host deployment prerequisites"
+validate_host_contract
+info "Host has the required deployment commands."
+
+step "3/20" "Validating deployment environment contract"
+validate_env_contract
+validate_image_reference_contract
+# What the containers would actually receive, rendered once (#4275).
+render_resolved_compose_config
+# Checked HERE, at the cheapest possible point, and not at step 13 where it is
+# used: a mistyped or removed lock-timeout bound should stop the deploy before
+# it pulls an image, never after a migration has already started waiting (#3377).
+validate_migration_lock_timeout_contract
+# The same reasoning for the settings #4275 made configurable: each is read as
+# its service would receive it, and refused here rather than at step 11 or 17.
+validate_resolved_email_transport
+require_resolved_caddy_tls_mode
+require_resolved_caddy_trusted_proxies
+require_resolved_caddy_switch CADDY_WWW_REDIRECT "whether www.<DOMAIN> redirects to <DOMAIN>"
+require_resolved_caddy_switch CADDY_LEGACY_ROUTES "whether Caddy serves a legacy finance dashboard's /finance-legacy route and bookings./dashboard. hosts"
+require_resolved_caddy_legacy_upstream
+validate_resolved_postgres_max_connections
+# Same reasoning (#3965): an unreadable bound must stop the deploy here, not
+# make the in-container read retry at step 14 compare against a non-number.
+require_integer_setting_in_range DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS "$DEPLOY_INTERNAL_READ_TIMEOUT_SECONDS" \
+  "$DEPLOY_INTERNAL_READ_TIMEOUT_MIN_SECONDS" "$DEPLOY_INTERNAL_READ_TIMEOUT_MAX_SECONDS" \
+  "how long steps 14 and 15 keep retrying each in-container readiness and /api/deploy/runtime-status read, in seconds"
+info ".env contains the required production settings."
+info "Migrations will wait at most ${MIGRATION_LOCK_TIMEOUT_MS_EFFECTIVE}ms for any lock."
+
+step "4/20" "Validating repository deployment files"
+validate_repo_contract
+validate_caddy_contract
+info "Docker, Prisma, and Caddy config files are present and valid."
+
+step "5/20" "Validating Docker Compose configuration"
+docker compose config -q
+info "docker compose config is valid."
+
+step "6/20" "Selecting target web service"
+info "Current live upstream: ${ACTIVE_SERVICE}"
+info "Target web service: ${TARGET_SERVICE}"
+
+step "7/20" "Pruning stale Docker cache before image preparation"
+# Captured BEFORE anything is pulled, built or re-tagged: after step 9 the
+# running colour's tag may name a different image than it does now.
+capture_rollback_image_ids
+prune_stale_docker_assets "before image preparation"
+
+step "8/20" "Pulling infrastructure images"
+docker compose pull "$POSTGRES_SERVICE" "$CADDY_SERVICE"
+
+step "9/20" "Preparing app, target web, and migration images"
+prepare_application_images
+
+step "10/20" "Validating runtime image contract"
+validate_runtime_image_contract
+info "App image contains the expected runtime artifacts."
+
+step "11/20" "Ensuring postgres is healthy"
+docker compose up -d "$POSTGRES_SERVICE"
+wait_for_health "$POSTGRES_SERVICE" "$HEALTH_TIMEOUT_SECONDS"
+verify_postgres_query
+info "Postgres is healthy and accepting queries."
+
+step "12/20" "Validating Prisma schema against committed migrations"
+validate_prisma_schema_matches_migrations
+validate_pending_migrations_blue_green_safe
+info "Prisma schema matches the committed migration history."
+
+verify_windowed_migration_runtime_drained
+
+step "13/20" "Running Prisma migrations"
+# From here on, any failure writes a record: the schema may no longer match
+# either release, and the terminal is not a record. Armed BEFORE the migrate
+# runs, because a migrate that dies part-way is the case this exists for.
+MIGRATE_STEP_REACHED=1
+# Restated on the step it governs, because this is the line an operator reads
+# back when a migration stops: it says the bound was in force and what it was,
+# so "canceling statement due to lock timeout" a few lines later is a guard
+# firing rather than a mystery. Recovery: PRODUCTION_UPGRADE_RUNBOOK 2.1a.
+info "Lock timeout in force for this migrate: ${MIGRATION_LOCK_TIMEOUT_MS_EFFECTIVE}ms (a migration that cannot get its lock in that time stops the deploy, having applied nothing)."
+docker compose --profile "$MIGRATE_SERVICE" run --rm "$MIGRATE_SERVICE"
+verify_prisma_migration_status
+info "Prisma migration status reports the database is up to date."
+verify_least_privilege_role_grants
+
+step "14/20" "Starting target web service"
+docker compose up -d --force-recreate "$TARGET_SERVICE"
+wait_for_health "$TARGET_SERVICE" "$HEALTH_TIMEOUT_SECONDS"
+verify_internal_health "$TARGET_SERVICE"
+info "Target web service is healthy before cutover."
+
+step "15/20" "Refreshing cron leader on the new release before cutover"
+docker compose up -d --force-recreate "$CRON_SERVICE"
+wait_for_health "$CRON_SERVICE" "$HEALTH_TIMEOUT_SECONDS"
+verify_internal_health "$CRON_SERVICE"
+verify_cron_registration
+info "Cron leader is healthy and scheduled jobs are registered before cutover."
+
+# The seam #2352 slice 1 left here, filled by #2566. It sits AFTER both web
+# instances are healthy and BEFORE the Caddy switch, which is the order the owner's
+# decision sets out: migrate, start the target, pass readiness, discover, warm,
+# verify the store, evaluate, and only then move traffic. A non-zero return from
+# this step propagates through `set -e` and the ERR trap, so the cutover below
+# never runs and the old colour keeps serving.
+step "16/20" "Warming the new release and verifying its page cache before cutover"
+run_warmup_gate
+
+step "17/20" "Switching Caddy upstream to target web service"
+docker compose up -d "$CADDY_SERVICE"
+PREVIOUS_UPSTREAM_CONTENTS="$(cat "$PROJECT_DIR/$ACTIVE_UPSTREAM_FILE_REL" 2>/dev/null || true)"
+write_active_upstream_file "$TARGET_SERVICE" "$CRON_SERVICE"
+if ! reload_caddy; then
+  restore_previous_upstream_file "$PREVIOUS_UPSTREAM_CONTENTS"
+  reload_caddy >/dev/null 2>&1 || true
+  echo "Failed to reload Caddy after writing the target upstream." >&2
+  # An explicit `exit` does NOT fire the ERR trap, so `fail` never runs and this
+  # one path - a post-migrate failure, which is exactly the class the record
+  # exists for - would leave none. Written here rather than by moving the exit
+  # into the trap, because the upstream file has already been restored above and
+  # the record should say so.
+  write_deploy_failure_record || true
+  exit 1
+fi
+SWITCHED_TRAFFIC=1
+verify_external_health "$TARGET_SERVICE"
+verify_internal_health "$TARGET_SERVICE"
+EXTERNAL_HEALTH_VERIFIED=1
+info "External and direct target readiness checks passed after cutover."
+drain_previous_connections "$BLUE_GREEN_DRAIN_SECONDS"
+
+step "18/20" "Removing inactive web service containers"
+cleanup_inactive_web_services
+
+step "19/20" "Removing orphan containers"
+remove_compose_orphans
+info "Removed any orphaned Compose containers."
+
+step "20/20" "Cleaning stale Docker cache after deploy"
+prune_stale_docker_assets "after deploy"
+
+# The completion line NAMES the state. A deploy that tolerated a failed public page, or
+# skipped the gate, or could not identify the release it warmed, is not the same event
+# as a clean one, and an operator reading the last line at 2am must not have to
+# remember a warning from four steps ago to know which they got.
+if [ -n "$WARMUP_WARNINGS" ]; then
+  warn "Blue/green deploy complete WITH WARNINGS. See the summary below."
+else
+  info "Blue/green deploy complete."
+fi
+
+echo
+echo "============================================"
+echo "  Deploy complete. Current status:"
+echo "============================================"
+docker compose ps
+echo
+docker compose logs "$TARGET_SERVICE" --tail 80
+
+# Last, deliberately: after the container table and the application logs, so it is the
+# final thing on screen rather than the thing they scrolled past.
+print_deploy_warning_summary || true
+}
+
+case "${1:-}" in
+  --internal-blue-green-deploy)
+    shift
+    if [ "$#" -ne 0 ]; then
+      echo "Unexpected arguments for --internal-blue-green-deploy: $*" >&2
+      exit 2
+    fi
+    run_internal_blue_green_deploy
+    ;;
+  --build-and-push-images)
+    shift
+    if [ "$#" -ne 0 ]; then
+      echo "Unexpected arguments for --build-and-push-images: $*" >&2
+      exit 2
+    fi
+    run_production_wrapper build-and-push-images
+    ;;
+  "")
+    run_production_wrapper deploy
+    ;;
+  *)
+    echo "Usage: $0 [--build-and-push-images | --internal-blue-green-deploy]" >&2
+    exit 2
+    ;;
+esac

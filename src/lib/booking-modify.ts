@@ -1,0 +1,55 @@
+// Booking modification boundary (issue #1138). The former single-file module
+// was split into three cohesive modules and this file is now a pure barrel,
+// re-exporting the names its importers use:
+// - booking-modify-validation: edit-eligibility validation + shared loaded types
+// - booking-modify-plan: the in-transaction modify pipeline (guest plan,
+//   repricing, promo changes, change fee, guest/chore writes)
+// - booking-modify-settlement: settlement handoff and lifecycle transitions
+// - booking-modify-quote-priced: the booking-request-origin fences (#4924 split
+//   it out of booking-modify-validation)
+
+export {
+  assertBookingModifiable,
+  GUEST_MEMBER_LINK_IN_PROGRESS_MESSAGE,
+  isBookingFullyPaidForGuestNameEdits,
+  resolveTargetDates,
+  type BatchModifyInput,
+  type BookingModificationSettlementMethod,
+  type LoadedBookingForModify,
+} from "@/lib/booking-modify-validation";
+export {
+  assertBookingNotQuotePriced,
+  GUEST_MEMBER_LINK_MEMBER_WHOLE_LODGE_ONLY_MESSAGE,
+  isMemberWholeLodgeBooking,
+  isQuotePricedBooking,
+  QUOTE_PRICED_EDIT_BLOCK_MESSAGE,
+} from "@/lib/booking-modify-quote-priced";
+export {
+  applyChoreCleanup,
+  applyGuestChanges,
+  applyPromoCodeChanges,
+  calculateModificationChangeFee,
+  calculateModifiedPricing,
+  GUEST_MEMBER_LINK_ADMIN_ONLY_MESSAGE,
+  loadActiveSeasonRates,
+  editedGuestPricingLocks,
+  prepareGuestPlan,
+  rateSnapshotUpdateForRepricedGuest,
+  resolveGuestMemberLinks,
+  resolveGuestNameUpdates,
+  resolvePartnerSharedCapacity,
+  resolvePromoBeneficiarySelection,
+  type PricingResult,
+  type ResolvedGuestNameUpdate,
+} from "@/lib/booking-modify-plan";
+export {
+  applyLifecycleTransitions,
+  applyPaymentAdjustments,
+  calculateModificationSettlementOptions,
+  organiserChildChargeRefusal,
+} from "@/lib/booking-modify-settlement";
+// #3232: straight from the module that declares them, whose only import is
+// `ApiError`, so recognising this refusal costs a caller nothing.
+export {
+  BookingModificationSettlementMethodRequiredError,
+} from "@/lib/booking-modify-settlement-required";

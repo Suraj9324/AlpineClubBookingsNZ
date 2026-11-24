@@ -1,0 +1,193 @@
+import type { MemberMoneySide, Prisma } from "@prisma/client";
+import { bookingOwnerProviderMetadata } from "../../booking-owner";
+import { readBookingTaxAnchorInstant } from "../../booking-tax-anchor";
+import { clubCalendarDateOf, type CalendarDate, type ClubTimeZone } from "../../club-time";
+import { BINDING_CHARGE_SOURCE_VERSION, type BookingChargeAccount } from "./booking-charges";
+import { componentKey, liveComponentGross, type PostedRevenueLeg } from "./components";
+import { memberMoneyEventKeys, type MemberMoneyEventKey } from "./keys";
+import type { MemberMoneyDebtor } from "./plan";
+
+/**
+ * What the journal holds of each booking's charges, for the comparison report
+ * (#4627, Ledger M3b; `pnpm run booking-ledger:census`). A read only, inside the
+ * census's read-only snapshot.
+ *
+ * `charged` says the booking's R01 is in the journal: only then is it in the
+ * population M3b posts, and every later legacy charge line must be bridged. A
+ * booking confirmed before M3b is back-posted whole by M9 and is not compared.
+ */
+export interface BookingJournalCharges {
+  charged: boolean;
+  /**
+   * #4628 (M3c): the R01 is a binding R01 (a bank-transfer booking charged
+   * before settlement) and no legacy line of the booking is bridged yet, so the
+   * journal holds a pending charge the legacy ledger does not have. Absent
+   * reads as false (a reader that did not ask).
+   */
+  pending?: boolean;
+  components: ReadonlyArray<{ account: BookingChargeAccount; chargeIdentity: string; liveGrossCents: number }>;
+  /** The booking's legacy lines a journal batch links (`MemberMoneySourceLink`). */
+  bridgedLineIds: ReadonlySet<string>;
+  /**
+   * When the journal took its first R01, for any booking: a booking created after
+   * it and confirmed with no R01 is a door that skipped the journal. Null before
+   * the first. The same for every booking in one read.
+   */
+  journalSince: Date | null;
+}
+
+const CHARGE_ACCOUNTS: readonly BookingChargeAccount[] = ["BOOKING_REVENUE", "FEE_REVENUE"];
+
+/** A booking charge component's live gross, as the posted legs leave it. */
+export type LiveChargeComponent = BookingJournalCharges["components"][number];
+
+/** The columns a charge leg is read with: what `PostedRevenueLeg` holds. */
+export const CHARGE_LEG_SELECT = {
+  account: true, chargeIdentity: true, side: true, amountCents: true,
+  grossCents: true, netCents: true, taxCents: true, taxCode: true, bookingId: true, lodgeId: true,
+} as const;
+type ChargeLeg = Prisma.MemberMoneyLineGetPayload<{ select: typeof CHARGE_LEG_SELECT }>;
+
+/** Each charge component the legs post, with the gross it still carries: the one rule for the doors and the census. */
+function liveChargeComponents(legs: readonly PostedRevenueLeg[]): LiveChargeComponent[] {
+  const gross = liveComponentGross(legs);
+  return [...new Map(legs.map((leg) => [componentKey(leg.account, leg.chargeIdentity!), leg])).entries()]
+    .map(([key, leg]) => ({
+      account: leg.account as BookingChargeAccount,
+      chargeIdentity: leg.chargeIdentity!,
+      liveGrossCents: gross.get(key) ?? 0,
+    }));
+}
+
+/** The booking and fee revenue legs with a component identity, of the given bookings. */
+export const chargeLegsOf = (bookingIds: readonly string[]) => ({
+  bookingId: { in: [...bookingIds] }, account: { in: [...CHARGE_ACCOUNTS] }, chargeIdentity: { not: null },
+});
+
+/** One booking's posted charge legs (booking and fee revenue), oldest first: what its components are computed from. */
+export async function readBookingChargeLegs(
+  db: Pick<Prisma.TransactionClient, "memberMoneyLine">,
+  bookingId: string,
+): Promise<PostedRevenueLeg[]> {
+  return db.memberMoneyLine.findMany({ where: chargeLegsOf([bookingId]), orderBy: { id: "asc" }, select: CHARGE_LEG_SELECT });
+}
+
+/** One booking's live charge components, read inside a door's transaction under `lock(1)`. */
+export async function readBookingLiveComponents(
+  db: Pick<Prisma.TransactionClient, "memberMoneyLine">,
+  bookingId: string,
+): Promise<LiveChargeComponent[]> {
+  return liveChargeComponents(await readBookingChargeLegs(db, bookingId));
+}
+
+/** The booking's live charge: the sum C2 caps collection by, for the receipts, the engine and the census alike. */
+export async function readBookingLiveChargeCents(db: Pick<Prisma.TransactionClient, "memberMoneyLine">, bookingId: string): Promise<number> {
+  return (await readBookingLiveComponents(db, bookingId)).reduce((sum, component) => sum + component.liveGrossCents, 0);
+}
+
+/**
+ * A booking's tax anchor (#4632, owner decision A): the club date of
+ * `readBookingTaxAnchorInstant`, on which every fresh split of its charges
+ * takes the treatment in force, so a booking keeps that treatment for its whole
+ * life. The one definition its Xero documents also read (`xero-tax-anchors.ts`):
+ * a group place takes its organiser's booking, as the combined invoice does.
+ */
+export async function readBookingTaxAnchorDate(
+  db: Pick<Prisma.TransactionClient, "booking">,
+  bookingId: string,
+  zone: ClubTimeZone,
+): Promise<CalendarDate> {
+  return clubCalendarDateOf(await readBookingTaxAnchorInstant(db, bookingId), zone);
+}
+
+/** Whether an event key is in the journal: a replay check, never a lock. */
+export async function eventPosted(db: Pick<Prisma.TransactionClient, "memberMoneyEvent">, eventKey: MemberMoneyEventKey): Promise<boolean> {
+  return (await db.memberMoneyEvent.findUnique({ where: { eventKey }, select: { id: true } })) !== null;
+}
+
+/**
+ * The receivable's debtor for a booking's owner row (`INV-SSOT-005`: who owns a
+ * booking is `booking-owner.ts`'s answer, never re-derived). The caller decides
+ * whether that read held the booking row: a door does, a receipt does not.
+ */
+export function bookingOwnerDebtor(booking: { memberId: string | null; organisationId: string | null }): MemberMoneyDebtor {
+  const owner = bookingOwnerProviderMetadata(booking);
+  return "memberId" in owner ? { kind: "MEMBER", memberId: owner.memberId } : { kind: "ORGANISATION", organisationId: owner.organisationId };
+}
+
+/** Signed receivable balances (debit positive), keyed by the caller: merge per booking, residue and census per member. */
+export function receivableBalances<R extends { side: MemberMoneySide; amountCents: number }, K>(rows: Iterable<R>, keyOf: (row: R) => K | null): Map<K, number> {
+  const balances = new Map<K, number>();
+  for (const row of rows) {
+    const key = keyOf(row);
+    if (key === null) continue;
+    balances.set(key, (balances.get(key) ?? 0) + (row.side === "DEBIT" ? 1 : -1) * row.amountCents);
+  }
+  return balances;
+}
+
+/**
+ * When the journal took its first R01 (#4627): the boundary between a booking
+ * confirmed before M3b (M9's to back-post) and one in the journal era. Null
+ * before the first.
+ */
+export async function readJournalSince(db: Pick<Prisma.TransactionClient, "memberMoneyEvent">): Promise<Date | null> {
+  const first = await db.memberMoneyEvent.aggregate({ where: { eventKey: { startsWith: "booking-charge:" } }, _min: { recordedAt: true } });
+  return first._min.recordedAt ?? null;
+}
+
+/**
+ * Whether a booking belongs to the journal era: created after the journal's
+ * first R01, so its confirmation must post one. One created before and
+ * confirmed after cannot be told from one confirmed before M3b (a stated limit).
+ */
+export function isJournalEraBooking(createdAt: Date | null | undefined, journalSince: Date | null): boolean {
+  return journalSince !== null && createdAt != null && createdAt > journalSince;
+}
+
+export async function readBookingJournalCharges(
+  db: Pick<Prisma.TransactionClient, "memberMoneyEvent" | "memberMoneyLine" | "memberMoneySourceLink">,
+  bookingIds: readonly string[],
+): Promise<Map<string, BookingJournalCharges>> {
+  const result = new Map<string, BookingJournalCharges>();
+  if (bookingIds.length === 0) return result;
+  const keys = new Map<string, string>(bookingIds.map((bookingId) => [memberMoneyEventKeys.bookingCharge(bookingId), bookingId]));
+  const charged = await db.memberMoneyEvent.findMany({ where: { eventKey: { in: [...keys.keys()] } }, select: { eventKey: true, sourceVersion: true } });
+  const chargedIds = new Set(charged.map((event) => keys.get(event.eventKey)));
+  const boundIds = new Set(charged.filter((event) => event.sourceVersion === BINDING_CHARGE_SOURCE_VERSION).map((event) => keys.get(event.eventKey)));
+  const legs = await db.memberMoneyLine.findMany({ where: chargeLegsOf(bookingIds), orderBy: { id: "asc" }, select: CHARGE_LEG_SELECT });
+  const journalSince = await readJournalSince(db);
+  const links = await db.memberMoneySourceLink.findMany({
+    where: { bookingLedgerLine: { bookingId: { in: [...bookingIds] } } },
+    orderBy: { id: "asc" },
+    select: { bookingLedgerLineId: true, bookingLedgerLine: { select: { bookingId: true } } },
+  });
+  const bridged = new Map<string, Set<string>>();
+  for (const link of links) {
+    const bookingId = link.bookingLedgerLine?.bookingId;
+    if (!bookingId || !link.bookingLedgerLineId) continue;
+    bridged.set(bookingId, (bridged.get(bookingId) ?? new Set<string>()).add(link.bookingLedgerLineId));
+  }
+  const byBooking = new Map<string, ChargeLeg[]>();
+  for (const leg of legs) byBooking.set(leg.bookingId!, [...(byBooking.get(leg.bookingId!) ?? []), leg]);
+  for (const bookingId of bookingIds) {
+    const bridgedLineIds = bridged.get(bookingId) ?? new Set<string>();
+    result.set(bookingId, {
+      charged: chargedIds.has(bookingId),
+      pending: boundIds.has(bookingId) && bridgedLineIds.size === 0,
+      components: liveChargeComponents(byBooking.get(bookingId) ?? []),
+      bridgedLineIds,
+      journalSince,
+    });
+  }
+  return result;
+}
+
+/**
+ * How many journal events name the booking as their source (#4627): what the
+ * back-post compares before and after a booking's transaction to report the
+ * batches it posted, R01, R26 and R04 alike. A read only.
+ */
+export async function countBookingJournalEvents(db: Pick<Prisma.TransactionClient, "memberMoneyEvent">, bookingId: string): Promise<number> {
+  return db.memberMoneyEvent.count({ where: { sourceKind: "BOOKING", sourceIdentity: bookingId } });
+}

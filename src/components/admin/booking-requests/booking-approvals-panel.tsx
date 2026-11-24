@@ -1,0 +1,674 @@
+"use client";
+import { fetchWithRecentAuth } from "@/components/confirm-its-you";
+
+import { adminHref } from "@/lib/admin-hubs";
+
+import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { DiagnosticsRecordButton } from "@/components/help-widget/diagnostics-record-button";
+import { Badge } from "@/components/ui/badge";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { DatasetResetButton } from "@/components/admin/dataset-reset-button";
+import { Pagination } from "@/components/admin/admin-pagination";
+import { fetchOffPageQueueRecord, useAdminQueuePage } from "@/components/admin/use-admin-queue-page";
+import { PinnedQueueRecordNote } from "@/components/admin/pinned-queue-record-note";
+import { parseAdminListPageParam } from "@/lib/admin-list-page";
+import { bookingOwner } from "@/lib/booking-owner";
+import { buildBookingRequestDatasetPath } from "@/lib/admin-dataset-reset-state";
+import { BOOKING_REQUESTS_STATUS_PARAM } from "@/lib/admin-booking-requests-path";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { NotifyChoiceDialog } from "@/components/admin/notify-choice-dialog";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  AdminViewOnlySectionBanner,
+  ViewOnlyActionButton,
+} from "@/components/admin/view-only-action";
+import { ADMIN_VIEW_ONLY_ACTION_REASON } from "@/hooks/use-admin-area-edit-access";
+import { BookingNoEmailsNotice } from "@/components/booking-no-emails-notice";
+import { useClubTime } from "@/components/club-time-provider";
+import { formatStayDate } from "@/lib/club-time";
+import { formatCents } from "@/lib/utils";
+import { FocusedActionError } from "@/components/focused-action-error";
+import { buildHrefWithReturnTo } from "@/lib/internal-return-path";
+import { useClubFormat } from "@/components/club-format-provider";
+import { notifyAdminQueueChanged } from "@/lib/admin-queue-events";
+
+type ReviewFilter = "PENDING" | "APPROVED" | "REJECTED" | "ALL";
+
+const reviewFilters = new Set<ReviewFilter>(["PENDING", "APPROVED", "REJECTED", "ALL"]);
+
+function isReviewFilter(value: string | null): value is ReviewFilter {
+  return reviewFilters.has(value as ReviewFilter);
+}
+
+interface BookingReviewData {
+  id: string;
+  checkIn: string;
+  checkOut: string;
+  status: string;
+  finalPriceCents: number;
+  memberReviewJustification: string | null;
+  adminReviewStatus: "PENDING" | "APPROVED" | "REJECTED" | null;
+  adminReviewNotes: string | null;
+  adminReviewedAt: string | null;
+  createdAt: string;
+  // #2259: the booking's "No emails" switch. The review outcome emails
+  // (`booking-review-approved` / `booking-review-rejected`) are booking-scoped,
+  // so the mailer withholds them while it is on and the notify prompt stops
+  // offering the choice. Served by `/api/admin/booking-reviews`, which is
+  // admin-only, so the field never reaches a member.
+  noEmails: boolean;
+  member: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+  };
+  adminReviewedBy: {
+    id: string;
+    firstName: string;
+    lastName: string;
+  } | null;
+  guests: Array<{
+    id: string;
+    firstName: string;
+    lastName: string;
+    ageTier: string;
+    isMember: boolean;
+  }>;
+}
+
+function statusBadgeClass(status: BookingReviewData["adminReviewStatus"]) {
+  if (status === "PENDING") return "border-warning-6 bg-warning-3 text-warning-11";
+  if (status === "APPROVED") return "border-success-6 bg-success-3 text-success-11";
+  return "border-border bg-muted text-muted-foreground";
+}
+
+interface BookingApprovalsPanelProps {
+  basePath?: string;
+  fixedSearchParams?: Record<string, string>;
+  showHeading?: boolean;
+  canEdit?: boolean;
+}
+
+const EMPTY_SEARCH_PARAMS: Record<string, string> = {};
+
+function buildBookingApprovalsPath(
+  basePath: string,
+  currentSearch: string,
+  fixedSearchParams: Record<string, string>,
+  status: ReviewFilter,
+  bookingId: string | null,
+  page: number,
+) {
+  return buildBookingRequestDatasetPath({
+    basePath,
+    currentSearch,
+    fixedSearchParams,
+    status,
+    defaultStatus: "PENDING",
+    recordKey: "bookingId",
+    recordId: bookingId,
+    page,
+  });
+}
+
+export function BookingApprovalsPanel({
+  basePath = adminHref("booking-requests"),
+  fixedSearchParams = EMPTY_SEARCH_PARAMS,
+  showHeading = true,
+  canEdit = true,
+}: BookingApprovalsPanelProps) {
+  const format = useClubFormat();
+  /**
+   * Real INSTANTS project through the club's PERSISTED timezone (CT-4, #2870;
+   * INV-CONFIG-002), not the container's `TZ`. The zone reaches this browser as
+   * data through `ClubTimeProvider` and is never read from the viewer's clock.
+   */
+  const clubTime = useClubTime();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const initialFilter = searchParams.get(BOOKING_REQUESTS_STATUS_PARAM);
+  const focusedBookingId = searchParams.get("bookingId");
+  const defaultFilter: ReviewFilter = focusedBookingId ? "ALL" : "PENDING";
+  const [bookings, setBookings] = useState<BookingReviewData[]>([]);
+  const [filter, setFilter] = useState<ReviewFilter>(
+    isReviewFilter(initialFilter) ? initialFilter : defaultFilter,
+  );
+  const queuePage = useAdminQueuePage({
+    filterKey: filter,
+    initialPage: parseAdminListPageParam(searchParams.get("page")),
+  });
+  const { page, setPage, receive, beginLoad } = queuePage;
+  // INV-OPS-020: a deep-linked booking that is not on the loaded page is read
+  // by id and pinned above it, so the link always lands on its booking.
+  const [pinnedBooking, setPinnedBooking] = useState<BookingReviewData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [reviewingId, setReviewingId] = useState<string | null>(null);
+  const [notesById, setNotesById] = useState<Record<string, string>>({});
+  const [error, setError] = useState("");
+  const [errorAttentionVersion, setErrorAttentionVersion] = useState(0);
+  const [recoveryAttentionVersion, setRecoveryAttentionVersion] = useState(0);
+  const [decisionRecovery, setDecisionRecovery] = useState<{
+    bookingId: string;
+    message: string;
+  } | null>(null);
+  // #1790: which decision is waiting on the admin's notify-or-not choice, and
+  // whether the dialog is open. Both approve and reject always email the member
+  // (unconditional sends in the route), so the dialog is shown for both. The
+  // choice is kept set while the dialog fades out (Radix keeps the content
+  // mounted through its exit animation) so the copy never flickers to the other
+  // decision's wording.
+  const [notifyChoice, setNotifyChoice] = useState<
+    {
+      bookingId: string;
+      decision: "APPROVED" | "REJECTED";
+      noEmails: boolean;
+    } | null
+  >(null);
+  const [notifyDialogOpen, setNotifyDialogOpen] = useState(false);
+  const currentPath = buildBookingApprovalsPath(
+    basePath,
+    searchParams.toString(),
+    fixedSearchParams,
+    filter,
+    focusedBookingId,
+    page,
+  );
+
+  const fetchBookings = useCallback(async () => {
+    const isCurrent = beginLoad();
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`/api/admin/booking-reviews?status=${filter}&page=${page}`);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to load booking reviews");
+      }
+      const rows: BookingReviewData[] = Array.isArray(data?.data) ? data.data : [];
+      const pinned = await fetchOffPageQueueRecord("/api/admin/booking-reviews", "bookingId", focusedBookingId, rows);
+      if (!isCurrent()) return true; // a newer read owns the list
+      setBookings(rows);
+      receive(data, rows.length);
+      setPinnedBooking(pinned);
+      return true;
+    } catch (err) {
+      if (!isCurrent()) return true;
+      setError(err instanceof Error ? err.message : "Failed to load booking reviews");
+      return false;
+    } finally {
+      if (isCurrent()) setLoading(false);
+    }
+    // setState functions are referentially stable; they are listed so the
+    // manual dependencies match what the React Compiler infers.
+  }, [beginLoad, filter, page, receive, focusedBookingId, setBookings, setError, setLoading, setPinnedBooking]);
+
+  useEffect(() => {
+    fetchBookings();
+  }, [fetchBookings]);
+
+  useEffect(() => {
+    router.replace(currentPath, { scroll: false });
+  }, [currentPath, router]);
+
+  function showActionError(message: string) {
+    setError(message);
+    setErrorAttentionVersion((version) => version + 1);
+  }
+
+  // #1790: validate the decision (reject needs admin notes) and then open the
+  // notify-choice dialog. Both decisions email the member either way, so the
+  // dialog always asks; the actual PATCH runs from confirmNotify.
+  function requestDecision(bookingId: string, decision: "APPROVED" | "REJECTED") {
+    const adminNotes = notesById[bookingId]?.trim() ?? "";
+    if (decision === "REJECTED" && !adminNotes) {
+      showActionError("Please add admin notes before rejecting so the member gets a reason.");
+      return;
+    }
+    setError("");
+    // #2259: carry the booking's "No emails" state into the choice, read off
+    // the already-loaded queue row rather than fetched per action.
+    setNotifyChoice({
+      bookingId,
+      decision,
+      noEmails:
+        shownBookings.find((booking) => booking.id === bookingId)?.noEmails === true,
+    });
+    setNotifyDialogOpen(true);
+  }
+
+  // #1790: dispatch the pending decision with the admin's notify choice. Close
+  // the dialog without clearing the choice, so the content keeps its wording
+  // while it fades out.
+  function confirmNotify(notify: boolean) {
+    const choice = notifyChoice;
+    setNotifyDialogOpen(false);
+    if (!choice) return;
+    void performDecision(choice.bookingId, choice.decision, notify);
+  }
+
+  /**
+   * #2259 H1: dispatch the silenced path with NO notify choice at all.
+   *
+   * `notifyMember: false` makes the route skip the send outright, so the
+   * mailer's gate never runs and no `SKIPPED_NO_EMAILS` row is recorded — the
+   * booking's withheld-list banner would then omit the very approval or
+   * decline just performed. Omitting the flag lets the send be ATTEMPTED and
+   * withheld, which records the row and, because the route only audits an
+   * explicit `false`, leaves the audit trail honestly showing that the admin
+   * made no choice, because none was offered.
+   */
+  function confirmSilenced() {
+    const choice = notifyChoice;
+    setNotifyDialogOpen(false);
+    if (!choice) return;
+    void performDecision(choice.bookingId, choice.decision, undefined, true);
+  }
+
+  async function performDecision(
+    bookingId: string,
+    decision: "APPROVED" | "REJECTED",
+    notifyMember: boolean | undefined,
+    noEmails = false,
+  ) {
+    const adminNotes = notesById[bookingId]?.trim() ?? "";
+    setReviewingId(bookingId);
+    setError("");
+    try {
+      const response = await fetchWithRecentAuth(`/api/admin/bookings/${bookingId}/review`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          status: decision,
+          adminNotes,
+          // Absent = notify (the route's documented default), which is what
+          // lets the gate withhold and record on a silenced booking.
+          ...(notifyMember !== undefined ? { notifyMember } : {}),
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (
+          decision === "REJECTED" &&
+          data.reviewRecorded === true &&
+          (data.cancellationPending === true ||
+            data.cancellationStatusUnconfirmed === true)
+        ) {
+          const recoveryBase = data.cancellationPending === true
+            ? "The rejection was recorded, but cancellation is still pending. Do not reject this booking again."
+            : "The rejection was recorded, but the booking's cancellation status could not be confirmed. Do not reject this booking again.";
+          setBookings((current) =>
+            current.filter((booking) => booking.id !== bookingId),
+          );
+          setPinnedBooking((current) => (current?.id === bookingId ? null : current));
+          setDecisionRecovery({ bookingId, message: recoveryBase });
+          setRecoveryAttentionVersion((version) => version + 1);
+          notifyAdminQueueChanged();
+          const refreshed = await fetchBookings();
+          // The refresh outcome is folded into the durable recovery below; do
+          // not duplicate it in the ordinary action region or steal focus.
+          setError("");
+          const refreshResult = refreshed
+            ? " The latest review queue was loaded; open the booking and check its cancellation status."
+            : " The review queue could not be refreshed. This warning remains active; open the booking and check its cancellation status.";
+          setDecisionRecovery({
+            bookingId,
+            message: `${recoveryBase}${refreshResult}`,
+          });
+          setRecoveryAttentionVersion((version) => version + 1);
+          return;
+        }
+        throw new Error(data.error || "Failed to record decision");
+      }
+      setNotesById((prev) => {
+        const next = { ...prev };
+        delete next[bookingId];
+        return next;
+      });
+      // #1790 honesty: approve sends only the review-approved email, so
+      // suppressing it means no email at all. Reject also triggers the shared
+      // cancellation flow, whose cancellation notice is deliberately
+      // always-notify (#1730, DOMAIN_INVARIANTS), so a suppressed reject only
+      // withholds the review-declined explainer — the member is still emailed.
+      //
+      // #2259: with the switch on, the cancellation notice the reject branch
+      // above relies on is withheld too, so "the member is still emailed" is
+      // false — say nothing was sent at all.
+      const suppressedNote = noEmails
+        ? " Emails are off for this booking, so nothing was sent — the withheld messages are listed on the booking."
+        : notifyMember === false
+          ? decision === "APPROVED"
+            ? " The member was not emailed."
+            : " The review-declined email was not sent."
+          : "";
+      toast.success(
+        (decision === "APPROVED" ? "Booking approved." : "Booking rejected and cancelled.") +
+          suppressedNote,
+      );
+      notifyAdminQueueChanged();
+      await fetchBookings();
+    } catch (err) {
+      showActionError(err instanceof Error ? err.message : "Failed to record decision");
+    } finally {
+      setReviewingId(null);
+    }
+  }
+
+  /*
+    #2160: the view-only explanation lives here, once, at the top of the section —
+    announced on arrival and ahead of the controls it explains — instead of on
+    each disabled button below. The `role="status"` wrapper is permanently
+    mounted so the live region is registered in the accessibility tree before
+    its content appears; a region injected already-populated is silently dropped
+    by some screen-reader/browser pairings. It sits OUTSIDE the `space-y-6`
+    stack so the empty wrapper an edit-capable admin gets costs no layout.
+  */
+  const shownBookings = pinnedBooking ? [pinnedBooking, ...bookings] : bookings;
+
+  const viewOnlyBanner = (
+    <AdminViewOnlySectionBanner canEdit={canEdit} className="mb-6">
+      Your admin role can view bookings awaiting approval but cannot decide
+      them. Bookings edit access is required to approve or reject a booking.
+    </AdminViewOnlySectionBanner>
+  );
+
+  return (
+    <div>
+      {viewOnlyBanner}
+      <div className="space-y-6">
+      {showHeading ? (
+        <div>
+          <h1 className="text-3xl font-bold">Booking approvals</h1>
+          <p className="mt-1 text-muted-foreground">
+            Review bookings that need admin approval before they can be paid.
+            See also{" "}
+            <Link className="underline" href={`${adminHref("booking-requests")}?tab=changes`}>
+              booking change requests
+            </Link>{" "}
+            and{" "}
+            <Link className="underline" href={adminHref("refund-requests")}>
+              refund requests
+            </Link>
+            .
+          </p>
+        </div>
+      ) : null}
+
+      <FocusedActionError
+        id="booking-approvals-recovery"
+        error={decisionRecovery?.message ?? ""}
+        attentionKey={recoveryAttentionVersion}
+        heading={decisionRecovery ? "Rejection recorded - cancellation pending" : undefined}
+        action={
+          decisionRecovery ? (
+            <Button asChild variant="outline" size="sm">
+              <Link
+                href={buildHrefWithReturnTo(
+                  `/bookings/${encodeURIComponent(decisionRecovery.bookingId)}`,
+                  currentPath,
+                )}
+              >
+                Open affected booking
+              </Link>
+            </Button>
+          ) : undefined
+        }
+      />
+      <FocusedActionError
+        id="booking-approvals-error"
+        error={error}
+        attentionKey={errorAttentionVersion}
+        action={
+          error ? (
+            <Button type="button" variant="outline" size="sm" onClick={() => setError("")}>
+              Dismiss
+            </Button>
+          ) : undefined
+        }
+      />
+
+
+      <div className="flex flex-wrap gap-2">
+        {(["PENDING", "APPROVED", "REJECTED", "ALL"] as const).map((status) => (
+          <Button
+            key={status}
+            variant={filter === status ? "default" : "outline"}
+            size="sm"
+            onClick={() => setFilter(status)}
+          >
+            {status === "ALL" ? "All" : status.charAt(0) + status.slice(1).toLowerCase()}
+          </Button>
+        ))}
+        <DatasetResetButton
+          disabled={filter === defaultFilter && page === 1}
+          onReset={() => { setFilter(defaultFilter); setPage(1); }}
+        />
+      </div>
+
+      {loading ? (
+        <div className="py-8 text-center">Loading...</div>
+      ) : shownBookings.length === 0 ? (
+        <div className="py-8 text-center text-muted-foreground">
+          No {filter === "ALL" ? "" : filter.toLowerCase() + " "}booking reviews found.
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {shownBookings.map((booking) => {
+            const decided = booking.adminReviewStatus !== "PENDING";
+            const highlighted = booking.id === focusedBookingId;
+            const pinned = booking === pinnedBooking;
+            return (
+              <Card
+                key={booking.id}
+                className={highlighted ? "border-warning-6" : undefined}
+              >
+                <CardHeader>
+                  {pinned ? <PinnedQueueRecordNote /> : null}
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <CardTitle className="text-lg">
+                        {bookingOwner(booking).member.firstName} {bookingOwner(booking).member.lastName}
+                      </CardTitle>
+                      <p className="text-sm text-muted-foreground">
+                        Created {clubTime.instantDateTime(new Date(booking.createdAt))} —{" "}
+                        <Link href={`${adminHref("bookings")}/${booking.id}`} className="underline">
+                          view booking
+                        </Link>
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Badge variant="outline" className={statusBadgeClass(booking.adminReviewStatus)}>
+                        {booking.adminReviewStatus ?? "—"}
+                      </Badge>
+                      {/* #2812 — the approvals queue is the single most likely
+                          place to ask "why will this booking not confirm?", and
+                          it was the one review surface #2378's D11 wiring left
+                          out (its registry row pointed at a redirect). Beside
+                          the review status, same as the other three lists. */}
+                      <DiagnosticsRecordButton
+                        recordId={booking.id}
+                        subject={`the booking for ${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName} awaiting review`}
+                      />
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+                    <div>
+                      <span className="text-muted-foreground">Dates:</span>{" "}
+                      {formatStayDate(booking.checkIn, format)} to{" "}
+                      {formatStayDate(booking.checkOut, format)}
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Status:</span> {booking.status}
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Total:</span>{" "}
+                      {formatCents(booking.finalPriceCents, format)}
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Guests:</span>{" "}
+                      {booking.guests.length}
+                    </div>
+                  </div>
+
+                  <div className="rounded-md border bg-muted p-3 text-sm">
+                    <p className="font-medium text-foreground">Guests on this booking</p>
+                    <ul className="mt-2 space-y-1 text-muted-foreground">
+                      {booking.guests.map((guest) => (
+                        <li key={guest.id}>
+                          {guest.firstName} {guest.lastName} — {guest.ageTier}
+                          {guest.isMember ? " (member)" : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {booking.memberReviewJustification && (
+                    <div className="rounded-md border border-warning-6 bg-warning-3 p-3 text-sm">
+                      <p className="font-medium text-warning-11">
+                        Member&apos;s reason for booking without an adult
+                      </p>
+                      <p className="mt-1 whitespace-pre-wrap text-warning-11">
+                        {booking.memberReviewJustification}
+                      </p>
+                    </div>
+                  )}
+
+                  {decided ? (
+                    <div className="rounded-md border bg-muted p-3 text-sm">
+                      <p className="font-medium text-foreground">
+                        Decision: {booking.adminReviewStatus}
+                        {booking.adminReviewedBy
+                          ? ` by ${booking.adminReviewedBy.firstName} ${booking.adminReviewedBy.lastName}`
+                          : ""}
+                        {booking.adminReviewedAt
+                          ? ` on ${clubTime.instantDateTime(new Date(booking.adminReviewedAt))}`
+                          : ""}
+                      </p>
+                      {booking.adminReviewNotes && (
+                        <p className="mt-2 whitespace-pre-wrap text-muted-foreground">
+                          {booking.adminReviewNotes}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium" htmlFor={`notes-${booking.id}`}>
+                        Admin notes (required to reject; optional for approval)
+                      </label>
+                      <Textarea
+                        id={`notes-${booking.id}`}
+                        value={notesById[booking.id] ?? ""}
+                        disabled={!canEdit}
+                        title={canEdit === false ? ADMIN_VIEW_ONLY_ACTION_REASON : undefined}
+                        onChange={(event) =>
+                          setNotesById((prev) => ({ ...prev, [booking.id]: event.target.value }))
+                        }
+                        rows={3}
+                        maxLength={2000}
+                        placeholder="Explain your decision. The member will see this note."
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <ViewOnlyActionButton
+                          canEdit={canEdit}
+                          describeReason={false}
+                          onClick={() => requestDecision(booking.id, "APPROVED")}
+                          disabled={reviewingId === booking.id}
+                        >
+                          Approve
+                        </ViewOnlyActionButton>
+                        <ViewOnlyActionButton
+                          canEdit={canEdit}
+                          describeReason={false}
+                          variant="destructive"
+                          onClick={() => requestDecision(booking.id, "REJECTED")}
+                          disabled={reviewingId === booking.id}
+                        >
+                          Reject and cancel
+                        </ViewOnlyActionButton>
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+      {queuePage.pagination ? (
+        <Pagination {...queuePage.pagination} aria-label="Booking approvals pages" />
+      ) : null}
+
+      {/* #1790: per-decision member-email choice, mirroring the #1695/#1705
+          pattern. Both approve and reject email the member either way, so the
+          dialog always asks; the choice itself is recorded in the audit log.
+          It suppresses only the review approval/rejection notice — the shared
+          cancellation flow behind a reject is unaffected. */}
+      <NotifyChoiceDialog
+        open={notifyDialogOpen}
+        onOpenChange={setNotifyDialogOpen}
+        submitting={reviewingId !== null}
+        title={
+          notifyChoice?.noEmails
+            ? notifyChoice.decision === "REJECTED"
+              ? "Decline this booking?"
+              : "Approve this booking?"
+            : notifyChoice?.decision === "REJECTED"
+              ? "Email the member about this decline?"
+              : "Email the member about this approval?"
+        }
+        description={
+          notifyChoice?.noEmails
+            ? notifyChoice.decision === "REJECTED"
+              ? "The booking will be declined and cancelled. Nothing at all is emailed to the member — not even the standard cancellation notice."
+              : "The booking will be approved."
+            : notifyChoice?.decision === "REJECTED"
+              ? "The booking is declined and cancelled either way, and the member always receives the standard cancellation notice. Choose whether they also receive the review-declined explainer email — your choice is recorded in the audit log."
+              : "The booking is approved either way. Choose whether the member receives the standard review-approved email — your choice is recorded in the audit log."
+        }
+        // #2259: with the booking's "No emails" switch on, the review outcome
+        // email is withheld whatever is chosen — and so, on the reject path,
+        // is the cancellation notice the copy above would otherwise promise.
+        // No choice is offered.
+        notice={notifyChoice?.noEmails ? <BookingNoEmailsNotice /> : null}
+        actions={
+          notifyChoice?.noEmails
+            ? {
+                kind: "single",
+                action: {
+                  label:
+                    notifyChoice.decision === "REJECTED"
+                      ? "Reject booking"
+                      : "Approve booking",
+                  variant: "outline",
+                  onSelect: confirmSilenced,
+                },
+              }
+            : {
+                kind: "choice",
+                withoutEmail: {
+                  label:
+                    notifyChoice?.decision === "REJECTED"
+                      ? "Reject without emailing"
+                      : "Approve without emailing",
+                  variant: "outline",
+                  onSelect: () => confirmNotify(false),
+                },
+                withEmail: {
+                  label:
+                    notifyChoice?.decision === "REJECTED"
+                      ? "Reject and email member"
+                      : "Approve and email member",
+                  onSelect: () => confirmNotify(true),
+                },
+              }
+        }
+      />
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,218 @@
+# Message Board
+
+Audience: Operator
+
+## What it is
+
+A message board members write to themselves. Any member can post; you can hide a
+post from members, correct its text, or remove it. Find the admin surface at
+**Admin → Members → Message Board** (`/admin/message-board`), and the member's
+own view at `/message-board`.
+
+The board is gated by the **Message board** module (Admin → Modules), which is
+**off by default** — if the entry is missing, that module is off. Hiding,
+editing and removing are **membership**-area edit actions: a view-only
+membership admin reads the board but cannot change anything.
+
+Unlike [Member notices](member-notices.md), which the committee writes and
+targets at chosen members, this is written by members and seen by all of them.
+Nobody targets a board post and nobody tracks who has read it.
+
+A post **stays inside your club unless its author shares it**. When your club
+has an Alpine Central Server connection (Admin → Integrations), members may
+tick **Share with all clubs** in the composer: the post is sent to the central
+server and appears on every other club's board. Without that connection the
+tickbox is disabled and says so, and every post is club-only.
+
+Posts **other clubs share** appear on your board too — on a differently shaded
+card with the origin club's name — and their pictures are copied to and served
+by your own installation, so your members' reading habits are not disclosed to
+anyone else and the board keeps working when the central server is down.
+
+## When you'd use it
+
+- A member has posted something that should not stay up, and you need it gone.
+- A post is fine but has an error in it worth correcting.
+- Somebody has asked for their own post to be taken down — they cannot do it
+  themselves.
+- You want to see what members have been posting.
+
+## Step-by-step
+
+### Find a post
+
+1. Go to **Admin → Members → Message Board**.
+2. **All posts** lists everything on the board, newest first. **Hidden** lists
+   only what is currently hidden from members.
+3. Search by any words in the post, or by the author's name.
+
+### Hide a post
+
+1. Find the post and click **Hide**.
+2. It disappears from the member board and the dashboard card immediately. The
+   text is kept.
+3. The post now appears under **Hidden** with a "Hidden from members" label, and
+   its button reads **Show to members**. Click that to put it back.
+
+Hiding is the reversible option. Reach for it when you are not certain, or when
+you want to take something out of view while you ask the author about it.
+
+### Correct a post's text
+
+1. Click **Edit text**, change the wording, and click **Save text**.
+2. The original wording is written to the audit log, so what the member actually
+   wrote can still be recovered.
+
+You are rewriting somebody else's words under their name. Prefer asking the
+member to repost, and keep edits to obvious corrections.
+
+### Moderating another club's post
+
+You can **hide** or **remove** another club's post from your own board — both
+are local acts that change nothing anywhere else. You cannot **edit** its
+words: the post still carries the other club's name, and rewriting it here
+would misrepresent that club to your members. The Edit control refuses with
+exactly that explanation.
+
+### When a shared post is taken down on the network
+
+If the central server removes a post (its administrator acted, or enough clubs
+reported it), your board follows: another club's post disappears, and **your
+own club's post is hidden rather than deleted** — the words belong to your
+member, so takedown convergence is a moderation act, not an erasure. You can
+unhide it from the **Hidden** tab, at which point it is a club-only post that
+is no longer on the network.
+
+### Remove a post
+
+1. Click **Remove** and confirm.
+2. The text is **deleted permanently**. It cannot be recovered from this screen,
+   and the audit log records that a removal happened without keeping a copy of
+   what was said.
+
+Use **Hide** unless you actually want the words gone.
+
+Removing a post **your club had shared** also withdraws it from the central
+server, so it comes off the other clubs' boards too. If the central server is
+unreachable at that moment the local removal still completes, and the
+withdrawal is retried.
+
+**While the central server is on a different software version from this
+site, everything that crosses to it is paused**: shares wait (without using
+up their retries), withdrawals wait, the pull that brings other clubs' posts
+here waits, and a push from the server is accepted but not acted on. Posts on
+your own board are unaffected. The
+[Alpine Central Server](integrations.md#connect-to-the-alpine-central-server)
+setup page shows both version numbers; once they match, sharing and the pull
+resume on their own.
+
+### Sharing problems
+
+Very rarely a share or a withdrawal ends in a way this site could not record.
+The site sends a post at most once, so that a failure never puts two copies on
+other clubs' boards, which means it never retries these on its own. They are
+listed in a **Sharing problems** box at the top of the moderation list, one
+entry per post, removed posts included:
+
+- **Copy on other clubs' boards** — the central server accepted the post, but
+  this site could not record that. The entry shows the **Central server id**
+  with a **Copy** button. Click **Withdraw the shared copy** to take that copy
+  down; the post stays on your own board. Removing the post also withdraws it.
+- **Removed here, not yet taken down elsewhere** — you removed a shared post
+  and the central server has not confirmed taking it off other clubs' boards.
+  The site retries this automatically; **Withdraw the shared copy** tries
+  again now.
+- **Share result unknown** — the post was sent, but no result was recorded, so
+  this site holds no central server id for it. Ask whoever runs the site to
+  find the id in the error log using the **Post reference** shown, then ask
+  the central server's administrator to take the copy down. Click **Mark as
+  dealt with** once that is done, or once you know there is no copy. This
+  button appears only once the send is 15 minutes old: before that, the site
+  may still be recording its own result.
+
+If **Withdraw the shared copy** fails, the reason shows under the entry and the
+id is kept. Send the id to the central server's administrator and ask them to
+take the copy down. A removed post can hold two copies; if one came down
+before the other failed, the message says which. Every attempt, including a
+failed or half-finished one, is written to the audit log with the ids
+withdrawn and the ids still outstanding.
+
+In the list below, a post with one of these problems carries a **Sharing
+problem** badge. A post whose share failed outright, so nothing reached other
+clubs, carries **Not shared with other clubs** with the recorded reason; post
+it again with **Share to all clubs** ticked if it still matters. Members see
+none of this.
+
+### Set how long posts are kept
+
+1. On the same screen, find the **Retention** card.
+2. Click **Edit**, choose a period, and click **Save**. **Cancel** puts it back.
+3. Before you save, the card tells you how many posts on the board are already
+   older than the period you have chosen — those are the ones that would go.
+
+The default is **Keep everything**, and nothing is deleted automatically until
+you change it.
+
+Once a period is set, a scheduled job deletes posts older than it. That job
+runs every few hours, not once at night, so a post reaching the end of the
+window goes within hours rather than waiting for the next evening. **This is
+permanent**: hidden posts are deleted too, and there is no recovery from this
+screen. A post exactly on the boundary is kept rather than deleted.
+
+**Run cleanup now** does the same job immediately and tells you how many posts
+it deleted. If the scheduled job happens to be running, it says so and does
+nothing rather than deleting twice.
+
+### How posts travel (for the technically curious)
+
+Sharing is push-with-a-polling-backstop. The central server notifies your
+installation the moment something changes, and a scheduled pull reconciles the
+board a few times a day regardless — so a missed notification delays a post,
+never loses one. Two rows on **Admin → Background jobs** watch this: **Club
+message board mirror sync** (the pull) and **Club message board share retry**
+(your own outbound shares). The push registration happens automatically the
+first time the sync runs; installations without a public https address simply
+stay on polling.
+
+Each pull remembers how far it got and asks the central server only for what
+changed since then — and it deliberately starts a minute **before** that point.
+That is not wasted work: two posts saved at the central server at almost the
+same moment do not always become visible in the order they were stamped, and
+without the re-ask a post caught on the wrong side of that gap would be stepped
+over and never asked for again, with no gap on the board to notice. A post the
+re-ask brings back that is already on your board exactly as delivered is
+recognised and written nowhere — it does not count as a change in the job's
+result — and the remembered position only ever moves forward, to where the
+server says the pull got to. The one-minute window is the same setting the
+[Alpine Central Server](integrations.md#connect-to-the-alpine-central-server)
+download uses, and like that download, a server that marks its place with a
+reference rather than a timestamp gets no re-ask; the application log says so
+on each such pull.
+
+## Good to know
+
+- **Members cannot edit or delete their own posts.** Every request comes to you.
+- **A post's author is taken from their login**, so a post cannot be made under
+  somebody else's name.
+- **Posts are limited to ten an hour per member**, so one person cannot fill the
+  board.
+- **Nothing is deleted automatically until you set a retention period.** The
+  default keeps everything.
+- **Every action you take is recorded** in the audit log against your account.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| The Message Board entry is missing | The **Message board** module is off | Turn it on at **Admin → Setup & Configuration → Modules** |
+| The buttons are greyed out | Your role has membership **view**, not **edit** | Ask a full admin for membership edit access |
+| A hidden post still shows for a member | They are looking at a cached page | Ask them to reload; hiding takes effect immediately on the server |
+| A member says their post vanished | It was hidden or removed by an admin | Check **Hidden**, and the audit log for a removal |
+| A post shows as not shared, or a shared post could not be withdrawn, but it is on other clubs' boards | Sharing reached the central server but recording that here failed (rare: the database was unavailable at that moment). To avoid a duplicate, the site never sends a post twice, so it is not retried | The post is listed under **Sharing problems** at the top of the moderation list. Where the **Central server id** is shown, click **Withdraw the shared copy**; if that fails, copy the id and send it to the central server's administrator to take the copy down. See [Sharing problems](#sharing-problems) |
+| A post you shared never appeared on other clubs' boards | Sharing was interrupted (the site restarted or the database dropped mid-share). A share is sent at most once, so it is not retried | If it is listed as **Share result unknown**, follow that entry: there may be a copy after all. Otherwise post it again with **Share to all clubs** ticked |
+
+## Related links
+
+- [Member notices](member-notices.md) — committee-written, targeted news.
+- [Modules](modules.md) — turning the board on and off.
+- [The message board](../user-guide/the-message-board.md) — what members see.

@@ -1,0 +1,202 @@
+import { prisma } from "@/lib/prisma";
+import type { FeatureFlags } from "@/config/schema";
+import {
+  findOverlappingCapacityHoldingBookings,
+  findOverlappingOverriddenNonHoldingBookings,
+} from "@/lib/capacity";
+import { getBookingManualPaymentState } from "@/lib/manual-booking-payment-state";
+import { getWithheldBookingEmailSummary } from "@/lib/booking-email-suppression";
+import { loadBookingFreshCopyOptions } from "@/lib/booking-fresh-email-copy";
+import { bookingHasLiveWaitlistOffer } from "@/lib/booking-no-emails-service";
+import { findUnresolvedWaitlistStrandReport, hasStrandedWaitlistConfirmShape } from "@/lib/waitlist-return-contract";
+import {
+  getBookingFinancialReviewWarnings,
+  getBookingProviderMismatches,
+} from "@/lib/booking-provider-mismatches";
+import type { BookingDetailRecord } from "./load-booking-detail";
+import { readDisputesByBookingId } from "@/lib/stripe-dispute-hold";
+import type { BookingDetailViewer } from "./booking-detail-viewer";
+import type { BookingDetailEditAccess } from "./booking-detail-edit-access";
+import type { BookingDetailHistory } from "./booking-detail-history";
+
+/**
+ * WHAT THE ADMIN TOOLS CARD IS TOLD (#2958): every admin-gated read the booking
+ * page performs for officers and nobody else — provider and finance
+ * diagnostics, the "No emails" switch and what it withheld, the cash-settlement
+ * state, the stranded waitlist confirm and the
+ * exclusive-hold conflicts. Each read keeps the gate it always had
+ * (`isAdmin` or `canSeeAdminTools`, plus `!isDeleted` where it applied), so a
+ * member's page still runs none of these queries. Advisory only: every route
+ * behind the card re-derives its own conditions under its own locks.
+ *
+ * `financialReviewPending` is the flag `booking-detail-history.ts` read once
+ * (#3033) and is reused here, never re-queried.
+ *
+ * Moved verbatim from `page.tsx`, comments included.
+ */
+export async function loadBookingDetailAdminTools({
+  booking,
+  modules,
+  viewer,
+  access,
+  history,
+}: {
+  booking: BookingDetailRecord;
+  modules: FeatureFlags;
+  viewer: BookingDetailViewer;
+  access: BookingDetailEditAccess;
+  history: BookingDetailHistory;
+}) {
+  const { isAdmin, canSeeAdminTools } = viewer;
+  const { isDeleted } = access;
+  const { financialReviewPending } = history;
+  const providerMismatches = isAdmin
+    ? await getBookingProviderMismatches(booking.id)
+    : [];
+
+  /*
+    #3033: the admin-side warning row. Derived from the flag already read above
+    rather than re-queried, so the member's banner and the admin's warning can
+    never disagree about the same booking on the same page load.
+  */
+  const financialReviewWarnings =
+    isAdmin && financialReviewPending
+      ? await getBookingFinancialReviewWarnings(booking.id)
+      : [];
+
+  /*
+    #2259 (owner decision D10) — the "No emails" switch and the persistent
+    record of what it has actually withheld.
+
+    Read ONLY behind `canSeeAdminTools`, exactly like the exclusive-hold
+    conflicts above, and for the same reason stated more strongly: a member must
+    never learn this switch exists. Not the control, not the banner, not a
+    count, not a field on anything rendered to them. Computing the list outside
+    the gate would put withheld subjects one careless prop away from a member's
+    screen, so the query does not run for them at all.
+
+    The withheld rows are audit records, not a static sentence: the admin has to
+    know WHICH messages the member never received in order to relay them — and
+    that list includes the invoice emails Xero would have sent on our behalf,
+    which are inside the same guarantee.
+  */
+  const withheldEmails = canSeeAdminTools
+    ? await getWithheldBookingEmailSummary(booking.id)
+    : { total: 0, groups: [] };
+  const withheldEmailGroups = withheldEmails.groups.map((group) => ({
+    templateName: group.templateName,
+    label: group.label,
+    count: group.count,
+    subject: group.subject,
+    latestAt: group.latestAt.toISOString(),
+    remedy: group.remedy,
+  }));
+  const noEmailsState = canSeeAdminTools
+    ? {
+        noEmails: booking.noEmails,
+        noEmailsAt: booking.noEmailsAt?.toISOString() ?? null,
+        setByName: booking.noEmailsBy
+          ? `${booking.noEmailsBy.firstName} ${booking.noEmailsBy.lastName}`
+          : null,
+        // Same predicate the setter evaluates, so the dialog's warning and the
+        // route's response flag cannot disagree about what "live" means.
+        hasLiveWaitlistOffer: bookingHasLiveWaitlistOffer(booking),
+        // A silenced WAITLISTED entry is skipped for offers entirely, so that
+        // consequence produces no withheld row and has to be stated up front.
+        isWaitlisted: booking.status === "WAITLISTED",
+      }
+    : null;
+
+  // B5 (#2262): cash / off-Xero payment controls. Advisory only — the settle
+  // path re-derives every condition under lock(1) + the per-lodge lock — so a
+  // stale page can cause a 409 and never a wrong write. Skipped for a deleted
+  // booking, which settles nothing.
+  const manualPaymentState =
+    canSeeAdminTools && !isDeleted
+      ? await getBookingManualPaymentState(booking.id)
+      : null;
+
+  /*
+    #2649: the stranded zero-dollar waitlist confirm.
+
+    The three cheap conditions — free, `PAYMENT_PENDING`, no payment record — are
+    NOT the stranded shape on their own. Six other producers reach them, none of
+    them a waitlist confirmation, including the `20260511113000` backfill
+    migration, which has no price predicate at all. So the
+    button is offered only where the route will accept it: on an unresolved
+    `waitlist.confirm_offer_release_failed` report, the same provenance test the
+    route re-runs under its locks (`findUnresolvedWaitlistStrandReport`). Without
+    this the banner would state as fact — about an ordinary confirmed booking —
+    that "the waitlist offer that created it has been used up".
+
+    The audit read runs only when the cheap shape matches, which is rare, so an
+    ordinary booking page issues no extra query. Admin-gated like every other
+    tools-card input above.
+  */
+  const strandedWaitlistConfirmShape =
+    canSeeAdminTools &&
+    !isDeleted &&
+    modules.waitlist &&
+    hasStrandedWaitlistConfirmShape(booking);
+  const showReturnToWaitlist = strandedWaitlistConfirmShape
+    ? Boolean(await findUnresolvedWaitlistStrandReport(prisma, booking.id))
+    : false;
+
+  // Admin conflict surfacing (ADR-001 decision 1, issue #119): when this
+  // booking exclusively holds the whole lodge, list the existing
+  // capacity-holding bookings overlapping its nights so the officer can resolve
+  // the clash. Admin-only — never computed or shown for members (decision 6).
+  const exclusiveHoldConflicts =
+    canSeeAdminTools && booking.wholeLodgeHold && booking.lodgeId
+      ? [
+          ...(await findOverlappingCapacityHoldingBookings(prisma, {
+            lodgeId: booking.lodgeId,
+            checkIn: booking.checkIn,
+            checkOut: booking.checkOut,
+            excludeBookingId: booking.id,
+          })),
+          // Override-settle blind spot (ADR-001 decision 1, issue #177): also
+          // list overridden-but-not-yet-holding overlaps (marked `overridden`)
+          // so the officer keeps seeing the future settle onto the held nights,
+          // matching what the exclusive-hold route surfaces at set time.
+          ...(await findOverlappingOverriddenNonHoldingBookings(prisma, {
+            lodgeId: booking.lodgeId,
+            checkIn: booking.checkIn,
+            checkOut: booking.checkOut,
+            excludeBookingId: booking.id,
+          })),
+        ]
+      : [];
+
+  // #4911 (`INV-PAY-154`): a cardholder's dispute on this booking's capture,
+  // including a group organiser's settlement, and how it ended, read from the
+  // durable record the dispute webhooks keep. Behind the same gate as the tools card.
+  const stripeDisputes = canSeeAdminTools
+    ? ((await readDisputesByBookingId(prisma, [booking.id])).get(booking.id) ?? [])
+    : [];
+
+  /*
+    The "send a fresh copy" panel: which of the never-kept booking emails can be
+    sent again, and how many earlier copies failed. Admin-gated like every other
+    input here; the route re-checks every condition when the officer sends.
+  */
+  const freshEmailCopyOptions =
+    canSeeAdminTools && !isDeleted ? await loadBookingFreshCopyOptions(booking.id) : [];
+
+  return {
+    stripeDisputes,
+    providerMismatches,
+    financialReviewWarnings,
+    withheldEmails,
+    withheldEmailGroups,
+    noEmailsState,
+    manualPaymentState,
+    showReturnToWaitlist,
+    exclusiveHoldConflicts,
+    freshEmailCopyOptions,
+  };
+}
+
+export type BookingDetailAdminTools = Awaited<
+  ReturnType<typeof loadBookingDetailAdminTools>
+>;

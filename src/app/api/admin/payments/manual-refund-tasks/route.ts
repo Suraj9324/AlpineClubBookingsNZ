@@ -1,0 +1,246 @@
+import { NextResponse } from "next/server";
+import { hasAdminAreaAccess } from "@/lib/admin-permissions";
+import { requireAdmin } from "@/lib/session-guards";
+import { prisma } from "@/lib/prisma";
+import {
+  AUTOMATIC_REFUND_NOTICE_WINDOW_DAYS,
+  automaticallyRefundedManualRefundTaskFilter,
+} from "@/lib/deleted-booking-modification-payment";
+import {
+  OPEN_TASK_BOOKING_PAYMENT_SELECT,
+  toAutoRefundedManualRefundTaskPayload,
+  toDismissedManualRefundTaskPayload,
+  toOpenManualRefundTaskPayloads,
+} from "@/lib/manual-refund-task-queue-payload";
+import {
+  NOT_RETIRED_REVIEW_WHERE,
+  readDismissedManualRefundTasks,
+  readOpenTaskDisputes,
+  readOrDegrade,
+} from "@/lib/manual-refund-task-queue-reads";
+
+/**
+ * GET /api/admin/payments/manual-refund-tasks
+ *
+ * B5 (#2262): the open hand-back queue for cancelled cash-settled bookings.
+ * Read-only, so finance:view is enough; closing a task is the finance:edit
+ * sibling route.
+ *
+ * TWO LISTS SINCE #2750, and the second one has nothing to do. `tasks` is the
+ * work: OPEN rows an operator has to settle by hand. `autoRefunded` is the
+ * record: rows the Stripe webhook closed — or, since #2760, wrote itself — because
+ * it had refunded the capture, which the operator can only read. They are returned together
+ * rather than from two endpoints because they render as two cards on one screen
+ * from one load, and a second round trip would buy nothing.
+ *
+ * Both are `take`-bounded and neither paginates, matching the pre-existing
+ * behaviour of this route: it is a queue card, not a dataset surface.
+ *
+ * THE SECOND LIST CANNOT TAKE THE FIRST DOWN WITH IT (#2750 review). One
+ * `Promise.all` rejection rejects the whole batch, the client blanks both lists
+ * on a non-OK answer, and the OPEN list is money the club still owes members by
+ * hand — so a failure of the informational query would have removed the
+ * actionable queue from the screen. The failure mode is specific to the new
+ * query rather than hypothetical: `note: { startsWith }` is an unindexed
+ * `LIKE 'prefix%'` scan over the DISMISSED slice, so it is the one of the two
+ * that can time out as the table grows. It is therefore caught on its own,
+ * answered as an empty list with `autoRefundedUnavailable: true`, and logged.
+ * The flag matters as much as the fallback: an empty list means "no automatic
+ * refunds", and a degraded read must not be allowed to say that.
+ */
+export async function GET() {
+  const guard = await requireAdmin({
+    permission: { area: "finance", level: "view" },
+  });
+  if (!guard.ok) return guard.response;
+
+  /*
+    #3033. Whether this caller may open a booking at all, read off the
+    DB-verified matrix `requireAdmin()` just resolved onto the session — the
+    #2823 stuck-state shape, and defaulted to FALSE on the client for the same
+    reason that route's own flag is: a caller that omits it must fail closed.
+
+    It is a real distinction on this card and not a hypothetical one. The card is
+    gated on `finance:view`, which a Finance Viewer holds with NO bookings access
+    at all, and the automatic-refund card beside it already prints identifiers as
+    plain text rather than linking, precisely because `/bookings/{id}` 403s or
+    404s for part of this card's audience. Owner decision D3 asks for "a link to
+    the booking's payment and rate history", so the link has to land somewhere
+    when it is offered; for everyone else the booking id is printed instead, which
+    is what a finance operator needs in order to quote it to somebody who can open
+    it.
+  */
+  const viewerCanViewBookings = hasAdminAreaAccess(guard.session.user, {
+    area: "bookings",
+    level: "view",
+  });
+
+  const bookingSummary = {
+    checkIn: true,
+    checkOut: true,
+    member: { select: { firstName: true, lastName: true } },
+    organisation: { select: { name: true, email: true } },
+  } as const;
+
+  /*
+    #3033. The hand-back queue's own summary additionally reads who OWNS the
+    booking and whether it still exists, for the ownership case below. Kept off
+    `bookingSummary` itself so the automatic-refund list, which offers no link at
+    all, does not start reading an identifier it has no use for.
+  */
+  const handBackBookingSummary = {
+    ...bookingSummary,
+    memberId: true,
+    deletedAt: true,
+    ...OPEN_TASK_BOOKING_PAYMENT_SELECT,
+  } as const;
+
+  /*
+    #2760: the record now covers two populations — a late capture auto-refunded on
+    a booking the club DELETED, and one on a booking that is cancelled but still
+    on file — and the card groups them, because the deleted case is the
+    interesting one and the cancelled case is normal operation that would
+    otherwise bury it. `deletedAt` is read only for that grouping and answered as
+    a boolean; the date itself is not the operator's business here and is not sent
+    to the browser.
+
+    Read as CURRENT state, not as the state at the moment of the refund. Deletion
+    is one-way (there is one writer of `deletedAt` and no restore path), so the
+    only disagreement possible is a row written while the booking was merely
+    cancelled and deleted afterwards — and for that row the present-tense grouping
+    ("this booking is deleted") is the more useful of the two truths: it is what
+    decides whether remaking the booking is even possible. The row's own stored
+    reason still says what was true when the money went back.
+  */
+  const autoRefundedBookingSummary = {
+    ...bookingSummary,
+    deletedAt: true,
+  } as const;
+
+  /*
+    An INSTANT window, not a calendar day, which is why it reads the raw clock
+    rather than the club's calendar. `INV-DATE-019` governs deriving "today" as a
+    `yyyy-MM-dd` day — the mistake it forbids is turning an instant into a UTC
+    day string, which lands on the previous NZ day all morning. Nothing here is
+    turned into a day: `completedAt` is a `DateTime` and this compares it against
+    a `DateTime` thirty times twenty-four hours ago. Sending it through
+    `getTodayDateOnly()` would make the window's edge depend on the time of day
+    the page was opened, which is worse rather than better.
+  */
+  const noticesSince = new Date(
+    Date.now() - AUTOMATIC_REFUND_NOTICE_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+  );
+
+  const [tasks, autoRefundedRead, dismissedRead] = await Promise.all([
+    prisma.manualRefundTask.findMany({
+      /*
+        #4344 (wave C1 of #4302): the retired officer edit review is left out
+        IN THE QUERY, before the `take`, so a leftover row can neither be acted
+        on here nor push a hand-back the club still owes past the limit. Wave B
+        closed every open review and nothing raises one any more; the resolve
+        route refuses the kind as well. A completed or dismissed review stays
+        readable as history on the booking and in the audit log.
+      */
+      where: { status: "OPEN", ...NOT_RETIRED_REVIEW_WHERE },
+      orderBy: { createdAt: "asc" },
+      take: 100,
+      select: {
+        id: true,
+        bookingId: true,
+        amountCents: true,
+        /*
+          #3033/#3827. `kind` - with `occurrenceKey`, which marks an edit's or an
+          appeal's hand-back (`INV-PAY-117`, `INV-PAY-118`) - decides the SENTENCE
+          the card prints: the standing "paid in cash or by a bank transfer that
+          never reached Xero" is untrue of those. `raisedAmountCents` shows an
+          amended amount on its face, not only in the audit log; `reviewContext`
+          holds a group hand-back's or a re-confirmed bank refund's own facts and
+          is never sent raw.
+        */
+        kind: true,
+        occurrenceKey: true,
+        // #3639: marks a late capture held for a treasurer's approval.
+        lateCaptureApprovalIntentId: true,
+        // #3643: marks a part-payment review, settled in Xero.
+        partPaymentReviewPaymentId: true,
+        // #3643 (`INV-PAY-108`): the sync's note that Xero reported it paid.
+        partPaymentReviewXeroPaidAt: true,
+        partPaymentReviewXeroPaidCents: true,
+        raisedAmountCents: true,
+        reviewContext: true,
+        reason: true,
+        createdAt: true,
+        paymentId: true,
+        booking: { select: handBackBookingSummary },
+      },
+    }),
+    /*
+      #2750. Newest first: this is "what happened lately", and the most recent
+      automatic refund is the one an operator can still act on.
+    */
+    readOrDegrade(
+      prisma.manualRefundTask.findMany({
+        where: {
+          ...automaticallyRefundedManualRefundTaskFilter,
+          completedAt: { gte: noticesSince },
+        },
+        orderBy: { completedAt: "desc" },
+        /*
+          The same 100 as the queue above, on purpose. The card prints its own
+          length as a count, so a tighter `take` would silently make that count a
+          lie about a money movement the moment a club had more of them than the
+          limit — and the honest bound here is the thirty-day window, not a row
+          cap. A club with 100 of these inside a month has a problem it needs to
+          see in full.
+        */
+        take: 100,
+        select: {
+          id: true,
+          bookingId: true,
+          amountCents: true,
+          reason: true,
+          note: true,
+          completedAt: true,
+          booking: { select: autoRefundedBookingSummary },
+        },
+      }),
+      "automatically refunded late-capture notices",
+    ),
+    // #3498 (owner decision D2): recently dismissed rows an officer could put
+    // back. Degrades on its own, exactly like the notices beside it - losing a
+    // correction surface must never take the OPEN queue, which is money the
+    // club owes members by hand, off the screen with it. Both bounds on what it
+    // lists are argued where the query is.
+    readOrDegrade(
+      readDismissedManualRefundTasks(prisma, new Date()),
+      "recently dismissed money tasks",
+    ),
+  ]);
+
+  const disputes = await readOpenTaskDisputes(prisma, tasks);
+
+  return NextResponse.json({
+    // #3033: whether the "open the booking's payment and rate history" link is
+    // offered at all. Sent as an explicit boolean, never inferred by the card
+    // from the presence of anything else.
+    viewerCanViewBookings,
+    /*
+      Shaped by `manual-refund-task-queue-payload.ts`, which is also where the
+      redaction lives: the raw context column never crosses the wire.
+    */
+    tasks: toOpenManualRefundTaskPayloads(tasks, guard.session.user.id, disputes),
+    // True only when the notices read itself failed. The surface says so in a
+    // line of its own rather than showing an empty card, because "no automatic
+    // refunds in the last 30 days" is a claim about money and a failed query is
+    // not entitled to make it.
+    autoRefundedUnavailable: autoRefundedRead.unavailable,
+    autoRefunded: autoRefundedRead.rows.map(
+      toAutoRefundedManualRefundTaskPayload,
+    ),
+    // #3498: and the same honesty about a degraded read. "Nothing has been
+    // dismissed lately" is a claim about money decisions, and a failed query is
+    // not entitled to make it.
+    dismissedUnavailable: dismissedRead.unavailable,
+    dismissed: dismissedRead.rows.map(toDismissedManualRefundTaskPayload),
+  });
+}

@@ -1,0 +1,484 @@
+import { BookingStatus } from "@prisma/client";
+import { addDaysDateOnly } from "@/lib/date-only";
+import { storedDateOnly } from "@/lib/stored-calendar-day";
+
+const MEMBER_FUTURE_EDIT_STATUSES = new Set<string>([
+  BookingStatus.PENDING,
+  BookingStatus.PAYMENT_PENDING,
+  BookingStatus.CONFIRMED,
+  BookingStatus.PAID,
+  // #2266: a member may edit their OWN draft. The dashboard's Resume button has
+  // always landed on the booking page, but the page offered a plain member no
+  // Edit button at all — the reporter only reached the editor because they were
+  // an admin. A draft edit moves no money and claims no capacity: it has no
+  // change fee (calculateModificationChangeFee), writes no hold dates
+  // (applyLifecycleTransitions), and has no settlement — confirm-draft / the
+  // pay step enforce capacity and holds when the draft becomes real. A member
+  // draft edit still gets the same over-capacity CHECK the wizard applies
+  // before saving a draft (#1767), because member edits do not skip the
+  // lifecycle machinery the way admin edits of non-lifecycle statuses do.
+  BookingStatus.DRAFT,
+]);
+
+const ADMIN_FUTURE_EDIT_STATUSES = new Set<string>([
+  ...MEMBER_FUTURE_EDIT_STATUSES,
+  BookingStatus.WAITLISTED,
+  BookingStatus.WAITLIST_OFFERED,
+  BookingStatus.BUMPED,
+]);
+
+const IN_PROGRESS_EDIT_STATUSES = new Set<string>([
+  BookingStatus.PAID,
+  BookingStatus.COMPLETED,
+]);
+
+type BookingEditMode =
+  | "future"
+  | "in-progress"
+  | "admin-override"
+  // #3750: an officer-approved LOCKED_PERIOD change request executing on a
+  // finished stay. Reachable ONLY through `finishedStayCorrection` below, which
+  // no route reads from a request body.
+  | "finished-stay-correction"
+  // Fork triyder/AlpineClubBookingsNZ#127/triyder/AlpineClubBookingsNZ#130: an officer adding a started stay to, or removing it from, a
+  // work party. Reachable ONLY through `workPartyCorrection` below.
+  | "work-party-correction";
+
+export interface BookingEditPolicy {
+  canModify: boolean;
+  mode: BookingEditMode | null;
+  today: Date;
+  editableFrom: Date | null;
+  checkInEditable: boolean;
+  reason: string | null;
+}
+
+export interface BookingEditPolicyInput {
+  status: string;
+  role: string;
+  checkIn: Date;
+  checkOut: Date;
+  // Admin-only escape hatch (issue #1668): when an admin (Full Admin or Booking
+  // Officer) explicitly requests an override, the date-window locks (in-progress
+  // check-in lock, fully-past refusal) are lifted so they can move any booking's
+  // dates. Ignored for non-admin roles — they fall through to the normal
+  // branches, so member/officer-without-bookings:edit output is byte-for-byte
+  // unchanged whether or not this flag is set.
+  adminOverride?: boolean;
+  /**
+   * #3750: the executor of an approved LOCKED_PERIOD change request
+   * (`booking-change-request-execution.ts`) is applying it to a FINISHED stay —
+   * see {@link isFinishedStay}. Ignored for non-admin roles, exactly like
+   * `adminOverride`, so a member's answer is byte-for-byte unchanged whether or
+   * not it is set. It is never a request-body field: `modifyBookingBatch` takes
+   * it as a service argument, and `finished-stay-correction-call-sites.test.ts`
+   * pins the executor as its only caller.
+   */
+  finishedStayCorrection?: boolean;
+  /**
+   * Fork triyder/AlpineClubBookingsNZ#127/triyder/AlpineClubBookingsNZ#130: an officer's "Add to work party" or "Remove from work
+   * party" (`modifyBookingBatch`'s work-party service argument, never a
+   * request body). On a stay in its in-progress window it prices the whole
+   * stay, so the work party's discount reaches every night inside its window,
+   * slept or not. Ignored for non-admin roles and for a stay not in progress,
+   * so no other answer moves.
+   */
+  workPartyCorrection?: boolean;
+  /**
+   * The club's TODAY, as the UTC-midnight instant a `@db.Date` round-trips
+   * through. REQUIRED since #3123 — see {@link getBookingEditPolicy}.
+   */
+  today: Date;
+}
+
+function isAdmin(role: string) {
+  return role === "ADMIN";
+}
+
+function isFutureEditStatusAllowed(status: string, role: string): boolean {
+  return isAdmin(role)
+    ? ADMIN_FUTURE_EDIT_STATUSES.has(status)
+    : MEMBER_FUTURE_EDIT_STATUSES.has(status);
+}
+
+function isInProgressEditStatusAllowed(status: string): boolean {
+  return IN_PROGRESS_EDIT_STATUSES.has(status);
+}
+
+/**
+ * Classify what may be edited on a booking, and from which date.
+ *
+ * `input.today` is the CLUB's day, from its persisted `ClubTimeSettings.timeZone`
+ * (`INV-CONFIG-002`), and it is REQUIRED (#3123).
+ *
+ * It used to be read here from the zone-defaulting `date-only` helper, whose
+ * default is `APP_TIME_ZONE` —
+ * `TZ || NEXT_PUBLIC_TZ || "Pacific/Auckland"` (`src/config/operational.ts`) —
+ * so with `NEXT_PUBLIC_TZ=America/Denver` in a UTC container, the exact
+ * deployment shape epic #2988 exists for, this was Denver's day, and with
+ * neither variable set it was Auckland's whatever the host was.
+ *
+ * The previous version of this comment said the plumbing to fix that was CT-6's
+ * (#2991). It is this issue's, and it is a THREADED REQUIRED PARAMETER rather
+ * than an `await` in here, deliberately: this function is synchronous and pure,
+ * it is called from eleven places including inside a `prisma.$transaction` (the
+ * guest-removal service) where an uncached `ClubTimeSettings` read would take a
+ * second pooled connection under held locks, and two of its callers invoke it
+ * TWICE and must get one answer both times. Making it `async` would have
+ * infected all eleven and bought nothing.
+ *
+ * `checkIn`/`checkOut` are stored `@db.Date` CALENDAR DAYS and take no zone at
+ * all — they are decoded zone-free through `storedDateOnly` (`INV-DATE-026`).
+ * `today` is the other side of those comparisons and must arrive on the same
+ * UTC-midnight frame, which is what every caller's `clubTodayDateOnlyInstant()`
+ * or `dateOnlyInstantOf(clubToday(zone))` produces.
+ */
+export function getBookingEditPolicy(
+  input: BookingEditPolicyInput
+): BookingEditPolicy {
+  const today = input.today;
+  const tomorrow = addDaysDateOnly(today, 1);
+  const checkIn = storedDateOnly(input.checkIn);
+  const checkOut = storedDateOnly(input.checkOut);
+
+  // Admin override (issue #1668): lift the date-window locks entirely. Status
+  // eligibility is still enforced (canModifyBookingStatusForRole); only the
+  // in-progress/fully-past date gates are bypassed. Non-admin roles skip this
+  // branch and fall through unchanged.
+  if (input.adminOverride && isAdmin(input.role)) {
+    const canModify = canModifyBookingStatusForRole(input.status, input.role);
+    return {
+      canModify,
+      mode: canModify ? "admin-override" : null,
+      today,
+      editableFrom: null,
+      checkInEditable: canModify,
+      reason: canModify
+        ? null
+        : "This booking cannot be modified in its current status",
+    };
+  }
+
+  // #3750: the officer-approved finished-stay correction. Only a stay that has
+  // FINISHED qualifies — every other window keeps its own branch below, so the
+  // flag can never widen what an in-progress or future booking allows. The
+  // status set is the active-lifecycle one with the finished stay admitted, the
+  // same derivation the #1668 date override uses (`INV-SSOT-001`): these edits
+  // move money and settle, so a lifecycle-inert status has no place here.
+  if (
+    input.finishedStayCorrection &&
+    isAdmin(input.role) &&
+    isFinishedStay({ checkOut: input.checkOut, status: input.status }, today)
+  ) {
+    const canModify = canModifyBookingInActiveLifecycle(input.status, input.role, {
+      includeFinishedStay: true,
+    });
+    return {
+      canModify,
+      mode: canModify ? "finished-stay-correction" : null,
+      today,
+      editableFrom: null,
+      checkInEditable: canModify,
+      reason: canModify
+        ? null
+        : "This booking cannot be modified in its current status",
+    };
+  }
+
+  // Fork triyder/AlpineClubBookingsNZ#127/triyder/AlpineClubBookingsNZ#130: the officer's work-party correction on a started stay. Only
+  // the in-progress window qualifies (a future stay keeps "future" below, a
+  // finished one its refusal), and only an active-lifecycle status, since the
+  // edit moves settlement money. No night moves: `resolveTargetDates` refuses
+  // a date change in this mode.
+  if (
+    input.workPartyCorrection &&
+    isAdmin(input.role) &&
+    checkIn <= today &&
+    !isFinishedStay({ checkOut: input.checkOut, status: input.status }, today)
+  ) {
+    const canModify = canModifyBookingInActiveLifecycle(input.status, input.role);
+    return {
+      canModify,
+      mode: canModify ? "work-party-correction" : null,
+      today,
+      editableFrom: null,
+      checkInEditable: false,
+      reason: canModify
+        ? null
+        : "This in-progress booking cannot be modified in its current status",
+    };
+  }
+
+  if (checkIn > today) {
+    const canModify = isFutureEditStatusAllowed(input.status, input.role);
+    return {
+      canModify,
+      mode: canModify ? "future" : null,
+      today,
+      editableFrom: checkIn,
+      checkInEditable: canModify,
+      reason: canModify
+        ? null
+        : "This booking cannot be modified in its current status",
+    };
+  }
+
+  // In-progress window (issue #2029): a stay is still amendable/extendable
+  // through the ENTIRE check-out day (NZ), not just up to it. `checkOut` is the
+  // departure date, so guests can be at the lodge on the morning of `checkOut`
+  // and must be able to extend then — the booking also stays PAID that whole
+  // day (the completion cron only flips once `checkOut < today`). The window is
+  // therefore `checkIn <= today <= checkOut`. `editableFrom` stays `tomorrow`:
+  // an extension moves check-out forward (new check-out >= tomorrow adds the
+  // check-out-day night and beyond), while today and earlier remain locked.
+  if (checkIn <= today && checkOut >= today) {
+    const canModify = isInProgressEditStatusAllowed(input.status);
+    return {
+      canModify,
+      mode: canModify ? "in-progress" : null,
+      today,
+      editableFrom: tomorrow,
+      checkInEditable: false,
+      reason: canModify
+        ? null
+        : "This in-progress booking cannot be modified in its current status",
+    };
+  }
+
+  return {
+    canModify: false,
+    mode: null,
+    today,
+    editableFrom: null,
+    checkInEditable: false,
+    reason: "This booking has no future nights available for self-service changes",
+  };
+}
+
+/**
+ * #3750: a stay has FINISHED once its check-out day is behind the club's today,
+ * or the completion cron has already marked it `COMPLETED`.
+ *
+ * ONE HOME for the question the locked-period change-request approval asks
+ * before it decides whether approving EXECUTES the request: the route asks it to
+ * choose the path, and `getBookingEditPolicy` asks it again under the locks
+ * (through `finishedStayCorrection`), so the two cannot disagree about which
+ * stays qualify. `checkOut` is a stored `@db.Date` calendar day read through
+ * `storedDateOnly` (`INV-DATE-026`); `today` is the club's day on the same
+ * UTC-midnight frame (`INV-CONFIG-002`). The departure day itself is still the
+ * in-progress window (#2029), which is why the comparison is strict.
+ */
+export function isFinishedStay(
+  booking: { checkOut: Date; status: string },
+  today: Date,
+): boolean {
+  return (
+    storedDateOnly(booking.checkOut) < today ||
+    booking.status === BookingStatus.COMPLETED
+  );
+}
+
+/**
+ * #4533 (`INV-SSOT-001`): whether an officer's finished-stay correction may
+ * touch this booking at all — its stay has finished ({@link isFinishedStay})
+ * and its status is one the correction edits (the active lifecycle with the
+ * finished stay admitted, {@link activeLifecycleEditRefusal}). ONE answer for
+ * Edit Booking's offer of a promo correction, the request route that raises
+ * one, and the executor that applies a request, so none of the three can
+ * offer, accept or apply what another refuses. The edit policy's own
+ * `finishedStayCorrection` mode asks both questions again under the locks.
+ */
+export type FinishedStayEligibility =
+  | { eligible: true }
+  | { eligible: false; reason: "not-finished" }
+  | { eligible: false; reason: "status"; message: string };
+
+export function finishedStayEligibility(
+  booking: { checkOut: Date; status: string },
+  today: Date,
+): FinishedStayEligibility {
+  if (!isFinishedStay(booking, today)) return { eligible: false, reason: "not-finished" };
+  const message = activeLifecycleEditRefusal(booking.status, "ADMIN", { includeFinishedStay: true });
+  return message ? { eligible: false, reason: "status", message } : { eligible: true };
+}
+
+/**
+ * #2029: a stay has "started" once its NZ check-in date is today or earlier.
+ * The single source of truth shared by the self-service started-stay cancel
+ * block (`booking-cancel.ts`) and the booking-detail UI, so the cancel route and
+ * the Cancel button can never disagree about when a stay has begun.
+ *
+ * `today` is REQUIRED since #3123. It was a default, and the default read the
+ * ENVIRONMENT's day rather than the club's persisted one — so a club configured
+ * behind its container's zone called a stay started a day early, blocking a
+ * self-service cancellation the member was still entitled to. `checkIn` is a
+ * `@db.Date` calendar day and is read as one (CT-4, #2870); `today` is the other
+ * side of that comparison and arrives on the same UTC-midnight frame.
+ */
+export function bookingStayHasStarted(
+  checkIn: Date,
+  today: Date,
+): boolean {
+  return storedDateOnly(checkIn) <= today;
+}
+
+export function canModifyBookingStatusForRole(status: string, role: string): boolean {
+  return isFutureEditStatusAllowed(status, role) || isInProgressEditStatusAllowed(status);
+}
+
+// #2266: frozen to an explicit list rather than derived from
+// MEMBER_FUTURE_EDIT_STATUSES, which now includes DRAFT. A DRAFT booking must
+// stay lifecycle-INERT however it is edited (no capacity re-check on apply for
+// admins, no hold recompute, no zero-dollar auto-pay, no credit clamp) — it
+// holds no capacity and owes no money until confirm-draft or the pay step makes
+// it real, and those doors enforce capacity/holds themselves. Deriving this set
+// would have silently flipped admin draft edits from "skip lifecycle rules" to
+// "run them" the day DRAFT joined the member set.
+const ACTIVE_BOOKING_EDIT_LIFECYCLE_STATUSES = new Set<string>([
+  BookingStatus.PENDING,
+  BookingStatus.PAYMENT_PENDING,
+  BookingStatus.CONFIRMED,
+  BookingStatus.PAID,
+  BookingStatus.COMPLETED,
+]);
+
+export function usesActiveBookingEditLifecycle(status: string): boolean {
+  return ACTIVE_BOOKING_EDIT_LIFECYCLE_STATUSES.has(status);
+}
+
+/**
+ * #3245 (epic #2797): "IS THIS BOOKING STILL EDITABLE AT ALL?" HAS ONE HOME.
+ *
+ * Three doors — the guest add, the guest removal and the date change — do not
+ * admit the whole of {@link canModifyBookingStatusForRole}. They settle money
+ * and move capacity the moment they are taken, with no lifecycle-skipping admin
+ * path, so they want the intersection of "editable for this role" with "this
+ * edit runs the real lifecycle" ({@link usesActiveBookingEditLifecycle}), and a
+ * finished stay excluded.
+ *
+ * Until this issue each of the three wrote that intersection out as its own
+ * `["PENDING", "PAYMENT_PENDING", "CONFIRMED", "PAID"]`. The lists agreed, but
+ * agreement by coincidence is not one home: a change to the rule had to be made
+ * in four places and would have been made in three, and the next door written
+ * had three hardcoded examples to copy and one derivation. #3200's defect was
+ * exactly that copy, one predicate over.
+ *
+ * This is a NAMED DERIVATION, not a second definition — the discipline
+ * `INV-SSOT-001` asks for when a door genuinely needs a narrower set than the
+ * one home gives it. Nothing here restates a status; every status it admits or
+ * refuses comes from the two sets above.
+ *
+ * It is role-independent TODAY and still takes the role, because that is the
+ * shape of the question rather than an accident: the two statuses `role` moves
+ * (`DRAFT` for everyone since #2266, the waitlist trio for an admin) are all
+ * outside the active-lifecycle set, so the intersection collapses to the same
+ * four either way. `booking-edit-eligibility-one-home.test.ts` pins that for
+ * every role and every status, so a status added to one of the role sets shows
+ * up as a diff rather than as a silently widened edit door.
+ *
+ * `includeFinishedStay` admits `COMPLETED`, for exactly two callers that each
+ * edit a fully-past booking on purpose: the admin date override (#1668), which
+ * moves a finished stay's dates, and the officer-approved finished-stay
+ * correction (#3750), which executes an approved LOCKED_PERIOD change request
+ * through {@link getBookingEditPolicy}'s `finishedStayCorrection` mode and asks
+ * this question again before it claims the request. Both have the date-window
+ * locks lifted in {@link getBookingEditPolicy}. It is the caller's flag, not a
+ * role test — each caller is already role-gated where it is read.
+ */
+export interface ActiveLifecycleEditOptions {
+  /**
+   * Admit a finished stay (`COMPLETED`): the #1668 admin date override and the
+   * #3750 finished-stay correction.
+   */
+  includeFinishedStay?: boolean;
+}
+
+export function canModifyBookingInActiveLifecycle(
+  status: string,
+  role: string,
+  options: ActiveLifecycleEditOptions = {},
+): boolean {
+  if (!canModifyBookingStatusForRole(status, role)) return false;
+  if (!usesActiveBookingEditLifecycle(status)) return false;
+  if (status === BookingStatus.COMPLETED) {
+    return options.includeFinishedStay === true;
+  }
+  return true;
+}
+
+/**
+ * The same answer as a list, in the schema's own `BookingStatus` order, for the
+ * refusal sentence and for tests. Enumerated from the enum rather than written
+ * down: a status added to `BookingStatus` is considered by this function the day
+ * it exists, and no caller can hold a stale copy of the answer.
+ */
+export function activeLifecycleEditableStatuses(
+  role: string,
+  options: ActiveLifecycleEditOptions = {},
+): string[] {
+  return Object.values(BookingStatus).filter((status) =>
+    canModifyBookingInActiveLifecycle(status, role, options),
+  );
+}
+
+/**
+ * The refusal, with one home too (#3245) — and it takes the STATUS, not just
+ * the options, deliberately. `null` means "no refusal", so a caller gets its
+ * answer and its sentence from ONE call and cannot state the options twice.
+ *
+ * The earlier shape exported the predicate and a separate options-taking
+ * sentence, and a door was free to ask the predicate with
+ * `{ includeFinishedStay: true }` and then print a sentence built without it.
+ * That is precisely the defect this issue exists to remove, one level up — the
+ * rule and the words about the rule disagreeing — and no census can see it,
+ * because both calls are correct on their own. `INV-SSOT-002`: both sides of a
+ * comparison come from one helper. This is the structural remedy `INV-SSOT-001`
+ * prefers over a guard, and it is why `activeLifecycleEditRefusalText` below is
+ * NOT exported.
+ *
+ * The structural option that was REJECTED, since the rule asks for that to be
+ * named: making a door unable to express a status list at all — branding
+ * `BookingStatus` so a bare array cannot be compared against it, or funnelling
+ * all four doors through one required-argument gatekeeper. The first touches
+ * every status comparison in the tree; the second is a redesign of four
+ * independent services. Both are far larger than this issue, so the remaining
+ * gap — a door hand-writing a fresh list — is covered by a census rather than
+ * by the type system, and `booking-edit-eligibility-one-home.test.ts` states
+ * what that census can and cannot see.
+ */
+export function activeLifecycleEditRefusal(
+  status: string,
+  role: string,
+  options: ActiveLifecycleEditOptions = {},
+): string | null {
+  return canModifyBookingInActiveLifecycle(status, role, options)
+    ? null
+    : activeLifecycleEditRefusalText(options);
+}
+
+/**
+ * The sentence itself, GENERATED from the set above rather than typed out, so a
+ * change to the rule cannot leave three doors telling a member something that is
+ * no longer true.
+ *
+ * Role-independent for the same reason the predicate is, so it takes no role:
+ * the wording a member sees and the wording an admin sees are the same sentence
+ * about the same four statuses. It enumerates against `ADMIN` — the WIDEST role,
+ * whose editable set contains every other role's — so that if the two ever did
+ * diverge the sentence would name a superset rather than hide a status somebody
+ * is in fact allowed. The pin asserts they do not diverge, and the exact text is
+ * pinned by `booking-edit-eligibility-one-home.test.ts`.
+ */
+function activeLifecycleEditRefusalText(
+  options: ActiveLifecycleEditOptions = {},
+): string {
+  const statuses = activeLifecycleEditableStatuses("ADMIN", options);
+  const last = statuses.at(-1);
+  const listed =
+    last === undefined
+      ? "no"
+      : statuses.length > 1
+        ? `${statuses.slice(0, -1).join(", ")}, or ${last}`
+        : last;
+  return `Only ${listed} bookings can be modified`;
+}

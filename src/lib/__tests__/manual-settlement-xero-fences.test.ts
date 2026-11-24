@@ -1,0 +1,587 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { BookingStatus, PaymentSource } from "@prisma/client";
+import { xeroClaim } from "@/lib/__tests__/helpers/xero-claim";
+
+/**
+ * B5 (#2262) HIGH #2 — the outbound invoice-mint fence, and the reciprocal
+ * inbound fence.
+ *
+ * A manually settled booking is PAID with source INTERNET_BANKING and no
+ * invoice, which is exactly the shape every outbound surface reads as "missing
+ * invoice, mint one". Unfenced they would raise a real AWAITING-PAYMENT invoice
+ * in Xero and EMAIL IT TO THE MEMBER for money already collected in cash.
+ *
+ * The fence is closed on three levels, two of which are asserted here (the
+ * third — mark-paid refusing while a CREATE-INVOICE operation is in flight —
+ * lives in manual-booking-payment.test.ts):
+ *  1. the enqueueXeroBookingInvoiceOperation CHOKE POINT, which every enqueuer
+ *     funnels through;
+ *  3. the HANDLER, createXeroInvoiceForBooking, which re-reads provenance at
+ *     execution time and abandons an operation queued microseconds before the
+ *     settle committed.
+ */
+
+const mocks = vi.hoisted(() => ({
+  bookingFindUnique: vi.fn(),
+  paymentFindUnique: vi.fn(),
+  seasonFindFirst: vi.fn(),
+  xeroObjectLinkFindFirst: vi.fn(),
+  xeroSyncOperationFindFirst: vi.fn(),
+  // #2929: the invoice path reads the creation-time email instruction off the
+  // operation a dispatcher claimed. These fences drive it WITH a syncOperationId,
+  // so the delegate has to exist; null is "no instruction was recorded", which
+  // is what every row a settle-fence scenario enqueues honestly carries.
+  xeroSyncOperationFindUnique: vi.fn().mockResolvedValue({
+    invoiceEmailDelivery: null,
+  }),
+  xeroSyncOperationUpdate: vi.fn(),
+  startXeroSyncOperation: vi.fn(),
+  completeXeroSyncOperation: vi.fn(),
+  upsertXeroObjectLink: vi.fn(),
+  getAuthenticatedXeroClient: vi.fn(),
+  callXeroApi: vi.fn(),
+  findOrCreateXeroContact: vi.fn(),
+  allocateAppliedCreditForBooking: vi.fn(),
+  warn: vi.fn(),
+}));
+
+vi.mock("@/lib/xero-tax-anchors", () => import("./support/xero-tax-anchors-baseline"));
+vi.mock("@/lib/prisma", () => {
+  const client = {
+    booking: { findUnique: (...a: unknown[]) => mocks.bookingFindUnique(...a) },
+    // #3980 review M1: the create's read is one snapshot, with the marked edits.
+    bookingModification: { findMany: async () => [] },
+    // #3953: and the captures its cash figure holds.
+    paymentTransaction: { findMany: async () => [] },
+    payment: { findUnique: (...a: unknown[]) => mocks.paymentFindUnique(...a) },
+    season: { findFirst: (...a: unknown[]) => mocks.seasonFindFirst(...a) },
+    xeroObjectLink: {
+      findFirst: (...a: unknown[]) => mocks.xeroObjectLinkFindFirst(...a),
+    },
+    xeroSyncOperation: {
+      findFirst: (...a: unknown[]) => mocks.xeroSyncOperationFindFirst(...a),
+      findUnique: (...a: unknown[]) => mocks.xeroSyncOperationFindUnique(...a),
+      update: (...a: unknown[]) => mocks.xeroSyncOperationUpdate(...a),
+      // #5208: no earlier attempt under the invoice's key.
+      findMany: async () => [],
+    },
+    // #5208: no GST mismatch pauses the overrides.
+    xeroTaxOverrideMismatch: { findFirst: async () => null },
+  };
+  return { prisma: { ...client, $transaction: async (run: (tx: typeof client) => unknown) => run(client) } };
+});
+
+vi.mock("@/lib/logger", () => ({
+  default: {
+    warn: (...a: unknown[]) => mocks.warn(...a),
+    error: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+describe("level 1 — the enqueueXeroBookingInvoiceOperation choke point", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  async function enqueue() {
+    vi.doMock("@/lib/xero-sync", async (importOriginal) => ({
+      ...((await importOriginal()) as typeof import("@/lib/xero-sync")),
+      startXeroSyncOperation: mocks.startXeroSyncOperation,
+      upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+    }));
+    const { enqueueXeroBookingInvoiceOperation } = await import(
+      "@/lib/xero-operation-outbox"
+    );
+    return enqueueXeroBookingInvoiceOperation("booking-1", {
+      invoiceEmailDelivery: null,
+    });
+  }
+
+  // Each case resets and cold-imports the deliberately broad Xero outbox graph.
+  // Keep the larger budget local to these two integration-shaped assertions;
+  // the repository-wide five-second unit-test budget remains unchanged.
+  it("refuses to queue an invoice for a manually settled booking, and says so", async () => {
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      payment: {
+        id: "payment-1",
+        xeroInvoiceId: null,
+        manuallyMarkedPaidAt: new Date("2026-07-20T00:00:00Z"),
+      },
+    });
+
+    const result = await enqueue();
+
+    expect(result).toEqual({
+      queueOperationId: null,
+      message:
+        "Booking was manually marked paid (cash / off-Xero) — no Xero invoice is expected.",
+    });
+    // No invoice operation is started at all — this is the choke point every
+    // enqueuer funnels through, so nothing downstream can mint.
+    expect(mocks.startXeroSyncOperation).not.toHaveBeenCalled();
+    // …and the skip is AUDIBLE, so a repeated attempt is visible.
+    expect(mocks.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ bookingId: "booking-1", paymentId: "payment-1" }),
+      expect.stringContaining("manually marked-paid"),
+    );
+  }, 30_000);
+
+  it("still queues normally for a booking with no manual provenance", async () => {
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      payment: {
+        id: "payment-1",
+        xeroInvoiceId: null,
+        manuallyMarkedPaidAt: null,
+      },
+    });
+    mocks.xeroObjectLinkFindFirst.mockResolvedValue(null);
+    mocks.xeroSyncOperationFindFirst.mockResolvedValue(null);
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "op-1" });
+
+    const result = await enqueue();
+
+    expect(result.queueOperationId).toBe("op-1");
+  }, 30_000);
+});
+
+describe("level 3 — the createXeroInvoiceForBooking handler re-check", () => {
+  it("abandons a queued mint loudly for a manually settled payment: no Xero client, no invoice, no email", async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    vi.doMock("@/lib/xero-sync", async (importOriginal) => ({
+      ...((await importOriginal()) as typeof import("@/lib/xero-sync")),
+      startXeroSyncOperation: mocks.startXeroSyncOperation,
+      completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+      upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+    }));
+    vi.doMock("@/lib/xero-client", () => ({
+      getAuthenticatedXeroClient: mocks.getAuthenticatedXeroClient,
+    }));
+
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      status: BookingStatus.PAID,
+      checkIn: new Date("2026-08-01"),
+      checkOut: new Date("2026-08-03"),
+      guests: [],
+      member: { email: "ada@example.org" },
+      promoRedemption: null,
+      payment: {
+        id: "payment-1",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: PaymentSource.INTERNET_BANKING,
+        manuallyMarkedPaidAt: new Date("2026-07-20T00:00:00Z"),
+      },
+    });
+
+    const { createXeroInvoiceForBooking } = await import(
+      "@/lib/xero-booking-invoices"
+    );
+
+    const result = await createXeroInvoiceForBooking("booking-1", {
+      syncOperation: xeroClaim("op-queued-before-the-settle"),
+    });
+
+    expect(result).toBeNull();
+    // The residual race is closed BEFORE any provider work: the Xero client is
+    // never even authenticated, so no invoice is created and none is emailed.
+    expect(mocks.getAuthenticatedXeroClient).not.toHaveBeenCalled();
+    // The operation is closed with a NON-SUCCEEDED terminal status carrying a
+    // populated reason, so it is visible to an operator and never replayed.
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-queued-before-the-settle" }),
+      expect.objectContaining({
+        status: "CANCELLED",
+        responsePayload: expect.objectContaining({ skipped: true }),
+      }),
+    );
+    expect(mocks.warn).toHaveBeenCalled();
+  });
+
+  it("#4299 B1: a row that bypassed the enqueue for an organiser-paid bank place closes with the same refusal, raising no invoice to the joiner", async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    vi.doMock("@/lib/xero-sync", async (importOriginal) => ({
+      ...((await importOriginal()) as typeof import("@/lib/xero-sync")),
+      startXeroSyncOperation: mocks.startXeroSyncOperation,
+      completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+      upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+    }));
+    vi.doMock("@/lib/xero-client", () => ({
+      getAuthenticatedXeroClient: mocks.getAuthenticatedXeroClient,
+    }));
+    vi.doMock("@/lib/xero-api-client", () => ({
+      getAuthenticatedXeroClient: mocks.getAuthenticatedXeroClient,
+      callXeroApi: mocks.callXeroApi,
+    }));
+
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      status: BookingStatus.PAID,
+      organiserSettled: true,
+      parentBookingId: "organiser-booking",
+      checkIn: new Date("2026-08-01"),
+      checkOut: new Date("2026-08-03"),
+      guests: [],
+      member: { email: "ada@example.org" },
+      promoRedemption: null,
+      payment: {
+        id: "payment-1",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: PaymentSource.INTERNET_BANKING,
+        manuallyMarkedPaidAt: null,
+      },
+    });
+
+    const { createXeroInvoiceForBooking } = await import("@/lib/xero-booking-invoices");
+    const { ORGANISER_COMBINED_INVOICE_PLACE_REFUSAL } = await import("@/lib/organiser-billing");
+
+    // Straight to the handler: no enqueue ran, so only this fence stands.
+    const result = await createXeroInvoiceForBooking("booking-1", { syncOperation: xeroClaim("op-for-an-organiser-place") });
+
+    expect(result).toBeNull();
+    expect(mocks.getAuthenticatedXeroClient).not.toHaveBeenCalled();
+    expect(mocks.startXeroSyncOperation).not.toHaveBeenCalled();
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-for-an-organiser-place" }),
+      expect.objectContaining({
+        status: "CANCELLED",
+        responsePayload: expect.objectContaining({ skipped: true, refusal: ORGANISER_COMBINED_INVOICE_PLACE_REFUSAL }),
+      }),
+    );
+    expect(mocks.warn).toHaveBeenCalled();
+  }, 30_000);
+
+  it("H3 — re-asserts provenance AFTER the operation exists: a settle that committed during the contact/mapping reads still abandons the mint", async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    vi.doMock("@/lib/xero-sync", async (importOriginal) => ({
+      ...((await importOriginal()) as typeof import("@/lib/xero-sync")),
+      startXeroSyncOperation: mocks.startXeroSyncOperation,
+      completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+      upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+    }));
+    vi.doMock("@/lib/xero-api-client", () => ({
+      getAuthenticatedXeroClient: mocks.getAuthenticatedXeroClient,
+      callXeroApi: mocks.callXeroApi,
+    }));
+    vi.doMock("@/lib/xero-contacts", () => ({
+      findOrCreateXeroContact: mocks.findOrCreateXeroContact,
+      retryXeroWriteWithContactRepair: vi.fn(),
+    }));
+    vi.doMock("@/lib/xero-mappings", () => ({
+      getResolvedAccountMapping: vi
+        .fn()
+        .mockResolvedValue({ code: "200", itemCode: null, codeExplicitlyConfigured: false }),
+      getAccountMapping: vi.fn().mockResolvedValue("606"),
+      getHutFeeItemCodeMap: vi.fn().mockResolvedValue({}),
+      // #3530: the season read now lives in xero-mappings; this fixture's
+      // `season.findFirst` answered null, and so does this.
+      getHutFeeSeasonType: vi.fn().mockResolvedValue(null),
+      isHutFeeResolverConfigured: vi.fn().mockReturnValue(false),
+      resolveHutFeeItemCode: vi.fn().mockReturnValue(null),
+    }));
+
+    // The TOP-of-function snapshot carries NO provenance: the manual settle
+    // commits only after this read, while the mint is deep in its contact and
+    // account-mapping round-trips.
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      status: BookingStatus.PAYMENT_PENDING,
+      checkIn: new Date("2026-08-01"),
+      checkOut: new Date("2026-08-03"),
+      createdAt: new Date("2026-07-01"),
+      totalPriceCents: 0,
+      promoAdjustmentCents: 0,
+      guests: [],
+      member: { email: "ada@example.org" },
+      promoRedemption: null,
+      nightAdjustments: [],
+      payment: {
+        id: "payment-1",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        source: PaymentSource.INTERNET_BANKING,
+        manuallyMarkedPaidAt: null,
+      },
+    });
+    mocks.getAuthenticatedXeroClient.mockImplementation(() => {
+      expect(mocks.xeroSyncOperationUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            requestPayload: expect.objectContaining({
+              moneyReconciliation: expect.any(Object),
+            }),
+          },
+        }),
+      );
+      return Promise.resolve({
+        xero: { accountingApi: {} },
+        tenantId: "tenant-1",
+      });
+    });
+    mocks.findOrCreateXeroContact.mockResolvedValue("contact-1");
+    mocks.seasonFindFirst.mockResolvedValue(null);
+    mocks.xeroSyncOperationUpdate.mockResolvedValue({});
+    // The FRESH re-read — strictly after the operation exists and is therefore
+    // visible to the settle-time fence — sees the settle's provenance.
+    mocks.paymentFindUnique.mockResolvedValue({
+      manuallyMarkedPaidAt: new Date("2026-07-29T00:00:00Z"),
+    });
+
+    const { createXeroInvoiceForBooking } = await import(
+      "@/lib/xero-booking-invoices"
+    );
+
+    const result = await createXeroInvoiceForBooking("booking-1", {
+      syncOperation: xeroClaim("op-retry-claimed"),
+    });
+
+    expect(result).toBeNull();
+    // #3278 review — the "persisted before the provider work" assertion above
+    // lives INSIDE the client mock's body, so it proves nothing unless that
+    // mock actually ran. Move `getAuthenticatedXeroClient()` below the fresh
+    // provenance re-check and this path cancels before ever authenticating:
+    // the mock never runs, the assertion silently stops executing, and the
+    // suite stays green over an unguarded ordering. These two close it from
+    // the outside, where no such move can silence them.
+    expect(mocks.getAuthenticatedXeroClient).toHaveBeenCalled();
+    expect(mocks.xeroSyncOperationUpdate.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.getAuthenticatedXeroClient.mock.invocationCallOrder[0]!,
+    );
+    // Nothing reached Xero: no create call, no email.
+    expect(mocks.callXeroApi).not.toHaveBeenCalled();
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-retry-claimed" }),
+      expect.objectContaining({
+        status: "CANCELLED",
+        responsePayload: expect.objectContaining({ skipped: true }),
+      }),
+    );
+    expect(mocks.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bookingId: "booking-1",
+        paymentId: "payment-1",
+        syncOperationId: "op-retry-claimed",
+      }),
+      expect.stringContaining("manually marked paid"),
+    );
+  });
+
+  it("H3 — a claimed operation whose invoice already exists is closed SUCCEEDED, never stranded RUNNING", async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    vi.doMock("@/lib/xero-sync", async (importOriginal) => ({
+      ...((await importOriginal()) as typeof import("@/lib/xero-sync")),
+      startXeroSyncOperation: mocks.startXeroSyncOperation,
+      completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+      upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+    }));
+    vi.doMock("@/lib/xero-applied-credit-allocation", () => ({
+      allocateAppliedCreditForBooking: mocks.allocateAppliedCreditForBooking,
+    }));
+
+    mocks.xeroSyncOperationFindUnique.mockResolvedValue({
+      requestPayload: {
+        queueType: "CREATE_INVOICE",
+        legacyMetadata: { retryCount: 1 },
+      },
+    });
+
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      status: BookingStatus.PAID,
+      totalPriceCents: 10000,
+      promoAdjustmentCents: 0,
+      discountCents: 0,
+      finalPriceCents: 10000,
+      guests: [
+        {
+          priceCents: 10000,
+          stayStart: new Date("2026-08-01T00:00:00Z"),
+          stayEnd: new Date("2026-08-02T00:00:00Z"),
+          nights: [
+            {
+              stayDate: new Date("2026-08-01T00:00:00Z"),
+              priceCents: 10000,
+              priceSource: "QUOTED",
+            },
+          ],
+        },
+      ],
+      member: { email: "ada@example.org" },
+      promoRedemption: null,
+      nightAdjustments: [],
+      payment: {
+        id: "payment-1",
+        xeroInvoiceId: "inv-already",
+        xeroInvoiceNumber: "INV-1",
+        source: PaymentSource.STRIPE,
+        status: "SUCCEEDED",
+        amountCents: 8000,
+        refundedAmountCents: 0,
+        creditAppliedCents: 2000,
+        manuallyMarkedPaidAt: null,
+      },
+    });
+
+    const { createXeroInvoiceForBooking } = await import(
+      "@/lib/xero-booking-invoices"
+    );
+
+    const result = await createXeroInvoiceForBooking("booking-1", {
+      syncOperation: xeroClaim("op-retry-claimed"),
+    });
+
+    expect(result).toBe("inv-already");
+    expect(mocks.xeroSyncOperationUpdate).toHaveBeenCalledWith({
+      where: { id: "op-retry-claimed" },
+      data: {
+        requestPayload: expect.objectContaining({
+          queueType: "CREATE_INVOICE",
+          legacyMetadata: { retryCount: 1 },
+          // #3278 review — a replay records TODAY's verdict under its own key.
+          // The invoice was raised on some earlier run, so writing this under
+          // `moneyReconciliation` would restate the raise-time evidence.
+          moneyReconciliationOnReplay: {
+            state: "RECONCILED",
+            reasons: [],
+          },
+        }),
+      },
+    });
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-retry-claimed" }),
+      expect.objectContaining({
+        status: "SUCCEEDED",
+        xeroObjectId: "inv-already",
+      }),
+    );
+    expect(mocks.xeroSyncOperationUpdate.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.allocateAppliedCreditForBooking.mock.invocationCallOrder[0],
+    );
+  });
+
+  /*
+    #3278 review — A REPLAY MUST NOT REWRITE HISTORY, AND THE ALLOCATION IT
+    RUNS INTO CAN THROW.
+
+    The enrichment above happens before `settleCardAppliedCreditAllocation`,
+    which makes a provider round trip and throws by design when the allocation
+    fails. So an operator retry of an operation that raised its invoice months
+    ago writes evidence and can then abandon the run. If the two verdicts
+    shared one key, that retry would leave the operation asserting the
+    booking's money was unreconciled WHEN THE INVOICE WAS RAISED — which it was
+    not — and the throw would walk away with the claim standing.
+
+    The fixture makes the two verdicts differ on purpose: the stored payload
+    carries a RECONCILED raise-time verdict, today's booking fails the
+    final-price identity, and the allocation then throws.
+  */
+  it("H3 — a replay records today's verdict beside the raise-time one, and an allocation failure cannot rewrite it", async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    vi.doMock("@/lib/xero-sync", async (importOriginal) => ({
+      ...((await importOriginal()) as typeof import("@/lib/xero-sync")),
+      startXeroSyncOperation: mocks.startXeroSyncOperation,
+      completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+      upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+    }));
+    vi.doMock("@/lib/xero-applied-credit-allocation", () => ({
+      allocateAppliedCreditForBooking: mocks.allocateAppliedCreditForBooking,
+    }));
+
+    // The evidence this operation recorded when it RAISED the invoice.
+    mocks.xeroSyncOperationFindUnique.mockResolvedValue({
+      requestPayload: {
+        queueType: "CREATE_INVOICE",
+        moneyReconciliation: { state: "RECONCILED", reasons: [] },
+      },
+    });
+
+    // Today the stored headline no longer satisfies the final-price identity.
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      status: BookingStatus.PAID,
+      totalPriceCents: 10000,
+      promoAdjustmentCents: 0,
+      discountCents: 0,
+      finalPriceCents: 9500,
+      guests: [
+        {
+          priceCents: 10000,
+          stayStart: new Date("2026-08-01T00:00:00Z"),
+          stayEnd: new Date("2026-08-02T00:00:00Z"),
+          nights: [
+            {
+              stayDate: new Date("2026-08-01T00:00:00Z"),
+              priceCents: 10000,
+              priceSource: "QUOTED",
+            },
+          ],
+        },
+      ],
+      member: { email: "ada@example.org" },
+      promoRedemption: null,
+      nightAdjustments: [],
+      payment: {
+        id: "payment-1",
+        xeroInvoiceId: "inv-already",
+        xeroInvoiceNumber: "INV-1",
+        source: PaymentSource.STRIPE,
+        status: "SUCCEEDED",
+        amountCents: 8000,
+        refundedAmountCents: 0,
+        creditAppliedCents: 2000,
+        manuallyMarkedPaidAt: null,
+      },
+    });
+    mocks.allocateAppliedCreditForBooking.mockRejectedValue(
+      new Error("Xero allocation refused"),
+    );
+
+    const { createXeroInvoiceForBooking } = await import(
+      "@/lib/xero-booking-invoices"
+    );
+
+    await expect(
+      createXeroInvoiceForBooking("booking-1", {
+        syncOperation: xeroClaim("op-retry-claimed"),
+      }),
+    ).rejects.toThrow("Xero allocation refused");
+
+    const [update] = mocks.xeroSyncOperationUpdate.mock.calls as Array<
+      [{ data: { requestPayload: Record<string, unknown> } }]
+    >;
+    // The raise-time verdict survives the replay byte for byte...
+    expect(update![0].data.requestPayload.moneyReconciliation).toEqual({
+      state: "RECONCILED",
+      reasons: [],
+    });
+    // ...and today's is recorded beside it rather than instead of it.
+    expect(update![0].data.requestPayload.moneyReconciliationOnReplay).toEqual({
+      state: "UNRECONCILED",
+      reasons: ["FINAL_PRICE_RELATION_MISMATCH"],
+    });
+    // The throw is by design: the operation stays open for the operator, so it
+    // must not have been closed SUCCEEDED behind a failed allocation.
+    expect(mocks.completeXeroSyncOperation).not.toHaveBeenCalled();
+  });
+});

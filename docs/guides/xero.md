@@ -1,0 +1,615 @@
+# Xero Sync
+
+Audience: Operator
+
+## What it is
+
+The dashboard for the club's operational **Xero** integration: monitor the
+connection, run contact and membership syncs, work the outbound operations queue
+and inbound webhook events, audit contact-group and link mismatches, and watch the
+daily API budget. Day-one **account/item mappings and one-time import** live on a
+separate **Xero Setup** page, and auto-grouping rules on the **Xero member
+grouping** page. Find the dashboard at **Admin → Finance → Xero Sync**
+(`/admin/xero`).
+
+Xero is a **finance** permission area: finance view to read, finance **edit** to
+run syncs, retry operations, replay events, or change mappings and rules. Most
+panels appear only once Xero is connected. Xero pushes and reconciliation are
+idempotent — retrying the same work never double-charges.
+
+A booking edit's credit note may appear in Xero before its bank refund has
+been sent. It corrects the invoice, but the app records the refund only when
+the treasurer marks the edit's refund task paid back. Dismissing that task
+does not record a refund (#4315).
+
+## When you'd use it
+
+- You are connecting Xero for the first time, or reconnecting it.
+- A booking invoice, payment, or subscription did not sync and you need to retry or
+  investigate it.
+- You want to import members from Xero contacts, repair link mismatches, or audit
+  contact-group membership.
+- You are preparing a club for its first real use and need every member to have
+  a Xero customer before invoices start going out.
+- A member has been erased here and you want to know whether they left a Xero
+  customer behind.
+- You are checking the daily Xero API budget or reconciliation health.
+
+## Step-by-step
+
+### Check the connection and health
+
+1. Go to **Admin → Finance → Xero Sync**. The **Connection Status** panel shows
+   whether Xero is connected (and the tenant/token), and the **Health Snapshot**
+   summarises unlinked members, failed issues, pending operations, paid bookings
+   missing invoices, group/link mismatches, credit used in Xero, and API budget.
+
+   > **Missing invoices** lists a paid booking only when the club's own records
+   > hold no invoice for it — no invoice id stamped on its payment and no active
+   > primary-invoice link. That is the same test the booking's own page and the
+   > invoice queue use (#3001, #3467), so a booking whose invoice operation
+   > **Failed** *after* Xero had accepted the invoice is not listed: the accounts
+   > already hold it, and raising it again from here would duplicate it. Such a
+   > booking shows under **Failed** operations instead, and its own page says
+   > what did and did not reach Xero. A booking whose records hold neither is
+   > listed, and **Trigger All Missing** raises an invoice for it.
+
+   > **Group mismatches** counts two kinds of entry (#5234). One *to re-sync*
+   > is a member a grouping rule matches whose Xero contact sits in the wrong
+   > managed group; the bulk re-sync on **Xero member grouping** repairs it.
+   > One *to review by hand* is a member no rule matches (often an
+   > organisation) whose contact still sits in a managed group. The re-sync
+   > never touches those, so the panel names each one with the group it sits
+   > in: remove the contact from that group in Xero, or add a grouping rule
+   > that covers the member, then press the panel's **Refresh**, which
+   > re-fetches both kinds from Xero. Stuck States counts both kinds and its
+   > link opens the panel.
+
+   > The whole Xero area (`/admin/xero`, `/admin/xero/*`, `/admin/internet-banking`)
+   > is gated by the **Xero integration** module (`src/config/feature-routes.ts`)
+   > and returns *Not Found* when it is off. The demo seed leaves Xero disabled,
+   > so no screenshots are captured for these pages; enable the module to see them.
+
+2. Use **Connect Xero** / **Disconnect Xero** on the connection panel.
+   Disconnecting stops invoicing, payment reconciliation, subscription paid-status
+   detection, and finance syncs until you reconnect (your data inside Xero is not
+   changed).
+
+3. **Go to Xero** (top right of the page) opens Xero in a new tab so you can
+   chase up whatever you just spotted. It sits in the page header, so it is
+   there whichever sections you have expanded. When
+   the club's Xero organisation is known, the link takes you straight into *that*
+   organisation's dashboard — useful if your Xero login covers several
+   organisations. If the app cannot read the organisation, or Xero is not
+   connected here, the button still works: it becomes a plain Xero sign-in
+   (labelled **Log in to Xero**) and Xero decides which organisation you land in.
+   It is never disabled, because opening Xero is exactly what you want when the
+   connection here is broken.
+
+### Run syncs and work the queues
+
+1. **Contact Sync** runs a broad link pass (**Sync Contacts from Xero**) or a
+   **Targeted force sync** to repair a single member, invoice, or membership.
+2. **Membership Status Refresh** checks Xero invoices for active members
+   (**Incremental Refresh** or **Repair Backfill**) — this also runs as a daily
+   cron, and only linked members are refreshed.
+3. **Xero Operations** lists outbound sync attempts; retry active failures, reset
+   stale running jobs, or mark an individual operation non-replayable / resolved.
+   An operation still **Running** after 15 minutes is stuck: nothing will finish
+   it. Its row shows **Mark failed**. Give a reason, and it moves to **Failed**
+   with an audit entry, keeping any earlier error so you can see what to fix.
+   Fix the cause, then **Retry in background**. Check Xero first if the stuck
+   run may already have created a document. **Reset stale running** does the
+   same for every stuck operation at once.
+   A stuck inbound `WEBHOOK_RECONCILE` operation needs none of this: **Replay** its
+   event and that attempt takes the operation over. An event whose worker
+   crashed is no longer left waiting: once it has been **Processing** for 15
+   minutes the automatic worker resets it and processes it again, taking the
+   operation over too. **Replay** does the same at once for an event already
+   past those 15 minutes, and is refused while it is still being processed.
+   An event that has stopped the server three times running is not retried by
+   itself again: it stays **Processing**, an error is logged on each run, and
+   only **Replay** retries it. Mark failed still works on the operation, and
+   lets the automatic retry start counting again.
+   Mark one **resolved** only after you have fixed it in Xero yourself: it is
+   then treated as done and is never retried or recreated automatically,
+   though the repair tool still lists it for information. You cannot resolve
+   one while a retry of it is running, or an applied-credit allocation at all
+   (retry those). If you later void a card refund's credit note in Xero, even
+   one you resolved, don't replace it by hand: the app raises a fresh one
+   overnight (#4250).
+   Choosing **Failed** under **Status** also picks **Active only** under
+   **Failure**, so a row that was repaired later, superseded or marked resolved
+   stops crowding out the ones that still need you. A line above the list says
+   how many are hidden; **Show them** (or **All failures** in the **Failure**
+   selector) brings them back, and they stay as the audit trail. Only the view
+   changes, never a row's status. A saved link that carries just the Failed
+   status still shows every failed row (#4220).
+   A failed operation (and the booking page's invoice warning) says **why** in
+   plain English: what happened, what it means for the club, and **What to do**,
+   including whether the app tries again by itself. Xero's own wording and the
+   stored error code sit under **Show technical details**; quote those when you
+   ask for help. When the reason is hidden for privacy, or is one the app does not
+   recognise, the explanation says so instead of guessing (#4278).
+   **Inbound Events** lists stored webhooks with a per-event **Replay**. Each
+   queue has its own **Reset** for filters and page; it keeps the current section,
+   the sibling queue's URL state, and unrelated URL context.
+
+### Create or link a member's Xero contact
+
+1. On a member's admin page (or the members-list editor), the **Xero** panel lets
+   you **link** an existing Xero contact or **create** a new one.
+2. **Creating a contact needs only a first name, last name, and email.** Email is
+   required because Xero uses it for invoice delivery and contact matching;
+   everything else — phone, date of birth, joined date, and both the postal and
+   physical addresses — is optional. Xero's contact-create API itself requires
+   only a unique contact name.
+3. When optional profile fields are blank the panel shows a small note (e.g.
+   *"Profile incomplete: postal address, joined date — missing details will
+   simply be left off the Xero contact"*) and still lets you create the contact. Blank
+   addresses and an all-blank phone are simply omitted from the payload rather
+   than sent as empty blocks. Date of birth and joined date are never sent to
+   Xero on create; the joined date round-trips only through Xero's *company
+   number* field on the import/backfill path.
+4. Before a brand-new contact is created the app checks for **similar existing
+   Xero contacts** and asks you to confirm if any are found, so link an existing
+   contact where one already exists.
+5. If Xero creates the contact, or the local link/import/unlink commits, but a later
+   bookkeeping or subscription step fails, the page says exactly which part is
+   already complete. **Do not repeat Create, Link, Unlink, or Import.** Check the
+   reloaded member and follow the displayed **Member Status Repair Backfill** remedy
+   when refresh or cleanup remains pending.
+6. That recovery warning stays visible while the current view reloads and if the
+   reload fails. On member detail, use **Try again** from the warning. The members
+   list refreshes its current results automatically; Contact Sync and diagnostics
+   direct you to reload the status or open the affected member before another
+   Xero action.
+7. Linking a member to the contact Xero already created is the remedy for the
+   "contact created, link unconfirmed" case, and it now also **closes that
+   operation**, so the member can be merged and deleted again straight away. If
+   Xero turns out to hold a *different* contact for the member, the operation
+   deliberately stays open — that is a duplicate for someone to look at — and the
+   member's Xero panel says which operation is blocking their merge and deletion,
+   and where to clear it.
+7. If the app can prove only that a contact create is still running or awaiting
+   recovery, it says exactly that and hides **Create in Xero** without claiming a
+   contact was created. Resetting the stale operation does not make Create safe:
+   reload the member, then explicitly resolve the operation only after checking
+   Xero and the member's current link.
+8. Profile/contact updates reserve the current member and Xero contact before
+   sending anything. A failed member update retry is rebuilt from the member's
+   current profile and link; it never replays the stored request if that member
+   was deleted, merged, or unlinked.
+9. Account deletion and Xero contact writes exclude one another. If either page
+   asks you to reload and retry, check the member and deletion request first; do
+   not repeat Create or Link while deletion or contact recovery remains pending.
+   A deleted/anonymised member cannot be sent to or re-linked with Xero, and its
+   former active contact ledger is retired with anonymisation.
+
+### Create the missing Xero contacts in bulk
+
+Use this when a club is starting out, or coming back after a spell where members
+were added here but not in Xero, and nobody knows how many members have no Xero
+customer. It lives in **Members with no Xero contact** on the Xero Sync page and
+it works in two halves: a dry run that only reads, then a confirmation that
+creates a small batch at a time.
+
+1. Run **Contact Sync** first. Until Xero's contacts have been pulled in at
+   least once, the dry run cannot tell who already has a contact — it says so
+   and refuses to answer rather than showing you counts that would send you
+   towards duplicates.
+2. Open **Members with no Xero contact** and press **Run the dry run**. Nothing
+   is written here and nothing is sent to Xero. You get counts and three lists.
+3. **Ready to create or link** is what the confirmation will act on. A row
+   marked as matching an existing Xero contact will be *linked* to it, not given
+   a second one; a row with no match is still searched for in Xero live before
+   anything is created, because a missing link here is not proof that Xero has
+   no contact.
+4. **Needs a decision** is the list worth your time. Nothing is done for these,
+   because each one has more than one defensible answer: two members sharing an
+   email address, an address that belongs to a school's own Xero customer,
+   several Xero contacts on one address, or a contact under a different name.
+   Fix the underlying record — give a dependant their own address, link a
+   contact by hand from the member's Xero panel, tidy duplicates in Xero — and
+   the member moves into the first list on the next dry run.
+5. **Not eligible** is informational: school records, anonymised accounts,
+   walk-in placeholders with no real address, and members missing a first name,
+   last name or email.
+6. Press **Create the next N**. You will be asked to confirm, and the
+   confirmation states exactly what is about to happen — how many brand-new Xero
+   contacts will be created and how many members will be linked to contacts Xero
+   already has. The batch size is chosen for you from what each member costs in
+   Xero API calls, so it is smaller on a club that uses contact groups.
+7. One member failing does not stop the batch. For **almost every** failure the
+   member is left exactly where they were and the next run picks them up with
+   nothing duplicated — a failed Xero search, a name that collides with an
+   existing contact, a contact that belongs to a school. The one exception is a
+   row that says the action **completed only in part**: there, something did
+   reach Xero, and the rule for that is the same as everywhere else on this page
+   — *do not repeat the action*, resolve it from **Operations** instead. The
+   result list names every member and says which of these happened to them.
+8. Run the dry run again and repeat until the count reaches zero.
+
+> Running it twice is safe, with that one exception. Every contact goes through
+> the same path a booking invoice uses, which searches Xero first and carries a
+> per-member key, so a repeat converges on the one contact rather than making a
+> second.
+
+### Check what an erasure left in Xero
+
+Erasing a member here removes their details from this application. It **does not
+ask Xero to change, archive or delete their contact**, and that is deliberate:
+Xero is the club's accounting system, it is administered separately, and that
+decision is not this application's to make. So where an erased member had a Xero
+customer, that customer is still in Xero — and until now nothing told you so.
+
+> **What erasure does do in Xero.** It cancels the member's future bookings, and
+> cancelling one they had paid for raises a credit note, exactly as any other
+> cancellation would. That is ordinary accounting, and it is the only thing an
+> erasure causes in Xero. The contact itself is never touched.
+
+**Erased members with a Xero contact** on the Xero Sync page is that telling. It
+is a notice rather than a tool: nothing on it changes anything in Xero, and the
+one button that reaches Xero at all only asks it a question.
+
+1. Open the section. It lists one line per Xero contact that an erasure left
+   behind, oldest erasure first, with a link straight to that contact in Xero.
+2. Each line says which kind of erasure it was. An **account deletion request**
+   leaves the member record here with the person's details removed, so the id is
+   a link you can follow. A **member delete** removed the record altogether, so
+   the id is shown but goes nowhere.
+3. Decide in Xero, if you decide anything at all. Archiving the contact, merging
+   it with another, editing it or leaving it exactly as it is are all legitimate
+   answers, and this application is not asking for any of them. Invoices and
+   accounting history raised against a contact stay valid and usable whatever
+   you choose.
+4. When you have archived some of them, press **Check these in Xero**. That asks
+   Xero about the contacts on the list — archived ones included — and the ones
+   you have dealt with drop off it, counted instead of listed.
+
+> **Who can do what here.** Anyone with finance access can read the list.
+> Pressing **Check these in Xero** needs finance *edit* access, because it
+> spends a share of the club's daily Xero allowance — and if that allowance runs
+> out, invoice and payment syncing stop for the rest of the day. If you can see
+> the list but the button is greyed out, that is why.
+
+> **Contact Sync will not do that for you, and nothing else will either.** It
+> only fetches contacts that are *not* archived, so the moment you archive one
+> it becomes invisible to it; and the erasure deleted this application's cached
+> copy of the contact, so there is nothing here for it to update. The button is
+> the only thing that ever makes this list shrink. A line you never deal with
+> stays on the list indefinitely, which is correct — there really is a customer
+> in Xero that nothing here points at any more.
+
+> Nothing here names the erased person, and the check does not bring their
+> details back: it keeps the contact's status and nothing else. The lines carry
+> an id and a link, because the details are exactly what the erasure removed —
+> and they are still in Xero, where they are yours to read.
+
+### Set up mappings and import (Xero Setup)
+
+1. Open **Xero Setup** (`/admin/xero/setup`, back-linked from **Integrations**) to
+   configure account and item **mappings** and run one-time import/link tools.
+   The **Xero Mappings** shortcuts in Finance Setup and the setup checklist open
+   its **Account mapping** step (`?step=mapping`); if an earlier step is still
+   unfinished, the wizard opens that step first.
+2. **Import Members from Xero** maps each contact group to an age tier and can send
+   invite emails; **Repair Canonical Links** and **Scan for Duplicates & Family
+   Groups** clean up the link ledger.
+
+### Subscribe to Xero webhooks, including credit notes
+
+This app does not register webhook events. In the Xero developer portal
+(**My Apps → your app → Webhooks**), paste the delivery URL from **Xero Setup →
+Webhooks**, then tick **Invoices**, **Contacts**, and **Credit Notes**. Credit
+Notes is what tells this app when a credit note is created, updated, or voided.
+Save the webhook, copy its signing key into the setup wizard, and **Verify**.
+Without the Credit Notes tick, a void made in Xero stays invisible here until
+something else reads that note.
+
+### A credit note used or un-used in Xero
+
+When the treasurer uses a member's credit note in Xero directly (an offset against an
+invoice that is not a booking's, or a payment made against it) the app notices
+without anyone using the credit first. Within about 15 minutes of the change, once
+the note has been left alone for two minutes, the credit the note funded is written
+down so it is no longer offered to the member, and an **Admin Adjustment** row
+appears on the member's credit history: "credit used in Xero outside the app,
+removed". The member's balance goes down by that amount and they are not emailed. If
+you undo the use in Xero, a second row gives the credit back. Credit that a booking
+has already been given is left alone here: it is released, and the booking's invoice
+left unpaid in Xero, only if Xero then refuses it (see the troubleshooting row).
+
+That case gets an early warning instead (#4220). The **Credit used in Xero** tile on
+the Health Snapshot counts the credit notes Xero shows used outside the app while a
+booking is still waiting for its credit to be allocated from them, so Xero would
+refuse that allocation, including a booking whose credit has not been allocated at
+all yet. The booking repair check
+(`pnpm run xero:booking-repair --dry-run`) names each booking with the finding
+`APPLIED_CREDIT_NOTE_CONSUMED_EXTERNALLY`. Neither changes anything: check the note
+in Xero, and undo the use there if it was a mistake. The count follows Xero by the
+webhook and sync delay, so a use shows, and an undo clears, after the note's next
+update reaches the app. A note Xero has not sent the app since this change, or one
+whose figures do not add up, is not counted. A booking whose allocation was resolved
+in Xero is not counted: the repair check reports it as resolved instead. A cancelled
+booking is counted while the app still has its credit to allocate: always for a slice
+it has not sent, and for the rest only if the booking was cancelled after its payment
+was taken. If the tile shows **Unknown**, the server did not report the
+count; reload once the update has finished.
+
+Each change has an audit entry (`xero.credit_note.outside_spend_mirrored` or
+`xero.credit_note.outside_spend_restored`). A note voided or deleted in Xero is never
+changed automatically; it is reported to the error log for an officer to look at.
+Operators can switch the writes off with no deploy
+([how](../xero/ARCHITECTURE.md#the-inbound-credit-note-mirror-4270)); while off, the log
+says what it would have done.
+
+### Unallocated payments
+
+Sometimes a member pays more than they owe, or pays before any invoice exists.
+Xero records that money as an **overpayment** or a **prepayment** on the
+member's contact. **Finance → Xero Unallocated Payments**
+(`/admin/xero/unallocated-payments`) lists every one that still has a balance:
+
+- its type, date and balance left (and the original amount when some has been
+  used), marked with its currency when that is not the club's;
+- the member whose Xero contact it is, or **No member linked** when no member is
+  linked to that contact (an organisation, or a contact not yet linked);
+- a link to the contact in Xero, where the document is listed.
+
+The list refreshes nightly. **Refresh from Xero** reads it again now (finance
+edit only, a few times a minute at most). A refresh reads every page from Xero
+before it changes anything, so a failed read leaves the list as it was and says
+so. A document that is fully used or voided in Xero drops off the list at the
+next refresh.
+
+For now the list is for looking only: allocate the money in Xero as before.
+Turning one into member credit is coming in a later release.
+
+### Manage auto-grouping (Xero member grouping)
+
+1. **Xero member grouping** (`/admin/xero/member-grouping`, also linked from the
+   sidebar) chooses the grouping **mode** (None / Membership Type / Membership Type
+   + Age) and the **rules**. Each rule can target a **set of age tiers** — tick
+   any subset, or tick none for **"All age tiers"** (the wildcard). When rules
+   overlap, the **most specific wins**: `type + tiers` beats `type-only` beats
+   `tiers-only`, and among tiered rules **fewer tiers is more specific** (an
+   "all age tiers" rule is the least specific). A **"Refresh from Xero"** button
+   re-pulls the contact-group cache and a **"Last synced"** header shows when it
+   last refreshed; a read-only **dry-run diff** must be reviewed before any
+   heavyweight **bulk re-sync**. Changing a mode or rule (including a tier set),
+   or refreshing from Xero, never re-groups existing members automatically and
+   invalidates any prior dry-run. For the full cutover procedure, follow the
+   [Xero member grouping runbook](../XERO_MEMBER_GROUPING_RUNBOOK.md).
+
+### Change the club's GST treatment
+
+The **GST / tax treatment** card on **Finance → Xero** shows how the club's
+prices are taxed on Xero documents and in the member-money journal: whether the
+club is GST-registered, the rate, and the Xero tax code. Prices members pay
+never change; only how much of each price is GST does.
+
+1. A Full Admin chooses **Edit**, sets the new treatment and a **Takes effect
+   from** date (tomorrow at the earliest), ticks the confirmation, and saves.
+   Other officers see the card read-only.
+2. A GST-registered treatment is checked against Xero's tax rates before it is
+   saved, so the tax code must be active in Xero and usable on revenue. If Xero
+   cannot be read, the change waits until the connection works. A
+   registration is saved even while the **Opening Credits** account is mapped
+   and **Exempt** has no usable rate; the health check then warns, and spent
+   opening credits wait until Exempt is mapped. On a card booking, the
+   booking's Xero invoice operation fails instead; retry it from the **Xero
+   Operations** list once Exempt is mapped.
+3. Bookings, subscriptions and entrance fees made on or after the date use the
+   new treatment. A booking already made keeps the treatment in force when it
+   was made for its whole life, including later edits, credit notes and
+   refunds; the card counts how many have nights after the date. A place in a
+   group booking takes the organiser's booking's treatment, as the group's
+   combined invoice does. Nothing already in Xero or the journal changes.
+4. A scheduled change can be cancelled before it starts. Saving and cancelling
+   are both in the audit log.
+
+The Xero health check warns if the tax code in force is missing or inactive in
+Xero, its rate differs, Xero's GST registration disagrees with the card, a
+mapped tax category's rate has gone, the **Opening Credits** account is
+mapped while a GST-registered club has no usable **Exempt** rate, or the
+**Opening Credits** account is stored on the Xero account another mapping
+uses. The account mapping refuses to save that last one, so it appears only
+if two people saved mappings, or one saved while a configuration import ran,
+at the same moment; choose an account for **Opening Credits** that no other
+mapping uses. How
+it works: [Tax treatment](../xero/ARCHITECTURE.md#tax-treatment).
+It checks only today's treatment. Bookings made under an earlier treatment
+still use that treatment's tax code on their later edits, credit notes and
+refunds, so keep an earlier code active in Xero while such bookings remain:
+archiving it makes those documents fail in Xero.
+
+### Map the club's tax categories (Xero Setup)
+
+Once Xero is connected, the **Tax categories** card sits under the account
+mappings on **Xero Setup**'s **Account mapping** step, and on **Finance →
+Xero**. It maps each of the club's four tax categories to a tax rate your own
+Xero organisation provides, so the app never assumes a Xero tax code:
+
+| Category | Where its Xero tax rate comes from | Used by |
+| --- | --- | --- |
+| Sales tax on income | The **GST / tax treatment** card above, read-only here | Bookings, subscriptions, fees and their credit notes |
+| Sales tax on expenses | This card | Nothing yet |
+| Exempt | This card | A spent opening credit coded to the Opening Credits liability account |
+| Zero rated | This card | Nothing yet |
+
+1. A Full Admin chooses **Map** on a category, picks a rate and saves. Other
+   finance admins see the card read-only. Each picker offers only rates that
+   are active in Xero and suit the category: Exempt and Zero rated must be 0%,
+   and Sales tax on expenses must be usable on expenses.
+2. **Clear** removes a mapping. Saving and clearing are both in the audit log.
+   **Exempt** cannot be cleared while the **Opening Credits** account is
+   mapped and the club is, or is scheduled to be, GST-registered: unset that
+   account on the account mapping first. That holds while Xero is disconnected
+   too, so the mapping is still there when you reconnect; only a mapping
+   chosen in a different Xero organisation from the one connected now clears.
+3. A mapping belongs to the Xero organisation it was chosen in. If you connect
+   a different organisation, the card and the health check say so; map the
+   category again.
+
+While the club is not GST-registered, Xero documents carry no tax and no
+category is used. While it is, a line in a category that is not mapped — or
+whose rate Xero has removed, made inactive or changed so it no longer suits the
+category (an Exempt rate edited to a non-zero percentage, say) — is held back
+with an error, not sent with a guessed code. **If your club is GST-registered and is moving in
+with opening credits, map Exempt before you map the Opening Credits account.**
+The account mapping refuses to save **Opening Credits** until you do, and
+refuses it on an account another mapping already uses, naming that mapping. A
+spent opening credit that cannot be sent waits in the Xero queue with a message
+naming the category, and is tried again by itself every few minutes; where it
+is part of a card booking's invoice operation, that operation fails with the
+same message and is retried by hand once the category is mapped
+([Moving in](moving-in.md#6-credit-post-the-opening-credits)).
+Nothing changes on upgrade: until you map a category, every document is sent
+exactly as before. How it works:
+[`INV-CONFIG-008`](../invariants/product-configuration.md#inv-config-008).
+
+**The app checks a rate against its own copy of Xero's tax rates, which can be
+up to 15 minutes old** (#5375). When the app sends a line in a mapped category,
+such as the Exempt line of a spent opening credit, it reads Xero's tax rates
+from a copy it keeps for up to 15 minutes (`CACHE_TTL_MS` in
+`src/lib/xero-tax-rates.ts`); it does not ask Xero each time. So for up to 15
+minutes after a rate is changed or archived in Xero, the app can still send a
+line with that rate. Once the copy is renewed, a line with that rate is no
+longer sent: it waits in the Xero queue or, on a card booking, the booking's
+invoice operation fails, as described above. This card, the **GST / tax
+treatment** card and the Xero health check also read a copy of that age, so
+they can take as long to show the change. A save does not use a copy: mapping
+a category on this card, saving a GST-registered treatment, and the Exempt
+check made when the **Opening Credits** account is saved each read Xero's
+rates fresh. A copy belongs to the Xero organisation it was read from, so
+after you connect a different organisation it is not used.
+
+### Resume the club's GST figures after Xero changed them
+
+A new booking invoice tells Xero the GST on each line, shared out from the
+club's own figure, so Xero's GST and the club's records agree to the cent. After
+each booking invoice is raised or updated, the app checks Xero kept it.
+
+If Xero changed the GST on any line, the app pauses: new invoices go to Xero
+without the club's GST figures and Xero works the GST out itself. **GST
+overrides paused** appears on the Finance dashboard and in the Xero health
+check, and the **GST overrides** card on **Finance → Xero** lists each invoice
+with the GST sent and the GST Xero holds on each line.
+
+1. Open each listed invoice in Xero and check its GST.
+2. On the card, tick **I've checked these invoices in Xero** and write what you
+   found.
+3. Choose **I've checked these, resume**. This needs finance edit access.
+
+Resuming changes nothing in Xero and re-sends nothing; the next new invoices
+carry the club's figures again. An invoice flagged after you opened the card
+keeps the pause on until it is checked too. How it works:
+[The journal's GST on each line](../xero/ARCHITECTURE.md#the-journals-gst-on-each-line-5208).
+
+## Settings reference
+
+| Area | What it does | Notes / constraints |
+| --- | --- | --- |
+| Connect / Disconnect Xero | Establish or remove the operational Xero connection | Finance edit; disconnect stops invoicing/reconciliation/paid-status |
+| Contact Sync / Targeted force sync | Broad or single-record contact link/repair | Finance edit |
+| Membership Status Refresh | Refresh current-season paid status from Xero | Also a daily cron; linked members only |
+| Xero Operations | Filter and page outbound work; retry / reset / mark non-replayable / resolve it | Dataset Reset keeps the section and Inbound state; write actions need finance edit and are idempotent |
+| Inbound Events | Filter and page stored webhooks; replay an event | Dataset Reset keeps the section and Operations state; Replay needs finance edit |
+| Xero Setup → Mappings | Account/item code mappings and hut/joining fee item codes | Finance edit; joining-fee amounts live in [Fees](fees.md) |
+| GST / tax treatment | Schedule a change to GST registration, rate or Xero tax code from a future date | Full Admin only; checked against Xero; bookings already made keep their treatment |
+| Tax categories | Map Sales tax on expenses, Exempt and Zero rated to Xero tax rates; shows Sales tax on income | Full Admin only; shown once Xero is connected; checked against Xero |
+| Member grouping | Grouping mode + rules, dry-run, bulk re-sync | Finance edit; never auto-re-groups; runbook-driven cutover |
+| Members with no Xero contact | Dry run over unlinked members, then create or link in small batches | Finance edit to create; needs a Contact Sync first; schools and ambiguous rows are never acted on; the batch size is shown on the button |
+| API budget / Usage | Daily call volume, rate limits, recent failures | Read-only meter |
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Only the Connection panel shows | Xero is not connected | Click **Connect Xero**; the sync/health panels appear once connected |
+| Xero Setup's **Connect** step cannot confirm the organisation name | The one read that fetches the name failed — Xero was busy, briefly unreachable, or the authorisation is no longer accepted | The step now says which of those it was and what to do. **Xero needs re-authorising**: disconnect and connect again (no button is offered, because retrying cannot fix it). **Xero's daily limit reached**: the cap resets at midnight UTC (about midday in New Zealand); **Try again** is still offered, since the reset may land while you are on the page. **Per-minute limit / could not reach Xero**: press **Try again**. Each press makes at most one fresh call — nothing retries by itself, so it never spends Xero calls you did not ask for |
+| The Connect step says **your admin role cannot read the Xero organisation details** | Your role has no finance access | Ask a full admin to finish the step, or to give your role finance access. No **Try again** is offered, because it cannot help |
+| The Connect step says **your sign-in has expired** | The session went, not the permission — nothing is wrong with your role or with Xero | Sign in again (another tab is fine), then press **Try again**. Nothing entered in the wizard is lost |
+| The Connect step shows the organisation as **"the last organisation we saw"** rather than a green tick | The name came from cache because the live re-check failed — most often because the club revoked this app inside Xero's own **Connected apps** screen, which leaves the stored connection looking healthy | Treat the name as unconfirmed. Follow the warning above it: usually disconnect and connect again, re-authorising the app in Xero |
+| Operations/events are read-only ("… can view Xero operations but cannot retry…") | Your finance role is view-only | Ask a finance-edit admin |
+| An outbound operation is stuck **Failed** | A push failed and needs a replay (or was fixed directly in Xero) | **Retry in background**, or **Resolve (fixed in Xero)** with a reason |
+| **Resolve (fixed in Xero)** on a failed refund credit note asks for a credit note number, or refuses the one you typed | The app records which Xero credit note stands for that refund, so one note never records two refunds (#4421) | Type the number of the note you made for this refund, as Xero shows it (for example `CN-0123`). It must be approved or paid, for the amount the box shows and the booking's Xero contact (the member's, or the organisation's), allocated to no other invoice, and not already recorded here; the box says which check failed. If a retry of the job ran meanwhile, wait for it and check Xero first ([Payments guide](payments.md#resolve-a-refund-credit-note-xero-could-not-raise)) |
+| **Resolve (fixed in Xero)** on a failed refund credit note says the app cannot read its amount | The job's stored amount is unreadable, so no note can be checked against it, and **Retry** refuses it too (#4421) | Use **Mark non-replayable** on it (it stops re-runs; the row stays listed) and ask the treasurer what Xero needs for that refund. Don't also make a credit note by hand |
+| **Resolve (fixed in Xero)** on a failed refund credit note says a later run already made its note | A retry of it, or another run of the same note, already raised its credit note in Xero (#4421) | Nothing to resolve: that note records the refund. Don't make another by hand; if you did, ask the treasurer whether to void it. If that earlier note was later voided in Xero, follow the voided-note task on the treasurer's refund list instead |
+| An allocation is **Failed** with `CREDIT_NOTE_SPENT_OUTSIDE_APP`: "the credit note this allocation needs has only $X left in Xero; it was used outside the app" | The credit note was used in Xero directly (an offset, a payment made against it, a manual allocation) and the app was not told, so it tried to apply credit Xero no longer has. Xero refused the allocation, so nothing changed in Xero | **A booking's applied-credit allocation fixes itself**: the app writes the used credit down, stops counting it as applied to the booking, and closes the failed rows, which leave Active failures labelled "Closed: credit used outside the app". The member's credit balance does not change. The released amount is now unpaid on the booking's invoice in Xero, which is where to collect it from (Xero's receivables); the booking page in the app does not show a balance for a booking that was already paid, and an email asking the member to pay follows in a later release. A failure recorded before this release clears the same way when you **Retry in background** on the booking's applied-credit allocation (or its invoice, on a card booking). **Any other credit-note allocation** (for example a booking change's credit note) still fails and stays: if the use in Xero was a mistake, reverse it there and **Retry in background**. A retry that fails with the same message on an applied-credit allocation means something the app could not account for is involved (for example the credit was used on one of the club's own invoices, which the normal sync handles, or the note is shared by several credits): leave it and ask for help. If you reverse the use in Xero **after** the app has converged, the app gives the credit back by itself within about 15 minutes (see "A credit note used or un-used in Xero") |
+| A Xero sync alert says **the refunds Xero accounts for on a bank-transfer payment add up to less than the refunds the club recorded on it** | Xero is short a refund credit note for money the club has paid back. The alert names the payment, its booking and, when Xero gave one, the credit note whose change raised it. The app kept its own record of the refunds | The alert's advice, in its own words: "A refund on this payment may have no Xero credit note of its own: a later refund can be counted under the payment's first refund note instead of getting its own. Check the booking's invoice in Xero and raise a credit note by hand only for a refund whose credit note was never raised. Never raise one by hand for a refund whose credit note was voided in Xero: a voided note is handled on the treasurer's refund list or on Stuck States, and once it has been answered there, any replacement note comes from that answer." Open the booking's invoice in Xero and compare its refund credit notes with the refunds on the booking. A note you raise by hand is not linked to the payment in the app, so the alert can come back when the payment's other notes change in Xero: check your note is there and carry on. The payment's refunded total stays at the club's own record unless an older version had already lowered it; see [the deploy note](../xero/ARCHITECTURE.md#a-later-refund-folded-into-the-first-note-4230) |
+| A credit note voided in Xero still looks live here | The Xero app is not subscribed to Credit Notes, or the void was delivered before credit-note events were reconciled | In the Xero developer portal (**My Apps → your app → Webhooks**), tick **Credit Notes** as well as Invoices and Contacts. Then open **Inbound Events**, filter Category to CREDITNOTE, and **Replay** the void. A later void is recorded on its own. A payment's voided refund note is then switched off, whatever the payment, and the payment's refunded total is recounted. Replaying the same void again recounts it again and does not undo or re-adopt anything, though it may send the refund divergence alert again. A refund request's own voided note is switched off too, but moves no refunded total. An internet-banking payment's voided refund is then handled each night as [Voided bank-transfer refund notes](../xero/ARCHITECTURE.md#voided-bank-transfer-refund-notes-4162) describes |
+| A membership subscription invoice operation is **Failed** with "Membership subscription charge not found: [REDACTED]" | A fault before this release (#3971): the job lost the charge it was meant to invoice, so the member was never invoiced | Press **Retry in background** on the row. It goes back to the queue and the next Xero run invoices and emails the member; check the charge in [Subscriptions](subscriptions.md) afterwards. If one charge has several failed rows, only the newest offers the button; the older ones are superseded and need nothing, and show as repaired once it succeeds |
+| An operation is stuck **Running** with no Retry button | Its run stopped without finishing it — a worker was interrupted, or (before this release) a requeue failed early | After 15 minutes the row shows **Mark failed**. Use it, fix the cause named in the error, then **Retry in background** |
+| A **REQUEUE** row says "not marked replayable" | A requeue is never replayed itself. Its error names the original operation and says where that operation now stands | Find the original operation it names. If it is back to **Failed**, fix the cause and requeue it again |
+| A **REVIEW** operation, `PRIMARY_INVOICE_OVERBILLED` or `PRIMARY_INVOICE_UNDERBILLED`, says a booking's primary invoice bills more or less than the booking is worth | The booking was changed in the seconds its first Xero invoice was being raised (#3980, `INV-PAY-136`). A shortfall is normally billed automatically on a supplementary invoice; this task appears when the invoice bills too much, or when no change could carry the shortfall — including a change already billed by the invoice for a late card payment the club kept (#4324), when the message asks you to bill only what that invoice does not. The message says by how much and, for an overcharge, how the change was settled (refund paid out, account credit, an unpaid request reduced) | Check the invoice in Xero. For an overcharge, raise a credit note for the amount if one is due, keeping in mind any refund already paid out; for a shortfall, bill it. Then **Resolve (fixed in Xero)**. **Retry** is not available: there is nothing for the app to resend |
+| A booking is under **Failed** operations but not under **Missing invoices** | Its invoice reached Xero before a later step of the same operation failed; the list reads the club's invoice records, not the operation's status | Nothing to raise — do not **Trigger All Missing** for it. Open the booking to see which step is outstanding, then **Retry in background** or **Resolve (fixed in Xero)** on the operation |
+| A booking-invoice operation here is **Failed**, part-finished, or stuck **Running**, and you want to know which booking it belongs to | These rows are stored against the payment, not the booking, so the booking is not obvious from this screen | The booking says it itself: a full admin opening that booking sees a warning naming what Xero does and does not have, with a link back to this screen. **Retry in background** or **Resolve (fixed in Xero)** on the operation clears the warning, without touching the booking, the payment or the invoice |
+| A member's grouping looks wrong | The mode/rules changed but existing members were not re-grouped automatically | Run the **dry-run diff**, then **bulk re-sync** per the [runbook](../XERO_MEMBER_GROUPING_RUNBOOK.md) |
+| A bulk re-sync halted | The daily Xero API limit was reached | Use **Resume re-sync** the next day |
+| Subscription paid-status isn't updating | The member has no Xero contact link | Link/create a contact, then run a membership refresh |
+| Create/link/unlink/import says the action completed only in part | The provider or canonical member change committed before a later local step failed | Do not repeat the action; reload/try again from the persistent warning, check the current link, then run **Member Status Repair Backfill** when directed. The message also names anything else left unfinished — the member's **Xero record links may still be active** (check them on the member and deactivate any that remain), and the **audit entry may be missing** so the action may not appear in the member's history |
+| **Member merge** or **account deletion** is refused for a member whose Xero contact looks fine | An open member CONTACT operation still blocks both, most often a create whose Xero contact was made under a different id | The member's Xero panel and the refusal both name the operation. Open **Xero → Operations**, find it, and either wait for it to finish or use **Resolve (fixed in Xero)** once the contact is correct in Xero. Linking the member to the contact that create actually made closes it by itself |
+| The dry run says Xero contacts have never been synced | The local copy of Xero's contacts is empty, so every member would look like they have no contact | Run **Contact Sync** on this page first, then run the dry run again |
+| The dry run warns that the cached contact list is old | The counts come from the last Contact Sync, and a contact added in Xero since then looks here like no contact at all | Run **Contact Sync**, then the dry run again, before creating anything |
+| Creating is refused because "what would happen has changed" | Something moved between the dry run you reviewed and pressing the button — a contact was found, archived or claimed | Nothing was created. Run the dry run again and review the new plan |
+| A row failed saying Xero could not be searched | The search failed for a reason other than the daily limit, so nothing was done rather than risk a second contact for somebody who already has one | Try again later. The member is unchanged |
+| A row failed saying Xero already has a contact with this name | Xero will not allow two contacts with the same name, and nothing here decides on a name alone whether it is the same person | Check the contact in Xero. Link this member to it by hand if it really is them, or rename the old contact |
+| A member stays in **Needs a decision** after a batch | Nothing is ever guessed for these rows — the batch deliberately skipped them | Read the reason on the row and fix the record it names: split a shared email address, link a contact by hand from the member's Xero panel, or tidy duplicate contacts in Xero |
+| A batch stopped part way saying Xero's daily limit was reached | The club has spent its Xero API calls for the day | Nothing is half-done: come back tomorrow, run the dry run again, and carry on. The limit resets at midnight UTC, about midday in New Zealand |
+| A row failed saying the Xero contact belongs to a school | That Xero customer is the school's own record, and one Xero customer belongs to one local record | Give the person their own email address, or link them to their own contact by hand. Never re-use the school's contact for a person |
+| **Force sync → Contact** for a walk-in owner | Walk-in owners have a placeholder email, so Xero cannot be searched by email for them | It works: the re-sync asks Xero by exact name instead. A live contact with that name is re-linked; only when Xero has no live contact of that name is a new one created |
+
+## Related links
+
+- Back to the [documentation hub](../README.md).
+- Feature hub: the [Xero subsystem architecture](../xero/ARCHITECTURE.md) and the
+  [Finance dashboard](../finance-dashboard/README.md).
+- Sibling guides: [Subscriptions](subscriptions.md), [Payments](payments.md),
+  [Internet Banking](internet-banking.md), [Members](members.md).
+- Reference: the
+  [Xero outbox and reconciliation lifecycle](../STATE_MACHINES.md#xero-outbox-and-reconciliation-lifecycle),
+  the [Xero member grouping runbook](../XERO_MEMBER_GROUPING_RUNBOOK.md),
+  [operational Xero](../ARCHITECTURE.md#operational-xero) and the
+  [Xero member grouping](../../CONFIGURATION.md#xero-member-grouping) reference,
+  and the [Xero member grouping invariants](../invariants/integrations.md#xero-member-grouping-e8-1934).
+
+## Pick up a change made in Xero now
+
+After recording a payment, changing a credit-note allocation or voiding a note
+in Xero, use **Sync from Xero now** on the member's Xero contact panel or the
+booking detail page. These read Xero and reuse the scheduled inbound repairs
+and credit-note mirror. The result reports changed financial records (including
+subscription status) and contact fields, or **Already in step**. Refreshing links and caches alone is not counted
+as a financial change. A failed sync may have updated some records; retrying is
+safe. Finance view-only users see disabled controls; Finance edit is required.
+All scopes share an officer rate limit of three requests per minute and record
+an audit entry under Xero.
+
+**Sync everything from Xero now**, on **Admin → Finance → Xero Sync**, runs the
+same bounded inbound cycle and credit-note sweep as the scheduler. Existing
+cursors, batch limits and sweep throttling still apply. It shares a database
+run claim with scheduled and HTTP cron runs; **A sync is already running** means
+no second cycle started. A stopped worker's database connection releases the
+claim automatically. Scoped buttons do not move the club's contact or membership
+delta cursors, so use those when you need a particular record refreshed now.
+
+The same page shows **Last webhook received**. Signed, valid deliveries count,
+including empty verification pings; rejected requests do not. When connected,
+a warning appears strictly after the saved quiet period, with a **Needs
+Attention** entry and a Stuck States item. The default is 24 hours. Use
+**Edit → Save/Cancel** to choose 1–720 hours. A connection that has never received
+a webhook gets the full threshold from its connection time. No quiet-period
+warning appears while disconnected or while the Xero module is disabled.
+
+**Refund notes voided before #4288 (#4336).** A club that ran a version before
+#4341 may hold refund credit notes that Xero voided but the app still counts.
+The owner finds them with the read-only report
+`pnpm run xero:revived-refund-note-report`, then uses **Sync from Xero now** on
+each listed booking. **Sync everything from Xero now** does not revisit them.
+What each line needs and what happens next:
+[MAINTENANCE.md](../MAINTENANCE.md#find-refund-notes-xero-voided-that-the-app-still-counts-4336).
+
+Webhook receipt history and the quiet-period policy remain local to each
+installation during configuration transfer, like the Xero connection itself.

@@ -1,0 +1,84 @@
+import type { ReactNode } from "react";
+import { AppProvidersClient } from "@/components/app-providers-client";
+import type { ClubIdentity } from "@/config/club-identity-types";
+import { clubFormatValues } from "@/lib/club-format-server";
+import { clubTimeZone } from "@/lib/club-time/server";
+
+/**
+ * The application shell every authenticated, admin, finance, lodge and member
+ * route group composes — now a SERVER component, so the club's timezone can be
+ * read where it lives (CT-4, #2870; epic #2988).
+ *
+ * ## What changed and why
+ *
+ * This file used to be the `"use client"` provider stack itself. The stack has
+ * moved, byte for byte, to `app-providers-client.tsx`; what is left is the one
+ * thing a client module cannot do, which is `await` the persisted club timezone.
+ * `INV-CONFIG-002` says the club's civil-time authority is
+ * `ClubTimeSettings.timeZone` and never the machine rendering the page, so the
+ * value has to be resolved on the server and handed to the browser as data.
+ *
+ * NO LAYOUT CHANGED. All five route groups already render
+ * `<AppProviders clubIdentity={...} nonce={...}>` from an async server layout,
+ * and a server component composing client components is the ordinary direction —
+ * so the boundary moved one file up and every caller stayed as it was.
+ *
+ * ## This is one of the epic's two client-boundary mount points
+ *
+ * Between this component and `website/website-chrome.tsx`, every route group in
+ * the application is wrapped by a `ClubTimeProvider`. That is what lets
+ * `useClubTime()` throw rather than fall back to a plausible wrong zone;
+ * `club-time-provider.tsx` has the full reasoning, and
+ * `club-time-provider-mount-census.test.tsx` is the guard that keeps the claim
+ * true as route groups come and go.
+ *
+ * ## And, since #3564, the club's CURRENCY AND LOCALE come the same way
+ *
+ * Stage 2 of programme #3205 put `ClubFormatSettings` behind the same seam, for
+ * the same reason and through the same two mount points: `NEXT_PUBLIC_CURRENCY`
+ * and `NEXT_PUBLIC_LOCALE` are inlined at BUILD time into an image that serves
+ * every club, so a browser that reads them sees `undefined` and falls back to
+ * New Zealand. `club-format-provider.tsx` has the reasoning and
+ * `club-format-provider-mount-census.test.tsx` is its guard.
+ *
+ * BOTH READS HAPPEN ONCE PER RENDER PASS, side by side, AND BOTH ARE MEMOISED.
+ * `clubTimeZone()` has been request-memoised with React `cache()` since CT-4.
+ * This component read the club's format through the raw `getClubFormat()` until
+ * #3565, because stage 1's reader deliberately cached nothing and recorded that
+ * the caching contract belonged to this stage, "where the hot per-format call
+ * sites arrive". #3565 chose it — React `cache()`, in
+ * `club-format-server.ts` — so the wait is over and this component takes
+ * `clubFormatValues()` like everything else.
+ *
+ * THAT IS NOT A TIDY-UP. React `cache()` memoises per FUNCTION IDENTITY, so a
+ * page that renders an amount through `clubFormat()` while this component calls
+ * `getClubFormat()` directly holds two memo entries that never share, and reads
+ * the same one-row table twice in one render pass. The values are what the
+ * browser seam needs; `clubFormatValues()` is the reader that hands them over
+ * and is the same memo `clubFormat()` builds its binding from.
+ */
+
+interface AppProvidersProps {
+  children: ReactNode;
+  clubIdentity: ClubIdentity;
+  nonce?: string;
+}
+
+export async function AppProviders({
+  children,
+  clubIdentity,
+  nonce,
+}: AppProvidersProps) {
+  const [zone, format] = await Promise.all([clubTimeZone(), clubFormatValues()]);
+  return (
+    <AppProvidersClient
+      clubIdentity={clubIdentity}
+      clubTimeZone={zone}
+      clubCurrencyCode={format.currencyCode}
+      clubLocale={format.locale}
+      nonce={nonce}
+    >
+      {children}
+    </AppProvidersClient>
+  );
+}

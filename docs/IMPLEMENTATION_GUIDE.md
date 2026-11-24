@@ -1,0 +1,312 @@
+# Implementation Guide
+
+This guide is the practical path for adapting AlpineClubBookingsNZ for another
+club. Keep live provider credentials and real member data out of public forks,
+CI, and local experiments.
+
+## 1. Fork And Install
+
+Start from the latest **release**, not from `main`. `main` is the development
+branch: on any given day it holds changes no release has tested yet, and it
+has no version name to report a bug against or roll back to. Releases are
+listed on the repository's GitHub **Releases** page.
+
+```bash
+git clone https://github.com/<owner>/AlpineClubBookingsNZ.git
+cd AlpineClubBookingsNZ
+git fetch --tags
+git checkout "$(git describe --abbrev=0 --match 'v[0-9]*' --exclude 'v*-*' origin/main)"
+cp .env.example .env
+pnpm install --frozen-lockfile
+pnpm exec prisma generate
+pnpm run setup:check
+```
+
+The `git checkout` line finds the newest release tag on `main` (an annotated
+tag named like `v0.13.2`, skipping pre-release names such as `v1.3.0-rc1`) and
+checks it out. Run `git describe --exact-match`
+at any time to print the release you are on. Git reports a "detached HEAD",
+which is expected: you are on a release, not on a branch. For a production host, follow
+[`DEPLOYMENT.md` → "First Bootstrap"](../DEPLOYMENT.md#first-bootstrap), which
+keeps the host checkout on a branch called `main` held at the release, because
+the deploy script expects that. To work on the code itself, `git switch main`.
+
+The copied `.env` declares `APP_ENVIRONMENT_ROLE=non-production`, which is right
+for a local checkout. The club's live site sets `APP_ENVIRONMENT_ROLE=production`
+instead; [`DEPLOYMENT.md` → "First Bootstrap"](../DEPLOYMENT.md#first-bootstrap)
+checks it before anything starts, and
+[`guides/environment-role.md`](guides/environment-role.md) explains why.
+
+Use Node.js 24 LTS and pnpm 11 (the version pinned in `package.json`
+`packageManager`; see
+[`CONTRIBUTING.md` → "Package manager: pnpm"](../CONTRIBUTING.md#package-manager-pnpm)
+for installing it).
+
+## 2. Configure Club Identity
+
+Club configuration lives in the database, not in a file. After the first
+migrate and seed (section 4), sign in and set the club's identity, beds and age
+tiers at `/admin/setup` and its linked editors. Set nightly rates at
+`/admin/seasons`.
+[`CONFIGURATION.md`](../CONFIGURATION.md#club-config) is the reference for what
+each layer controls.
+
+`config/club.json` is optional. Only a process run from the checkout reads it,
+such as a host-run seed or `pnpm run dev`. On the Docker path in section 4 the
+app container holds no `config/` folder, so the seed run inside it fills in
+placeholder values ("Example Mountain Club", 20 beds, default rates). Check
+each one from `/admin/setup` (rates are edited at `/admin/seasons`) and correct
+it before opening bookings.
+
+Keep all money values in cents. Keep booking dates as New Zealand date-only
+lodge nights unless you intentionally rework the booking model.
+
+The seeded starter pages (privacy policy, booking terms, FAQ) are fully generic
+and token-driven — they carry no club-specific name or geography, filling in your
+club and lodge automatically via `{{club-name}}` / `{{lodge-name}}` /
+`{{lodge-capacity}}` (#1945). A guard test keeps club-specific names out of the
+seeded content; edit the rendered pages under Admin > Site Contents after setup.
+
+For a guided config pass, run:
+
+```bash
+pnpm run setup:wizard
+```
+
+Run it against the migrated database from section 4. The wizard writes the same
+settings rows as the admin editors (identity, time zone, capacity and age
+tiers), writes no files and does not set rates. Before the database is migrated
+it writes nothing and points you at `/admin/setup`. Keep provider keys, OAuth
+secrets, SMTP credentials, and deployment secrets in environment variables, your
+deployment secret store, or the in-app integration wizards.
+
+After the first administrator can sign in, the club name, short name, and
+hut-leader label can also be overridden at runtime from Admin > Appearance >
+Club Identity — cross-linked from Admin > Setup > Foundations Setup as "Club
+Identity". A blank field falls back to the configured default, and the change
+reaches the public site and emails within a few seconds.
+
+Configure public website colours, fonts, and the logo from the admin
+`/admin/site-style` wizard after the first administrator can sign in. The public
+website shows a neutral setup holding page until that wizard is finished. The
+logo is stored in the database as a validated image data URL, so it survives
+container rebuilds without a writable upload volume.
+
+Replace the remaining deployment branding files in `public/branding/`:
+
+- `favicon.ico`
+- `favicon.png`
+- `og-image.png`
+- `lodge.jpg`
+- `ski-field.jpg`
+- `snowboarder.jpg`
+- `sunset.jpg`
+
+The public `*.example.*` files are placeholders for forks and documentation.
+
+The public seed provisions **only** the generic default site style — the three
+brand **seed** colours of the #2181 3-seed model (an accent plus an optional
+neutral character and support accent, from which the generator derives the full
+light/dark palette). A deployment fork that wants its own brand palette carries
+it in that fork's own `ClubTheme` database row and provisions it from its own
+seed override; per standing directive D15, no fork's brand colours (or a
+fork-specific seed path) live in this public repository. Setting a club's palette
+in a fresh install is done through the Site Style admin wizard, which stores the
+three seeds and marks setup complete.
+
+## 3. Configure Local Environment
+
+Set at least these values in `.env` before running a database-backed app:
+
+- `DATABASE_URL`
+- `DB_PASSWORD`
+- `AUTH_SECRET`
+- `NEXTAUTH_SECRET`
+- `NEXTAUTH_URL`
+- `AUTH_TRUST_HOST`
+- `CRON_SECRET`
+- `SEED_ADMIN_EMAIL`
+- `SEED_ADMIN_PASSWORD`
+- `SEED_LODGE_PASSWORD`
+
+External integrations can stay disabled or use test/demo credentials while you
+bring up the core app.
+
+After migrations and seed data run, admins activate or deactivate optional
+modules at `/admin/modules`. Which modules exist, what each one enables and
+whether it ships on or off is listed once, in
+[`docs/guides/modules.md` → Settings reference](guides/modules.md#settings-reference);
+capability modules that need deploy-time setup (credentials, hardware, bed
+inventory) ship off, general-purpose modules ship on, and each row names what
+a module needs before it is useful.
+
+Internet Banking payment policy is configured at `/admin/internet-banking`.
+The default policy preserves the historical behavior: Internet Banking bookings
+do not hold beds and there is no minimum lead time before check-in. Admins can
+switch on bed-slot holding, set the hold duration, and set a minimum
+date-only lead time. When holding is enabled, the payment cron releases unpaid
+holds after expiry by cancelling the booking, marking the pending payment
+failed, and queueing Xero invoice-clearing credit-note work.
+
+Member-facing booking, payment-link, cancellation/refund appeal, and group
+booking payment copy is configured at `/admin/booking-messages` under
+Notifications & Email. These messages are plain text with audited changes and
+support the documented merge fields; audited email templates stay in the Email
+Messages editor.
+
+## 4. Bring Up A Local Database
+
+For a Docker-backed local/staging-style setup:
+
+```bash
+cp .env.staging.example .env.staging
+docker compose --env-file .env.staging -p tacbookings-staging \
+  -f docker-compose.yml -f docker-compose.staging.yml up -d --build postgres app
+docker compose --env-file .env.staging -p tacbookings-staging \
+  -f docker-compose.yml -f docker-compose.staging.yml run --rm migrate
+docker compose --env-file .env.staging -p tacbookings-staging \
+  -f docker-compose.yml -f docker-compose.staging.yml run --rm seed
+```
+
+The Docker-only app listens on `http://localhost:3001` by default.
+
+For a host-run development app, point `DATABASE_URL` at PostgreSQL and run:
+
+```bash
+pnpm run db:migrate
+pnpm run db:seed
+pnpm run dev
+```
+
+For a disposable local showcase database, run `ALLOW_DEMO_SEED=1 pnpm run
+db:seed:demo` only against a development database whose `Member` table is empty
+or contains only `demo.alpineclub.test` emails. The demo seed refuses
+`NODE_ENV=production`, non-local `DATABASE_URL` hosts, and non-demo member
+data, then deletes demo plus transactional rows before rebuilding sample
+members, bookings, payments, credits, requests, inductions, and public booking
+requests. Demo users sign in with `demo1234` unless `DEMO_SEED_PASSWORD` is
+set. It must not be used on deployment hosts or against shared, staging,
+or production databases.
+
+Do not start a development server in a shared, staging, or production checkout
+unless you own that environment and intend to expose it.
+
+After signing in with the seeded administrator, open `/admin/setup` to finish
+the readiness checklist, run explicit provider tests, connect Xero, and review
+booking, membership cancellation, rate, and mapping settings.
+
+Admin Setup also exposes email and notification controls. Review the shared
+email variables, editable templates, and admin/system delivery policies before
+inviting members; cancellation, archive, and safe-delete lifecycle messages are
+registered there and can be previewed before go-live. Keep transactional member
+emails enabled unless your club has a replacement operational process.
+
+For Xero-backed deployments, complete the operational Xero mappings before
+using membership cancellation in production. In `/admin/xero`, set the
+`membershipCancellationCredit` account/item mapping and configure the cancelled
+member contact groups under `/admin/setup`. The same screen offers a
+**Goodwill & Write-Offs** expense account (#2717): credit an admin granted and a
+member then spent on a booking posts there, so the accounts show what the club
+billed and what it chose not to collect rather than netting the two together.
+Credit a member had already paid for — a cancellation or reprice refund sitting
+on their account — is not goodwill and still posts to the hut-fee-refund
+account. Leaving the new mapping unset is safe: goodwill keeps going to the
+hut-fee-refund account, the screen says so, and nothing already in Xero is
+reclassified when you do set it. An optional **Opening Credits** account
+(#4988) falls back the same way for credit brought across with an
+opening-credit import. Once set, its line is sent with the Xero tax rate mapped
+to the Exempt tax category, which a GST-registered club maps first: see
+[Moving in](guides/moving-in.md#6-credit-post-the-opening-credits) for when to
+set it. The same screen offers a **Bank Transfer
+Refunds Account** (#3529): a refund the club sends back by internet banking —
+an edit review settled by hand, or the hand-back of an internet-banking payment
+that reached Xero for a booking already cancelled — is recorded in Xero as a
+credit note worded "Refund requested via internet banking", settled from that
+account, so the treasurer can tell it
+from a card refund ("Refund against original credit card", settled from the
+Stripe account when Stripe reports the refund) and from credit left on the
+member's account ("Account Credit"). Until you choose the account, those
+credit notes are raised **without** a settling payment — they stay visibly
+outstanding in Xero for you to match to the bank line by hand — and the
+Setup Completeness checklist and the mapping row both say so. A bank
+transfer is never recorded as leaving the Stripe account. Cancellation
+approval only disables
+the local member and queues Xero operations; archive and hard delete do not
+remove Xero contacts.
+
+Member cancellation is a member-initiated workflow from the profile page.
+Login-capable adults included by another member must confirm their own
+inclusion before admin review. Admins review confirmed participants under
+`/admin/membership-cancellations`; approval cancels the local membership while
+preserving booking, payment, Xero, and audit history.
+
+Archive and hard delete are separate admin lifecycle policies on the member
+detail page. Archive is for already-cancelled members and keeps the member row
+for historical reporting while hiding it from default operational views. Archive
+requests are reviewed under `/admin/membership-cancellations` alongside the
+cancellation review queue and require a different admin for approval. Hard
+delete is only for records added in error: it requires a clean dependency check,
+a reason, second-admin approval, and a retained request snapshot before the row
+is removed. If any meaningful history exists, use cancellation and archive
+instead of hard delete.
+
+## 5. Configure Providers In Test Mode
+
+Use non-production accounts until your own deployment is ready:
+
+- Stripe test mode for payments and webhooks.
+- Xero demo tenants for operational and finance sync flows.
+- Internet Banking payment trials only against a Xero demo tenant and
+  non-production bank-reference process.
+- SES sandbox or another non-production SMTP setup for email.
+- A dedicated Sentry project if browser/server error reporting is enabled.
+
+Webhook routes are:
+
+- `/api/webhooks/stripe`
+- `/api/webhooks/xero`
+- `/api/webhooks/ses-sns`
+
+## 6. Validate Before Sharing
+
+Run the core gates before opening a PR or exposing an environment:
+
+```bash
+pnpm run audit:deps            # the same gate CI runs, with the same threshold
+pnpm run lint
+DATABASE_URL=postgresql://user:pass@localhost:5432/tacbookings pnpm exec prisma validate
+pnpm test
+pnpm run build
+git diff --check
+```
+
+If you change framework behavior, read the relevant Next.js guide in
+`node_modules/next/dist/docs/` first.
+
+## 7. Prepare Deployment
+
+Read `DEPLOYMENT.md` before production. At minimum, plan:
+
+- DNS and TLS through Caddy or your equivalent reverse proxy.
+- PostgreSQL backups and restore testing.
+- GHCR image visibility or a host login with `read:packages`.
+- Stripe, Xero, SES, and Sentry credentials owned by your organisation.
+- A migration process that follows `BLUE_GREEN_MIGRATION_POLICY.md`.
+
+For forks that publish GHCR images under different names, set repository
+variables:
+
+```text
+GHCR_APP_IMAGE_REPOSITORY=ghcr.io/<owner>/<image-name>-app
+GHCR_MIGRATE_IMAGE_REPOSITORY=ghcr.io/<owner>/<image-name>-migrate
+```
+
+The deployment wrapper also supports `GHCR_APP_IMAGE_REPOSITORY` and
+`GHCR_MIGRATE_IMAGE_REPOSITORY` environment overrides on the host.
+
+## 8. Keep A Clean Public/Private Split
+
+Generic features, bug fixes, framework upgrades, and adopter documentation
+belong in the public upstream. Deployment-specific branding, production
+identifiers, service configuration, private data fixes, and real assets belong
+in a private fork or deployment environment.

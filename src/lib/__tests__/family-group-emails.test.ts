@@ -1,0 +1,396 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// ── Template tests (no mocking needed) ────────────────────────────────────
+
+describe("Family group email templates", () => {
+  it("familyGroupInvitationTemplate includes inviter name and group name", async () => {
+    const { familyGroupInvitationTemplate } = await import("@/lib/email-templates/family");
+    const html = familyGroupInvitationTemplate("Jane Doe", "Doe Family", "https://example.com/profile");
+
+    expect(html).toContain("Jane Doe");
+    expect(html).toContain("Doe Family");
+    expect(html).toContain("https://example.com/profile");
+    expect(html).toContain("View Invitation");
+  });
+
+  it("familyGroupInvitationTemplate escapes HTML in names", async () => {
+    const { familyGroupInvitationTemplate } = await import("@/lib/email-templates/family");
+    const html = familyGroupInvitationTemplate("<b>Evil</b>", "<script>alert(1)</script>", "https://x.com");
+
+    expect(html).not.toContain("<b>Evil</b>");
+    expect(html).toContain("&lt;b&gt;Evil&lt;/b&gt;");
+    expect(html).not.toContain("<script>");
+  });
+
+  it("familyGroupInviteAcceptedTemplate includes invitee name and group name", async () => {
+    const { familyGroupInviteAcceptedTemplate } = await import("@/lib/email-templates/family");
+    const html = familyGroupInviteAcceptedTemplate("Alice Smith", "Smith Family");
+
+    expect(html).toContain("Alice Smith");
+    expect(html).toContain("Smith Family");
+    expect(html).toContain("Invitation Accepted");
+  });
+
+  it("childRequestSubmittedTemplate includes parent name, child name, and group", async () => {
+    const { childRequestSubmittedTemplate } = await import("@/lib/email-templates/family");
+    const html = childRequestSubmittedTemplate("Bob", "Bobby Jr", "Johnson Family");
+
+    expect(html).toContain("Bob");
+    expect(html).toContain("Bobby Jr");
+    expect(html).toContain("Johnson Family");
+    expect(html).toContain("submitted");
+  });
+
+  it("childRequestApprovedTemplate includes parent name, child name, and group", async () => {
+    const { childRequestApprovedTemplate } = await import("@/lib/email-templates/family");
+    const html = childRequestApprovedTemplate("Carol", "Timmy", "Taylor Family");
+
+    expect(html).toContain("Carol");
+    expect(html).toContain("Timmy");
+    expect(html).toContain("Taylor Family");
+    expect(html).toContain("added to your family group");
+  });
+
+  it("childRequestRejectedTemplate includes parent name and child name", async () => {
+    const { childRequestRejectedTemplate } = await import("@/lib/email-templates/family");
+    const html = childRequestRejectedTemplate("Dave", "Susie", "Child is not registered");
+
+    expect(html).toContain("Dave");
+    expect(html).toContain("Susie");
+    expect(html).toContain("not approved");
+    expect(html).toContain("Child is not registered");
+  });
+
+  it("childRequestRejectedTemplate works without reason", async () => {
+    const { childRequestRejectedTemplate } = await import("@/lib/email-templates/family");
+    const html = childRequestRejectedTemplate("Dave", "Susie");
+
+    expect(html).toContain("Dave");
+    expect(html).toContain("not approved");
+    // Should not contain admin note box
+    expect(html).not.toContain("Admin note:");
+  });
+
+  it("groupCreateRequestConfirmationTemplate includes requester and group name", async () => {
+    const { groupCreateRequestConfirmationTemplate } = await import("@/lib/email-templates/family");
+    const html = groupCreateRequestConfirmationTemplate("Alice Smith", "Smith Family");
+
+    expect(html).toContain("Alice Smith");
+    expect(html).toContain("Smith Family");
+    expect(html).toContain("has been submitted");
+  });
+
+  it("groupCreateApprovedTemplate includes requester and group name", async () => {
+    const { groupCreateApprovedTemplate } = await import("@/lib/email-templates/family");
+    const html = groupCreateApprovedTemplate("Alice", "Smith Family");
+
+    expect(html).toContain("Alice");
+    expect(html).toContain("Smith Family");
+    expect(html).toContain("group admin");
+  });
+
+  it("groupCreateRejectedTemplate includes reason when provided and escapes HTML", async () => {
+    const { groupCreateRejectedTemplate } = await import("@/lib/email-templates/family");
+    const html = groupCreateRejectedTemplate("Alice", "<b>Smith</b> Family", "Duplicate group");
+
+    expect(html).toContain("Alice");
+    expect(html).not.toContain("<b>Smith</b>");
+    expect(html).toContain("&lt;b&gt;Smith&lt;/b&gt;");
+    expect(html).toContain("not approved");
+    expect(html).toContain("Duplicate group");
+  });
+
+  it("groupCreateRejectedTemplate works without reason", async () => {
+    const { groupCreateRejectedTemplate } = await import("@/lib/email-templates/family");
+    const html = groupCreateRejectedTemplate("Alice", "Smith Family");
+
+    expect(html).toContain("not approved");
+    expect(html).not.toContain("Admin note:");
+  });
+
+  it("partnerInviteTemplate includes inviter, group, claim URL, and expiry", async () => {
+    const { partnerInviteTemplate } = await import("@/lib/email-templates/family");
+    const expiresAt = new Date("2026-08-10T00:00:00.000Z");
+    // Same-origin claim link (the sameOrigin button sanitiser drops foreign
+    // origins, matching the membership-cancellation token template).
+    const html = partnerInviteTemplate({
+      inviterName: "Jane Doe",
+      groupName: "Doe Family",
+      claimUrl: "http://localhost:3000/family-invite/abc123",
+      expiresAt,
+    });
+
+    expect(html).toContain("Jane Doe");
+    expect(html).toContain("Doe Family");
+    expect(html).toContain("family-invite/abc123");
+    expect(html).toContain("Accept Invitation");
+    expect(html).toContain("expires on");
+  });
+
+  it("partnerInviteTemplate escapes HTML in user-controlled inviter and group names", async () => {
+    const { partnerInviteTemplate } = await import("@/lib/email-templates/family");
+    const html = partnerInviteTemplate({
+      inviterName: "<b>Evil</b>",
+      groupName: "<script>alert(1)</script>",
+      claimUrl: "http://localhost:3000/family-invite/abc123",
+      expiresAt: new Date("2026-08-10T00:00:00.000Z"),
+    });
+
+    expect(html).not.toContain("<b>Evil</b>");
+    expect(html).toContain("&lt;b&gt;Evil&lt;/b&gt;");
+    expect(html).not.toContain("<script>alert(1)</script>");
+  });
+
+  it("partnerInviteClaimedTemplate includes first name and group name", async () => {
+    const { partnerInviteClaimedTemplate } = await import("@/lib/email-templates/family");
+    const html = partnerInviteClaimedTemplate("Bob", "Smith Family");
+
+    expect(html).toContain("Bob");
+    expect(html).toContain("Smith Family");
+    expect(html).toContain("Family Group Joined");
+  });
+
+  it("partnerInviteClaimedTemplate escapes HTML in group name", async () => {
+    const { partnerInviteClaimedTemplate } = await import("@/lib/email-templates/family");
+    const html = partnerInviteClaimedTemplate("Bob", "<script>alert(1)</script>");
+
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+});
+
+// ── Route integration tests ──────────────────────────────────────────────
+
+vi.mock("../prisma", () => ({
+  prisma: {
+    member: {
+      count: vi.fn(),
+findUnique: vi.fn(),
+      findFirst: vi.fn(),
+    },
+    familyGroup: {
+      findUnique: vi.fn(),
+    },
+    familyGroupJoinRequest: {
+      findFirst: vi.fn(),
+      findUnique: vi.fn(),
+      findMany: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+    },
+    familyGroupMember: {
+      upsert: vi.fn(),
+    },
+    $transaction: vi.fn((fn: (tx: any) => any) =>
+      fn({
+        familyGroupMember: { upsert: vi.fn() },
+        familyGroupJoinRequest: { update: vi.fn() },
+      })
+    ),
+  },
+}));
+
+vi.mock("../email", () => ({
+  sendFamilyGroupInvitationEmail: vi.fn(),
+  sendFamilyGroupInviteAcceptedEmail: vi.fn(),
+  sendChildRequestSubmittedEmail: vi.fn(),
+  sendChildRequestApprovedEmail: vi.fn(),
+  sendChildRequestRejectedEmail: vi.fn(),
+  sendAdminFamilyGroupRequestAlert: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../auth", () => ({
+  auth: vi.fn(),
+}));
+
+vi.mock("../audit", () => ({
+  logAudit: vi.fn(),
+}));
+
+vi.mock("../logger", () => ({
+  default: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}));
+
+vi.mock("../rate-limit", () => ({
+  applyRateLimit: vi.fn(() => null),
+  rateLimiters: { familyGroupJoinRequest: {} },
+}));
+
+import { prisma } from "../prisma";
+import { auth } from "../auth";
+import {
+  sendFamilyGroupInvitationEmail,
+  sendFamilyGroupInviteAcceptedEmail,
+  sendChildRequestSubmittedEmail,
+} from "../email";
+
+const mockedAuth = vi.mocked(auth);
+const mockedSendInvitation = vi.mocked(sendFamilyGroupInvitationEmail);
+const mockedSendInviteAccepted = vi.mocked(sendFamilyGroupInviteAcceptedEmail);
+const mockedSendChildSubmitted = vi.mocked(sendChildRequestSubmittedEmail);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(prisma.member.findUnique).mockResolvedValue({
+    id: "session-member",
+    active: true,
+    forcePasswordChange: false,
+  } as any);
+});
+
+describe("POST /api/members/family/invite — email sending", () => {
+  it("should send invitation email on successful invite", async () => {
+    mockedAuth.mockResolvedValue({
+      user: { id: "u1", role: "MEMBER", accessRoles: [{ role: "USER" }], email: "inviter@test.com" },
+    } as any);
+
+    vi.mocked(prisma.member.findUnique).mockResolvedValue({
+      id: "u1",
+      firstName: "Jane",
+      lastName: "Doe",
+      active: true,
+      ageTier: "ADULT",
+      canLogin: true,
+      familyGroupMemberships: [{ familyGroupId: "fg1" }],
+    } as any);
+
+    vi.mocked(prisma.member.findFirst).mockResolvedValue({
+      id: "u2",
+      firstName: "Bob",
+      lastName: "Smith",
+      ageTier: "ADULT",
+      familyGroupMemberships: [],
+    } as any);
+
+    vi.mocked(prisma.familyGroupJoinRequest.findFirst).mockResolvedValue(null);
+    vi.mocked(prisma.familyGroupJoinRequest.create).mockResolvedValue({ id: "inv1" } as any);
+    vi.mocked(prisma.familyGroup.findUnique).mockResolvedValue({ name: "Doe Family" } as any);
+    mockedSendInvitation.mockResolvedValue(undefined);
+
+    const { POST } = await import(
+      "../../app/api/members/family/invite/route"
+    );
+
+    const req = new Request("http://localhost/api/members/family/invite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "bob@test.com", familyGroupId: "fg1" }),
+    });
+
+    const res = await POST(req as any);
+    expect(res.status).toBe(201);
+
+    // Email should be sent
+    expect(mockedSendInvitation).toHaveBeenCalledWith(
+      "bob@test.com",
+      "Jane Doe",
+      "Doe Family"
+    );
+  });
+});
+
+describe("PUT /api/members/family/invitations — email on accept", () => {
+  it("should send accepted email to inviter when invitation is accepted", async () => {
+    mockedAuth.mockResolvedValue({
+      user: { id: "u2", role: "MEMBER", accessRoles: [{ role: "USER" }], email: "invitee@test.com" },
+    } as any);
+
+    vi.mocked(prisma.familyGroupJoinRequest.findFirst).mockResolvedValue({
+      id: "inv1",
+      familyGroupId: "fg1",
+      invitedMemberId: "u2",
+      type: "ADULT_INVITE",
+      status: "PENDING",
+      requesterId: "u1",
+      familyGroup: { id: "fg1", name: "Doe Family" },
+      requester: { id: "u1", firstName: "Jane", lastName: "Doe", email: "jane@test.com" },
+    } as any);
+
+    vi.mocked(prisma.member.findUnique)
+      .mockResolvedValueOnce({
+        id: "u2",
+        active: true,
+        forcePasswordChange: false,
+      } as any)
+      .mockResolvedValueOnce({
+        firstName: "Bob",
+        lastName: "Smith",
+      } as any);
+
+    mockedSendInviteAccepted.mockResolvedValue(undefined);
+
+    const { PUT } = await import(
+      "../../app/api/members/family/invitations/route"
+    );
+
+    const req = new Request("http://localhost/api/members/family/invitations", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ invitationId: "inv1", action: "accept" }),
+    });
+
+    const res = await PUT(req as any);
+    expect(res.status).toBe(200);
+
+    expect(mockedSendInviteAccepted).toHaveBeenCalledWith(
+      "jane@test.com",
+      "Bob Smith",
+      "Doe Family"
+    );
+  });
+});
+
+describe("POST /api/members/family/request-child — email on submit", () => {
+  it("should send submitted email to parent on successful child request", async () => {
+    mockedAuth.mockResolvedValue({
+      user: { id: "u1", role: "MEMBER", accessRoles: [{ role: "USER" }], email: "parent@test.com" },
+    } as any);
+
+    vi.mocked(prisma.member.findUnique)
+      .mockResolvedValueOnce({
+        id: "u1",
+        active: true,
+        forcePasswordChange: false,
+      } as any)
+      .mockResolvedValueOnce({
+        id: "u1",
+        firstName: "Jane",
+        lastName: "Doe",
+        active: true,
+        ageTier: "ADULT",
+        familyGroupMemberships: [{ familyGroupId: "fg1" }],
+      } as any)
+      // Third call: parent email lookup
+      .mockResolvedValueOnce({ email: "parent@test.com" } as any);
+
+    vi.mocked(prisma.familyGroupJoinRequest.findFirst).mockResolvedValue(null);
+    vi.mocked(prisma.familyGroupJoinRequest.create).mockResolvedValue({ id: "req1" } as any);
+    vi.mocked(prisma.familyGroup.findUnique).mockResolvedValue({ name: "Doe Family" } as any);
+    mockedSendChildSubmitted.mockResolvedValue(undefined);
+
+    const { POST } = await import(
+      "../../app/api/members/family/request-child/route"
+    );
+
+    const req = new Request("http://localhost/api/members/family/request-child", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        familyGroupId: "fg1",
+        firstName: "Timmy",
+        lastName: "Doe",
+        dateOfBirth: "2018-03-15",
+      }),
+    });
+
+    const res = await POST(req as any);
+    expect(res.status).toBe(201);
+
+    expect(mockedSendChildSubmitted).toHaveBeenCalledWith(
+      "parent@test.com",
+      "Jane",
+      "Timmy Doe",
+      "Doe Family"
+    );
+  });
+});

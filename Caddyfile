@@ -1,0 +1,188 @@
+{
+	# Access logging, with URL tokens and query secrets redacted (#3293).
+	#
+	# Before this, only Caddy's error log existed, so a request that SUCCEEDED
+	# left no trace at all — which is why the connection-reuse race this issue
+	# fixes could not be measured after the fact: two logged 502s, and no way to
+	# tell whether that was two attempts out of two or two out of fifty.
+	#
+	# The filter is attached to the DEFAULT logger rather than to the access log,
+	# because Caddy's `http.log.error` entries carry the full request too and were
+	# already printing URLs in full. `deploy/caddy/log-redaction.caddy` carries the
+	# rules and the reasoning; each site opts in with a bare `log`.
+	#
+	# `wrap json` matches what this logger already emits when it is not attached to
+	# a terminal, so nothing about the existing lines changes shape.
+	log default {
+		format filter {
+			wrap json
+			import /etc/caddy/deploy/log-redaction.caddy
+		}
+	}
+
+	# How Caddy gets its certificates — a per-installation choice, so it is a
+	# setting (`CADDY_TLS_MODE`, docker-compose.yml) rather than an edit to this
+	# file: a local edit dirties the checkout the deploy refuses to run from and
+	# is dropped by the next `git archive` workspace anyway.
+	#
+	#   acme  (default) Caddy is the public edge and obtains certificates from
+	#         Let's Encrypt itself.
+	#   local Caddy sits behind a proxy that terminates TLS (Nginx Proxy Manager,
+	#         Traefik, a cloud load balancer). Let's Encrypt can never reach it,
+	#         so it issues its own certificates from its internal CA and the
+	#         proxy is told to accept them. Without this, a freshly created Caddy
+	#         container has no certificate at all and the proxy answers 502.
+	import /etc/caddy/deploy/tls-{$CADDY_TLS_MODE:acme}.caddy
+}
+
+{$DOMAIN} {
+	# X-Frame-Options is PATH-SCOPED so the edge states the same intent the app
+	# does (#2246). /display is deliberately framed by the admin's own sandboxed
+	# preview surfaces (LTV-036, ADR-003 §5) and `src/lib/csp.ts` sets SAMEORIGIN
+	# on it, but a blanket edge DENY REPLACED that value — the previews worked
+	# only because CSP2 tells browsers to ignore X-Frame-Options when
+	# `frame-ancestors` is present. Scoping the header here removes that
+	# dependence on a browser precedence rule.
+	#
+	# Every other path keeps a GUARANTEED DENY set at the edge, including
+	# /images/* and, when CADDY_LEGACY_ROUTES=on, /finance-legacy* (a
+	# reverse-proxied third-party upstream), neither of which the app's own
+	# middleware covers. Deliberately NOT the
+	# set-if-absent `?X-Frame-Options` form: that would downgrade a guaranteed
+	# edge control into an advisory one on every route, so any upstream emitting
+	# a permissive value would win.
+	#
+	# X-Frame-Options is set in TWO places and BOTH are load-bearing. Do not
+	# "de-duplicate" them — deleting either one is a regression:
+	#
+	#  1. The DEFERRED, scoped pair below (the `>` prefix). `>` rewrites the
+	#     header as the response is written, so the edge value REPLACES the
+	#     upstream's instead of sitting next to it. Without it Caddy sets the
+	#     header before proxying and the app's value is APPENDED, so a response
+	#     carries two conflicting X-Frame-Options values (measured against
+	#     caddy:2 with a permissive upstream: a plain set left both `DENY` and
+	#     `ALLOWALL` on the same response).
+	#  2. The EAGER `X-Frame-Options "DENY"` in the shared `header { }` block
+	#     below. The deferred rewrite lives in a ResponseWriter wrapper that is
+	#     unwound when a handler returns an ERROR, so Caddy's error chain writes
+	#     the response without it: a 502 when an upstream is down (including
+	#     an opted-in /finance-legacy*), the 413 from the request_body cap
+	#     below, any 5xx.
+	#     Those responses never reach Next either, so they carry no CSP and no
+	#     `frame-ancestors` fallback — the eager set is the only thing that makes
+	#     DENY GUARANTEED on them. On a normal proxied response the deferred pair
+	#     runs afterwards and overwrites it, so there is still exactly one value.
+	#
+	# Measured against caddy:2 with a permissive upstream, exactly one
+	# X-Frame-Options per response: /display and /display/ → SAMEORIGIN; /other,
+	# /DISPLAY, /display/foo, /display-foo, /images/* → DENY; 502 → DENY;
+	# 413 → DENY.
+	#
+	# `path_regexp`, not `path`, because it is case-SENSITIVE and so mirrors the
+	# app's own `pathname === "/display"` comparison (Caddy's `path` matcher is
+	# case-insensitive, which would hand SAMEORIGIN to `/DISPLAY`); `/?` mirrors
+	# the trailing-slash normalisation in `src/lib/csp.ts`.
+	#
+	# The matcher is NOT byte-identical to the app's comparison, and cannot be:
+	# Caddy matches on the CLEANED, PERCENT-DECODED path but forwards the RAW
+	# URI, so the app sees a different string. Measured divergences, where the
+	# edge relaxes to SAMEORIGIN but the app still sends DENY: //display,
+	# /display//, /%64isplay, /dis%70lay, /display%2F. That is acceptable — those
+	# responses still carry the app's own `frame-ancestors 'none'`, which
+	# browsers honour over X-Frame-Options, and SAMEORIGIN never permits more
+	# than same-origin framing. The dangerous inverse (app relaxes, edge denies,
+	# breaking the preview) is impossible, because both paths the app relaxes sit
+	# inside the edge's match set.
+	#
+	# `header` runs ahead of `handle` in Caddy's directive order, so both
+	# matchers also cover the handled paths below.
+	# Guarded by src/lib/__tests__/edge-frame-options-static.test.ts.
+	@display path_regexp ^/display/?$
+	@not_display not path_regexp ^/display/?$
+	header @display >X-Frame-Options "SAMEORIGIN"
+	header @not_display >X-Frame-Options "DENY"
+	header {
+		X-Content-Type-Options "nosniff"
+		# The eager guaranteed floor — point 2 of the note above. This is the
+		# value error responses (502/413/5xx) carry, because they bypass the
+		# deferred rewrite; the deferred pair replaces it on every normal
+		# response. Removing this line silently makes error pages framable.
+		X-Frame-Options "DENY"
+		# Disabled: the legacy XSS auditor is removed from modern browsers and
+		# enabling it could introduce information leaks in older ones. CSP is the control.
+		X-XSS-Protection "0"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		# CSP is emitted by Next middleware so script nonces are generated per request.
+		# style-src intentionally keeps 'unsafe-inline' there while Tailwind/Radix runtime styles are audited.
+		# Defensive baseline: only applied if Next omits the header (e.g. middleware regression).
+		# Caddy's `?` prefix means "set if not already present" so it never intersects with Next's policy.
+		#
+		# Note what this fallback CANNOT rescue, because it was mistaken for a
+		# safety net once (#2404). It carries no `'nonce-…'` source, so on an HTML
+		# document the app rendered WITHOUT its own policy this line does not
+		# protect the page — it breaks it, blocking every inline script Next
+		# emitted unnonced. That was the live failure on static-asset URLs nothing
+		# served: `/foo.png` answered 404 with ~29KB of HTML and unnonced inline
+		# scripts, and this header blocked all of them.
+		#
+		# The app closes that at its own end now rather than leaning on the edge.
+		# Asset-shaped misses are answered with no document at all, by
+		# `src/app/asset-not-found/route.ts` via the rewrites in `next.config.ts`
+		# — and that route sets its own, tighter `default-src 'none'`, so it does
+		# not depend on this line either. Keep this fallback: it is still the
+		# floor for a response that reaches Caddy without one (an upstream that is
+		# not our app, or a middleware regression). Just never read "Caddy
+		# supplies a CSP" as "a page without its own is safe".
+		?Content-Security-Policy "default-src 'self'"
+	}
+	# Send this site's access entries to the redacting default logger (#3293).
+	log
+
+	# Guaranteed request-body backstop (#2235): drop oversize bodies at the
+	# edge before they reach the app. Set comfortably above the largest
+	# legitimate in-app cap (80MB image-manager batch, ~52MB config bundle);
+	# the app's streamed per-route caps do the precise enforcement.
+	request_body {
+		max_size 100MB
+	}
+	# Rewrite legacy /images/* requests to the runtime-serving API route so
+	# uploaded images are served correctly without restarting containers.
+	handle /images/* {
+		uri strip_prefix /images
+		rewrite * /api/images/uploaded{path}
+		import /etc/caddy/deploy/tacbookings-active.caddy
+	}
+	# A legacy finance dashboard's `/finance-legacy*` route, opt-in and off by
+	# default (CADDY_LEGACY_ROUTES, docker-compose.yml; #4981). It stays HERE,
+	# inside this site, so the header directives above cover it and its 502s.
+	import /etc/caddy/deploy/legacy-routes-{$CADDY_LEGACY_ROUTES:off}.caddy
+	import /etc/caddy/deploy/tacbookings-active.caddy
+}
+
+# Extra hostnames, each a per-installation setting rather than an edit to this
+# file (see CADDY_TLS_MODE above for why), and each needing its own DNS record:
+#   CADDY_WWW_REDIRECT  on (default) redirects www.<DOMAIN> to <DOMAIN>.
+#   CADDY_LEGACY_ROUTES off (default); on adds the bookings. and dashboard.
+#                       hosts of a legacy finance dashboard, with the
+#                       /finance-legacy* route imported above.
+import /etc/caddy/deploy/www-redirect-{$CADDY_WWW_REDIRECT:on}.caddy
+import /etc/caddy/deploy/legacy-hosts-{$CADDY_LEGACY_ROUTES:off}.caddy
+
+# MiroTalk video-meeting host. MEET_HOST must be the EXACT public hostname you
+# browse to (e.g. meet.example.org) — it is NOT necessarily a subdomain of
+# $DOMAIN, so it is its own variable. MIROTALK_UPSTREAM is where MiroTalk is
+# reachable FROM THE CADDY CONTAINER: host.docker.internal:3010 for a MiroTalk
+# started with its own `docker run` (needs the extra_hosts entry on the caddy
+# service), or a compose service name like mirotalk:3010. Defaults keep Caddy
+# valid (and this block inert) when the vars are unset, so the main site is
+# never affected. DNS for MEET_HOST must point at this VM and ports 80+443 must
+# be open so Caddy can obtain the TLS certificate.
+{$MEET_HOST:meet.localhost} {
+    header {
+        Permissions-Policy "camera=(self), microphone=(self), display-capture=(self)"
+        Strict-Transport-Security "max-age=63072000; includeSubDomains"
+    }
+    reverse_proxy {$MIROTALK_UPSTREAM:host.docker.internal:3010}
+}

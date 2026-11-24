@@ -1,0 +1,397 @@
+import { NextRequest, NextResponse } from "next/server";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { bookingOwner } from "@/lib/booking-owner";
+import { hostingCoverageParticipantRetryResponse } from "@/lib/adult-member-hosting-retry-response";
+import { z } from "zod";
+import { AdminReviewStatus, BookingStatus, type Prisma } from "@prisma/client";
+
+import { logAudit } from "@/lib/audit";
+import { getClientIp } from "@/lib/rate-limit-http";
+import { prisma } from "@/lib/prisma";
+import { requireAdmin } from "@/lib/session-guards";
+import {
+  TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE,
+  transactionContendedResponse,
+} from "@/lib/transaction-contended-response";
+import { cancelBooking } from "@/lib/booking-cancel";
+import {
+  sendBookingReviewApprovedEmail,
+  sendBookingReviewRejectedEmail,
+} from "@/lib/email";
+import logger from "@/lib/logger";
+import { reconcileBedAllocationsForBookingWithLodgeLockHeld } from "@/lib/bed-allocation-lifecycle";
+import { acquireLodgeCapacityLock } from "@/lib/capacity";
+import { releaseBookingPromoRedemptions } from "@/lib/promo";
+import { clubFormatValues } from "@/lib/club-format-server";
+import { requireRecentAuth } from "@/lib/require-recent-auth";
+import { LOCK1_HOLDER_TRANSACTION_BUDGET } from "@/lib/db-transaction";
+
+const reviewSchema = z
+  .object({
+    status: z.enum(["APPROVED", "REJECTED"]),
+    // Optional when approving; required when rejecting so the member always
+    // gets a reason.
+    adminNotes: z.string().trim().max(2000).optional().default(""),
+    // #1790: admin per-decision email choice. Absent/undefined = notify
+    // (default), false = suppress the member-facing review email. Both member
+    // sends here are unconditional, so a non-boolean is a 400 via this parse.
+    notifyMember: z.boolean().optional(),
+  })
+  .refine((data) => data.status === "APPROVED" || data.adminNotes.length > 0, {
+    message: "Admin notes are required when rejecting",
+    path: ["adminNotes"],
+  });
+
+async function loadPendingReviewUnderEligibilityLocks(
+  tx: Prisma.TransactionClient,
+  bookingId: string,
+  lodgeId: string,
+) {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+  await acquireLodgeCapacityLock(tx, lodgeId);
+
+  const current = await tx.booking.findUnique({
+    where: { id: bookingId },
+    // #3369: the owner may be an Organisation; bookingOwner() reads both.
+    include: { member: true, organisation: { select: { name: true, email: true } } },
+  });
+  if (
+    !current ||
+    current.deletedAt ||
+    current.adminReviewStatus !== AdminReviewStatus.PENDING
+  ) {
+    return null;
+  }
+  return current;
+}
+
+/** The claim found the review already decisioned: someone else got there first. */
+function alreadyReviewedResponse(): NextResponse {
+  return NextResponse.json({ error: "This booking has already been reviewed" }, { status: 409 });
+}
+
+/**
+ * `INV-LOCK-006`: a review claim that ran out of its lock(1) budget rolled back
+ * with nothing recorded, so it answers the shared retryable 503.
+ */
+function reviewClaimContended(err: unknown, bookingId: string): NextResponse {
+  const contended = transactionContendedResponse(
+    err,
+    "Booking review claim contended for the lock(1) budget",
+    { context: { bookingId } },
+  );
+  if (contended) return contended;
+  throw err;
+}
+
+/**
+ * The rejection committed but the cancellation after it threw. A contended
+ * cancel claim (`INV-LOCK-006`) is a retryable 503 that still says the review
+ * landed; anything else is a 500 asking the officer to check before retrying.
+ */
+function rejectedCancellationFailedResponse(err: unknown, bookingId: string): NextResponse {
+  const hostingRetry = hostingCoverageParticipantRetryResponse(err, {
+    reviewRecorded: true,
+    cancellationPending: true,
+  });
+  if (hostingRetry) return hostingRetry;
+  const contended = transactionContendedResponse(
+    err,
+    "Rejected review committed but its cancellation contended for the lock(1) budget",
+    {
+      message: TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE,
+      context: { bookingId },
+      body: { reviewRecorded: true, cancellationStatusUnconfirmed: true },
+    },
+  );
+  if (contended) return contended;
+  logger.error(
+    { err, bookingId },
+    "Rejected review committed but cancellation status could not be confirmed",
+  );
+  return NextResponse.json(
+    {
+      error:
+        "The rejection was recorded, but the booking's cancellation status could not be confirmed. Open the booking and check its status before retrying.",
+      reviewRecorded: true,
+      cancellationStatusUnconfirmed: true,
+    },
+    { status: 500 },
+  );
+}
+
+// Approve/decline a booking request: a bookings write. Explicit bookings:edit
+// matches the area the route-area matrix already infers for /api/admin/bookings
+// (#1997), pairing the queue's view-only UI gating with a route-level guard.
+export async function PATCH(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const guard = await requireAdmin({
+    permission: { area: "bookings", level: "edit" },
+  });
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+
+  const { id: bookingId } = await params;
+  const recent = await requireRecentAuth();
+  if (!recent.ok) return recent.response;
+  const jsonBody = await parseJsonRequestBody(req);
+  if (!jsonBody.ok) return jsonBody.response;
+  const parsed = reviewSchema.safeParse(jsonBody.body);
+  if (!parsed.success) {
+    return NextResponse.json({ error: "Validation failed", details: parsed.error.flatten() }, { status: 400 });
+  }
+
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    // #3369: the owner may be an Organisation; bookingOwner() reads both.
+    include: { member: true, organisation: { select: { name: true, email: true } } },
+  });
+
+  if (!booking) {
+    return NextResponse.json({ error: "Booking not found" }, { status: 404 });
+  }
+
+  // A PENDING review can sit on a parked pre-payment booking
+  // (AWAITING_REVIEW) or on a live paid/confirmed booking flagged by an edit
+  // that left no adult (#1100) — both are decisioned here.
+  if (booking.adminReviewStatus !== AdminReviewStatus.PENDING) {
+    return NextResponse.json(
+      { error: "This booking is not awaiting admin review" },
+      { status: 409 },
+    );
+  }
+  const reviewedAt = new Date();
+  const ipAddress = getClientIp(req);
+  // The club's format (#3565), resolved once, before any transaction or
+  // lock below — never per amount and never inside a transaction.
+  const format = await clubFormatValues();
+
+  // #1790: only record the notify choice when a member email was actually
+  // suppressed. Both review sends below are unconditional, so this reflects
+  // exactly whether the admin opted out.
+  const notifyAuditFields =
+    parsed.data.notifyMember === false ? { notifyMember: false } : {};
+
+  if (parsed.data.status === "APPROVED") {
+    // Approval can make a live booking operationally eligible for the roster.
+    // Join the roster's global -> immutable-lodge order, then re-read and claim
+    // under those locks so an empty roster partition cannot validate the old
+    // PENDING state and insert after this commit.
+    const reviewedBooking = await prisma.$transaction(async (tx) => {
+      const current = await loadPendingReviewUnderEligibilityLocks(
+        tx,
+        bookingId,
+        booking.lodgeId,
+      );
+      if (!current) return null;
+
+      const parkedForReview = current.status === BookingStatus.AWAITING_REVIEW;
+      const claim = await tx.booking.updateMany({
+        where: {
+          id: bookingId,
+          deletedAt: null,
+          adminReviewStatus: AdminReviewStatus.PENDING,
+          status: current.status,
+        },
+        data: {
+          adminReviewStatus: AdminReviewStatus.APPROVED,
+          adminReviewNotes: parsed.data.adminNotes || null,
+          adminReviewedById: session.user.id,
+          adminReviewedAt: reviewedAt,
+          // Only a parked pre-payment booking is released toward payment; a
+          // flagged paid/confirmed booking keeps its status (#1100) — the
+          // approval clears the review, never re-opens the payment lifecycle.
+          ...(parkedForReview ? { status: BookingStatus.PAYMENT_PENDING } : {}),
+        },
+      });
+      if (claim.count !== 1) return null;
+
+      await reconcileBedAllocationsForBookingWithLodgeLockHeld({ bookingId, db: tx });
+      return current;
+    }, LOCK1_HOLDER_TRANSACTION_BUDGET).catch((err: unknown) => reviewClaimContended(err, bookingId));
+    if (reviewedBooking instanceof NextResponse) return reviewedBooking;
+
+    if (!reviewedBooking) return alreadyReviewedResponse();
+
+    // #1790: approve always emails the member unless the admin chose not to
+    // notify (default is notify; the suppression is audited below).
+    if (parsed.data.notifyMember !== false) {
+      sendBookingReviewApprovedEmail({
+        email: bookingOwner(reviewedBooking).member.email,
+        firstName: bookingOwner(reviewedBooking).member.firstName,
+        checkIn: reviewedBooking.checkIn,
+        checkOut: reviewedBooking.checkOut,
+        adminNotes: parsed.data.adminNotes,
+        bookingId,
+        recipientMemberId: bookingOwner(reviewedBooking).memberId,
+        lodgeId: reviewedBooking.lodgeId,
+      }).catch((err) =>
+        logger.error({ err, bookingId }, "Failed to send booking review approved email"),
+      );
+    }
+
+    logAudit({
+      action: "booking.review.approve",
+      memberId: session.user.id,
+      targetId: bookingId,
+      subjectMemberId: bookingOwner(reviewedBooking).memberId,
+      entityType: "Booking",
+      entityId: bookingId,
+      category: "booking",
+      outcome: "success",
+      summary: "Admin approved booking awaiting review",
+      details: parsed.data.adminNotes,
+      // #2695 (`INV-PRIV-018`) - member-facing, which PRESERVES what the member
+      // reads rather than widening it: `adminNotes` is stored as
+      // `adminReviewNotes` above and shown to them on their own booking page as the
+      // "Admin note". NOT because it was emailed — `notifyMember: false` suppresses
+      // that on this very route, so a reader who checked that reason and found it
+      // false could reasonably withdraw the declaration. `internalNotes` reaches no
+      // member surface and is not in this row at all.
+      memberDisclosure: parsed.data.adminNotes
+        ? { visibility: "member-facing", text: parsed.data.adminNotes }
+        : { visibility: "internal" },
+      metadata: { decision: "APPROVED", ...notifyAuditFields },
+      ipAddress,
+    });
+
+    return NextResponse.json({ success: true, decision: "APPROVED" });
+  }
+
+  // A rejected review remains operationally ineligible until cancellation has
+  // finished. Claim it in the same global -> lodge order as approval and the
+  // roster, eliminating the old PENDING -> REJECTED eligibility window. The
+  // shared cancellation flow runs after commit because it owns its own global
+  // transaction and may call payment providers outside that transaction.
+  const reviewedBooking = await prisma.$transaction(async (tx) => {
+    const current = await loadPendingReviewUnderEligibilityLocks(
+      tx,
+      bookingId,
+      booking.lodgeId,
+    );
+    if (!current) return null;
+
+    const legacyDraft = current.status === BookingStatus.DRAFT;
+    const claim = await tx.booking.updateMany({
+      where: {
+        id: bookingId,
+        deletedAt: null,
+        adminReviewStatus: AdminReviewStatus.PENDING,
+        status: current.status,
+      },
+      data: {
+        adminReviewStatus: AdminReviewStatus.REJECTED,
+        adminReviewNotes: parsed.data.adminNotes,
+        adminReviewedById: session.user.id,
+        adminReviewedAt: reviewedAt,
+        ...(legacyDraft
+          ? { status: BookingStatus.CANCELLED, draftExpiresAt: null }
+          : {}),
+      },
+    });
+    if (claim.count !== 1) return null;
+
+    if (legacyDraft) {
+      await reconcileBedAllocationsForBookingWithLodgeLockHeld({ bookingId, db: tx });
+      await releaseBookingPromoRedemptions(tx, bookingId);
+    }
+    return current;
+  }, LOCK1_HOLDER_TRANSACTION_BUDGET).catch((err: unknown) => reviewClaimContended(err, bookingId));
+  if (reviewedBooking instanceof NextResponse) return reviewedBooking;
+
+  if (!reviewedBooking) return alreadyReviewedResponse();
+
+  // Legacy PENDING+DRAFT rows are rejected and cancelled in the claim above;
+  // every other status uses the shared cancellation/refund flow after commit.
+  if (reviewedBooking.status !== BookingStatus.DRAFT) {
+    let cancelResult;
+    try {
+      cancelResult = await cancelBooking(
+        bookingId,
+        session.user.id,
+        "ADMIN",
+        ipAddress,
+        format,
+        "card",
+      );
+    } catch (err) {
+      return rejectedCancellationFailedResponse(err, bookingId);
+    }
+
+    // A concurrent cancel won the single-flight claim (#1160): surface the 409
+    // rather than mislabelling it a 500. The review was already recorded and the
+    // booking is being/has been cancelled, so this is a benign race, not a fault.
+    if (cancelResult.status === 409) {
+      return NextResponse.json(
+        {
+          error: cancelResult.error,
+          reviewRecorded: true,
+          cancellationStatusUnconfirmed: true,
+        },
+        { status: 409 },
+      );
+    }
+
+    if ("error" in cancelResult) {
+      logger.error(
+        { bookingId, error: cancelResult.error },
+        "Failed to cancel rejected booking",
+      );
+      return NextResponse.json(
+        {
+          error: "Review recorded but booking could not be cancelled",
+          reviewRecorded: true,
+          cancellationPending: true,
+        },
+        { status: 500 },
+      );
+    }
+  }
+
+  // #1790: reject always emails the member unless the admin chose not to
+  // notify (default is notify; the suppression is audited below). This gates
+  // only the rejection notice — the shared cancelBooking flow is untouched.
+  if (parsed.data.notifyMember !== false) {
+    sendBookingReviewRejectedEmail({
+      bookingId: reviewedBooking.id,
+      recipientMemberId: bookingOwner(reviewedBooking).memberId,
+      email: bookingOwner(reviewedBooking).member.email,
+      firstName: bookingOwner(reviewedBooking).member.firstName,
+      checkIn: reviewedBooking.checkIn,
+      checkOut: reviewedBooking.checkOut,
+      adminNotes: parsed.data.adminNotes,
+      lodgeId: reviewedBooking.lodgeId,
+    }).catch((err) =>
+      logger.error({ err, bookingId }, "Failed to send booking review rejected email"),
+    );
+  }
+
+  logAudit({
+    action: "booking.review.reject",
+    memberId: session.user.id,
+    targetId: bookingId,
+    subjectMemberId: bookingOwner(reviewedBooking).memberId,
+    entityType: "Booking",
+    entityId: bookingId,
+    category: "booking",
+    outcome: "success",
+    summary: "Admin rejected booking awaiting review",
+    details: parsed.data.adminNotes,
+    // #2695 (`INV-PRIV-018`) - member-facing, which PRESERVES what the member
+    // reads rather than widening it: `adminNotes` is stored as
+    // `adminReviewNotes` above and shown to them on their own booking page as the
+    // "Admin note". NOT because it was emailed — `notifyMember: false` suppresses
+    // that on this very route, so a reader who checked that reason and found it
+    // false could reasonably withdraw the declaration. `internalNotes` reaches no
+    // member surface and is not in this row at all.
+    memberDisclosure: parsed.data.adminNotes
+      ? { visibility: "member-facing", text: parsed.data.adminNotes }
+      : { visibility: "internal" },
+    metadata: { decision: "REJECTED", ...notifyAuditFields },
+    ipAddress,
+  });
+
+  return NextResponse.json({ success: true, decision: "REJECTED" });
+}

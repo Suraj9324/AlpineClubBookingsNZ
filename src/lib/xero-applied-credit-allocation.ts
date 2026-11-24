@@ -1,0 +1,696 @@
+/**
+ * #1620 — allocate-existing applied credit on the Internet-Banking raise path.
+ *
+ * An IB booking's Xero invoice is raised at the FULL finalPrice; locally-applied
+ * member credit historically never reduced it (DOMAIN_INVARIANTS: "locally-applied
+ * credit never reduced the invoice"), so a member who applied credit and paid the
+ * full invoice double-paid. This engine makes the member pay EFFECTIVE by reducing
+ * the invoice: it allocates the member's EXISTING floating ACCRECCREDIT notes
+ * (minted when the credit was created, e.g. a cancellation) against the new
+ * invoice, oldest-first, up to the applied amount. Credit with no floating note
+ * (admin adjustments, and #1547 restored credit whose funding note was consumed by
+ * a prior cancel) is covered by a freshly minted note for the remainder.
+ *
+ * Minting a fresh note for the WHOLE applied amount would double-count against the
+ * still-floating original note; allocating the existing note is the only
+ * conservation-correct mechanism (owner decision, #1620).
+ *
+ * Per-note remaining balances are tracked in `MemberCreditNoteAllocation`
+ * (remaining = lot.amountCents − Σ its allocation rows). Provider calls run in the
+ * outbox worker, outside the ledger transactions.
+ */
+import { CreditNote } from "xero-node";
+import { storedShortBookingId } from "@/lib/booking-reference";
+import { CreditType, Prisma } from "@prisma/client";
+import { appliedCreditSettledByCancel, unallocatedAppliedCents } from "./xero-applied-credit-ledger-state";
+import { prisma } from "./prisma";
+import { APPLIED_CREDIT_ALLOCATION_ROLE, APPLIED_CREDIT_REMAINDER_NOTE_ROLE } from "./xero-applied-credit-link-roles";
+import { sliceHeldInXero } from "./xero-applied-credit-slice-lookup";
+import { loadFreeCreditLots } from "./xero-applied-credit-lots";
+import { lockMemberCreditLedger } from "./member-credit";
+import { convergedForNamedFailure } from "./xero-applied-credit-spent-outside-app";
+import { allocateCreditNoteToInvoice } from "./xero-credit-notes";
+import {
+  buildXeroIdempotencyKey,
+  completeXeroSyncOperation,
+  failXeroSyncOperation,
+  startXeroSyncOperation,
+} from "@/lib/xero-sync";
+import { callXeroApi, getAuthenticatedXeroClient } from "./xero-api-client";
+import { getResolvedAccountMappingWithFallback } from "./xero-mappings";
+import {
+  codeMintLine,
+  mintLineItems,
+  planMintGroups,
+  type PlannedMintGroup,
+} from "./xero-applied-credit-mint-accounts";
+import {
+  findOrCreateXeroContact,
+  retryXeroWriteWithContactRepair,
+} from "./xero-contacts";
+import { bookingOwner } from "@/lib/booking-owner";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import { resolveXeroTaxRendering } from "@/lib/xero-tax-anchors";
+import { resolveXeroCategoryLineTax } from "@/lib/xero-tax-category-mappings";
+import { OPENING_CREDITS_MAPPING_KEY } from "@/lib/xero-account-mapping-keys";
+import { xeroDocumentDateForClubToday } from "@/lib/xero-provider-dates";
+import logger from "@/lib/logger";
+import { getClubFormat } from "@/lib/club-format-settings";
+import { formatCents } from "@/lib/utils";
+import { assertMintSlicesWaitForAdminGrantNotes } from "./admin-grant-credit-note";
+import {
+  assertNoAppliedCreditDeallocationFence,
+} from "./xero-applied-credit-operation-serialization";
+
+// XeroObjectLink roles for this engine's artefacts.
+const APPLIED_CREDIT_REMAINDER_ALLOCATION_ROLE =
+  "APPLIED_CREDIT_REMAINDER_ALLOCATION";
+
+export {
+  planAppliedCreditAllocation,
+  type AppliedCreditLot,
+  type AppliedCreditPlan,
+  type PlannedMintSlice,
+  type PlannedNoteAllocation,
+} from "./xero-applied-credit-plan";
+import { assertPlanKeepsCommittedSlices, planAppliedCreditAllocation, type AppliedCreditLot } from "./xero-applied-credit-plan";
+import type { XeroOperationClaim } from "@/lib/xero-operation-outcome-guard";
+
+/**
+ * Gather the member's positive credit lots in `CREDIT_LOT_USE_ORDER` (oldest
+ * first, ties by `id` — `INV-PAY-127`) with each lot's
+ * remaining unallocated balance. Read within the caller's ledger-locked tx.
+ *
+ * CRITICAL — the remaining balance EXCLUDES `forBookingId`'s own prior allocation
+ * rows. The plan phase commits join rows before the (out-of-transaction) Xero
+ * allocations run, so a retry after a mid-flight provider failure re-enters this
+ * function with this booking's own rows already committed. Counting them would
+ * read the lots as consumed, produce an empty plan, and throw a spurious "ledger
+ * inconsistency" — permanently bricking the op (and re-manifesting the #1620
+ * double-pay). Excluding them makes the retry reproduce the SAME plan; the
+ * upserts become no-ops and step 2's completion-link check skips the notes
+ * already allocated. Other bookings' allocations ARE still subtracted, so
+ * concurrent-different-booking consumption stays correct.
+ */
+async function gatherAppliedCreditLots(
+  memberId: string,
+  forBookingId: string,
+  tx: Prisma.TransactionClient,
+): Promise<AppliedCreditLot[]> {
+  const loaded = await loadFreeCreditLots(tx, [memberId], { exceptBookingId: forBookingId });
+  return loaded.get(memberId)?.lots ?? [];
+}
+
+/** The remainder note this payment already minted, if any. */
+async function existingRemainderNoteId(paymentId: string): Promise<string | null> {
+  const link = await prisma.xeroObjectLink.findFirst({
+    where: { localModel: "Payment", localId: paymentId, xeroObjectType: "CREDIT_NOTE", role: APPLIED_CREDIT_REMAINDER_NOTE_ROLE, active: true },
+    select: { xeroObjectId: true },
+  });
+  return link?.xeroObjectId ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Remainder mint (noteless lots)
+// ---------------------------------------------------------------------------
+
+/**
+ * The coded shares of a remainder note and the tax its lines carry. Reads
+ * only: the account mappings, the booking's tax treatment and, for an Exempt
+ * share, the club's Exempt mapping checked against Xero's rates.
+ *
+ * THE EXEMPT LINE (#4988; owner, 17 Nov 2026). A spent opening credit coded to
+ * the club's mapped Opening Credits account is in the Exempt tax category
+ * (`codeMintLine`). Its tax field comes from `resolveXeroCategoryLineTax`, the
+ * one resolver (#5209, `INV-CONFIG-008`): the club's mapped Exempt rate while a
+ * registered period applies, no tax type otherwise. A registered club whose
+ * Exempt category Xero cannot carry gets `XeroTaxCategoryUnavailableError` from
+ * here, and there is no fallback code. Every caller runs this BEFORE its first
+ * provider write, so nothing reaches Xero for an operation that must wait.
+ *
+ * With no Exempt share the resolver is not asked, so a club that has not mapped
+ * Opening Credits reads exactly what it read before.
+ */
+async function resolveMintLines(bookingId: string, mintGroups: readonly PlannedMintGroup[]) {
+  // Resolve each destination once; `mintLineItems` merges shares whose coding is
+  // identical, which is what makes an unset `goodwillWriteOffs` a no-op.
+  const codings = [];
+  for (const group of mintGroups) {
+    // A failed read of the Opening Credits mapping must not look like "unset":
+    // the share would go out on the refund account under the income code. It
+    // fails the operation instead, before any provider write.
+    const mapping = await getResolvedAccountMappingWithFallback(group.mappingKey, prisma, {
+      throwOnReadError: group.mappingKey === OPENING_CREDITS_MAPPING_KEY,
+    });
+    codings.push(codeMintLine(mapping, group.amountCents));
+  }
+  // #4632: the note settles the booking's invoice, so it carries the booking's treatment.
+  const anchor = { kind: "booking", bookingId } as const;
+  const taxRendering = await resolveXeroTaxRendering(anchor);
+  const exemptLineTax = codings.some((coding) => coding.taxCategory === "EXEMPT")
+    ? await resolveXeroCategoryLineTax(anchor, "EXEMPT")
+    : undefined;
+  return { codings, taxRendering, exemptLineTax };
+}
+
+/**
+ * What must hold before the operation's FIRST provider write for a plan that
+ * mints. Either refusal leaves Xero untouched and the operation waiting.
+ *
+ * A grant queued at approval is not minted again, even before its note id
+ * lands (`assertMintSlicesWaitForAdminGrantNotes`, #4431).
+ *
+ * #4988: the Exempt line's tax is asked for here, not only at the mint.
+ * Without this a booking that also spends a credit holding its own floating
+ * note would allocate that note, then stop at the mint, and sit part-allocated
+ * for as long as the Exempt category stays unavailable. Asked only when an
+ * opening-credit share is planned and its note is not minted yet, so every
+ * other operation reads nothing extra and a retry that already holds its note
+ * is never stopped here.
+ */
+async function assertMintMayProceed(
+  bookingId: string,
+  paymentId: string,
+  mintSlices: Parameters<typeof planMintGroups>[0] & Parameters<typeof assertMintSlicesWaitForAdminGrantNotes>[0],
+): Promise<void> {
+  await assertMintSlicesWaitForAdminGrantNotes(mintSlices);
+  const mintGroups = planMintGroups(mintSlices);
+  if (!mintGroups.some((group) => group.mappingKey === OPENING_CREDITS_MAPPING_KEY)) return;
+  if (await existingRemainderNoteId(paymentId)) return;
+  await resolveMintLines(bookingId, mintGroups);
+}
+
+/**
+ * Mint a fresh ACCRECCREDIT note for the noteless remainder. Idempotent: reuses
+ * an existing `APPLIED_CREDIT_REMAINDER_NOTE` link for the payment. Returns the
+ * note id.
+ *
+ * ACCOUNTING POLICY, SETTLED (#2717; owner, 10 Aug 2026). "Noteless" is not the
+ * accounting question and was never the owner's: the decision is about
+ * DISCRETIONARY GOODWILL — credit a club chose to grant and was never owed —
+ * which is a cost the club bears rather than a reduction of what it billed.
+ * Revenue stays at the billed figure and the goodwill shows as its own expense
+ * line, so a committee can say at year end that it billed one amount and chose
+ * not to collect another. That is an `ADMIN_ADJUSTMENT` lot, and only that, so
+ * only that share posts to `goodwillWriteOffs` (the EXPENSE mapping the admin
+ * picker offers expense accounts for).
+ *
+ * The rest of a noteless remainder is the MEMBER'S OWN MONEY — #1547-restored
+ * cancellation credit whose funding note a prior cancel consumed, a downward
+ * reprice, or an ordinary refund whose note has not arrived from the outbox
+ * worker yet — and it stays on `hutFeeRefunds`, where it went before #2717.
+ * `mintSliceMappingKey` is the one rule; see its docblock for why each type
+ * lands where it does.
+ *
+ * A note therefore carries ONE LINE PER DISTINCT DESTINATION, normally one. The
+ * note's total, its immediate full allocation to the invoice and its
+ * idempotency key are untouched by the split, and the amounts stay in integer
+ * cents. While `goodwillWriteOffs` is unset both shares resolve to the
+ * `hutFeeRefunds` mapping verbatim (`INV-INT-021`) — identical coding, so they
+ * merge back into the single line an upgrading club has always had.
+ */
+async function mintAppliedCreditRemainderNote(params: {
+  bookingId: string;
+  memberId: string;
+  paymentId: string;
+  amountCents: number;
+  mintGroups: readonly PlannedMintGroup[];
+  createdByMemberId?: string;
+}): Promise<string> {
+  const {
+    bookingId,
+    memberId,
+    paymentId,
+    amountCents,
+    mintGroups,
+    createdByMemberId,
+  } = params;
+
+  const existingLink = await prisma.xeroObjectLink.findFirst({
+    where: {
+      localModel: "Payment",
+      localId: paymentId,
+      xeroObjectType: "CREDIT_NOTE",
+      role: APPLIED_CREDIT_REMAINDER_NOTE_ROLE,
+      active: true,
+    },
+    select: { xeroObjectId: true },
+  });
+  if (existingLink?.xeroObjectId) {
+    return existingLink.xeroObjectId;
+  }
+
+  // Before the contact lookup, which can create a Xero contact: a line whose
+  // tax Xero cannot carry is refused with nothing written (#4988).
+  const { codings, taxRendering, exemptLineTax } = await resolveMintLines(bookingId, mintGroups);
+  const lineItems = mintLineItems(
+    codings,
+    `Account credit applied to booking ${storedShortBookingId(bookingId)}`,
+    taxRendering,
+    exemptLineTax,
+  );
+
+  const { xero, tenantId } = await getAuthenticatedXeroClient();
+  const contactId = await findOrCreateXeroContact(memberId, { createdByMemberId });
+
+  // Club calendar day: the note's date decides its GST period, and the UTC day
+  // is still yesterday all New Zealand morning (INV-DATE-019, #2834). Read once,
+  // outside a closure that runs for the recorded payload and each repair attempt.
+  const remainderNoteDate = xeroDocumentDateForClubToday(await readClubTimeZoneOutsideRequest());
+
+  const buildCreditNote = (resolvedContactId: string): CreditNote => ({
+    type: CreditNote.TypeEnum.ACCRECCREDIT,
+    contact: { contactID: resolvedContactId },
+    date: remainderNoteDate,
+    lineAmountTypes: taxRendering.lineAmountTypes,
+    lineItems,
+    reference: `Applied credit - Booking ${storedShortBookingId(bookingId)}`,
+    status: CreditNote.StatusEnum.AUTHORISED,
+  });
+
+  const idempotencyKey = buildXeroIdempotencyKey(
+    "payment",
+    paymentId,
+    "applied-credit-remainder-note",
+    amountCents,
+    "v1",
+  );
+  const operation = await startXeroSyncOperation({
+    direction: "OUTBOUND",
+    entityType: "CREDIT_NOTE",
+    operationType: "CREATE",
+    localModel: "Payment",
+    localId: paymentId,
+    idempotencyKey,
+    correlationKey: idempotencyKey,
+    requestPayload: { creditNotes: [buildCreditNote(contactId)] },
+    createdByMemberId: createdByMemberId ?? null,
+  });
+
+  try {
+    const response = await retryXeroWriteWithContactRepair({
+      memberId,
+      currentContactId: contactId,
+      workflow: "mintAppliedCreditRemainderNote",
+      operationId: operation.id,
+      createdByMemberId,
+      buildRequestPayload: (resolvedContactId) => ({
+        creditNotes: [buildCreditNote(resolvedContactId)],
+      }),
+      run: ({ contactId: resolvedContactId }) =>
+        callXeroApi(
+          () =>
+            xero.accountingApi.createCreditNotes(
+              tenantId,
+              { creditNotes: [buildCreditNote(resolvedContactId)] },
+              undefined,
+              undefined,
+              idempotencyKey,
+            ),
+          {
+            operation: "createCreditNotes",
+            resourceType: "CREDIT_NOTE",
+            workflow: "mintAppliedCreditRemainderNote",
+            context: `createCreditNotes(applied-credit remainder ${paymentId})`,
+          },
+        ),
+    });
+
+    const created = response.body.creditNotes?.[0];
+    if (!created?.creditNoteID) {
+      throw new Error("Failed to mint applied-credit remainder note");
+    }
+
+    await completeXeroSyncOperation(operation, {
+      responsePayload: response.body,
+      xeroObjectType: "CREDIT_NOTE",
+      xeroObjectId: created.creditNoteID,
+      xeroObjectNumber: created.creditNoteNumber ?? null,
+      extraLinks: [
+        {
+          localModel: "Payment",
+          localId: paymentId,
+          xeroObjectType: "CREDIT_NOTE",
+          xeroObjectId: created.creditNoteID,
+          xeroObjectNumber: created.creditNoteNumber ?? null,
+          role: APPLIED_CREDIT_REMAINDER_NOTE_ROLE,
+        },
+      ],
+    });
+
+    return created.creditNoteID;
+  } catch (error) {
+    await failXeroSyncOperation(operation, error);
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration handler (outbox op APPLIED_CREDIT_ALLOCATION)
+// ---------------------------------------------------------------------------
+
+async function completeSkip(syncOperation: XeroOperationClaim | undefined, reason: string) {
+  if (syncOperation) {
+    await completeXeroSyncOperation(syncOperation, {
+      responsePayload: { skipped: true, reason },
+    });
+  }
+}
+
+/**
+ * Allocate the member's existing floating credit notes (plus a minted remainder)
+ * against an Internet-Banking booking's invoice, so the member pays the
+ * credit-reduced (effective) amount. Idempotent and retry-safe.
+ *
+ * Ordering: enqueued after the invoice op; if the invoice is not raised yet this
+ * throws so the outbox retries (the invoice op, older, completes first).
+ */
+export async function allocateAppliedCreditForBooking(
+  bookingId: string,
+  options?: { createdByMemberId?: string; syncOperation?: XeroOperationClaim; convergeAttempts?: number },
+): Promise<void> {
+  const format = await getClubFormat();
+  const syncOperation = options?.syncOperation;
+  const syncOperationId = syncOperation?.id;
+  const createdByMemberId = options?.createdByMemberId;
+
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    include: { payment: true },
+  });
+  if (!booking?.payment) {
+    await completeSkip(syncOperation, "No booking or payment.");
+    return;
+  }
+  // #3369: every write below lands in a MEMBER's credit ledger — the notes, the
+  // allocations, the lock that serialises them. An organisation-owned booking
+  // has no such ledger and can hold no applied credit, so there is nothing here
+  // to do. Resolved once, at the top, so no statement further down has to ask
+  // again.
+  const creditOwnerMemberId = bookingOwner(booking).memberId;
+  if (!creditOwnerMemberId) {
+    await completeSkip(
+      syncOperation,
+      "The booking is owned by an organisation, which holds no member credit.",
+    );
+    return;
+  }
+  const payment = booking.payment;
+  // Payment-method-agnostic (#1620/#1641): the engine keys on the booking's
+  // invoice + BOOKING_APPLIED ledger, never on payment.source. The enqueue call
+  // sites are Internet-Banking-only in #1620; #1641 will add a card caller
+  // (which must handle card invoice timing — see the note in the report).
+
+  const appliedCents = await unallocatedAppliedCents(bookingId, prisma);
+  if (appliedCents === 0) {
+    await completeSkip(syncOperation, "No unallocated applied credit.");
+    return;
+  }
+  const settledSkipReason =
+    "The booking was cancelled with nothing captured: its invoice is cleared by a note sized net of the allocations already committed, so nothing new is allocated (#3836).";
+  if (
+    (await appliedCreditSettledByCancel(bookingId, prisma)) &&
+    (await prisma.memberCreditNoteAllocation.count({ where: { appliedToBookingId: bookingId } })) === 0
+  ) {
+    await completeSkip(syncOperation, settledSkipReason);
+    return;
+  }
+
+  if (!payment.xeroInvoiceId) {
+    // Invoice not raised yet — retry (the booking-invoice op is enqueued first
+    // and completes first; this throw is the self-healing ordering fallback).
+    throw new Error(
+      `Booking ${bookingId} has ${formatCents(appliedCents, format)} applied credit to allocate but no Xero invoice yet; retrying.`,
+    );
+  }
+  const invoiceId = payment.xeroInvoiceId;
+
+  // 1) LOCAL: plan the allocation and persist the note-allocation join rows under
+  // the ledger lock. Mint-slice join rows are written after the note is minted.
+  const plan = await prisma.$transaction(async (tx) => {
+    const creditLedgerMemberId = creditOwnerMemberId;
+    // #3369: applied credit is a MEMBER ledger entry, so an organisation-owned
+    // booking has no ledger to lock and cannot reach this worker with credit
+    // applied. A null key would degenerate to a shared advisory key, which is
+    // an `INV-LOCK` hazard visible only under concurrency.
+    if (creditLedgerMemberId) {
+      await lockMemberCreditLedger(creditLedgerMemberId, tx);
+    }
+    await assertNoAppliedCreditDeallocationFence(payment.id, tx, {
+      // An older allocation must be allowed to complete before a fresh clamp's
+      // deallocation. Once that deallocation has a snapshot/checkpoint it is a
+      // hard fence and this worker returns to PENDING.
+      allowUncheckpointedPending: true,
+    });
+    const lockedApplied = await unallocatedAppliedCents(bookingId, tx);
+    if (lockedApplied === 0) {
+      return null; // a concurrent run already stamped it
+    }
+    if (await appliedCreditSettledByCancel(bookingId, tx)) {
+      // #3836 (H1): finish only the slices already committed - the ones the
+      // cancel's clearing sizing subtracted - and never plan or mint new ones.
+      const committed = await tx.memberCreditNoteAllocation.findMany({
+        where: { appliedToBookingId: bookingId },
+        select: { memberCreditId: true, xeroCreditNoteId: true, amountCents: true },
+      });
+      const remainderNoteId = await existingRemainderNoteId(payment.id);
+      const remainderCents = committed
+        .filter((row) => row.xeroCreditNoteId === remainderNoteId)
+        .reduce((sum, row) => sum + row.amountCents, 0);
+      return {
+        settled: true as const,
+        remainderNoteId: remainderCents > 0 ? remainderNoteId : null,
+        remainderCents,
+        noteAllocations: committed.filter((row) => row.xeroCreditNoteId !== remainderNoteId),
+        mintSlices: [],
+        mintTotalCents: 0,
+        coveredCents: 0,
+      };
+    }
+    const lots = await gatherAppliedCreditLots(creditOwnerMemberId, bookingId, tx);
+    const planned = planAppliedCreditAllocation(lots, lockedApplied, format);
+    // #4013: a retry must keep what an earlier attempt committed; refuse before any write.
+    const committed = await tx.memberCreditNoteAllocation.findMany({ where: { appliedToBookingId: bookingId }, select: { memberCreditId: true, xeroCreditNoteId: true, amountCents: true } });
+    assertPlanKeepsCommittedSlices(bookingId, committed, planned, format);
+    for (const na of planned.noteAllocations) {
+      await tx.memberCreditNoteAllocation.upsert({
+        where: {
+          memberCreditId_appliedToBookingId: {
+            memberCreditId: na.memberCreditId,
+            appliedToBookingId: bookingId,
+          },
+        },
+        create: {
+          memberCreditId: na.memberCreditId,
+          xeroCreditNoteId: na.xeroCreditNoteId,
+          appliedToBookingId: bookingId,
+          amountCents: na.amountCents,
+        },
+        update: {},
+      });
+    }
+    return { ...planned, settled: false as const, remainderNoteId: null, remainderCents: 0 };
+  });
+
+  if (!plan) {
+    await completeSkip(syncOperation, "Applied credit already allocated.");
+    return;
+  }
+  if (plan.settled && plan.noteAllocations.length === 0 && !plan.remainderNoteId) {
+    await completeSkip(syncOperation, settledSkipReason);
+    return;
+  }
+
+  // A queued grant note (#4431), or an Exempt line Xero cannot carry (#4988), stops the operation here, whole.
+  await assertMintMayProceed(bookingId, payment.id, plan.mintSlices);
+
+  // 2) Allocate each existing floating note against the invoice (idempotent per
+  // join row via its completion link).
+  for (const na of plan.noteAllocations) {
+    const joinRow = await prisma.memberCreditNoteAllocation.findUnique({
+      where: {
+        memberCreditId_appliedToBookingId: {
+          memberCreditId: na.memberCreditId,
+          appliedToBookingId: bookingId,
+        },
+      },
+      select: { id: true, amountCents: true },
+    });
+    if (!joinRow) {
+      continue;
+    }
+    if (await sliceHeldInXero(prisma, joinRow.id)) {
+      continue;
+    }
+    try {
+      // The slice's current amount, not the plan's: a concurrent converge may have shrunk it (#4219).
+      await allocateCreditNoteToInvoice(na.xeroCreditNoteId, invoiceId, joinRow.amountCents, {
+        localModel: "MemberCreditNoteAllocation",
+        localId: joinRow.id,
+        role: APPLIED_CREDIT_ALLOCATION_ROLE,
+        createdByMemberId,
+        appliedCreditContext: {
+          parentOperationId: syncOperationId ?? null,
+          bookingId,
+          paymentId: payment.id,
+        },
+      });
+    } catch (error) {
+      // #4219: the note was confirmed spent in Xero outside the app. Bring the
+      // ledger into line, then plan again so the booking's other slices still
+      // allocate; a refusal to converge leaves the original failure standing.
+      if (await convergedForNamedFailure(error, bookingId, options?.convergeAttempts)) {
+        return allocateAppliedCreditForBooking(bookingId, {
+          ...options,
+          convergeAttempts: (options?.convergeAttempts ?? 0) + 1,
+        });
+      }
+      throw error;
+    }
+  }
+
+  // 3) Mint + allocate the noteless (admin / restored) remainder, if any.
+  // The remainder note's one allocation, idempotent on its completion link.
+  const allocateRemainderOnce = async (noteId: string, cents: number) => {
+    const remainderAllocated = await prisma.xeroObjectLink.findFirst({
+      where: {
+        localModel: "Payment",
+        localId: payment.id,
+        xeroObjectType: "ALLOCATION",
+        role: APPLIED_CREDIT_REMAINDER_ALLOCATION_ROLE,
+        active: true,
+      },
+      select: { id: true },
+    });
+    if (remainderAllocated) return;
+    await allocateCreditNoteToInvoice(noteId, invoiceId, cents, {
+      localModel: "Payment",
+      localId: payment.id,
+      role: APPLIED_CREDIT_REMAINDER_ALLOCATION_ROLE,
+      createdByMemberId,
+      appliedCreditContext: {
+        parentOperationId: syncOperationId ?? null,
+        bookingId,
+        paymentId: payment.id,
+      },
+    });
+  };
+  let remainderNoteId: string | null = plan.remainderNoteId;
+  // #3836 (H1): re-asked just before the mint - a cancel that landed after the
+  // plan settled the credit, and a mint now would credit the invoice twice.
+  const mintStillDue =
+    plan.mintTotalCents > 0 &&
+    !(await prisma.$transaction(async (tx) => {
+      await lockMemberCreditLedger(creditOwnerMemberId, tx);
+      return appliedCreditSettledByCancel(bookingId, tx);
+    }));
+  if (plan.settled && plan.remainderNoteId) {
+    await allocateRemainderOnce(plan.remainderNoteId, plan.remainderCents);
+  }
+  if (mintStillDue) {
+    remainderNoteId = await mintAppliedCreditRemainderNote({
+      bookingId,
+      memberId: creditOwnerMemberId,
+      paymentId: payment.id,
+      amountCents: plan.mintTotalCents,
+      // Goodwill and a member's own refunded money post to different Xero
+      // mappings (#2717); the groups sum to mintTotalCents, so nothing about
+      // the note's total or its allocation below changes.
+      mintGroups: planMintGroups(plan.mintSlices),
+      createdByMemberId,
+    });
+    const mintedNoteId = remainderNoteId;
+
+    await prisma.$transaction(async (tx) => {
+      const creditLedgerMemberId = creditOwnerMemberId;
+      // #3369: applied credit is a MEMBER ledger entry, so an organisation-owned
+      // booking has no ledger to lock and cannot reach this worker with credit
+      // applied. A null key would degenerate to a shared advisory key, which is
+      // an `INV-LOCK` hazard visible only under concurrency.
+      if (creditLedgerMemberId) {
+        await lockMemberCreditLedger(creditLedgerMemberId, tx);
+      }
+      for (const ms of plan.mintSlices) {
+        await tx.memberCreditNoteAllocation.upsert({
+          where: {
+            memberCreditId_appliedToBookingId: {
+              memberCreditId: ms.memberCreditId,
+              appliedToBookingId: bookingId,
+            },
+          },
+          create: {
+            memberCreditId: ms.memberCreditId,
+            xeroCreditNoteId: mintedNoteId,
+            appliedToBookingId: bookingId,
+            amountCents: ms.amountCents,
+          },
+          update: { xeroCreditNoteId: mintedNoteId },
+        });
+      }
+    });
+
+    await allocateRemainderOnce(mintedNoteId, plan.mintTotalCents);
+  }
+
+  // 4) STAMP LAST — only now that the FULL applied amount is covered by allocated
+  // notes. The #1597 hold-expiry / cancel clearing formula subtracts
+  // `Σ BOOKING_APPLIED with xeroCreditNoteId` as the invoice's already-allocated
+  // credit; stamping before full coverage would let a concurrent cancel/expiry
+  // subtract credit not yet on the invoice and UNDER-clear. The reverse
+  // partial-window residual (some notes allocated, stamp not yet written) is
+  // documented and self-healing: a concurrent cancel treats the credit as
+  // unallocated and its clearing note + the allocations can exceed the invoice,
+  // which Xero rejects LOUDLY (the #1597 loud-over-allocation class); this op's
+  // retry finishes the remaining allocations and then stamps. The @@unique join
+  // key + per-row completion links make that retry idempotent.
+  // A cancel-settled booking is never stamped (#3836): the cancel restored its
+  // credit, and only the slices it had already counted were finished.
+  const representativeNoteId =
+    plan.noteAllocations[0]?.xeroCreditNoteId ?? remainderNoteId;
+  if (representativeNoteId && !plan.settled && (plan.mintTotalCents === 0 || mintStillDue)) {
+    await prisma.$transaction(async (tx) => {
+      const creditLedgerMemberId = creditOwnerMemberId;
+      // #3369: applied credit is a MEMBER ledger entry, so an organisation-owned
+      // booking has no ledger to lock and cannot reach this worker with credit
+      // applied. A null key would degenerate to a shared advisory key, which is
+      // an `INV-LOCK` hazard visible only under concurrency.
+      if (creditLedgerMemberId) {
+        await lockMemberCreditLedger(creditLedgerMemberId, tx);
+      }
+      await tx.memberCredit.updateMany({
+        where: {
+          appliedToBookingId: bookingId,
+          type: CreditType.BOOKING_APPLIED,
+          xeroCreditNoteId: null,
+        },
+        data: { xeroCreditNoteId: representativeNoteId },
+      });
+    });
+  }
+
+  logger.info(
+    {
+      bookingId,
+      invoiceId,
+      appliedCents,
+      noteAllocations: plan.noteAllocations.length,
+      mintedRemainderCents: mintStillDue ? plan.mintTotalCents : 0,
+      settledByCancel: plan.settled,
+    },
+    "Allocated applied credit against the booking invoice (#1620, #1641, #3836)",
+  );
+
+  if (syncOperation) {
+    await completeXeroSyncOperation(syncOperation, {
+      responsePayload: {
+        bookingId,
+        invoiceId,
+        appliedCents,
+        allocatedNotes: plan.noteAllocations.length,
+        mintedRemainderCents: mintStillDue ? plan.mintTotalCents : 0,
+        // #3836: a cancel settled the credit; only committed slices were finished.
+        settledByCancel: plan.settled || (plan.mintTotalCents > 0 && !mintStillDue),
+      },
+    });
+  }
+}

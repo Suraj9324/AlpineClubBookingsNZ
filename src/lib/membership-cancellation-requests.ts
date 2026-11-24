@@ -1,0 +1,1316 @@
+import type { Prisma } from "@prisma/client";
+import { hashActionToken, issueActionToken } from "@/lib/action-tokens";
+import { logAudit } from "@/lib/audit";
+import {
+  sendAdminMembershipCancellationRequestAlert,
+  sendMembershipCancellationConfirmationEmail,
+  sendMembershipCancellationSubmittedEmail,
+} from "@/lib/email";
+import logger from "@/lib/logger";
+import {
+  memberDisplayName,
+  memberName,
+  serializeDate,
+} from "@/lib/member-serialization";
+import {
+  loadMembershipCancellationSettings,
+  type MembershipCancellationSettings,
+} from "@/lib/membership-cancellation-settings";
+import { isMembershipHolderRecord } from "@/lib/member-roles";
+import { prisma } from "@/lib/prisma";
+
+const MEMBERSHIP_CANCELLATION_CONFIRMATION_TTL_MS =
+  7 * 24 * 60 * 60 * 1000;
+
+const OPEN_REQUEST_STATUSES = ["REQUESTED", "APPROVED"] as const;
+const OPEN_PARTICIPANT_STATUSES = [
+  "REQUESTED",
+  "PENDING_CONFIRMATION",
+  "APPROVED",
+] as const;
+
+const participantMemberSummarySelect = {
+  id: true,
+  firstName: true,
+  lastName: true,
+  email: true,
+  ageTier: true,
+  canLogin: true,
+  active: true,
+} satisfies Prisma.MemberSelect;
+
+/**
+ * Every column the member-raised candidate rules read, in one place so the
+ * requester query and the family query cannot drift apart (#2391). The last two
+ * are what `isMembershipHolderRecord` needs to tell a lodge kiosk device from a
+ * person who merely also holds the lodge tools; omit either and the field
+ * arrives `undefined` at runtime and the record is misclassified as the device.
+ * `src/lib/__tests__/membership-cancellation-requests.test.ts` asserts both
+ * queries against this, the way the admin path is already asserted.
+ */
+const cancellationCandidateSelect = {
+  id: true,
+  email: true,
+  firstName: true,
+  lastName: true,
+  ageTier: true,
+  active: true,
+  canLogin: true,
+  role: true,
+  cancelledAt: true,
+  parentMemberId: true,
+  secondaryParentId: true,
+  financeAccessLevel: true,
+  accessRoles: { select: { role: true, roleDefinitionId: true } },
+} satisfies Prisma.MemberSelect;
+
+const cancellationRequestInclude = {
+  requestedBy: {
+    select: { id: true, firstName: true, lastName: true, email: true },
+  },
+  participants: {
+    include: {
+      member: { select: participantMemberSummarySelect },
+    },
+    orderBy: { createdAt: "asc" },
+  },
+} satisfies Prisma.MembershipCancellationRequestInclude;
+
+const cancellationParticipantWithRequestInclude = {
+  member: { select: participantMemberSummarySelect },
+  request: { include: cancellationRequestInclude },
+} satisfies Prisma.MembershipCancellationRequestParticipantInclude;
+
+type CancellationMemberRecord = {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  ageTier: string;
+  active: boolean;
+  canLogin: boolean;
+  role: string;
+  // #2391: the three extra columns `isMembershipHolderRecord` reads to tell a
+  // device or a booking-request contact from a person. Selected here as well as
+  // on the admin path, because a field that is not selected arrives `undefined`
+  // and would silently misclassify the record as the lodge kiosk.
+  financeAccessLevel: string | null;
+  accessRoles: Array<{ role: string | null; roleDefinitionId: string | null }>;
+  cancelledAt: Date | null;
+  parentMemberId: string | null;
+  secondaryParentId: string | null;
+  familyGroupMemberships: Array<{
+    familyGroupId: string;
+    familyGroup: { id: string; name: string | null } | null;
+  }>;
+};
+
+type CancellationParticipantRecord = {
+  id: string;
+  status: string;
+  memberId: string;
+  confirmationTokenExpiresAt?: Date | null;
+  confirmedAt?: Date | null;
+  declinedAt?: Date | null;
+  createdAt: Date;
+  member: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+    ageTier: string;
+    canLogin: boolean;
+    active: boolean;
+  };
+};
+
+type CancellationRequestRecord = {
+  id: string;
+  status: string;
+  reason: string | null;
+  submittedAt: Date;
+  reviewedAt?: Date | null;
+  completedAt?: Date | null;
+  requestedBy: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+  } | null;
+  participants: CancellationParticipantRecord[];
+};
+
+type MembershipCancellationRelationship =
+  | "self"
+  | "organisation"
+  | "dependent"
+  | "non_login_adult"
+  | "family_adult";
+
+export type MembershipCancellationCandidate = {
+  id: string;
+  name: string;
+  email: string;
+  ageTier: string;
+  relationship: MembershipCancellationRelationship;
+  canLogin: boolean;
+  requiresOwnConfirmation: boolean;
+  eligible: boolean;
+  ineligibleReason: string | null;
+  familyGroupNames: string[];
+  activeRequest: {
+    id: string;
+    status: string;
+    participantStatus: string;
+    submittedAt: string;
+  } | null;
+};
+
+export type SerializedMembershipCancellationRequest = {
+  id: string;
+  status: string;
+  reason: string | null;
+  submittedAt: string;
+  reviewedAt: string | null;
+  completedAt: string | null;
+  requestedBy: {
+    id: string;
+    name: string;
+    email: string;
+  } | null;
+  participants: Array<{
+    id: string;
+    memberId: string;
+    name: string;
+    email: string;
+    ageTier: string;
+    canLogin: boolean;
+    active: boolean;
+    status: string;
+    confirmationTokenExpiresAt: string | null;
+    confirmedAt: string | null;
+    declinedAt: string | null;
+    createdAt: string;
+  }>;
+};
+
+export type MembershipCancellationOverview = {
+  settings: MembershipCancellationSettings;
+  candidates: MembershipCancellationCandidate[];
+  requests: SerializedMembershipCancellationRequest[];
+};
+
+export type MembershipCancellationConfirmationDetails = {
+  tokenStatus:
+    | "missing"
+    | "invalid"
+    | "wrong_member"
+    | "expired"
+    | "responded"
+    | "request_closed"
+    | "ready";
+  canRespond: boolean;
+  message: string;
+  request: SerializedMembershipCancellationRequest | null;
+  participant: SerializedMembershipCancellationRequest["participants"][number] | null;
+};
+
+export class MembershipCancellationRequestError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode = 400,
+  ) {
+    super(message);
+    this.name = "MembershipCancellationRequestError";
+  }
+}
+
+function cleanString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function nullableText(value: unknown) {
+  const cleaned = cleanString(value);
+  return cleaned ? cleaned : null;
+}
+
+function participantSummary(
+  participants: Array<{
+    member: {
+      firstName?: string | null;
+      lastName?: string | null;
+      email?: string | null;
+    };
+  }>,
+) {
+  return participants.map((participant) => memberDisplayName(participant.member)).join(", ");
+}
+
+function hasReviewableCancellationParticipant(
+  participants: Array<{ status: string; confirmedAt?: Date | string | null }>,
+) {
+  return participants.some(
+    (participant) =>
+      participant.status === "REQUESTED" && Boolean(participant.confirmedAt),
+  );
+}
+
+function serializeRequest(
+  request: CancellationRequestRecord,
+): SerializedMembershipCancellationRequest {
+  return {
+    id: request.id,
+    status: request.status,
+    reason: request.reason,
+    submittedAt: serializeDate(request.submittedAt) ?? "",
+    reviewedAt: serializeDate(request.reviewedAt),
+    completedAt: serializeDate(request.completedAt),
+    requestedBy: request.requestedBy
+      ? {
+          id: request.requestedBy.id,
+          name: memberName(request.requestedBy),
+          email: request.requestedBy.email,
+        }
+      : null,
+    participants: request.participants.map((participant) => ({
+      id: participant.id,
+      memberId: participant.memberId,
+      name: memberName(participant.member),
+      email: participant.member.email,
+      ageTier: participant.member.ageTier,
+      canLogin: participant.member.canLogin,
+      active: participant.member.active,
+      status: participant.status,
+      confirmationTokenExpiresAt: serializeDate(
+        participant.confirmationTokenExpiresAt,
+      ),
+      confirmedAt: serializeDate(participant.confirmedAt),
+      declinedAt: serializeDate(participant.declinedAt),
+      createdAt: serializeDate(participant.createdAt) ?? "",
+    })),
+  };
+}
+
+function relationshipForMember(
+  member: CancellationMemberRecord,
+  requesterId: string,
+): MembershipCancellationRelationship {
+  if (member.id === requesterId) return "self";
+  // #2391: an organisation account carries `ageTier = NOT_APPLICABLE`, so
+  // without this it fell through to the age test below and was badged
+  // "Dependant" — nonsense for an organisation, and freshly reachable now that
+  // the family list no longer filters organisations out.
+  if (member.role === "SCHOOL") return "organisation";
+  if (
+    member.ageTier !== "ADULT" ||
+    member.parentMemberId === requesterId ||
+    member.secondaryParentId === requesterId
+  ) {
+    return "dependent";
+  }
+  if (!member.canLogin) return "non_login_adult";
+  return "family_adult";
+}
+
+function getFamilyGroupNames(member: CancellationMemberRecord) {
+  return member.familyGroupMemberships
+    .map((membership) => membership.familyGroup?.name?.trim())
+    .filter((name): name is string => Boolean(name));
+}
+
+function toCandidate(
+  member: CancellationMemberRecord,
+  requesterId: string,
+  activeParticipant:
+    | {
+        status: string;
+        request: {
+          id: string;
+          status: string;
+          submittedAt: Date;
+        };
+      }
+    | undefined,
+): MembershipCancellationCandidate {
+  const relationship = relationshipForMember(member, requesterId);
+  const requiresOwnConfirmation = member.id !== requesterId && member.canLogin;
+  // #2391: one rule for both routes. The test here used to be the narrow
+  // legacy one (`isMemberLevelRole`: legacy role `USER`), which already
+  // accepted every scoped-role admin — a Membership Officer, Booking Officer,
+  // Treasurer, Content Manager or custom-role holder keeps an ordinary member
+  // account underneath their access. What it dropped, silently and with no
+  // reason shown, were the two classes the member page used to refuse as well
+  // (#2383): a relative holding the full admin bundle (legacy role `ADMIN`),
+  // and an organisation account in the family. Both hold a membership, so both
+  // are selectable here now.
+  const holdsMembership = isMembershipHolderRecord({
+    role: member.role,
+    canLogin: member.canLogin,
+    financeAccessLevel: member.financeAccessLevel,
+    // Raw access-role rows, the shape a server-side select yields. The helper
+    // takes these or the admin page's resolved tokens and applies the same
+    // login-clearing to both, so no two callers can disagree.
+    accessRoles: member.accessRoles,
+  });
+  const activeAllowed = member.active && !member.cancelledAt;
+  const eligible = holdsMembership && activeAllowed && !activeParticipant;
+
+  let ineligibleReason: string | null = null;
+  if (!holdsMembership) {
+    // The only records this can now be: the shared lodge kiosk device login,
+    // and the contact records the booking-request flows mint. Neither holds a
+    // membership, so say that rather than pointing at another route.
+    ineligibleReason =
+      "This record holds no membership to cancel — it is a shared lodge kiosk login or a booking-request contact.";
+  } else if (!activeAllowed) {
+    ineligibleReason = "This membership is not active.";
+  } else if (activeParticipant) {
+    ineligibleReason = "This member already has an open cancellation request.";
+  }
+
+  return {
+    id: member.id,
+    name: memberName(member),
+    email: member.email,
+    ageTier: member.ageTier,
+    relationship,
+    canLogin: member.canLogin,
+    requiresOwnConfirmation,
+    eligible,
+    ineligibleReason,
+    familyGroupNames: getFamilyGroupNames(member),
+    activeRequest: activeParticipant
+      ? {
+          id: activeParticipant.request.id,
+          status: activeParticipant.request.status,
+          participantStatus: activeParticipant.status,
+          submittedAt: activeParticipant.request.submittedAt.toISOString(),
+        }
+      : null,
+  };
+}
+
+async function loadCancellationCandidates(requesterMemberId: string) {
+  const currentMember = await prisma.member.findUnique({
+    where: { id: requesterMemberId },
+    select: {
+      ...cancellationCandidateSelect,
+      familyGroupMemberships: {
+        select: {
+          familyGroupId: true,
+          familyGroup: { select: { id: true, name: true } },
+        },
+      },
+    },
+  });
+
+  if (!currentMember) {
+    throw new MembershipCancellationRequestError("Member not found", 404);
+  }
+
+  // #2391: the member-raised route now asks the same question as the
+  // admin-raised one — is there an account holder here with a membership? The
+  // only records this refuses are the two that are not account holders at all.
+  if (
+    !isMembershipHolderRecord({
+      role: currentMember.role,
+      canLogin: currentMember.canLogin,
+      financeAccessLevel: currentMember.financeAccessLevel,
+      accessRoles: currentMember.accessRoles,
+    })
+  ) {
+    throw new MembershipCancellationRequestError(
+      "This login holds no membership of its own. The shared lodge kiosk login and the contact records created by booking requests have nothing to cancel here.",
+      403,
+    );
+  }
+
+  // The two conditions this route retains, and the only ones. They are about
+  // being able to USE your own profile, not about what kind of account it is:
+  // an account that is closed, or that has no login of its own, cannot raise
+  // anything from here. Those memberships are still cancellable — an admin
+  // raises it from the member page on their behalf.
+  if (!currentMember.active || !currentMember.canLogin) {
+    throw new MembershipCancellationRequestError(
+      "Cancelling a membership from here needs an active account with its own login. Contact the club office and an administrator can raise the cancellation for you.",
+      403,
+    );
+  }
+
+  const groupIds = currentMember.familyGroupMemberships.map(
+    (membership) => membership.familyGroupId,
+  );
+  const relatedMembers = await prisma.member.findMany({
+    where: {
+      active: true,
+      // #2391: no role filter. The filter this replaces was
+      // `role in MEMBER_LEVEL_ROLE_VALUES`, i.e. legacy role `USER`, which
+      // already listed every scoped-role admin (they store `USER` underneath
+      // their access) and dropped exactly two classes that do hold a
+      // membership: a relative holding the full admin bundle (legacy role
+      // `ADMIN`), and an organisation account sharing the family group. Both
+      // are listed like anyone else now; whether each one may actually be
+      // selected is decided per candidate by `isMembershipHolderRecord` in
+      // `toCandidate`, which can also say WHY not. Filtering here instead
+      // drops a record from the list silently, which is the failure #2354 and
+      // #2383 both set out to end.
+      OR: [
+        { id: currentMember.id },
+        ...(groupIds.length > 0
+          ? [{ familyGroupMemberships: { some: { familyGroupId: { in: groupIds } } } }]
+          : []),
+      ],
+    },
+    select: {
+      ...cancellationCandidateSelect,
+      familyGroupMemberships: {
+        where: groupIds.length > 0 ? { familyGroupId: { in: groupIds } } : undefined,
+        select: {
+          familyGroupId: true,
+          familyGroup: { select: { id: true, name: true } },
+        },
+      },
+    },
+    orderBy: [{ firstName: "asc" }, { lastName: "asc" }],
+  });
+
+  const memberIds = relatedMembers.map((member) => member.id);
+  const activeParticipants =
+    memberIds.length > 0
+      ? await prisma.membershipCancellationRequestParticipant.findMany({
+          where: {
+            memberId: { in: memberIds },
+            status: { in: [...OPEN_PARTICIPANT_STATUSES] },
+            request: { status: { in: [...OPEN_REQUEST_STATUSES] } },
+          },
+          select: {
+            memberId: true,
+            status: true,
+            request: {
+              select: {
+                id: true,
+                status: true,
+                submittedAt: true,
+              },
+            },
+          },
+          orderBy: { createdAt: "desc" },
+        })
+      : [];
+  const activeParticipantByMemberId = new Map(
+    activeParticipants.map((participant) => [participant.memberId, participant]),
+  );
+  const candidates = relatedMembers.map((member) =>
+    toCandidate(member, currentMember.id, activeParticipantByMemberId.get(member.id)),
+  );
+
+  return {
+    currentMember,
+    candidates,
+  };
+}
+
+async function loadVisibleRequests(memberId: string) {
+  const requests = await prisma.membershipCancellationRequest.findMany({
+    where: {
+      OR: [
+        { requestedByMemberId: memberId },
+        { participants: { some: { memberId } } },
+      ],
+    },
+    include: cancellationRequestInclude,
+    orderBy: { submittedAt: "desc" },
+    take: 10,
+  });
+
+  return requests.map(serializeRequest);
+}
+
+export async function getMembershipCancellationOverview(
+  memberId: string,
+): Promise<MembershipCancellationOverview> {
+  const [settings, candidateData, requests] = await Promise.all([
+    loadMembershipCancellationSettings(),
+    loadCancellationCandidates(memberId),
+    loadVisibleRequests(memberId),
+  ]);
+
+  return {
+    settings,
+    candidates: candidateData.candidates,
+    requests,
+  };
+}
+
+export async function createMembershipCancellationRequest({
+  requesterMemberId,
+  participantMemberIds,
+  reason,
+  acknowledgedWarning,
+  ipAddress,
+}: {
+  requesterMemberId: string;
+  participantMemberIds: string[];
+  reason?: string | null;
+  acknowledgedWarning: boolean;
+  ipAddress?: string | null;
+}) {
+  if (!acknowledgedWarning) {
+    throw new MembershipCancellationRequestError(
+      "You must acknowledge the membership cancellation warning before submitting",
+      422,
+    );
+  }
+
+  const selectedIds = Array.from(
+    new Set(participantMemberIds.map(cleanString).filter(Boolean)),
+  );
+
+  if (selectedIds.length === 0) {
+    throw new MembershipCancellationRequestError(
+      "Select at least one membership to include",
+      422,
+    );
+  }
+
+  const { currentMember, candidates } =
+    await loadCancellationCandidates(requesterMemberId);
+  const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  const invalidIds = selectedIds.filter((id) => !candidateById.get(id)?.eligible);
+
+  if (invalidIds.length > 0) {
+    throw new MembershipCancellationRequestError(
+      "One or more selected memberships are not eligible for cancellation requests",
+      422,
+    );
+  }
+
+  const selectedCandidates = selectedIds.map((id) => candidateById.get(id)!);
+  const now = new Date();
+  const tokenByMemberId = new Map<
+    string,
+    { token: string; tokenHash: string; expiresAt: Date }
+  >();
+
+  for (const candidate of selectedCandidates) {
+    if (!candidate.requiresOwnConfirmation) continue;
+    const issued = issueActionToken();
+    tokenByMemberId.set(candidate.id, {
+      ...issued,
+      expiresAt: new Date(now.getTime() + MEMBERSHIP_CANCELLATION_CONFIRMATION_TTL_MS),
+    });
+  }
+
+  const request = await prisma.$transaction(async (tx) => {
+    // Re-check open participant rows for each selected member inside
+    // the transaction so two near-simultaneous submissions cannot both
+    // succeed and create duplicate participants for the same member
+    // across overlapping cancellation requests.
+    const conflicting =
+      await tx.membershipCancellationRequestParticipant.findMany({
+        where: {
+          memberId: { in: selectedCandidates.map((candidate) => candidate.id) },
+          status: { in: [...OPEN_PARTICIPANT_STATUSES] },
+        },
+        select: { memberId: true },
+      });
+    if (conflicting.length > 0) {
+      throw new MembershipCancellationRequestError(
+        "One or more selected memberships already have an open cancellation request",
+        409,
+      );
+    }
+
+    return tx.membershipCancellationRequest.create({
+    data: {
+      requestedByMemberId: currentMember.id,
+      status: "REQUESTED",
+      reason: nullableText(reason),
+      participants: {
+        create: selectedCandidates.map((candidate) => {
+          const token = tokenByMemberId.get(candidate.id);
+          return {
+            memberId: candidate.id,
+            status: token ? "PENDING_CONFIRMATION" : "REQUESTED",
+            confirmedAt: token ? null : now,
+            confirmationTokenHash: token?.tokenHash ?? null,
+            confirmationTokenExpiresAt: token?.expiresAt ?? null,
+          };
+        }),
+      },
+    },
+    include: cancellationRequestInclude,
+    });
+  });
+
+  logAudit({
+    action: "membership_cancellation.requested",
+    memberId: currentMember.id,
+    actorMemberId: currentMember.id,
+    targetId: request.id,
+    entityType: "MembershipCancellationRequest",
+    entityId: request.id,
+    category: "account",
+    severity: "important",
+    outcome: "success",
+    summary: "Membership cancellation request submitted",
+    metadata: {
+      participantMemberIds: selectedCandidates.map((candidate) => candidate.id),
+      pendingConfirmationMemberIds: selectedCandidates
+        .filter((candidate) => candidate.requiresOwnConfirmation)
+        .map((candidate) => candidate.id),
+    },
+    ipAddress,
+  });
+
+  const requesterName = memberDisplayName(currentMember);
+  const summary = participantSummary(request.participants);
+  const emailWarnings: string[] = [];
+
+  try {
+    await sendMembershipCancellationSubmittedEmail({
+      email: currentMember.email,
+      firstName: currentMember.firstName,
+      participantSummary: summary,
+      reason: request.reason,
+    });
+  } catch (err) {
+    logger.error(
+      { err, requestId: request.id, requesterMemberId: currentMember.id },
+      "Failed to send membership cancellation submitted email",
+    );
+    emailWarnings.push("Submission confirmation email could not be sent");
+  }
+
+  await Promise.all(
+    request.participants.map(async (participant) => {
+      const token = tokenByMemberId.get(participant.memberId);
+      if (!token) return;
+
+      try {
+        await sendMembershipCancellationConfirmationEmail({
+          email: participant.member.email,
+          firstName: participant.member.firstName,
+          requesterName,
+          participantName: memberName(participant.member),
+          token: token.token,
+          expiresAt: token.expiresAt,
+        });
+      } catch (err) {
+        logger.error(
+          { err, requestId: request.id, participantId: participant.id },
+          "Failed to send membership cancellation confirmation email",
+        );
+        emailWarnings.push(
+          `Confirmation email could not be sent to ${memberName(participant.member)}`,
+        );
+      }
+    }),
+  );
+
+  if (hasReviewableCancellationParticipant(request.participants)) {
+    try {
+      await sendAdminMembershipCancellationRequestAlert({
+        requesterName,
+        participantSummary: summary,
+        reason: request.reason,
+      });
+    } catch (err) {
+      logger.error(
+        { err, requestId: request.id },
+        "Failed to send admin membership cancellation request alert",
+      );
+      emailWarnings.push("Admin review alert could not be sent");
+    }
+  }
+
+  return {
+    request: serializeRequest(request),
+    emailWarnings,
+  };
+}
+
+export async function createAdminMembershipCancellationRequest({
+  targetMemberId,
+  adminMemberId,
+  reason,
+  ipAddress,
+}: {
+  targetMemberId: string;
+  adminMemberId: string;
+  reason?: string | null;
+  ipAddress?: string | null;
+}) {
+  const cleanedTargetId = cleanString(targetMemberId);
+  if (!cleanedTargetId) {
+    throw new MembershipCancellationRequestError(
+      "Target member is required",
+      422,
+    );
+  }
+
+  const cleanedAdminId = cleanString(adminMemberId);
+  if (!cleanedAdminId) {
+    throw new MembershipCancellationRequestError(
+      "Admin member is required",
+      422,
+    );
+  }
+
+  const target = await prisma.member.findUnique({
+    where: { id: cleanedTargetId },
+    select: {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      ageTier: true,
+      active: true,
+      canLogin: true,
+      role: true,
+      cancelledAt: true,
+      archivedAt: true,
+      // #2383: read alongside the legacy role column so a lodge kiosk carrying
+      // only a LODGE access-role row is still recognised as a device login —
+      // and so a person who merely also holds the lodge tools is not. The
+      // definition id and the legacy finance column are selected too, because
+      // both widen the classification away from "kiosk"; without them a
+      // custom-role holder with lodge access would be refused here while the
+      // admin page (which is served resolved tokens) offered the action.
+      financeAccessLevel: true,
+      accessRoles: { select: { role: true, roleDefinitionId: true } },
+    },
+  });
+
+  if (!target) {
+    throw new MembershipCancellationRequestError("Member not found", 404);
+  }
+
+  // The next four member-state checks are mirrored client-side by
+  // canAdminRequestMembershipCancellation (src/lib/member-roles.ts) so the
+  // admin UI offers the action exactly where this function accepts it (#2354).
+  // Keep them in step; the distinct status codes and messages here are why
+  // this stays inline rather than calling the helper.
+  //
+  // #2383: the only accounts refused here are the records that are not an
+  // account holder at all — the shared lodge kiosk device login, and the guest
+  // and school contacts minted by the public booking-request flows. Whatever
+  // admin access a real member holds is irrelevant to whether their membership
+  // can be cancelled; who may APPROVE that cancellation against a privileged
+  // account, and the rule that the club can never be left without a Full
+  // Admin, are enforced at approval time by the #1604/#1622 guards in
+  // membership-cancellation-admin.
+  if (
+    !isMembershipHolderRecord({
+      role: target.role,
+      canLogin: target.canLogin,
+      financeAccessLevel: target.financeAccessLevel,
+      // Raw rows: the helper accepts these and the resolved string tokens the
+      // admin page is served interchangeably, and applies the same
+      // login-clearing to both, so page and server never disagree.
+      accessRoles: target.accessRoles,
+    })
+  ) {
+    throw new MembershipCancellationRequestError(
+      "Lodge kiosk logins and booking-request contact records hold no membership to cancel",
+      422,
+    );
+  }
+
+  if (!target.active) {
+    throw new MembershipCancellationRequestError(
+      "This membership is not active",
+      409,
+    );
+  }
+
+  if (target.cancelledAt) {
+    throw new MembershipCancellationRequestError(
+      "This membership is already cancelled",
+      409,
+    );
+  }
+
+  if (target.archivedAt) {
+    throw new MembershipCancellationRequestError(
+      "Archived members cannot have new cancellation requests",
+      409,
+    );
+  }
+
+  const cleanedReason = nullableText(reason);
+  const now = new Date();
+
+  const request = await prisma.$transaction(async (tx) => {
+    const conflicting =
+      await tx.membershipCancellationRequestParticipant.findMany({
+        where: {
+          memberId: target.id,
+          status: { in: [...OPEN_PARTICIPANT_STATUSES] },
+        },
+        select: { memberId: true },
+      });
+    if (conflicting.length > 0) {
+      throw new MembershipCancellationRequestError(
+        "This member already has an open cancellation request",
+        409,
+      );
+    }
+
+    return tx.membershipCancellationRequest.create({
+      data: {
+        requestedByMemberId: cleanedAdminId,
+        status: "REQUESTED",
+        reason: cleanedReason,
+        participants: {
+          create: [
+            {
+              memberId: target.id,
+              status: "REQUESTED",
+              confirmedAt: now,
+              confirmationTokenHash: null,
+              confirmationTokenExpiresAt: null,
+            },
+          ],
+        },
+      },
+      include: cancellationRequestInclude,
+    });
+  });
+
+  logAudit({
+    action: "membership_cancellation.admin_requested",
+    memberId: cleanedAdminId,
+    actorMemberId: cleanedAdminId,
+    subjectMemberId: target.id,
+    targetId: request.id,
+    entityType: "MembershipCancellationRequest",
+    entityId: request.id,
+    category: "account",
+    severity: "important",
+    outcome: "success",
+    summary: "Admin initiated membership cancellation request",
+    metadata: {
+      participantMemberIds: [target.id],
+      adminInitiated: true,
+    },
+    ipAddress,
+  });
+
+  const emailWarnings: string[] = [];
+  const requesterName = request.requestedBy
+    ? memberDisplayName(request.requestedBy)
+    : "Admin";
+
+  try {
+    await sendAdminMembershipCancellationRequestAlert({
+      requesterName,
+      participantSummary: participantSummary(request.participants),
+      reason: request.reason,
+    });
+  } catch (err) {
+    logger.error(
+      { err, requestId: request.id },
+      "Failed to send admin membership cancellation request alert",
+    );
+    emailWarnings.push("Admin review alert could not be sent");
+  }
+
+  return {
+    request: serializeRequest(request),
+    emailWarnings,
+  };
+}
+
+export async function reissueParticipantConfirmationToken({
+  requestId,
+  participantId,
+  adminMemberId,
+  ipAddress,
+}: {
+  requestId: string;
+  participantId: string;
+  adminMemberId: string;
+  ipAddress?: string | null;
+}): Promise<{
+  request: SerializedMembershipCancellationRequest;
+  emailWarnings: string[];
+}> {
+  const participant = await prisma.membershipCancellationRequestParticipant.findUnique({
+    where: { id: participantId },
+    include: cancellationParticipantWithRequestInclude,
+  });
+
+  if (!participant || participant.requestId !== requestId) {
+    throw new MembershipCancellationRequestError(
+      "Membership cancellation participant not found",
+      404,
+    );
+  }
+
+  if (participant.status !== "PENDING_CONFIRMATION") {
+    throw new MembershipCancellationRequestError(
+      "Confirmation token can only be reissued for participants awaiting confirmation",
+      409,
+    );
+  }
+
+  if (participant.request.status !== "REQUESTED") {
+    throw new MembershipCancellationRequestError(
+      "Confirmation token cannot be reissued for a cancellation request that is no longer open",
+      409,
+    );
+  }
+
+  const issued = issueActionToken();
+  const expiresAt = new Date(
+    Date.now() + MEMBERSHIP_CANCELLATION_CONFIRMATION_TTL_MS,
+  );
+
+  await prisma.membershipCancellationRequestParticipant.update({
+    where: { id: participantId },
+    data: {
+      confirmationTokenHash: issued.tokenHash,
+      confirmationTokenExpiresAt: expiresAt,
+    },
+  });
+
+  logAudit({
+    action: "membership_cancellation.confirmation_token_reissued",
+    memberId: adminMemberId,
+    actorMemberId: adminMemberId,
+    subjectMemberId: participant.memberId,
+    targetId: participant.requestId,
+    entityType: "MembershipCancellationRequestParticipant",
+    entityId: participant.id,
+    category: "account",
+    severity: "important",
+    outcome: "success",
+    summary: "Membership cancellation confirmation token reissued",
+    metadata: {
+      requestId: participant.requestId,
+      participantId: participant.id,
+      participantMemberId: participant.memberId,
+    },
+    ipAddress: ipAddress ?? undefined,
+  });
+
+  const requesterName = participant.request.requestedBy
+    ? memberDisplayName(participant.request.requestedBy)
+    : memberDisplayName(participant.member);
+
+  const emailWarnings: string[] = [];
+  try {
+    await sendMembershipCancellationConfirmationEmail({
+      email: participant.member.email,
+      firstName: participant.member.firstName,
+      requesterName,
+      participantName: memberName(participant.member),
+      token: issued.token,
+      expiresAt,
+    });
+  } catch (err) {
+    logger.error(
+      {
+        err,
+        requestId: participant.requestId,
+        participantId: participant.id,
+      },
+      "Failed to send reissued membership cancellation confirmation email",
+    );
+    emailWarnings.push(
+      `Confirmation email could not be sent to ${memberName(participant.member)}`,
+    );
+  }
+
+  const refreshedRequest = await prisma.membershipCancellationRequest.findUnique({
+    where: { id: requestId },
+    include: cancellationRequestInclude,
+  });
+
+  if (!refreshedRequest) {
+    throw new MembershipCancellationRequestError(
+      "Membership cancellation request not found",
+      404,
+    );
+  }
+
+  return {
+    request: serializeRequest(refreshedRequest),
+    emailWarnings,
+  };
+}
+
+async function findConfirmationParticipant(token: string) {
+  const normalizedToken = cleanString(token);
+  if (!normalizedToken) return null;
+
+  return prisma.membershipCancellationRequestParticipant.findUnique({
+    where: { confirmationTokenHash: hashActionToken(normalizedToken) },
+    include: cancellationParticipantWithRequestInclude,
+  });
+}
+
+export async function getMembershipCancellationConfirmationDetails(
+  token: string,
+  memberId: string,
+): Promise<MembershipCancellationConfirmationDetails> {
+  if (!cleanString(token)) {
+    return {
+      tokenStatus: "missing",
+      canRespond: false,
+      message: "This cancellation confirmation link is missing its token.",
+      request: null,
+      participant: null,
+    };
+  }
+
+  const participant = await findConfirmationParticipant(token);
+  if (!participant) {
+    return {
+      tokenStatus: "invalid",
+      canRespond: false,
+      message:
+        "This cancellation confirmation link is invalid or has already been used. If you are still expecting to confirm, contact the club office — an administrator can send you a fresh confirmation link.",
+      request: null,
+      participant: null,
+    };
+  }
+
+  if (participant.memberId !== memberId) {
+    return {
+      tokenStatus: "wrong_member",
+      canRespond: false,
+      message: "This cancellation confirmation link is assigned to a different member account.",
+      request: null,
+      participant: null,
+    };
+  }
+
+  const serializedRequest = serializeRequest(participant.request);
+  const serializedParticipant =
+    serializedRequest.participants.find((item) => item.id === participant.id) ??
+    null;
+
+  if (participant.request.status !== "REQUESTED") {
+    return {
+      tokenStatus: "request_closed",
+      canRespond: false,
+      message: "This cancellation request is no longer open.",
+      request: serializedRequest,
+      participant: serializedParticipant,
+    };
+  }
+
+  if (participant.status !== "PENDING_CONFIRMATION") {
+    return {
+      tokenStatus: "responded",
+      canRespond: false,
+      message: "You have already responded to this cancellation request.",
+      request: serializedRequest,
+      participant: serializedParticipant,
+    };
+  }
+
+  if (
+    participant.confirmationTokenExpiresAt &&
+    participant.confirmationTokenExpiresAt < new Date()
+  ) {
+    return {
+      tokenStatus: "expired",
+      canRespond: false,
+      message:
+        "This cancellation confirmation link has expired. Contact the club office — an administrator can send you a fresh confirmation link.",
+      request: serializedRequest,
+      participant: serializedParticipant,
+    };
+  }
+
+  return {
+    tokenStatus: "ready",
+    canRespond: true,
+    message:
+      "Confirm whether your membership should be included in this cancellation request.",
+    request: serializedRequest,
+    participant: serializedParticipant,
+  };
+}
+
+export async function respondToMembershipCancellationConfirmation({
+  token,
+  memberId,
+  decision,
+  ipAddress,
+}: {
+  token: string;
+  memberId: string;
+  decision: "confirm" | "decline";
+  ipAddress?: string | null;
+}) {
+  const normalizedToken = cleanString(token);
+  if (!normalizedToken) {
+    throw new MembershipCancellationRequestError(
+      "Cancellation confirmation token is required",
+      422,
+    );
+  }
+
+  const tokenHash = hashActionToken(normalizedToken);
+  const now = new Date();
+  const participant =
+    await prisma.membershipCancellationRequestParticipant.findUnique({
+      where: { confirmationTokenHash: tokenHash },
+      include: {
+        member: { select: participantMemberSummarySelect },
+        request: true,
+      },
+    });
+
+  if (!participant) {
+    throw new MembershipCancellationRequestError(
+      "This cancellation confirmation link is invalid or has already been used",
+      404,
+    );
+  }
+
+  if (participant.memberId !== memberId) {
+    throw new MembershipCancellationRequestError(
+      "This cancellation confirmation link is for a different member account",
+      403,
+    );
+  }
+
+  if (participant.request.status !== "REQUESTED") {
+    throw new MembershipCancellationRequestError(
+      "This cancellation request is no longer open",
+      409,
+    );
+  }
+
+  if (participant.status !== "PENDING_CONFIRMATION") {
+    throw new MembershipCancellationRequestError(
+      "This cancellation confirmation has already been answered",
+      409,
+    );
+  }
+
+  if (
+    participant.confirmationTokenExpiresAt &&
+    participant.confirmationTokenExpiresAt < now
+  ) {
+    throw new MembershipCancellationRequestError(
+      "This cancellation confirmation link has expired",
+      410,
+    );
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    // Atomic claim: only one concurrent confirm/decline for a given
+    // token can pass this guarded updateMany. The where clause re-checks
+    // the status and expiry inside the database so the read+write race
+    // is closed.
+    const claim =
+      await tx.membershipCancellationRequestParticipant.updateMany({
+        where: {
+          id: participant.id,
+          confirmationTokenHash: tokenHash,
+          status: "PENDING_CONFIRMATION",
+          confirmationTokenExpiresAt: { gt: now },
+        },
+        data:
+          decision === "confirm"
+            ? {
+                status: "REQUESTED",
+                confirmedAt: now,
+                confirmationTokenHash: null,
+                confirmationTokenExpiresAt: null,
+              }
+            : {
+                status: "DECLINED",
+                declinedAt: now,
+                confirmationTokenHash: null,
+                confirmationTokenExpiresAt: null,
+              },
+      });
+    if (claim.count !== 1) {
+      throw new MembershipCancellationRequestError(
+        "This cancellation confirmation link has already been used or has expired",
+        409,
+      );
+    }
+
+    const updatedParticipant =
+      await tx.membershipCancellationRequestParticipant.findUniqueOrThrow({
+        where: { id: participant.id },
+        include: cancellationParticipantWithRequestInclude,
+      });
+
+    // Defence in depth: if the same member somehow has another open
+    // PENDING_CONFIRMATION row across overlapping requests, invalidate
+    // its token now so it cannot be replayed.
+    await tx.membershipCancellationRequestParticipant.updateMany({
+      where: {
+        memberId,
+        status: "PENDING_CONFIRMATION",
+        id: { not: participant.id },
+      },
+      data: {
+        confirmationTokenHash: null,
+        confirmationTokenExpiresAt: null,
+      },
+    });
+
+    return updatedParticipant;
+  });
+
+  logAudit({
+    action:
+      decision === "confirm"
+        ? "membership_cancellation.participant_confirmed"
+        : "membership_cancellation.participant_declined",
+    memberId,
+    actorMemberId: memberId,
+    subjectMemberId: memberId,
+    targetId: updated.requestId,
+    entityType: "MembershipCancellationRequest",
+    entityId: updated.requestId,
+    category: "account",
+    severity: "important",
+    outcome: "success",
+    summary:
+      decision === "confirm"
+        ? "Membership cancellation participant confirmed"
+        : "Membership cancellation participant declined",
+    ipAddress,
+  });
+
+  if (decision === "confirm") {
+    const requesterName = updated.request.requestedBy
+      ? memberDisplayName(updated.request.requestedBy)
+      : "Unknown member";
+    try {
+      await sendAdminMembershipCancellationRequestAlert({
+        requesterName,
+        participantSummary: participantSummary(updated.request.participants),
+        reason: updated.request.reason,
+      });
+    } catch (err) {
+      logger.error(
+        { err, requestId: updated.requestId, participantId: updated.id },
+        "Failed to send admin membership cancellation confirmation alert",
+      );
+    }
+  }
+
+  return {
+    request: serializeRequest(updated.request),
+    participant:
+      serializeRequest(updated.request).participants.find(
+        (item) => item.id === updated.id,
+      ) ?? null,
+    message:
+      decision === "confirm"
+        ? "Your confirmation has been recorded. Your membership remains active until an administrator reviews the request."
+        : "Your decline has been recorded. Your membership remains active.",
+  };
+}

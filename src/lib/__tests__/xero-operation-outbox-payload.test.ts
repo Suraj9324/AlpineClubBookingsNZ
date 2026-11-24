@@ -1,0 +1,500 @@
+import { describe, expect, it } from "vitest";
+import {
+  getQueuedOutboxExpectedOperation,
+  readQueuedOutboxPayload,
+  readQueueType,
+  subscriptionInvoiceChargeId,
+  subscriptionInvoiceOutboxRow,
+  XERO_OUTBOX_QUEUE_TYPES,
+} from "@/lib/xero-operation-outbox-payload";
+import { isAccountCreditNotePayload, parsePaymentCreditNoteRetryInput } from "@/lib/xero-payment-credit-note-payload";
+
+describe("xero operation outbox payload parsing", () => {
+  it("#4685: reads an account-credit note's own credit, and none from a row queued before it", () => {
+    expect(readQueuedOutboxPayload({ queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200, memberCreditId: "credit_1" })).toEqual({
+      queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200, memberCreditId: "credit_1",
+    });
+    expect(readQueuedOutboxPayload({ queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200 })).toEqual({
+      queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200,
+    });
+    // An unreadable id reads as none: the stamp then falls back, never stamps a bad id.
+    expect(readQueuedOutboxPayload({ queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200, memberCreditId: 7 })).toEqual({
+      queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200,
+    });
+    expect(readQueuedOutboxPayload({ queueType: "ACCOUNT_CREDIT_NOTE", memberCreditId: "credit_1" })).toBeNull();
+  });
+
+  it("#4685: the retry parser reads the same credit off the queued and executed account-credit shapes", () => {
+    expect(parsePaymentCreditNoteRetryInput({ requestPayload: { queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200, memberCreditId: "credit_1" } }))
+      .toEqual({ amountCents: 4200, kind: "unapplied", memberCreditId: "credit_1" });
+    expect(parsePaymentCreditNoteRetryInput({ requestPayload: { creditNotes: [{ lineItems: [{ unitAmount: 42 }] }], memberCreditId: "credit_1" } }))
+      .toEqual({ amountCents: 4200, kind: "unapplied", memberCreditId: "credit_1" });
+    expect(parsePaymentCreditNoteRetryInput({ requestPayload: { queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 4200 } }))
+      .toEqual({ amountCents: 4200, kind: "unapplied" });
+  });
+
+  it("normalizes entrance fee invoice payloads with integer cents", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "ENTRANCE_FEE_INVOICE",
+        category: "ADULT",
+        itemCode: "EF-ADULT",
+        feeAmountCents: "15000",
+        description: "Entrance fee",
+      })
+    ).toEqual({
+      queueType: "ENTRANCE_FEE_INVOICE",
+      category: "ADULT",
+      itemCode: "EF-ADULT",
+      feeAmountCents: 15000,
+      description: "Entrance fee",
+    });
+  });
+
+  it("rejects incomplete or unknown queued payloads", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "BOOKING_INVOICE",
+        bookingId: " ",
+      })
+    ).toBeNull();
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "REFUND_CREDIT_NOTE",
+        refundAmountCents: "not-a-number",
+      })
+    ).toBeNull();
+    expect(readQueuedOutboxPayload({ queueType: "UNKNOWN" })).toBeNull();
+  });
+
+  it("parses supplementary invoice flags without coercing non-booleans", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "SUPPLEMENTARY_INVOICE",
+        bookingId: "booking_1",
+        priceDiffCents: 2500,
+        changeFeeCents: "500",
+        bookingModificationId: "mod_1",
+        recordPayment: false,
+        waitForConfirmedAdditionalPayment: "yes",
+      })
+    ).toEqual({
+      queueType: "SUPPLEMENTARY_INVOICE",
+      bookingId: "booking_1",
+      priceDiffCents: 2500,
+      changeFeeCents: 500,
+      bookingModificationId: "mod_1",
+      recordPayment: false,
+      paymentIntentId: undefined,
+      waitForConfirmedAdditionalPayment: undefined,
+      shortfallReviewTaskId: undefined,
+    });
+  });
+
+  /**
+   * #3193: the second ask's marker survives the parse, and the claim guard
+   * accepts its anchor.
+   *
+   * Both halves matter and they fail differently. A dropped marker sends the
+   * handler down the ordinary path, which would write the invoice's link onto
+   * the BOOKING CHANGE - where the change's own reads would find it - and key
+   * the create the way the change's own invoice is keyed, so Xero would answer
+   * it with the invoice already sent. A missing `ManualRefundTask` in the claim
+   * guard is quieter and just as bad: the row is skipped on every pass, forever,
+   * and the difference is never billed at all.
+   */
+  it("carries the second ask's review task through the parse (#3193)", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "SUPPLEMENTARY_INVOICE",
+        bookingId: "booking_1",
+        priceDiffCents: 3000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod_1",
+        recordPayment: false,
+        shortfallReviewTaskId: "task_2",
+      })
+    ).toMatchObject({ shortfallReviewTaskId: "task_2" });
+
+    expect(
+      getQueuedOutboxExpectedOperation("SUPPLEMENTARY_INVOICE").localModels
+    ).toContain("ManualRefundTask");
+  });
+
+  it("normalizes modification account-credit note payloads", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "MODIFICATION_ACCOUNT_CREDIT_NOTE",
+        bookingId: "booking_1",
+        paymentId: "payment_1",
+        refundAmountCents: "3750",
+        bookingModificationId: "mod_1",
+      })
+    ).toEqual({
+      queueType: "MODIFICATION_ACCOUNT_CREDIT_NOTE",
+      bookingId: "booking_1",
+      paymentId: "payment_1",
+      refundAmountCents: 3750,
+      bookingModificationId: "mod_1",
+    });
+  });
+
+  it("carries the refund method through the two cash credit-note payloads, and drops one it does not recognise (INV-PAY-101)", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "REFUND_CREDIT_NOTE",
+        refundAmountCents: 2275,
+        watermarkCents: 2275,
+        refundMethod: "internet-banking",
+      })
+    ).toEqual({
+      queueType: "REFUND_CREDIT_NOTE",
+      refundAmountCents: 2275,
+      watermarkCents: 2275,
+      refundMethod: "internet-banking",
+    });
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "MODIFICATION_CREDIT_NOTE",
+        bookingId: "booking_1",
+        refundAmountCents: 2500,
+        bookingModificationId: "mod_1",
+        refundMethod: "cheque",
+      })
+    ).toEqual({
+      queueType: "MODIFICATION_CREDIT_NOTE",
+      bookingId: "booking_1",
+      refundAmountCents: 2500,
+      bookingModificationId: "mod_1",
+      refundMethod: undefined,
+    });
+    // A row queued before the field existed parses exactly as it did.
+    expect(
+      readQueuedOutboxPayload({ queueType: "REFUND_CREDIT_NOTE", refundAmountCents: 100 })
+    ).toEqual({
+      queueType: "REFUND_CREDIT_NOTE",
+      refundAmountCents: 100,
+      watermarkCents: undefined,
+      refundMethod: undefined,
+    });
+  });
+
+  it("MUTATION (#3935): carries a refund note's cash wording only beside the internet-banking method", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "REFUND_CREDIT_NOTE",
+        refundAmountCents: 2500,
+        refundMethod: "internet-banking",
+        noteWording: "cash",
+      })
+    ).toMatchObject({ refundMethod: "internet-banking", noteWording: "cash" });
+    for (const raw of [
+      { refundMethod: "card", noteWording: "cash" },
+      { refundMethod: "internet-banking", noteWording: "invoice-correction" },
+      { noteWording: "cash" },
+    ]) {
+      expect(
+        readQueuedOutboxPayload({ queueType: "REFUND_CREDIT_NOTE", refundAmountCents: 2500, ...raw })
+      ).toHaveProperty("noteWording", undefined);
+    }
+  });
+
+  it("tells the abandon VOID from the cancellation VOID by the invoice it names (#3642)", () => {
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "GROUP_SETTLEMENT_INVOICE_VOID",
+        settlementId: "settle-1",
+      })
+    ).toEqual({ queueType: "GROUP_SETTLEMENT_INVOICE_VOID", settlementId: "settle-1" });
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "GROUP_SETTLEMENT_INVOICE_VOID",
+        settlementId: "settle-1",
+        xeroInvoiceId: "inv-1",
+      })
+    ).toEqual({
+      queueType: "GROUP_SETTLEMENT_INVOICE_VOID",
+      settlementId: "settle-1",
+      xeroInvoiceId: "inv-1",
+    });
+    // Present but unreadable is refused, never read as the cancellation VOID
+    // (which would void whatever the settlement points at now).
+    expect(
+      readQueuedOutboxPayload({
+        queueType: "GROUP_SETTLEMENT_INVOICE_VOID",
+        settlementId: "settle-1",
+        xeroInvoiceId: 42,
+      })
+    ).toBeNull();
+  });
+
+  it("maps queued payload types to guarded sync operation claims", () => {
+    expect(getQueuedOutboxExpectedOperation("BOOKING_INVOICE_UPDATE")).toEqual({
+      entityType: "INVOICE",
+      operationType: "UPDATE",
+      localModels: ["Payment"],
+    });
+    expect(
+      getQueuedOutboxExpectedOperation("GROUP_SETTLEMENT_INVOICE_VOID")
+    ).toEqual({
+      entityType: "INVOICE",
+      operationType: "UPDATE",
+      localModels: ["GroupBookingSettlement"],
+    });
+    expect(
+      getQueuedOutboxExpectedOperation(
+        "MEMBERSHIP_CANCELLATION_CREDIT_NOTE"
+      )
+    ).toEqual({
+      entityType: "CREDIT_NOTE",
+      operationType: "CREATE",
+      localModels: ["MemberSubscription"],
+    });
+    expect(getQueuedOutboxExpectedOperation("CREDIT_NOTE_ALLOCATION")).toEqual({
+      entityType: "ALLOCATION",
+      operationType: "ALLOCATE",
+      localModels: [
+        "Payment",
+        "Booking",
+        "BookingModification",
+        "MemberCreditNoteAllocation",
+      ],
+    });
+    expect(getQueuedOutboxExpectedOperation("APPLIED_CREDIT_ALLOCATION")).toEqual({
+      entityType: "ALLOCATION",
+      operationType: "ALLOCATE",
+      localModels: ["Payment"],
+    });
+    expect(getQueuedOutboxExpectedOperation("MODIFICATION_ACCOUNT_CREDIT_NOTE")).toEqual({
+      entityType: "CREDIT_NOTE",
+      operationType: "CREATE",
+      localModels: ["Booking", "BookingModification"],
+    });
+  });
+
+  it("reads queue type only from object payloads", () => {
+    expect(readQueueType({ queueType: "BOOKING_INVOICE" })).toBe(
+      "BOOKING_INVOICE"
+    );
+    expect(readQueueType(null)).toBeNull();
+    expect(readQueueType(["BOOKING_INVOICE"])).toBeNull();
+  });
+
+  it("exposes the exact set of outbox queue types the pending scan dispatches (#1272)", () => {
+    // Single source of truth: the pending-outbox scan filters `queueType IN`
+    // this list and the dispatch switch routes exactly these members. Locking
+    // the wire values guards the scan/dispatch domain against drift.
+    expect([...XERO_OUTBOX_QUEUE_TYPES]).toEqual([
+      "ENTRANCE_FEE_INVOICE",
+      "BOOKING_INVOICE",
+      "BOOKING_INVOICE_UPDATE",
+      "REFUND_CREDIT_NOTE",
+      "ACCOUNT_CREDIT_NOTE",
+      "SUPPLEMENTARY_INVOICE",
+      "MODIFICATION_CREDIT_NOTE",
+      "MODIFICATION_ACCOUNT_CREDIT_NOTE",
+      "CREDIT_NOTE_ALLOCATION",
+      "APPLIED_CREDIT_ALLOCATION",
+      "APPLIED_CREDIT_DEALLOCATION",
+      "MEMBERSHIP_CANCELLATION_CREDIT_NOTE",
+      "MEMBERSHIP_CANCELLATION_CONTACT",
+      "GROUP_SETTLEMENT_INVOICE",
+      "GROUP_SETTLEMENT_INVOICE_VOID",
+      "MEMBERSHIP_SUBSCRIPTION_INVOICE",
+      "KEPT_LATE_CAPTURE_INVOICE",
+      "CARD_REFUND_REVERSAL_INVOICE",
+      "ADDITIONAL_CAPTURE_RECEIPT",
+      "ORGANISER_EXTRA_ADJUSTMENT",
+      "ADMIN_GRANT_CREDIT_NOTE",
+      "ORGANISATION_CONTACT_DETAILS",
+    ]);
+    expect(new Set(XERO_OUTBOX_QUEUE_TYPES).size).toBe(
+      XERO_OUTBOX_QUEUE_TYPES.length
+    );
+  });
+
+  it("#5245: reads a school contact-details row as its queue type alone, a CONTACT UPDATE on the Organisation", () => {
+    expect(readQueuedOutboxPayload({ queueType: "ORGANISATION_CONTACT_DETAILS", organisationId: "org_1" })).toEqual({
+      queueType: "ORGANISATION_CONTACT_DETAILS",
+    });
+    expect(getQueuedOutboxExpectedOperation("ORGANISATION_CONTACT_DETAILS")).toEqual({
+      entityType: "CONTACT",
+      operationType: "UPDATE",
+      localModels: ["Organisation"],
+    });
+  });
+
+  it("ALP-580: reads a card-refund reversal's close day only when it is a real day", () => {
+    const queued = {
+      queueType: "CARD_REFUND_REVERSAL_INVOICE",
+      bookingId: "booking_1",
+      paymentId: "payment_1",
+      closeTaskId: "task_close_1",
+      amountCents: 8000,
+      closedOn: "2026-07-01",
+    };
+    expect(readQueuedOutboxPayload(queued)).toEqual(queued);
+    for (const closedOn of [undefined, "", "01/07/2026", "2026-02-30"]) {
+      expect(readQueuedOutboxPayload({ ...queued, closedOn })).toBeNull();
+    }
+  });
+
+  // #3971: the payload carries no charge id; a pre-fix row's blanked one is ignored.
+  it("#3971: reads a subscription invoice as its queue type alone, whatever chargeId a stored row holds", () => {
+    for (const stored of [
+      { queueType: "MEMBERSHIP_SUBSCRIPTION_INVOICE" },
+      { queueType: "MEMBERSHIP_SUBSCRIPTION_INVOICE", chargeId: "[REDACTED]" },
+      { queueType: "MEMBERSHIP_SUBSCRIPTION_INVOICE", chargeId: "charge_1" },
+    ]) {
+      expect(readQueuedOutboxPayload(stored)).toEqual({
+        queueType: "MEMBERSHIP_SUBSCRIPTION_INVOICE",
+      });
+    }
+  });
+
+  it("#3971: takes a subscription invoice's charge from the row's localId, only on a charge anchor", () => {
+    expect(
+      subscriptionInvoiceChargeId({ localModel: "MembershipSubscriptionCharge", localId: "charge_1" })
+    ).toBe("charge_1");
+    expect(
+      subscriptionInvoiceChargeId({ localModel: "MembershipSubscriptionCharge", localId: null })
+    ).toBeNull();
+    expect(subscriptionInvoiceChargeId({ localModel: "Member", localId: "member_1" })).toBeNull();
+  });
+
+  // #3994 (SSOT): both enqueues build the row here, so it always passes the
+  // claim guard and reads its charge back from its own anchor.
+  it("#3994: builds a subscription invoice row the claim guard accepts and whose charge reads back", () => {
+    const row = subscriptionInvoiceOutboxRow("charge_1");
+    expect(row.requestPayload).toEqual({ queueType: "MEMBERSHIP_SUBSCRIPTION_INVOICE" });
+    expect(readQueuedOutboxPayload(row.requestPayload)).toEqual(row.requestPayload);
+    const expected = getQueuedOutboxExpectedOperation(row.queueType);
+    expect(row.entityType).toBe(expected.entityType);
+    expect(row.operationType).toBe(expected.operationType);
+    expect(expected.localModels).toEqual([row.localModel]);
+    expect(subscriptionInvoiceChargeId(row)).toBe("charge_1");
+  });
+
+  it("#3635: reads a kept late-capture invoice's frozen gross cents and capture day, anchored on the approval task", () => {
+    const queued = {
+      queueType: "KEPT_LATE_CAPTURE_INVOICE",
+      bookingId: "booking_1",
+      manualRefundTaskId: "task_1",
+      paymentIntentId: "pi_kept",
+      capturedCents: 24000,
+      capturedOn: "2026-06-10",
+    };
+    expect(readQueuedOutboxPayload(queued)).toEqual(queued);
+    // Whole positive cents only (`INV-MONEY-001`); anything else is unreadable.
+    for (const capturedCents of [0, -100, 12.5]) {
+      expect(readQueuedOutboxPayload({ ...queued, capturedCents })).toBeNull();
+    }
+    // A receipt without its capture day would be dated on some later day.
+    for (const capturedOn of [undefined, "", "10/06/2026", "2026-02-30"]) {
+      expect(readQueuedOutboxPayload({ ...queued, capturedOn })).toBeNull();
+    }
+    expect(readQueuedOutboxPayload({ ...queued, manualRefundTaskId: undefined })).toBeNull();
+    expect(getQueuedOutboxExpectedOperation("KEPT_LATE_CAPTURE_INVOICE")).toEqual({
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModels: ["ManualRefundTask"],
+    });
+  });
+
+  it("#3953: reads a change capture's receipt, anchored on its ledger row, and its stored decision", () => {
+    const queued = {
+      queueType: "ADDITIONAL_CAPTURE_RECEIPT",
+      bookingId: "booking_1",
+      paymentId: "payment_1",
+      paymentTransactionId: "ptx_1",
+      paymentIntentId: "pi_change",
+    };
+    expect(readQueuedOutboxPayload(queued)).toEqual(queued);
+    const plan = { target: "GAP_INVOICE", invoiceId: "inv_gap", amountCents: 8000, capturedCents: 8000, date: "2026-06-30" };
+    // A legacy decision (#3953, before #4434) reads as its one leg.
+    const legacyLeg = { target: "GAP_INVOICE", invoiceId: "inv_gap", amountCents: 8000 };
+    expect(readQueuedOutboxPayload({ ...queued, plan })).toEqual({ ...queued, plan: { ...plan, legs: [legacyLeg] } });
+    expect(readQueuedOutboxPayload({ ...queued, paymentIntentId: undefined })).toBeNull();
+    // A decision that does not parse never lets a retry decide again.
+    expect(readQueuedOutboxPayload({ ...queued, plan: { ...plan, amountCents: 12.5 } })).toBeNull();
+    expect(readQueuedOutboxPayload({ ...queued, plan: { ...plan, date: "2026-02-30" } })).toBeNull();
+    expect(getQueuedOutboxExpectedOperation("ADDITIONAL_CAPTURE_RECEIPT")).toEqual({
+      entityType: "PAYMENT",
+      operationType: "CREATE",
+      localModels: ["PaymentTransaction"],
+    });
+  });
+
+  it("routes every scanned queue type through the guarded expected-operation map (#1272)", () => {
+    // Every queueType the scan selects must resolve to a concrete claim guard,
+    // so the column scan can never surface a type the dispatch path lacks.
+    const expectedEntityTypes = new Map<string, string>([
+      ["ORGANISER_EXTRA_ADJUSTMENT", "CREDIT_NOTE"],
+      ["ENTRANCE_FEE_INVOICE", "INVOICE"],
+      ["BOOKING_INVOICE", "INVOICE"],
+      ["BOOKING_INVOICE_UPDATE", "INVOICE"],
+      ["REFUND_CREDIT_NOTE", "CREDIT_NOTE"],
+      ["ACCOUNT_CREDIT_NOTE", "CREDIT_NOTE"],
+      ["SUPPLEMENTARY_INVOICE", "INVOICE"],
+      ["MODIFICATION_CREDIT_NOTE", "CREDIT_NOTE"],
+      ["MODIFICATION_ACCOUNT_CREDIT_NOTE", "CREDIT_NOTE"],
+      ["CREDIT_NOTE_ALLOCATION", "ALLOCATION"],
+      ["APPLIED_CREDIT_ALLOCATION", "ALLOCATION"],
+      ["APPLIED_CREDIT_DEALLOCATION", "ALLOCATION"],
+      ["MEMBERSHIP_CANCELLATION_CREDIT_NOTE", "CREDIT_NOTE"],
+      ["MEMBERSHIP_CANCELLATION_CONTACT", "CONTACT"],
+      ["GROUP_SETTLEMENT_INVOICE", "INVOICE"],
+      ["GROUP_SETTLEMENT_INVOICE_VOID", "INVOICE"],
+      ["MEMBERSHIP_SUBSCRIPTION_INVOICE", "INVOICE"],
+      ["KEPT_LATE_CAPTURE_INVOICE", "INVOICE"],
+      ["CARD_REFUND_REVERSAL_INVOICE", "INVOICE"],
+      ["ADDITIONAL_CAPTURE_RECEIPT", "PAYMENT"],
+      ["ADMIN_GRANT_CREDIT_NOTE", "CREDIT_NOTE"],
+      ["ORGANISATION_CONTACT_DETAILS", "CONTACT"],
+    ]);
+    for (const queueType of XERO_OUTBOX_QUEUE_TYPES) {
+      expect(getQueuedOutboxExpectedOperation(queueType).entityType).toBe(
+        expectedEntityTypes.get(queueType)
+      );
+    }
+  });
+});
+
+describe("admin grant credit note payload (#4431)", () => {
+  it("parses the queue type and expects a credit-note create on the credit row", () => {
+    const queued = {
+      queueType: "ADMIN_GRANT_CREDIT_NOTE" as const,
+      amountCents: 2500,
+      mappingKey: "hutFeeRefunds" as const,
+      memberCreditId: "credit_1",
+    };
+    expect(readQueuedOutboxPayload(queued)).toEqual(queued);
+    expect(readQueuedOutboxPayload({ ...queued, mappingKey: "goodwillWriteOffs" })).toEqual({
+      ...queued,
+      mappingKey: "goodwillWriteOffs",
+    });
+    expect(readQueuedOutboxPayload({ ...queued, amountCents: 0 })).toBeNull();
+    expect(readQueuedOutboxPayload({ ...queued, mappingKey: "somethingElse" })).toBeNull();
+    expect(getQueuedOutboxExpectedOperation("ADMIN_GRANT_CREDIT_NOTE")).toEqual({
+      entityType: "CREDIT_NOTE",
+      operationType: "CREATE",
+      localModels: ["MemberCredit"],
+    });
+  });
+});
+
+describe("isAccountCreditNotePayload (#4705, PR #4711 review)", () => {
+  it("MUTATION: reads an account-credit note's queued and executed shapes as its own", () => {
+    expect(isAccountCreditNotePayload({ queueType: "ACCOUNT_CREDIT_NOTE", refundAmountCents: 5000 })).toBe(true);
+    expect(isAccountCreditNotePayload({ creditNotes: [], refundAmountCents: 5000, queueType: "ACCOUNT_CREDIT_NOTE", memberCreditId: "credit_1" })).toBe(true);
+    // An inline create's executed shape: no queue type, the amount kept.
+    expect(isAccountCreditNotePayload({ creditNotes: [], refundAmountCents: 5000 })).toBe(true);
+  });
+
+  it("MUTATION: refuses an applied-credit remainder mint, a refund note, and every other queue type", () => {
+    expect(isAccountCreditNotePayload({ creditNotes: [{ lineItems: [{ unitAmount: 50 }] }] })).toBe(false);
+    expect(isAccountCreditNotePayload({ creditNotes: [], allocation: { invoiceId: "inv_1", amount: 50 }, refundAmountCents: 5000 })).toBe(false);
+    expect(isAccountCreditNotePayload({ queueType: "REFUND_CREDIT_NOTE", refundAmountCents: 5000 })).toBe(false);
+    expect(isAccountCreditNotePayload({ queueType: "MODIFICATION_ACCOUNT_CREDIT_NOTE", refundAmountCents: 5000 })).toBe(false);
+  });
+});

@@ -1,0 +1,237 @@
+import { NextRequest, NextResponse } from "next/server"
+import { parseJsonRequestBody } from "@/lib/api-json"
+import { requireAdmin } from "@/lib/session-guards";
+import { prisma } from "@/lib/prisma"
+import { logAudit } from "@/lib/audit"
+import {
+  auditLateCaptureSettingChange,
+  checkLateCaptureSettingChange,
+  LateCaptureSettingRefusal,
+} from "@/lib/late-capture-refund-setting-change"
+import { normalizeCancellationRule } from "@/lib/cancellation-rules"
+import {
+  clubWideDefaults,
+  policySchema,
+} from "@/lib/booking-policy-cancellation-schema"
+import { revalidatePublicPageContent } from "@/lib/public-content-revalidation"
+import { adminPolicyLodgeQuerySchema } from "@/lib/admin-bookings-schemas/setup"
+import {
+  ADMIN_CANCELLATION_POLICY_CONNECTION_SHAPE,
+  ADMIN_CANCELLATION_POLICY_SAVED_CONNECTION_SHAPE,
+} from "@/lib/connection-shapes/bookings-setup"
+import { connectionJson } from "@/lib/mcp-connection-request"
+
+export async function GET(req: NextRequest) {
+  const guard = await requireAdmin({
+    permission: { area: "bookings", level: "view" },
+  });
+  if (!guard.ok) return guard.response;
+  // Exact partition, not null-tolerant: null rows are the club-wide rules
+  // and a lodge's rows are its override set (replace, never merge).
+  // A string or nothing always parses; the 400 is only a backstop.
+  const query = adminPolicyLodgeQuerySchema.safeParse({
+    lodgeId: req.nextUrl.searchParams.get("lodgeId") ?? undefined,
+  })
+  if (!query.success) {
+    return NextResponse.json({ error: query.error.issues[0]?.message }, { status: 400 })
+  }
+  const lodgeId = query.data.lodgeId
+  const policies = await prisma.cancellationPolicy.findMany({
+    where: { lodgeId: lodgeId ?? null },
+    orderBy: { daysBeforeStay: "desc" },
+  })
+
+  const defaults = await prisma.bookingDefaults.findUnique({
+    where: { id: "default" },
+  })
+
+  return connectionJson(
+    req,
+    {
+      rules: policies.map(normalizeCancellationRule),
+      ...clubWideDefaults(defaults),
+      lodgeId: lodgeId ?? null,
+    },
+    ADMIN_CANCELLATION_POLICY_CONNECTION_SHAPE,
+  )
+}
+
+export async function PUT(req: NextRequest) {
+  const guard = await requireAdmin({
+    permission: { area: "bookings", level: "edit" },
+  });
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+  const jsonBody = await parseJsonRequestBody(req)
+  if (!jsonBody.ok) return jsonBody.response
+  const body = jsonBody.body
+  const parsed = policySchema.safeParse(body)
+
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: parsed.error.flatten() },
+      { status: 400 }
+    )
+  }
+
+  const {
+    rules,
+    nonMemberHoldEnabled,
+    nonMemberHoldDays,
+    waitlistCrossLodgeOrder,
+    linkedMoveChargesBothChangeFees,
+    lateCaptureRefundNeedsApproval,
+    lateCaptureRefundNeedsApprovalLoaded,
+    preArrivalReminderDays,
+    additionalPaymentReminderDays,
+    policyExceptionHoldDays,
+    lodgeId,
+  } = parsed.data
+  // #4932: the three booking timings, written only when the request names them.
+  // A new hold length applies to requests raised from now on; one already
+  // holding beds keeps the deadline stamped on it (INV-EXCEPT).
+  const timings = {
+    ...(preArrivalReminderDays !== undefined ? { preArrivalReminderDays } : {}),
+    ...(additionalPaymentReminderDays !== undefined ? { additionalPaymentReminderDays } : {}),
+    ...(policyExceptionHoldDays !== undefined ? { policyExceptionHoldDays } : {}),
+  }
+
+  if (lodgeId) {
+    const lodge = await prisma.lodge.findUnique({
+      where: { id: lodgeId },
+      select: { id: true, active: true },
+    })
+    if (!lodge || !lodge.active) {
+      return NextResponse.json(
+        { error: "Lodge not found or not active" },
+        { status: 400 }
+      )
+    }
+  }
+
+  // Validate: days must be unique
+  const sortedRules = [...rules]
+    .map(normalizeCancellationRule)
+    .sort((a, b) => b.daysBeforeStay - a.daysBeforeStay)
+  const dayValues = sortedRules.map((r) => r.daysBeforeStay)
+  if (new Set(dayValues).size !== dayValues.length) {
+    return NextResponse.json(
+      { error: "Each rule must have a unique number of days" },
+      { status: 400 }
+    )
+  }
+
+  // Replace the partition's rules atomically and update defaults. Scoping
+  // the delete to one partition means editing the club-wide rules never
+  // touches a lodge's override set and vice versa. Serializable isolation
+  // keeps the replace race-free; the club-wide partition's uniqueness is
+  // also DB-enforced by the CancellationPolicy_clubwide_daysBeforeStay_unique
+  // partial index (WHERE "lodgeId" IS NULL, migration 20260709000100 —
+  // PostgreSQL treats nulls as distinct under [lodgeId, daysBeforeStay]).
+  // #3639 review F2 / delta D3: the late-capture refund choice is checked on
+  // this Serializable transaction, so the stored value it compares is the one
+  // the write replaces.
+  let lateCapture = { before: false, changing: false }
+  let result
+  try {
+  result = await prisma.$transaction(async (tx) => {
+    lateCapture = await checkLateCaptureSettingChange(
+      tx,
+      session.user,
+      lateCaptureRefundNeedsApproval,
+      lateCaptureRefundNeedsApprovalLoaded,
+    )
+    await tx.cancellationPolicy.deleteMany({
+      where: { lodgeId: lodgeId ?? null },
+    })
+    await tx.cancellationPolicy.createMany({
+      data: sortedRules.map((rule) => ({
+        daysBeforeStay: rule.daysBeforeStay,
+        refundPercentage: rule.refundPercentage,
+        creditRefundPercentage: rule.creditRefundPercentage,
+        fixedFeeCents: rule.fixedFeeCents,
+        creditFixedFeeCents: rule.creditFixedFeeCents,
+        lodgeId: lodgeId ?? null,
+      })),
+    })
+
+    if (
+      nonMemberHoldDays !== undefined ||
+      nonMemberHoldEnabled !== undefined ||
+      waitlistCrossLodgeOrder !== undefined ||
+      linkedMoveChargesBothChangeFees !== undefined ||
+      lateCaptureRefundNeedsApproval !== undefined ||
+      Object.keys(timings).length > 0
+    ) {
+      await tx.bookingDefaults.upsert({
+        where: { id: "default" },
+        update: {
+          ...(nonMemberHoldEnabled !== undefined ? { nonMemberHoldEnabled } : {}),
+          ...(nonMemberHoldDays !== undefined ? { nonMemberHoldDays } : {}),
+          ...(waitlistCrossLodgeOrder !== undefined ? { waitlistCrossLodgeOrder } : {}),
+          ...(linkedMoveChargesBothChangeFees !== undefined
+            ? { linkedMoveChargesBothChangeFees }
+            : {}),
+          ...(lateCaptureRefundNeedsApproval !== undefined
+            ? { lateCaptureRefundNeedsApproval }
+            : {}),
+          ...timings,
+        },
+        create: {
+          id: "default",
+          nonMemberHoldEnabled: nonMemberHoldEnabled ?? true,
+          nonMemberHoldDays: nonMemberHoldDays ?? 7,
+          ...(waitlistCrossLodgeOrder !== undefined ? { waitlistCrossLodgeOrder } : {}),
+          // #3232: only when the request said so, so an unrelated save of the
+          // cancellation rules cannot stamp a decision this club never made — the
+          // schema default supplies `true` on a create that omits it.
+          ...(linkedMoveChargesBothChangeFees !== undefined
+            ? { linkedMoveChargesBothChangeFees }
+            : {}),
+          ...(lateCaptureRefundNeedsApproval !== undefined
+            ? { lateCaptureRefundNeedsApproval }
+            : {}),
+          ...timings,
+        },
+      })
+    }
+
+    const policies = await tx.cancellationPolicy.findMany({
+      where: { lodgeId: lodgeId ?? null },
+      orderBy: { daysBeforeStay: "desc" },
+    })
+
+    const defaults = await tx.bookingDefaults.findUnique({
+      where: { id: "default" },
+    })
+
+    return {
+      rules: policies.map(normalizeCancellationRule),
+      ...clubWideDefaults(defaults),
+    }
+  }, { isolationLevel: "Serializable" })
+  } catch (error) {
+    if (error instanceof LateCaptureSettingRefusal) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
+    throw error
+  }
+
+  logAudit({
+    action: "cancellation-policy.update",
+    category: "booking",
+    memberId: session.user.id,
+    details: `Updated to ${sortedRules.length} rules, holdEnabled=${nonMemberHoldEnabled ?? "unchanged"}, holdDays=${nonMemberHoldDays ?? "unchanged"}, waitlistOrder=${waitlistCrossLodgeOrder ?? "unchanged"}, linkedMoveBothFees=${linkedMoveChargesBothChangeFees ?? "unchanged"}, lateCaptureNeedsApproval=${lateCaptureRefundNeedsApproval ?? "unchanged"}, preArrivalReminderDays=${preArrivalReminderDays ?? "unchanged"}, additionalPaymentReminderDays=${additionalPaymentReminderDays ?? "unchanged"}, policyExceptionHoldDays=${policyExceptionHoldDays ?? "unchanged"}, lodge=${lodgeId ?? "club-wide"}`,
+  })
+
+  if (lateCapture.changing) {
+    auditLateCaptureSettingChange({
+      actorMemberId: session.user.id,
+      before: lateCapture.before,
+      after: !lateCapture.before,
+      via: "cancellation-page",
+    })
+  }
+  revalidatePublicPageContent()
+  return connectionJson(req, result, ADMIN_CANCELLATION_POLICY_SAVED_CONNECTION_SHAPE)
+}

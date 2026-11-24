@@ -1,0 +1,112 @@
+import type { Metadata } from "next";
+import { redirect } from "next/navigation";
+import { auth } from "@/lib/auth";
+import { buildLoginPath, getExplicitCallbackUrl } from "@/lib/auth-redirect";
+import { readFamilyInviteReturnCookieValue } from "@/lib/family-invite-return-address-cookie";
+import {
+  appendFamilyInviteReturnParam,
+  getFamilyInviteReturnNonce,
+} from "@/lib/family-invite-return-address";
+import { resolvePostLoginLandingPath } from "@/lib/post-login-landing";
+import { isSecondFactorEnrolled } from "@/lib/second-factor-enrolment";
+import { memberHoldsRetiredRecoveryCodes } from "@/lib/two-factor";
+import { TwoFactorVerifyPanel } from "../two-factor-panels";
+
+export const metadata: Metadata = {
+  title: "Verify your sign-in",
+};
+
+function singleSearchParam(value?: string | string[]) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+export default async function TwoFactorVerifyPage({
+  searchParams,
+}: {
+  searchParams: Promise<{
+    callbackUrl?: string | string[];
+    inviteReturn?: string | string[];
+  }>;
+}) {
+  const params = await searchParams;
+  // A genuinely explicit deep link only (null when absent/unsafe/self-referential).
+  // The detour never carries a flow-materialised default, so this is the sole
+  // "user asked for a specific page" signal here (D-D4).
+  const explicitCallbackUrl =
+    getExplicitCallbackUrl(singleSearchParam(params.callbackUrl)) ?? undefined;
+  // #2974: the tab-binding nonce the family-invite page minted, carried across
+  // the detour hop that brought us here. Tokenless, and shape-checked before it
+  // is forwarded anywhere; a missing or malformed value simply means the invite
+  // address is not honoured and the member lands where they normally would.
+  const familyInviteReturnNonce =
+    getFamilyInviteReturnNonce(params.inviteReturn) ?? undefined;
+  const session = await auth();
+
+  if (!session?.user) {
+    redirect(buildLoginPath(explicitCallbackUrl));
+  }
+
+  if (session.user.forcePasswordChange) {
+    redirect("/change-password");
+  }
+
+  // Resolve the default landing here (#2090), from the live session's preference
+  // + admin matrix (both refreshed by the auth jwt callback and unchanged by the
+  // 2FA step), so post-verification navigation is deterministic — computed
+  // server-side from the authoritative session, never a raced post-signIn fetch.
+  // An explicit deep link still wins (D-D4). This is the single authoritative
+  // resolution site for a member reaching verification via any entry point.
+  // #2827: a 2FA-enabled member who came from a family invite must still land back
+  // on the invite after the challenge. The address is read from the HttpOnly cookie
+  // rather than carried in this page's query string, and the panel below only ever
+  // passes it to `window.location.replace()` — never into a rendered attribute. #2974: and
+  // only when this request presents the nonce the invite page's own tab was given.
+  const landing = resolvePostLoginLandingPath({
+    explicitCallbackUrl,
+    familyInviteReturn: {
+      cookieValue: await readFamilyInviteReturnCookieValue(),
+      presentedNonce: familyInviteReturnNonce,
+    },
+    landingPreference: session.user.postLoginLanding,
+    permissionInput: {
+      adminPermissionMatrix: session.user.adminPermissionMatrix,
+      canLogin: session.user.canLogin,
+    },
+  });
+
+  if (!session.user.twoFactorRequired || session.user.twoFactorVerified) {
+    redirect(landing);
+  }
+
+  if (
+    !isSecondFactorEnrolled({
+      twoFactorEnabled: false,
+      hasPasskey: session.user.hasPasskey === true,
+      sessionEnrolled: session.user.twoFactorEnrolled === true,
+    })
+  ) {
+    // Carry only the explicit deep link across to /login/enroll; that page
+    // re-resolves the default the same way, so the detour hop never bakes one in.
+    // The #2974 tab-binding nonce rides along too, so the second hop can still
+    // honour the family-invite address — it is the nonce, never the invite path.
+    const query = new URLSearchParams();
+    if (explicitCallbackUrl) {
+      query.set("callbackUrl", explicitCallbackUrl);
+    }
+    appendFamilyInviteReturnParam(query, familyInviteReturnNonce);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    redirect(`/login/enroll${suffix}`);
+  }
+
+  // #4456: recovery codes issued under a retired key no longer sign anyone in;
+  // the member is told here, at sign-in, rather than discovering it when they
+  // have lost their authenticator.
+  return (
+    <TwoFactorVerifyPanel
+      callbackUrl={landing}
+      enrolledMethod={session.user.twoFactorMethod}
+      hasPasskey={session.user.hasPasskey === true}
+      recoveryCodesRetired={await memberHoldsRetiredRecoveryCodes(session.user.id)}
+    />
+  );
+}

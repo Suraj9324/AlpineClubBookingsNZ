@@ -1,0 +1,49 @@
+import type { Metadata } from "next";
+import { BackLink } from "@/components/admin/back-link";
+import { getServerNzSetupState } from "@/lib/servernz-config";
+import { loadServerNzSettings, serverNzDefaultBaseUrl } from "@/lib/servernz-settings";
+import { AlpineServerSetup } from "./alpine-server-setup";
+import { getAdminPage } from "@/lib/admin-hubs";
+
+export const metadata: Metadata = {
+  title: getAdminPage("alpine-server-setup").label,
+};
+
+// Server component: resolves the (metadata-only) connection state once, then
+// renders the interactive setup. The API key value is never read here — only
+// whether one is stored.
+export default async function AlpineServerSetupPage() {
+  const [setupState, settings] = await Promise.all([
+    getServerNzSetupState(),
+    loadServerNzSettings(),
+  ]);
+
+  return (
+    <div className="max-w-6xl p-6">
+      <BackLink href="/admin/integrations" label="Integrations" />
+      <h1 className="mt-2 mb-2 text-2xl font-bold">{getAdminPage("alpine-server-setup").label}</h1>
+      <p className="mb-6 text-muted-foreground">
+        Connect this club to the Alpine Central Server (ServerNZ). Request a
+        connection, store the API key you are issued, then upload or download the
+        data shared across clubs.
+      </p>
+
+      <AlpineServerSetup
+        initialState={{
+          apiKeySet: setupState.apiKeySet,
+          apiKeyUpdatedAt: setupState.apiKeyUpdatedAt,
+          baseUrl: settings.baseUrl,
+          // triyder/AlpineClubBookingsNZ#81: offered only while nothing is saved; the Save stores it.
+          defaultBaseUrl: settings.baseUrl ? null : serverNzDefaultBaseUrl(),
+          otherLodgesEnabled: settings.otherLodgesEnabled,
+          otherLodgesLastUploadAt: settings.otherLodgesLastUploadAt,
+          otherLodgesLastDownloadAt: settings.otherLodgesLastDownloadAt,
+          // The STORED answer (triyder/AlpineClubBookingsNZ#49), shown at once; the component then asks
+          // the server once on entry through the version route.
+          serverVersion: settings.serverVersion,
+          serverVersionCheckedAt: settings.serverVersionCheckedAt,
+        }}
+      />
+    </div>
+  );
+}

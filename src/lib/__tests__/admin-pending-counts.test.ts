@@ -1,0 +1,467 @@
+vi.mock("@/lib/xero-webhook-health", () => ({ getXeroWebhookHealth: vi.fn().mockResolvedValue({ connected: false, silent: false, hours: 24, lastReceivedAt: null }) }));
+import { buildUnpaidFinishedStaysWhere } from "@/lib/unpaid-finished-stays";
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import { BookingRequestStatus, ManualRefundTaskKind } from "@prisma/client";
+
+/*
+  The three date-bounded queues below are bounded on the CLUB's day, from its
+  persisted timezone, never on the container's (#3123). The environment's default
+  is `Pacific/Auckland` — what the replaced `getTodayDateOnly()` answered here —
+  while the persisted club zone is `America/Denver`. (The `APP_TIME_ZONE` pin
+  that used to sit here went with the constant in #3567; nothing reads the
+  environment's zone any more.) Under the frozen clock that is 1 July against 30 June, so a
+  bound taken from the environment fails these assertions instead of matching
+  them. Before #3123 this file compared against `getTodayDateOnly()` itself,
+  which agreed with the subject however wrong both were.
+*/
+vi.mock("server-only", () => ({}));
+
+
+const mocks = vi.hoisted(() => ({
+  familyGroupJoinRequestCount: vi.fn(),
+  memberApplicationCount: vi.fn(),
+  refundRequestCount: vi.fn(),
+  manualRefundTaskCount: vi.fn(),
+  adminCreditAdjustmentRequestCount: vi.fn(),
+  bookingCount: vi.fn(),
+  bookingChangeRequestCount: vi.fn(),
+  newBookingPolicyExceptionRequestCount: vi.fn(),
+  bookingRequestCount: vi.fn(),
+  deletionRequestCount: vi.fn(),
+  issueReportCount: vi.fn(),
+  getPendingMembershipCancellationReviewCount: vi.fn(),
+  getPendingMemberArchiveReviewCount: vi.fn(),
+  getPendingMemberDeleteReviewCount: vi.fn(),
+  getUnassignedHutLeaderDates: vi.fn(),
+  getStuckStateAffectedCount: vi.fn(),
+  loggerError: vi.fn(),
+  clubTimeSettingsFindUnique: vi.fn(),
+}));
+
+vi.mock("@/lib/stuck-state-affected-count", () => ({
+  getStuckStateAffectedCount: mocks.getStuckStateAffectedCount,
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: { error: mocks.loggerError, warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    familyGroupJoinRequest: { count: mocks.familyGroupJoinRequestCount },
+    memberApplication: { count: mocks.memberApplicationCount },
+    refundRequest: { count: mocks.refundRequestCount },
+    manualRefundTask: { count: mocks.manualRefundTaskCount },
+    adminCreditAdjustmentRequest: {
+      count: mocks.adminCreditAdjustmentRequestCount,
+    },
+    booking: { count: mocks.bookingCount },
+    bookingChangeRequest: { count: mocks.bookingChangeRequestCount },
+    newBookingPolicyExceptionRequest: {
+      count: mocks.newBookingPolicyExceptionRequestCount,
+    },
+    bookingRequest: { count: mocks.bookingRequestCount },
+    deletionRequest: { count: mocks.deletionRequestCount },
+    issueReport: { count: mocks.issueReportCount },
+    // Load-bearing: `getClubTimeZone` is fail-soft on a missing delegate and
+    // degrades silently to the environment, which is precisely the reading
+    // this file must be able to reject (#3123).
+    clubTimeSettings: { findUnique: mocks.clubTimeSettingsFindUnique },
+  },
+}));
+
+vi.mock("@/lib/membership-cancellation-admin", () => ({
+  getPendingMembershipCancellationReviewCount:
+    mocks.getPendingMembershipCancellationReviewCount,
+}));
+
+vi.mock("@/lib/member-lifecycle-actions", () => ({
+  getPendingMemberArchiveReviewCount: mocks.getPendingMemberArchiveReviewCount,
+  getPendingMemberDeleteReviewCount: mocks.getPendingMemberDeleteReviewCount,
+}));
+
+vi.mock("@/lib/hut-leader-coverage", () => ({
+  getUnassignedHutLeaderDates: mocks.getUnassignedHutLeaderDates,
+}));
+
+import { getAdminPendingCounts } from "@/lib/admin-pending-counts";
+
+/** The club's day at the frozen instant, as Prisma's `@db.Date` encoding. */
+const CLUB_DAY = new Date("2026-06-30T00:00:00.000Z");
+/** What `Pacific/Auckland` would have said. No bound below may equal this. */
+const ENVIRONMENT_DAY = new Date("2026-07-01T00:00:00.000Z");
+
+function persistClubZone(timeZone: string) {
+  mocks.clubTimeSettingsFindUnique.mockResolvedValue({
+    timeZone,
+    updatedByMemberId: null,
+    updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+  });
+}
+
+describe("getAdminPendingCounts", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    persistClubZone("America/Denver");
+    mocks.familyGroupJoinRequestCount.mockResolvedValue(1);
+    mocks.memberApplicationCount.mockResolvedValue(2);
+    mocks.refundRequestCount.mockResolvedValue(3);
+    mocks.manualRefundTaskCount.mockResolvedValue(15);
+    mocks.adminCreditAdjustmentRequestCount.mockResolvedValue(4);
+    // prisma.booking.count backs four queues: pending admin booking reviews,
+    // unpaid finished stays (#1731), and the two halves of the unsettled stay
+    // additions queue — finished (#1723) and still upcoming (#2350).
+    // Discriminate on the where-clause; the additions halves differ only in the
+    // direction of their check-out bound.
+    mocks.bookingCount.mockImplementation(
+      async ({
+        where,
+      }: {
+        where: { OR?: unknown; payment?: unknown; checkOut?: { gt?: Date } };
+      }) => {
+        if (where.payment) return where.checkOut?.gt ? 15 : 13;
+        // The unpaid-finished-stays queue is the one OR-shaped where (#4019).
+        return where.OR ? 12 : 5;
+      },
+    );
+    // One table, two queues (#4969): LOCKED_PERIOD rows are the Changes tab,
+    // POLICY_EXCEPTION rows join the new-booking exceptions on their tab.
+    mocks.bookingChangeRequestCount.mockImplementation(
+      async ({ where }: { where: { kind?: string } }) =>
+        where.kind === "LOCKED_PERIOD" ? 6 : where.kind === "POLICY_EXCEPTION" ? 3 : 999,
+    );
+    mocks.newBookingPolicyExceptionRequestCount.mockResolvedValue(16);
+    mocks.bookingRequestCount.mockResolvedValue(7);
+    mocks.getPendingMembershipCancellationReviewCount.mockResolvedValue(8);
+    mocks.getPendingMemberArchiveReviewCount.mockResolvedValue(9);
+    mocks.deletionRequestCount.mockResolvedValue(10);
+    mocks.getPendingMemberDeleteReviewCount.mockResolvedValue(14);
+    mocks.issueReportCount.mockResolvedValue(11);
+    mocks.getStuckStateAffectedCount.mockResolvedValue(17);
+    // Uncovered lodge-nights (#2917), not bare dates: the SAME night at two
+    // lodges is two rows, and the badge counts two — the sidebar number is
+    // pieces of work, not calendar days.
+    mocks.getUnassignedHutLeaderDates.mockResolvedValue([
+      {
+        date: "2026-07-04",
+        lodgeId: "lodge-a",
+        lodgeName: "Alpine Lodge",
+        lodgeActive: true,
+        bookingCount: 1,
+        guestCount: 2,
+      },
+      {
+        date: "2026-07-04",
+        lodgeId: "lodge-b",
+        lodgeName: "Basin Lodge",
+        lodgeActive: true,
+        bookingCount: 1,
+        guestCount: 1,
+      },
+    ]);
+  });
+
+  it("returns every queue count keyed for the sidebar", async () => {
+    expect(await getAdminPendingCounts()).toEqual({
+      xeroSilentWebhook: 0,
+      familyRequests: 1,
+      memberApplications: 2,
+      refundAppeals: 3,
+      manualRefundTasks: 15,
+      creditApprovals: 4,
+      bookingReviews: 5,
+      lockedPeriodChangeRequests: 6,
+      policyExceptionRequests: 16 + 3,
+      publicBookingRequests: 7,
+      unpaidFinishedStays: 12,
+      unsettledAdditionalFinishedStays: 13,
+      unsettledAdditionalUpcomingStays: 15,
+      membershipCancellations: 8,
+      archiveRequests: 9,
+      deletionRequests: 10,
+      memberDeleteRequests: 14,
+      issueReports: 11,
+      unassignedHutLeaderDates: 2,
+      stuckStatesAffected: 17,
+      unavailable: [],
+    });
+  });
+
+  // #4344: the finance queue leaves a retired officer edit review out of its
+  // OPEN read, so the badge must too. Counting it would show a badge of one
+  // over an empty queue with no control to clear it. The `kind: null` arm keeps
+  // legacy hand-backs written before the column existed in the count.
+  it("counts manual refund tasks with the finance queue's own OPEN where, leaving retired edit reviews out", async () => {
+    await getAdminPendingCounts();
+    expect(mocks.manualRefundTaskCount).toHaveBeenCalledTimes(1);
+    expect(mocks.manualRefundTaskCount).toHaveBeenCalledWith({
+      where: {
+        status: "OPEN",
+        OR: [
+          { kind: null },
+          { kind: { not: ManualRefundTaskKind.EDIT_FINANCIAL_REVIEW } },
+        ],
+      },
+    });
+  });
+
+  it("returns the other counts when one counter throws, naming the failed one (#4962)", async () => {
+    // A database blip on ONE queue used to reject the whole Promise.all, and
+    // the sidebar read every count as zero.
+    mocks.issueReportCount.mockRejectedValue(new Error("connection reset"));
+    mocks.getStuckStateAffectedCount.mockRejectedValue(new Error("scan failed"));
+
+    const counts = await getAdminPendingCounts();
+
+    expect(counts.unavailable).toEqual(["issueReports", "stuckStatesAffected"]);
+    expect(counts.issueReports).toBe(0);
+    expect(counts.stuckStatesAffected).toBe(0);
+    expect(counts.bookingReviews).toBe(5);
+    expect(counts.manualRefundTasks).toBe(15);
+    expect(mocks.loggerError).toHaveBeenCalledWith(
+      expect.objectContaining({ count: "issueReports" }),
+      expect.any(String),
+    );
+  });
+
+  // The four Booking Requests counts are one read of the helper the page's tab
+  // badges share (#4969), taken once per batch: four counters each making their
+  // own call would run 20 queries on every sidebar refetch instead of 5.
+  it("reads the four Booking Requests counts once per batch, not once per counter", async () => {
+    await getAdminPendingCounts();
+    expect(mocks.newBookingPolicyExceptionRequestCount).toHaveBeenCalledTimes(1);
+    expect(mocks.bookingRequestCount).toHaveBeenCalledTimes(1);
+    // LOCKED_PERIOD and POLICY_EXCEPTION: two queries, once each.
+    expect(mocks.bookingChangeRequestCount).toHaveBeenCalledTimes(2);
+
+    await getAdminPendingCounts();
+    expect(mocks.newBookingPolicyExceptionRequestCount).toHaveBeenCalledTimes(2);
+  });
+
+  it("names all four Booking Requests counts unavailable when their one read fails, and loads the rest", async () => {
+    // Once only: four counters each making their own read would see one
+    // failure and three successes, so this proves the four share one read.
+    mocks.newBookingPolicyExceptionRequestCount.mockRejectedValueOnce(
+      new Error("connection reset"),
+    );
+
+    const counts = await getAdminPendingCounts();
+
+    expect([...counts.unavailable].sort()).toEqual(
+      [
+        "bookingReviews",
+        "lockedPeriodChangeRequests",
+        "policyExceptionRequests",
+        "publicBookingRequests",
+      ].sort(),
+    );
+    expect(counts.bookingReviews).toBe(0);
+    expect(counts.publicBookingRequests).toBe(0);
+    // Every other queue still arrives.
+    expect(counts.familyRequests).toBe(1);
+    expect(counts.manualRefundTasks).toBe(15);
+    expect(counts.issueReports).toBe(11);
+    expect(counts.unpaidFinishedStays).toBe(12);
+  });
+
+  it("uses a count the caller supplies and does not scan for it a second time (#4962 review)", async () => {
+    // The dashboard already reads the uncovered nights for its hut-leader cards
+    // and hands that number in, so the page holds one number, from one read.
+    const counts = await getAdminPendingCounts({
+      supplied: { unassignedHutLeaderDates: Promise.resolve(7) },
+    });
+
+    expect(counts.unassignedHutLeaderDates).toBe(7);
+    expect(counts.unavailable).toEqual([]);
+    expect(mocks.getUnassignedHutLeaderDates).not.toHaveBeenCalled();
+    // Every other queue is still counted.
+    expect(counts.bookingReviews).toBe(5);
+    expect(counts.issueReports).toBe(11);
+  });
+
+  it("names a supplied count that rejects as unavailable, whenever it rejects (#4962 review)", async () => {
+    // Rejected while the club day is still being read (a real database round
+    // trip, a macrotask here), so nothing awaits it yet: that must be reported as
+    // a failed count, and must not surface as an unhandled rejection, which
+    // vitest turns into a failed run.
+    mocks.clubTimeSettingsFindUnique.mockImplementation(
+      () =>
+        new Promise((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                timeZone: "America/Denver",
+                updatedByMemberId: null,
+                updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+              }),
+            20,
+          ),
+        ),
+    );
+    const failed = Promise.reject(new Error("coverage read failed"));
+
+    const counts = await getAdminPendingCounts({
+      supplied: { unassignedHutLeaderDates: failed },
+    });
+
+    expect(counts.unavailable).toEqual(["unassignedHutLeaderDates"]);
+    expect(counts.unassignedHutLeaderDates).toBe(0);
+    expect(counts.bookingReviews).toBe(5);
+    expect(mocks.getUnassignedHutLeaderDates).not.toHaveBeenCalled();
+    expect(mocks.loggerError).toHaveBeenCalledWith(
+      expect.objectContaining({ count: "unassignedHutLeaderDates" }),
+      expect.any(String),
+    );
+  });
+
+  it("uses the club day a caller passes rather than reading its own", async () => {
+    // The dashboard holds one club day for its whole render (#3123).
+    const passed = new Date("2026-05-01T00:00:00.000Z");
+    await getAdminPendingCounts({ today: passed });
+
+    expect(mocks.getUnassignedHutLeaderDates).toHaveBeenCalledWith({
+      today: passed,
+      scope: { kind: "all" },
+    });
+    expect(mocks.clubTimeSettingsFindUnique).not.toHaveBeenCalled();
+  });
+
+  // These where-clauses mirror the individual queue routes; if one of these
+  // assertions fails, the matching route's queue definition changed and
+  // admin-pending-counts.ts must be updated with it.
+  it("counts with the same where-clauses as the queue routes", async () => {
+    await getAdminPendingCounts();
+
+    expect(mocks.familyGroupJoinRequestCount).toHaveBeenCalledWith({
+      where: {
+        status: "PENDING",
+        type: {
+          in: [
+            "JOIN_REQUEST",
+            "CHILD_REQUEST",
+            "ADULT_REQUEST",
+            "REMOVAL_REQUEST",
+            "GROUP_CREATE",
+          ],
+        },
+      },
+    });
+    expect(mocks.memberApplicationCount).toHaveBeenCalledWith({
+      where: { status: "PENDING_ADMIN" },
+    });
+    expect(mocks.refundRequestCount).toHaveBeenCalledWith({
+      where: { status: "PENDING" },
+    });
+    expect(mocks.adminCreditAdjustmentRequestCount).toHaveBeenCalledWith({
+      where: { status: "PENDING" },
+    });
+    expect(mocks.bookingCount).toHaveBeenCalledWith({
+      where: { deletedAt: null, adminReviewStatus: "PENDING" },
+    });
+    // Unpaid finished stays (#1709/#1731): mirrors the dashboard attention
+    // card via the shared src/lib/unpaid-finished-stays.ts predicate.
+    expect(mocks.bookingCount).toHaveBeenCalledWith({
+      where: buildUnpaidFinishedStaysWhere(CLUB_DAY),
+    });
+    // Unsettled finished-stay additions (#1723 path 2): mirrors the sibling
+    // dashboard card via the same shared module. Statuses deliberately
+    // exclude PAYMENT_PENDING so the two booking queues stay disjoint.
+    expect(mocks.bookingCount).toHaveBeenCalledWith({
+      where: {
+        deletedAt: null,
+        checkOut: { lte: CLUB_DAY },
+        status: { in: ["CONFIRMED", "PAID", "COMPLETED"] },
+        payment: {
+          is: {
+            additionalAmountCents: { gt: 0 },
+            OR: [
+              { additionalPaymentStatus: null },
+              { additionalPaymentStatus: { not: "SUCCEEDED" } },
+            ],
+          },
+        },
+      },
+    });
+    // Mirrors /api/admin/booking-change-requests (LOCKED_PERIOD only) and the
+    // unified exception queue (POLICY_EXCEPTION change requests + new-booking
+    // exception requests), so each tab's badge counts the list it shows.
+    expect(mocks.bookingChangeRequestCount).toHaveBeenCalledWith({
+      where: { kind: "LOCKED_PERIOD", status: "REQUESTED" },
+    });
+    expect(mocks.bookingChangeRequestCount).toHaveBeenCalledWith({
+      where: { kind: "POLICY_EXCEPTION", status: "REQUESTED" },
+    });
+    expect(mocks.newBookingPolicyExceptionRequestCount).toHaveBeenCalledWith({
+      where: { status: "REQUESTED" },
+    });
+    expect(mocks.bookingRequestCount).toHaveBeenCalledWith({
+      where: {
+        status: {
+          in: [
+            BookingRequestStatus.VERIFIED,
+            BookingRequestStatus.PRICED,
+            BookingRequestStatus.QUOTED,
+            BookingRequestStatus.QUOTE_SENT,
+            BookingRequestStatus.ACCEPTED,
+            BookingRequestStatus.QUERY_PENDING,
+            BookingRequestStatus.MODIFICATION_REQUESTED,
+          ],
+        },
+      },
+    });
+    // #2597: a request mid-approval has already cancelled bookings and still
+    // owes the member its anonymisation, so it stays in the admin's count.
+    expect(mocks.deletionRequestCount).toHaveBeenCalledWith({
+      where: { status: { in: ["PENDING", "APPROVAL_IN_PROGRESS"] } },
+    });
+    expect(mocks.issueReportCount).toHaveBeenCalledWith({
+      where: { resolvedAt: null },
+    });
+  });
+
+  it("bounds every date-sensitive queue on ONE club day, hut-leader coverage included", async () => {
+    // Three queues and the coverage read all key on today. Resolved
+    // independently they could straddle club midnight and report counts from two
+    // different days beside each other in the same sidebar (#3123).
+    await getAdminPendingCounts();
+
+    const bounds = mocks.bookingCount.mock.calls
+      .map(([args]) => (args as { where: { checkOut?: { lte?: Date } } }).where.checkOut?.lte)
+      .filter((bound): bound is Date => bound instanceof Date);
+    expect(bounds).toHaveLength(2);
+    expect(new Set(bounds.map((bound) => bound.toISOString()))).toEqual(
+      new Set([CLUB_DAY.toISOString()]),
+    );
+    expect(mocks.getUnassignedHutLeaderDates).toHaveBeenCalledWith({
+      today: CLUB_DAY,
+      scope: { kind: "all" },
+    });
+  });
+
+  it("moves those bounds when the persisted club zone moves", async () => {
+    // Kills a hard-coded `Pacific/Auckland` and every other way of ignoring the
+    // stored row. Same clock, same mocks; only the club's zone differs.
+    persistClubZone("Pacific/Kiritimati"); // UTC+14 — the club's day is 1 July
+
+    await getAdminPendingCounts();
+
+    expect(mocks.getUnassignedHutLeaderDates).toHaveBeenCalledWith({
+      today: ENVIRONMENT_DAY,
+      scope: { kind: "all" },
+    });
+  });
+
+  it("really asks the ClubTimeSettings row for the zone", async () => {
+    await getAdminPendingCounts();
+
+    expect(mocks.clubTimeSettingsFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "default" } }),
+    );
+  });
+  it("surfaces a silent webhook in the Needs Attention count", async () => {
+    const { getXeroWebhookHealth } = await import("@/lib/xero-webhook-health");
+    vi.mocked(getXeroWebhookHealth).mockResolvedValueOnce({ connected: true, silent: true, hours: 24, lastReceivedAt: null });
+    expect((await getAdminPendingCounts()).xeroSilentWebhook).toBe(1);
+  });
+
+});

@@ -1,0 +1,85 @@
+import { describe, expect, it } from "vitest";
+import {
+  BookingGuestStayRangeValidationError,
+  normalizeGuestStayRanges,
+  type BookingGuestStayRangeInput,
+} from "@/lib/booking-guest-stay-range-input";
+import { formatDateOnly, parseDateOnly } from "@/lib/date-only";
+
+describe("normalizeGuestStayRanges", () => {
+  const booking = {
+    checkIn: parseDateOnly("2026-07-10"),
+    checkOut: parseDateOnly("2026-07-14"),
+  };
+
+  it("defaults guests without per-guest dates to the booking range", () => {
+    const inputGuests: Array<
+      { ageTier: "ADULT"; isMember: boolean } & BookingGuestStayRangeInput
+    > = [{ ageTier: "ADULT", isMember: true }];
+    const guests = normalizeGuestStayRanges(inputGuests, booking);
+
+    expect(formatDateOnly(guests[0].stayStart)).toBe("2026-07-10");
+    expect(formatDateOnly(guests[0].stayEnd)).toBe("2026-07-14");
+  });
+
+  it("normalizes date-only guest range strings", () => {
+    const guests = normalizeGuestStayRanges(
+      [
+        {
+          ageTier: "ADULT" as const,
+          isMember: true,
+          stayStart: "2026-07-11",
+          stayEnd: "2026-07-13",
+        },
+      ],
+      booking
+    );
+
+    expect(formatDateOnly(guests[0].stayStart)).toBe("2026-07-11");
+    expect(formatDateOnly(guests[0].stayEnd)).toBe("2026-07-13");
+  });
+
+  it("rejects a partial guest date range", () => {
+    expect(() =>
+      normalizeGuestStayRanges(
+        [{ ageTier: "ADULT" as const, isMember: true, stayStart: "2026-07-11" }],
+        booking
+      )
+    ).toThrow(BookingGuestStayRangeValidationError);
+  });
+
+  it("rejects empty and inverted ranges", () => {
+    expect(() =>
+      normalizeGuestStayRanges(
+        [
+          {
+            ageTier: "ADULT" as const,
+            isMember: true,
+            stayStart: "2026-07-11",
+            stayEnd: "2026-07-11",
+          },
+        ],
+        booking
+      )
+    ).toThrow("Date Out must be after Date In");
+  });
+
+  it("accepts a range outside the booking dates so it can auto-expand (issue #713)", () => {
+    // Previously this threw "guest dates must stay within ...". The booking
+    // range now auto-expands to cover guest dates instead of rejecting them.
+    const guests = normalizeGuestStayRanges(
+      [
+        {
+          ageTier: "ADULT" as const,
+          isMember: true,
+          stayStart: "2026-07-09",
+          stayEnd: "2026-07-11",
+        },
+      ],
+      booking
+    );
+
+    expect(formatDateOnly(guests[0].stayStart)).toBe("2026-07-09");
+    expect(formatDateOnly(guests[0].stayEnd)).toBe("2026-07-11");
+  });
+});

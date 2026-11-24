@@ -1,0 +1,239 @@
+/**
+ * N-09: Bulk Member Communication
+ * POST /api/admin/communications/send
+ * Admin-only. Rate limited to BULK_SENDMAIL_LIMIT sends per hour.
+ * Each send declares a category (club notice or newsletter); who receives it
+ * is decided by the shared bulk-email rule (#4987, INV-PRIV-026).
+ * Sanitises input to prevent HTML/header injection.
+ *
+ * GET returns the rate limit and, given `?recipientFilter=&category=`, how many
+ * accounts that audience reaches and how many the category's preference rule
+ * excludes, for the page's live count and confirmation step (#4964, #4987). It
+ * sends nothing and never touches the hourly quota; it must stay a GET, because
+ * the POST spends the quota before it reads its body.
+ */
+import { NextResponse, type NextRequest } from "next/server";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { requireAdmin } from "@/lib/session-guards";
+import { z } from "zod";
+import { checkRateLimit, type RateLimitConfig } from "@/lib/rate-limit";
+import {
+  bulkCommunicationTemplate,
+} from "@/lib/email-templates/communications";
+import { logAudit } from "@/lib/audit";
+import logger from "@/lib/logger";
+import {
+  BULK_RECIPIENT_FILTERS,
+  bulkCommunicationCounts,
+  selectBulkCommunicationRecipients,
+} from "@/lib/bulk-communication-recipients";
+import { BULK_EMAIL_CATEGORIES } from "@/lib/email/bulk-audience";
+import { renderEmailHtml } from "@/lib/email-theme";
+
+const DEFAULT_BULK_SENDMAIL_LIMIT = 1;
+
+function resolveBulkSendMailLimit() {
+  const parsed = Number.parseInt(process.env.BULK_SENDMAIL_LIMIT ?? "", 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return DEFAULT_BULK_SENDMAIL_LIMIT;
+}
+
+const bulkSendRateLimit: RateLimitConfig = {
+  id: "bulk-communication",
+  limit: resolveBulkSendMailLimit(),
+  windowSeconds: 60 * 60, // 1 hour
+};
+
+// A request that names no category gets the opt-in newsletter rule, so an older
+// page still open during a deploy can never widen who is emailed.
+const categorySchema = z.enum(BULK_EMAIL_CATEGORIES).default("newsletter");
+
+const sendSchema = z.object({
+  subject: z
+    .string()
+    .min(1, "Subject is required")
+    .max(200, "Subject must be under 200 characters")
+    .transform((s) => s.replace(/[\r\n]/g, " ")), // Strip newlines to prevent header injection
+  body: z
+    .string()
+    .min(1, "Body is required")
+    .max(10000, "Body must be under 10,000 characters"),
+  recipientFilter: z.enum(BULK_RECIPIENT_FILTERS),
+  memberIds: z.array(z.string()).optional(),
+  category: categorySchema,
+});
+
+// The page offers only the named audiences; `custom` needs a member list, which
+// a query string is no place for.
+const countQuerySchema = z.object({
+  recipientFilter: z.enum(BULK_RECIPIENT_FILTERS).exclude(["custom"]).optional(),
+  category: categorySchema,
+});
+
+export async function GET(request: NextRequest) {
+  const guard = await requireAdmin({
+    permission: { area: "membership", level: "view" },
+  });
+  if (!guard.ok) return guard.response;
+
+  const parsed = countQuerySchema.safeParse(
+    Object.fromEntries(request.nextUrl.searchParams),
+  );
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid query parameters", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const rateLimit = {
+    limit: bulkSendRateLimit.limit,
+    windowSeconds: bulkSendRateLimit.windowSeconds,
+  };
+  const { recipientFilter, category } = parsed.data;
+  if (!recipientFilter) return NextResponse.json(rateLimit);
+
+  // Counts only, never addresses: a membership:view admin may call this.
+  const selection = await selectBulkCommunicationRecipients(
+    recipientFilter,
+    undefined,
+    category,
+  );
+  return NextResponse.json({
+    ...rateLimit,
+    recipientFilter,
+    category,
+    ...bulkCommunicationCounts(selection),
+  });
+}
+
+export async function POST(request: Request) {
+  const guard = await requireAdmin({
+    permission: { area: "membership", level: "edit" },
+  });
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+  // Rate limit is keyed by "admin" since this is a global communication action.
+  const rlResult = await checkRateLimit(bulkSendRateLimit, "admin-global");
+  if (!rlResult.success) {
+    const retryAfter = Math.ceil((rlResult.resetAt - Date.now()) / 1000);
+    return NextResponse.json(
+      {
+        error: `Rate limit exceeded. Maximum ${bulkSendRateLimit.limit} bulk send per hour.`,
+      },
+      {
+        status: 429,
+        headers: { "Retry-After": String(retryAfter) },
+      },
+    );
+  }
+
+  const jsonBody = await parseJsonRequestBody(request, {
+    error: "Invalid JSON",
+  });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = sendSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid input", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const {
+    subject,
+    body: messageBody,
+    recipientFilter,
+    memberIds,
+    category,
+  } = parsed.data;
+
+  if (
+    recipientFilter === "custom" &&
+    (!memberIds || memberIds.length === 0)
+  ) {
+    return NextResponse.json(
+      { error: "memberIds required for custom filter" },
+      { status: 400 },
+    );
+  }
+
+  const selection = await selectBulkCommunicationRecipients(
+    recipientFilter,
+    memberIds,
+    category,
+  );
+  const eligibleRecipients = selection.eligible;
+  const counts = bulkCommunicationCounts(selection);
+
+  // Generate the email HTML (using escapeHtml inside the template)
+  const html = await renderEmailHtml(() => bulkCommunicationTemplate(subject, messageBody));
+
+  const queued = eligibleRecipients.length;
+
+  // Send emails in background with batching to avoid SMTP rate limits.
+  // sendEmail() handles its own EmailLog creation — no manual QUEUED records needed.
+  const BATCH_SIZE = 10;
+  const BATCH_DELAY_MS = 1000; // 1 second between batches
+
+  (async () => {
+    const { sendEmail } = await import("@/lib/email");
+    for (const [i, recipient] of eligibleRecipients.entries()) {
+      try {
+        await sendEmail({
+          to: recipient.email,
+          subject,
+          html,
+          // Ad-hoc admin broadcast, addressed to members rather than to a
+          // booking (#2258).
+          bookingContext: "none",
+          templateName: "bulk-communication",
+          templateData: {
+            adminEnteredSubject: subject,
+            adminEnteredBody: messageBody,
+          },
+        });
+      } catch (err) {
+        logger.error(
+          { err, email: recipient.email },
+          "Failed to send bulk communication email",
+        );
+      }
+      // Pause between batches to avoid overwhelming SMTP
+      if ((i + 1) % BATCH_SIZE === 0 && i + 1 < eligibleRecipients.length) {
+        await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
+      }
+    }
+  })();
+
+  logAudit({
+    action: "BULK_COMMUNICATION_SENT",
+    // Safe here only BECAUSE Child 1 moved `communication` out of the
+    // support-only system correlation entry into the membership one (#2581
+    // decision 7). Under the previous map this would have put bulk-email
+    // evidence behind `support:view` alone. No entity identifier: the send
+    // targets a recipient FILTER, not one record, and `details` already names
+    // the filter and the counts.
+    category: "communication",
+    memberId: session.user.id,
+    details: JSON.stringify({
+      subject,
+      recipientFilter,
+      category,
+      ...counts,
+      queued,
+    }),
+  });
+
+  return NextResponse.json({
+    success: true,
+    category,
+    ...counts,
+    queued,
+    filteredByPreference: counts.optedOut + counts.neverOptedIn,
+  });
+}

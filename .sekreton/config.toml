@@ -1,0 +1,72 @@
+schema = 1
+
+[environment]
+packages = ["postgresql", "gh"]
+
+[setup]
+run = '''
+git config --global user.name "thatskiff33-agents" &&
+git config --global user.email "318094810+thatskiff33-agents@users.noreply.github.com" &&
+git config --global pull.rebase true &&
+git config --local user.name "thatskiff33-agents" &&
+git config --local user.email "318094810+thatskiff33-agents@users.noreply.github.com" &&
+git config --local pull.rebase true &&
+mkdir -p "$HOME/.cursor" &&
+node -e 'const f=process.env.HOME+"/.cursor/cli-config.json";const fs=require("fs");let d={};try{d=JSON.parse(fs.readFileSync(f,"utf8"))}catch{};d.attribution={...(d.attribution||{}),attributeCommitsToAgent:false,attributePRsToAgent:false};fs.writeFileSync(f,JSON.stringify(d,null,2)+"\n")' &&
+{ [ -z "${CURSOR_CONFIG_DIR:-}" ] || {
+  mkdir -p "$CURSOR_CONFIG_DIR" &&
+  node -e 'const f=process.env.CURSOR_CONFIG_DIR+"/cli-config.json";const fs=require("fs");let d={};try{d=JSON.parse(fs.readFileSync(f,"utf8"))}catch{};d.attribution={...(d.attribution||{}),attributeCommitsToAgent:false,attributePRsToAgent:false};fs.writeFileSync(f,JSON.stringify(d,null,2)+"\n")'
+}; } &&
+hooks_dir=$(git rev-parse --git-path hooks) &&
+mkdir -p "$hooks_dir" &&
+cat > "$hooks_dir/commit-msg" << 'EOF' &&
+#!/bin/sh
+# Drop Cursor's Co-authored-by trailer. It is already on the message
+# when this hook runs; attribution flags written at setup are not.
+tmp="${1}.strip"
+grep -viE '^Co-authored-by:[[:space:]].*@cursor\.com>?[[:space:]]*$' "$1" > "$tmp" || true
+mv "$tmp" "$1"
+EOF
+chmod +x "$hooks_dir/commit-msg" &&
+node_version=$(cat .nvmrc) &&
+node_major=${node_version%%.*} &&
+{ node -v | grep -q "^v${node_major}\." || {
+  mkdir -p "$SETUP_TOOL_DIR/bin" &&
+  curl -fsSL -o "$SETUP_TOOL_DIR/node.tar.xz" "https://nodejs.org/dist/v${node_version}/node-v${node_version}-linux-x64.tar.xz" &&
+  tar -xJf "$SETUP_TOOL_DIR/node.tar.xz" -C "$SETUP_TOOL_DIR" &&
+  rm "$SETUP_TOOL_DIR/node.tar.xz" &&
+  ln -sf "$SETUP_TOOL_DIR"/node-v${node_version}-linux-x64/bin/* "$SETUP_TOOL_DIR/bin/"
+}; } &&
+pnpm_spec=$(node -p 'require("./package.json").packageManager.split("+")[0]') &&
+{ command -v pnpm >/dev/null || npm install -g --prefix "$SETUP_TOOL_DIR" "$pnpm_spec"; } &&
+pnpm install --frozen-lockfile &&
+env DATABASE_URL=postgresql://postgres:postgres@localhost:5432/tacbookings pnpm run db:generate
+'''
+
+[jobs.lint]
+run = "pnpm install --frozen-lockfile --prefer-offline && pnpm run lint"
+
+[jobs.knip]
+run = "pnpm install --frozen-lockfile --prefer-offline && env AUTH_SECRET=ci-auth-secret NEXTAUTH_SECRET=ci-auth-secret NEXTAUTH_URL=http://localhost:3000 AUTH_TRUST_HOST=false CRON_SECRET=ci-cron-secret DATABASE_URL=postgresql://postgres:postgres@localhost:5432/tacbookings STRIPE_SECRET_KEY=sk_test_fake NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_test_fake XERO_ENABLE_DAILY_MEMBERSHIP_REFRESH=false XERO_ENABLE_LIVE_MEMBER_GROUP_LOOKUPS=false XERO_ENABLE_AUTOLOAD_XERO_CONTACT_GROUPS=false pnpm exec knip"
+
+[jobs.kept-change-realdb]
+run = "pnpm install --frozen-lockfile --prefer-offline && bash scripts/ci/kept-change-realdb.sh"
+
+# CI parity (owner decision, 12 Nov 2026): the production half of `typecheck`
+# only, and only on runners with 6 GiB or more; it skips with a message on 4 GB
+# platform compute (see the script). CI keeps the full typecheck.
+[jobs.typecheck]
+run = "pnpm install --frozen-lockfile --prefer-offline && bash scripts/ci/sekreton-typecheck.sh"
+
+# The disk-reading censuses plus docs:indexcheck and the file-size ratchet
+# (quality:budget), both judged against origin/main. The base comes from the
+# origin remote, or from the sandbox's local main when there is no remote.
+[jobs.fast-censuses]
+run = "pnpm install --frozen-lockfile --prefer-offline && bash scripts/ci/sekreton-prepare-base.sh && pnpm run ci:fast-censuses"
+
+# The data-migration coverage gate always; migration drift and the
+# data-migration realdb suites on a disposable cluster when the change can move
+# them (CHANGE_SCOPES.migrations), judged against origin/main from the origin
+# remote, or from the sandbox's local main when there is no remote.
+[jobs.migrations]
+run = "pnpm install --frozen-lockfile --prefer-offline && bash scripts/ci/sekreton-prepare-base.sh && bash scripts/ci/sekreton-migration-checks.sh"

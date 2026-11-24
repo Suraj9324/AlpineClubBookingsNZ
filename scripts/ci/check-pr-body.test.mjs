@@ -1,0 +1,411 @@
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const script = join(repoRoot, "scripts", "ci", "check-pr-body.mjs");
+
+/**
+ * A throwaway repo with a `base` branch and one commit on top of it, so the
+ * script's `git merge-base HEAD <base>` has something real to resolve.
+ * `extraFiles` is `{ relPath: contents }` added in that second commit.
+ */
+function makeRepo(extraFiles) {
+  const root = mkdtempSync(join(tmpdir(), "pr-body-gate-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" });
+  git("init", "--quiet", "--initial-branch", "base");
+  git("config", "user.email", "gate-test@example.invalid");
+  git("config", "user.name", "Gate Test");
+  git("config", "commit.gpgsign", "false");
+  git("config", "core.autocrlf", "false");
+  writeFileSync(join(root, "seed.txt"), "seed\n");
+  git("add", "-A");
+  git("commit", "--quiet", "-m", "seed");
+  git("checkout", "--quiet", "-b", "work");
+  for (const [relPath, contents] of Object.entries(extraFiles)) {
+    mkdirSync(join(root, dirname(relPath)), { recursive: true });
+    writeFileSync(join(root, relPath), contents);
+  }
+  git("add", "-A");
+  git("commit", "--quiet", "-m", "work");
+  return root;
+}
+
+function runGate(root, body) {
+  const bodyPath = join(root, "body.md");
+  writeFileSync(bodyPath, body);
+  const result = spawnSync(process.execPath, [script, bodyPath, "--base", "base"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  return { ...result, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+}
+
+/**
+ * A body that satisfies the concurrency gate, so the exit code these tests
+ * assert on is decided by the changelog gate alone rather than by a second
+ * failure leaking into the same status. The fixtures below touch only
+ * `src/lib/thing.ts`, which is not on a concurrency-sensitive path, so the
+ * ticked `N/A` is the truthful declaration for them.
+ *
+ * The heading and the checkbox line are copied verbatim from
+ * `.github/pull_request_template.md`; the gate matches them exactly. It answers
+ * `## Plan Deviation` too (#4463), so these verdicts survive that gate's switch
+ * from warning to failure.
+ */
+const BODY_WITHOUT_FRAGMENT = [
+  "## Summary",
+  "",
+  "- adds a source file",
+  "",
+  "## Plan Deviation",
+  "",
+  "- None",
+  "",
+  "## Concurrency And Lock Impact",
+  "",
+  "- [x] N/A — no transaction, lifecycle, capacity, settlement, credit, webhook,",
+  "      cron, or concurrency-sensitive writer changed.",
+  "",
+].join("\n");
+
+describe("pr:check offline gate runner", () => {
+  let root;
+
+  afterEach(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+    root = undefined;
+  });
+
+  /**
+   * The regression this file exists for. `validateChangelogFragment` reads
+   * `change.path` off each element, so handing it bare `--name-only` strings
+   * makes every path `undefined`: `isCodeBearing` sees nothing, the gate returns
+   * `not-code-bearing`, and PASS is printed for a body that CI will reject.
+   *
+   * Dropping `parseNameStatus` from `changesAgainst` turns this assertion red,
+   * which is the point — the previous shape reported a hollow PASS on every
+   * local run.
+   */
+  it("fails a code-bearing diff that adds no fragment and carries no marker", () => {
+    root = makeRepo({ "src/lib/thing.ts": "export const value = 1;\n" });
+    const { status, output } = runGate(root, BODY_WITHOUT_FRAGMENT);
+    expect(output).toContain("FAIL  Changelog fragment");
+    expect(status).toBe(1);
+  });
+
+  it("passes the same diff once it adds a fragment", () => {
+    root = makeRepo({
+      "src/lib/thing.ts": "export const value = 1;\n",
+      "changelog.d/1234-thing.md": "Adds a thing.\n",
+    });
+    const { status, output } = runGate(root, BODY_WITHOUT_FRAGMENT);
+    expect(output).toContain("PASS  Changelog fragment");
+    expect(status).toBe(0);
+  });
+
+  it("passes the same diff when the body carries the none marker instead", () => {
+    root = makeRepo({ "src/lib/thing.ts": "export const value = 1;\n" });
+    const { status, output } = runGate(
+      root,
+      `${BODY_WITHOUT_FRAGMENT}\nchangelog: none — internal refactor with no behaviour change\n`,
+    );
+    expect(output).toContain("PASS  Changelog fragment");
+    expect(status).toBe(0);
+  });
+
+  /**
+   * A deleted fragment must not be credited as an added one — one of the two
+   * reasons the shared diff helper only ever runs `--name-status`. (The other is
+   * that `--name-only` hides the source path of a rename.)
+   */
+  it("does not credit a code-bearing diff for deleting somebody else's fragment", () => {
+    root = mkdtempSync(join(tmpdir(), "pr-body-gate-"));
+    const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" });
+    git("init", "--quiet", "--initial-branch", "base");
+    git("config", "user.email", "gate-test@example.invalid");
+    git("config", "user.name", "Gate Test");
+    git("config", "commit.gpgsign", "false");
+    git("config", "core.autocrlf", "false");
+    mkdirSync(join(root, "changelog.d"), { recursive: true });
+    writeFileSync(join(root, "changelog.d", "1111-existing.md"), "Someone else's entry.\n");
+    git("add", "-A");
+    git("commit", "--quiet", "-m", "seed");
+    git("checkout", "--quiet", "-b", "work");
+    rmSync(join(root, "changelog.d", "1111-existing.md"));
+    mkdirSync(join(root, "src", "lib"), { recursive: true });
+    writeFileSync(join(root, "src", "lib", "thing.ts"), "export const value = 1;\n");
+    git("add", "-A");
+    git("commit", "--quiet", "-m", "work");
+
+    const { status, output } = runGate(root, BODY_WITHOUT_FRAGMENT);
+    expect(output).toContain("FAIL  Changelog fragment");
+    expect(status).toBe(1);
+  });
+
+  /** Test-only source changes are not code-bearing, so no fragment is owed. */
+  it("passes a test-only change under src/ with no fragment", () => {
+    root = makeRepo({
+      "src/lib/__tests__/thing.test.ts": "it('works', () => {});\n",
+    });
+    const { status, output } = runGate(root, BODY_WITHOUT_FRAGMENT);
+    expect(output).toContain("PASS  Changelog fragment");
+    expect(status).toBe(0);
+  });
+
+  /*
+    #2726: this runner has to reach the SAME verdict as CI, and CI no longer
+    fails a non-sensitive diff for a missing concurrency section. A Dependabot
+    body — package table, none of the template headings — over a dependency-only
+    diff is exactly that case, and it is the case that failed every bot PR.
+  */
+  const DEPENDABOT_BODY = [
+    "Bumps [next](https://github.com/vercel/next.js) from 15.5.0 to 15.5.1.",
+    "",
+    "| Package | From | To |",
+    "| --- | --- | --- |",
+    "| next | 15.5.0 | 15.5.1 |",
+    "",
+  ].join("\n");
+
+  it("passes a dependency-only diff whose body has no concurrency section", () => {
+    root = makeRepo({ "package.json": '{ "name": "x" }\n' });
+    const { status, output } = runGate(root, DEPENDABOT_BODY);
+    expect(output).toContain("PASS  Concurrency declaration");
+    expect(output).toContain("PASS  Plan deviation");
+    expect(status).toBe(0);
+  });
+
+  it("requires a plan answer when even a non-sensitive file accompanies dependencies", () => {
+    root = makeRepo({
+      "package.json": '{}\n',
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+      "docs/note.md": "hello\n",
+    });
+    const { status, output } = runGate(root, DEPENDABOT_BODY);
+    expect(output).toContain("PASS  Concurrency declaration");
+    expect(output).toContain("FAIL  Plan deviation");
+    expect(status).toBe(1);
+  });
+
+  it("fails the same sectionless body once the diff touches a sensitive path", () => {
+    // The file must HOLD a writer, not just be named like one (#5038).
+    root = makeRepo({
+      "src/lib/booking-capacity.ts":
+        "export const claim = (db) => db.booking.updateMany({ where: {}, data: {} });\n",
+    });
+    const { status, output } = runGate(root, DEPENDABOT_BODY);
+    expect(output).toContain("FAIL  Concurrency declaration");
+    expect(output).toContain("src/lib/booking-capacity.ts");
+    expect(status).toBe(1);
+  });
+
+  /*
+    No diff context at all. `--base` names a ref that does not exist, so
+    `git merge-base` fails and the runner cannot see what changed. It must NOT
+    read that as "changed nothing" and hand out the #2726 waiver — an unresolved
+    base is the state a fresh clone with an unfetched `origin/main` is in, and a
+    runner that printed PASS for any body there would be worse than useless.
+  */
+  function runGateWithUnresolvableBase(root, body) {
+    const bodyPath = join(root, "body.md");
+    writeFileSync(bodyPath, body);
+    const result = spawnSync(
+      process.execPath,
+      [script, bodyPath, "--base", "refs/heads/no-such-branch"],
+      { cwd: root, encoding: "utf8" },
+    );
+    return { ...result, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+  }
+
+  it("keeps the section required when it cannot resolve the diff at all", () => {
+    root = makeRepo({ "package.json": '{ "name": "x" }\n' });
+    const { status, output } = runGateWithUnresolvableBase(root, DEPENDABOT_BODY);
+    expect(output).toContain("Could not diff against");
+    expect(output).toContain("FAIL  Concurrency declaration");
+    expect(output).toContain("no diff context");
+    expect(output).toContain("FAIL  Plan deviation");
+    expect(status).toBe(1);
+  });
+
+  /*
+    The same unresolved-diff state, with the body shape agents actually write:
+    the template's ticked `N/A` and no fragment. Both gates decide from the diff,
+    so with no diff neither can reach CI's verdict — and this runner used to
+    print "PR body passes both gates" and exit 0 for exactly this input, because
+    an empty sensitive-file list read as "nothing sensitive changed" and an empty
+    change list read as "not code-bearing". A green here is worse than no answer:
+    it is the answer CI will contradict.
+  */
+  it("refuses to green a ticked N/A and a missing fragment with no diff to check", () => {
+    root = makeRepo({ "src/lib/booking-capacity.ts": "export const beds = 1;\n" });
+    const { status, output } = runGateWithUnresolvableBase(root, BODY_WITHOUT_FRAGMENT);
+    expect(output).toContain("FAIL  Concurrency declaration");
+    expect(output).toContain("FAIL  Changelog fragment");
+    expect(output).not.toContain("passes every enforced gate");
+    expect(status).toBe(1);
+  });
+
+  /*
+    An unresolved diff must not become an unpassable gate either: a body that
+    carries a COMPLETE declaration needs no diff evidence, so that half still
+    passes and only the undecidable changelog question fails.
+  */
+  it("still passes a complete declaration with no diff, failing only the changelog half", () => {
+    root = makeRepo({ "src/lib/booking-capacity.ts": "export const beds = 1;\n" });
+    const complete = [
+      "## Concurrency And Lock Impact",
+      "",
+      "- Writer class(es), canonical lock key(s), and acquisition order: cancel; global -> lodge",
+      "- Immutable pre-lock key source and mutable under-lock re-read: immutable lodgeId; full re-read",
+      "- Status-guarded claim and proof that a lost claim runs no side effect: updateMany; count=0 exits",
+      "- Relevant open/last-10 PR numbers, counterpart writers/tests, and compatibility evidence: #1911 shares the lodge helper",
+      "- Provider calls inside a transaction (write `None`, or justify the bounded exception from `docs/CONCURRENCY_AND_LOCKING.md`): None",
+      "",
+    ].join("\n");
+    const { status, output } = runGateWithUnresolvableBase(root, complete);
+    expect(output).toContain("PASS  Concurrency declaration");
+    expect(output).toContain("FAIL  Changelog fragment");
+    expect(status).toBe(1);
+  });
+
+  /*
+    #4633: plan-deviation answers are enforced for every non-dependency diff;
+    the soft size gate still reports WARN for a large PR with no reason.
+  */
+  it.each(["", "## Plan Deviation\n\n", "## Plan Deviation\n\n- Added a column\n"])(
+    "fails a missing, empty or unlinked section on a docs diff: %s",
+    (section) => {
+      root = makeRepo({ "docs/note.md": "hello\n" });
+      const { status, output } = runGate(root, BODY_WITHOUT_FRAGMENT.replace("## Plan Deviation\n\n- None\n", section));
+      expect(output).toContain("FAIL  Plan deviation");
+      expect(output).toContain("PASS  PR size");
+      expect(output).not.toContain("passes every enforced gate");
+      expect(status).toBe(1);
+    },
+  );
+
+  it("passes the plan-deviation section answered None, and warns on an unexplained large PR", () => {
+    const big = Array.from({ length: 900 }, (_, i) => `line ${i}`).join("\n");
+    root = makeRepo({ "docs/note.md": `${big}\n` });
+    const answered = BODY_WITHOUT_FRAGMENT;
+    let result = runGate(root, answered);
+    expect(result.output).toContain("PASS  Plan deviation");
+    expect(result.output).toContain("WARN  PR size");
+    expect(result.status).toBe(0);
+
+    result = runGate(root, `${answered}\nlarge-pr: a generated docs table\n`);
+    expect(result.output).toContain("PASS  PR size");
+    expect(result.output).not.toContain("warning(s)");
+    expect(result.status).toBe(0);
+  });
+
+  /*
+    #5038: one definition of "sensitive", reached by both runners. The offline
+    runner and the `verify` entrypoint each turn a git range into paths and a
+    content reader on their own, so the place they could come apart is that
+    wiring, not the validator. Each row is one repository and one body, judged
+    by both; the verdicts must be the same and must be the stated one.
+  */
+  const ciGate = join(repoRoot, "scripts", "ci", "check-pr-concurrency-declaration.mjs");
+  const NA_BODY = BODY_WITHOUT_FRAGMENT;
+  const WORDING = 'export const BOOKING_MESSAGES = { confirmed: "Your booking is confirmed." };\n';
+
+  function runCiGate(repo, body) {
+    const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+    const result = spawnSync(process.execPath, [ciGate], {
+      cwd: repo,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PR_BODY: body,
+        PR_BASE_SHA: git("rev-parse", "base"),
+        PR_HEAD_SHA: git("rev-parse", "HEAD"),
+        PR_NUMBER: "",
+        GITHUB_TOKEN: "",
+        GH_TOKEN: "",
+        GITHUB_REPOSITORY: "",
+      },
+    });
+    return { ...result, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+  }
+
+  it.each([
+    ["a wording-only file on a sensitive path", { "src/lib/booking-message-definitions.ts": WORDING }, "PASS"],
+    [
+      "a file holding a transaction",
+      { "src/lib/booking-message-definitions.ts": `${WORDING}export const run = (db) => db.$transaction([]);\n` },
+      "FAIL",
+    ],
+    [
+      "an async route that only calls a writer elsewhere",
+      { "src/app/api/bookings/[id]/cancel/route.ts": "export async function POST() { return cancelBooking(); }\n" },
+      "FAIL",
+    ],
+    ["a migration", { "prisma/migrations/20260101000000_x/migration.sql": "-- no-op\n" }, "FAIL"],
+    ["a file that never matched by name", { "src/lib/thing.ts": "export const a = async () => 1;\n" }, "PASS"],
+  ])("pr:check and the CI gate agree on %s", (_label, files, verdict) => {
+    root = makeRepo(files);
+    const offline = runGate(root, NA_BODY);
+    const ci = runCiGate(root, NA_BODY);
+    expect(offline.output).toContain(`${verdict}  Concurrency declaration`);
+    expect(ci.status).toBe(verdict === "PASS" ? 0 : 1);
+    if (verdict === "FAIL") {
+      // Same reason, same file named, in both.
+      const [file] = Object.keys(files);
+      expect(offline.output).toContain(`cannot use N/A for sensitive paths: ${file}`);
+      expect(ci.output).toContain(`cannot use N/A for sensitive paths: ${file}`);
+    }
+  });
+
+  /*
+    #5379: the after-deploy step gate, judged by both runners over one
+    repository and one body each. Each runner reads the fragment at the head
+    of its own range, so the wiring is what could differ.
+  */
+  const deployGate = join(repoRoot, "scripts", "ci", "check-pr-deploy-fragment.mjs");
+  const STEP = "## Who\n\nowner\n\n## What to do\n\nRun the report once.\n\n## How to check it worked\n\nIt lists no rows.\n";
+  const withStep = `${BODY_WITHOUT_FRAGMENT}\n## Manual Checks Required\n\n- After deploy, the owner runs the report once.\n`;
+
+  function runCiDeployGate(repo, body) {
+    const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+    const result = spawnSync(process.execPath, [deployGate], {
+      cwd: repo,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PR_BODY: body,
+        PR_BASE_SHA: git("rev-parse", "base"),
+        PR_HEAD_SHA: git("rev-parse", "HEAD"),
+        PR_NUMBER: "",
+        GITHUB_TOKEN: "",
+        GH_TOKEN: "",
+        GITHUB_REPOSITORY: "",
+      },
+    });
+    return { ...result, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+  }
+
+  it.each([
+    ["a step written as its fragment", { "docs/note.md": "x\n", "changelog.d/1234-report.deploy.md": STEP }, withStep, "PASS"],
+    ["a step with no fragment", { "docs/note.md": "x\n" }, withStep, "FAIL"],
+    ["a malformed fragment", { "changelog.d/1234-report.deploy.md": STEP.replace("owner", "everyone") }, BODY_WITHOUT_FRAGMENT, "FAIL"],
+    ["no step at all", { "docs/note.md": "x\n" }, BODY_WITHOUT_FRAGMENT, "PASS"],
+  ])("pr:check and the CI gate agree on after-deploy steps: %s", (_label, files, body, verdict) => {
+    root = makeRepo(files);
+    const offline = runGate(root, body);
+    const ci = runCiDeployGate(root, body);
+    expect(offline.output).toContain(`${verdict}  After-deploy steps`);
+    expect(ci.status).toBe(verdict === "PASS" ? 0 : 1);
+  });
+
+  it("refuses the after-deploy step check when it cannot resolve the diff", () => {
+    root = makeRepo({ "docs/note.md": "x\n" });
+    const { status, output } = runGateWithUnresolvableBase(root, BODY_WITHOUT_FRAGMENT);
+    expect(output).toContain("FAIL  After-deploy steps");
+    expect(output).toContain("The PR diff is unknown");
+    expect(status).toBe(1);
+  });
+});

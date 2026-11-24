@@ -1,0 +1,933 @@
+# Booking Requests
+
+Audience: Operator
+
+## What it is
+
+A four-tab console for the requests that need an officer's decision before they
+become (or change) a booking:
+
+- **Approvals** — new bookings flagged for review (for example minors booked
+  without an adult).
+- **Changes** — change requests on bookings whose dates are locked (same-day or
+  past nights).
+- **Policy Exceptions** — members asking to be let past a booking rule (a
+  minimum stay, or the requirement that an adult member hosts non-member
+  guests). Unlike **Changes**, approving here *does the thing*: it creates the
+  booking, or applies the change, in one step.
+- **Public Requests** — booking enquiries from non-members and school groups,
+  which you price, quote, and approve.
+
+Find it at **Admin → Bookings & Beds → Booking Requests**
+(`/admin/booking-requests`). When any of these queues has pending items it also
+appears under **Admin → Needs Attention → Booking Requests**, and the badge
+counts waiting policy exceptions alongside the other queues.
+
+Each tab shows how many items are waiting on it, across every page of that
+queue, not only the 25 rows on screen. The four counts are worked out
+the same way as the sidebar badge, so they add up to it. The page reads them
+again whenever the sidebar does: after you decide something on any tab, and
+when you come back to the window or browser tab. The tab you are on stays put.
+If a read fails, the badges keep their last numbers.
+
+A link to the page that names no tab, such as the sidebar entry followed from
+another page, the dashboard card, or a typed address, opens on the first tab
+that has work, in tab order (Approvals, Changes, Policy Exceptions, Public
+Requests), or on **Approvals** when nothing is waiting or the counts could not
+be read when the page opened. The dashboard's
+**Booking Requests** card links to that tab. A link that names a tab, a single
+booking or request, or a status filter always opens where it points. Once the
+page is open its address names the tab, so a bookmark taken then keeps that
+tab, and the sidebar entry followed while you are already on this page opens
+**Approvals**, as it always has. The tab counts show where the work is.
+
+**Changes** counts only locked-period change requests; a policy-exception
+request, whether for a new booking or a change to one, is counted on **Policy
+Exceptions**, where it is listed.
+
+> The two older routes **`/admin/booking-approvals`** and
+> **`/admin/booking-change-requests`** are redirects: they open this page on the
+> **Approvals** and **Changes** tabs respectively. They have no separate screen,
+> so they are documented here.
+
+Every tab's list shows 25 requests a page, with a total line such as "Showing
+1–25 of 40" under it (shown even when everything fits on one page) and
+previous and next arrows with page numbers when there is more. On **Approvals**,
+**Changes**, **Public Requests** and **Policy Exceptions** the waiting filter
+lists the oldest request first, so the one that has waited longest is at the top; decided and **All**
+filters list the newest first, and **All** on Approvals keeps every pending
+booking ahead of the decided ones. Changing the filter or tab, or pressing
+**Reset**, returns to page 1; the page stays in the address (except on
+**Policy Exceptions**, which keeps its filter and page on screen only); and if deciding the last request on a page
+empties it, the list steps back a page. A link that opens one booking or
+request — from an email, **Needs Attention** or the Bookings Review chip —
+shows that record pinned above the list, with a note, when it is not on the
+page you are looking at.
+
+Money is integer cents (shown as dollars); dates are NZ date-only lodge nights.
+Every approve/reject/decline flow asks whether to email the member, and records
+your choice in the audit log — except on a booking that has **No emails**
+switched on ([Bookings](bookings.md#turn-off-all-emails-for-one-booking)), where
+nothing can be sent either way, so the dialog says so instead of asking. On a
+silenced booking a **reject** emails the member nothing at all: the cancellation
+notice that normally always goes out is withheld too, and the withheld messages
+are listed on the booking for you to relay.
+
+The club can set the policy-exception hold length under **Booking Policies →
+Cancellation → Reminder and hold timings** (1–30 days, default 7). Changing it
+applies to new requests only: an existing hold keeps its stamped deadline.
+The same section controls arrival reminder lead time and the first reminder
+for an extra payment (both default to 3 days). Changes are staged with Edit,
+then Save or Cancel.
+
+## When you'd use it
+
+- A booking is held for review and a member is waiting to hear if it is
+  approved.
+- A member asks to change a booking whose dates are already locked.
+- A non-member or school submits a request through the public form and you need
+  to price it, send a quote, and turn it into a booking.
+
+## Step-by-step
+
+### Approvals — decide a flagged booking
+
+1. Open **Booking Requests** and choose the **Approvals** tab (the page opens on
+   it when it has work, or when no tab does).
+   Filter by **Pending**, **Approved**, **Rejected**, or **All**.
+
+   ![Booking Requests, Approvals tab: a pending review card for a member with Approve and Reject and cancel buttons](../images/admin/admin-booking-requests.png)
+
+2. Each card shows the member, the dates, status, total, and guests, plus the
+   member's reason for booking (for example "Club committee trip, approved
+   verbally by President"). Use **view booking** to open the full booking.
+3. In **Admin notes**, explain your decision (required to reject, optional to
+   approve).
+4. Click **Approve** or **Reject and cancel**. Choose whether to email the
+   member in the dialog. A rejection always sends the member the standard
+   cancellation notice.
+
+### Changes — decide a locked-period change request
+
+1. Switch to the **Changes** tab. Filter by **Requested**, **Approved**,
+   **Rejected**, or **All**.
+
+   ![Booking Requests, Changes tab showing a locked-period change request with separate member explanation and internal note fields](../images/admin/admin-booking-requests-changes.png)
+
+2. Read the request summary and reason. Before sending, the member's added-guest
+   estimate checks the dates and guest nights from the whole proposed change.
+   If those nights would discard a requested check-in or check-out change, the
+   card shows the same explanation as submission instead of a price. Editing
+   the proposal refreshes that check. The estimate still prices only the guests
+   added in that card; member guests are priced when the officer approves. It
+   judges the group discount on the whole proposed party, counted on each
+   night, using the nights the request gives each guest: the booking's guests,
+   less any removed in the editor, plus the guests the editor added and the
+   card's own guests.
+
+   What approving does depends on whether the stay has finished:
+   - **The stay is still running** (or not yet started): approving only
+     *acknowledges* the review. Use **Open booking** to make the actual edit on
+     the booking page.
+   - **The stay has finished** (fully past, or completed): approving **applies**
+     the request (#3750). The button reads **Approve and apply**, and the card
+     says so before you click. Every part of the request is applied — guests
+     added, removed or swapped, and date or stay-range changes. A request sent
+     from the booking editor's night-by-night grid names each guest's exact
+     nights, gaps included, and approving applies and prices exactly those
+     nights (#4088). A request sent with ordinary Date In and Date Out can't
+     show gaps, so a guest whose stay has gaps has their own dates sent back
+     unchanged: approving keeps the nights that guest already has, and charges
+     nothing for the gaps (#4157). Only a guest whose dates really move is put
+     on every night of their new dates. The card counts and lists the nights
+     each guest is asked for, in runs, and marks a guest whose nights would not
+     change, and one whose moved Date In and Date Out would fill gaps in their
+     stay (approving writes, and charges, every night of that range). Once a
+     request is decided, the card says what happened: a request approved since
+     this release (applied, or only acknowledged on a stay still running)
+     lists the nights the guest kept, marked as no change, and a
+     declined request shows the nights the guest held when it was sent. A request approved before
+     this release filled the gaps, so a guest with gaps whose dates were only
+     repeated is listed with the dates as asked and neither mark. Added guests are
+     priced at the stay's own season rates; guests already on the booking keep
+     exactly what they paid. Any extra is asked for in the usual way (card, or
+     internet banking against a supplementary invoice), and the member gets the
+     ordinary booking-change email with the amount due. A member named among
+     the added guests goes through the same rules as on the member's own edit —
+     the family boundary, bookability, and a consent request for a member
+     outside the family — and the card links to them.
+   - **The fee.** Adding guests carries no change fee. Anything the change
+     takes away — a removed guest, or nights trimmed off a guest who stays —
+     is charged what the cancellation policy's same-day tier keeps of it,
+     valued at what was actually paid for those nights after any promotion.
+     That charge is the change fee; whatever else comes off the price comes
+     back in full. It is never netted against guests added in the same request.
+     A change of dates or nights is charged the same way — only on the nights
+     it removes; nights it adds are charged normally, and there is no separate
+     late-change fee. An unpaid stay is charged it the same as a paid one: it
+     is added to what the member owes, so the payment page (which shows it as
+     its own **Change fee** row), the card, a payment link, a saved card, an
+     internet-banking payment, an officer recording cash and a group
+     organiser's combined payment all collect it with the rest, and the
+     booking's invoice bills it. Account credit already on the booking, or
+     credit the member chooses to use when paying, pays towards it like the
+     rest of the price. If the booking's invoice is raised
+     at the moment you approve, nothing is applied and you are asked to
+     approve again. The member can still ask the committee to refund a fee
+     through a refund request.
+   - **A request that names nobody.** A member's request has to say who or
+     what changes (#4030), but older ones were a note alone ("can we add these
+     three grandchildren"), which nothing can be applied or charged from. On a
+     finished stay such a card shows **Guests the member asked to add**: enter
+     each person the member described — name and age, or a member found by
+     email (or by name, if you can see the membership list) — with the nights
+     they stayed, inside the stay's dates. Then check the figures as below; they
+     are worked out for exactly the guests you entered, and change if you change
+     the list. Approving records the guests on the request as entered by you on
+     the member's behalf (the audit log names you and lists them), then applies
+     them exactly as if the member had named them: no change fee for adding,
+     the member guest rules, the overbooking confirmation, and the usual change
+     email with the amount due. If the approval is refused at any step, nothing
+     you entered is kept on the request. To decline instead, **Reject** with a
+     note; a rejection never carries the guests. Changing the list clears the
+     figures (and any overbooking confirmation), so check them again. A guest
+     who shares a name with one of the member's dependants is refused: if it is
+     that dependant, add them with **+ Add a member**, so they are booked as the
+     member they are; if it is a different person with the same name, this
+     entry can't add them, so leave them off and say so in your explanation.
+   - **A missed promo code** (#4533). When a member should have had a promo
+     code on a finished stay — usually a free night assigned to them that
+     wasn't added when an officer booked the stay for them — the correction is
+     applied through this card, never by hand in Xero. There are two ways in:
+     - On the booking, **Edit Booking**: choose the code in the promo box as
+       usual. A finished stay can't be saved, so instead of **Save** the panel
+       says why and offers **Send as a promo correction request**. That raises
+       a request carrying only the code, entered by you on the member's behalf,
+       and opens it here.
+       It can't be raised while another change request on the booking is
+       pending; enter the code on that request instead.
+     - On any request about a finished stay that names no promo code, type it
+       into **Promo code to apply**.
+
+     A correction only adds a code: a code the booking already carries stays
+     on it (where the club allows several codes, the card keeps it beside the
+     new one; otherwise the booking can't take a second code), and a change
+     that would raise the price is refused.
+
+     Either way **Check the figures** prices it, and **Approve and apply**
+     applies it exactly as Edit Booking would on a future stay: who the code is
+     assigned to, its lifetime free-night limit and its uses per member all
+     still apply, and a code that doesn't apply is refused with the same reason
+     the booking editor gives. The free night is then counted as used. A promo
+     code carries no change fee, and its reduction comes back in full — as
+     account credit unless you choose a refund under **If the change lowers the
+     price**; credit raises an unapplied account-credit note in Xero. On a
+     booking a group organiser paid for, it goes back to the organiser. Where the
+     code is the request's only change, you can untick **Apply and email member
+     about the correction**; a guest or date change always emails them, and a
+     booking whose emails are off shows the usual notice instead. If a code
+     was added to or taken off the booking since the request was raised,
+     nothing is applied and the request stays pending.
+   - **The figures you approve are the figures charged.** **Approve and apply**
+     sends the figures you checked. If anything moved since — a season rate, a
+     payment, the lodge's capacity — nothing is applied and you are asked to
+     check the figures again.
+   - **Check the figures first.** **Check the figures** works out exactly what
+     approving will do — the change fee, and the refund, credit or amount due —
+     without changing anything, and **Approve and apply** stays off until it
+     has. Under **If the change lowers the price** the default is the way the
+     booking was paid (account credit for a promo code); you can choose card or
+     account credit instead.
+   - **When nothing is applied.** If the booking has changed since the member
+     asked (its dates, its guests, or a guest's nights), the season for those nights has been switched off, a guest cannot
+     be booked, nothing
+     is applied and the request stays pending with the reason. If the change
+     moves the stay's dates on an unpaid booking whose invoice was issued in a
+     period now locked in Xero, it is refused for the same reason an ordinary
+     date change would be. If the lodge was already full on one of those
+     nights, the figures ask you to **Confirm overbooking**; a night held for a
+     whole-lodge booking is always refused. Past bed allocations are never
+     changed.
+   - If the card was loaded before the stay finished (or the other way round),
+     approving asks you to reload rather than doing something you were not told.
+3. Write **Explanation for the member**. The member reads this verbatim on their
+   own booking page, the field says so above the box, and neither decision can be
+   sent until it is filled in — so write it for them rather than for the file.
+   Anything you would not want them to read goes in **Internal note**, which is
+   optional and never leaves the admin screens (#2562). Each card keeps its own
+   draft: a note you start on one request is never submitted with another.
+4. For a stay that is still running, optionally paste the **Linked booking
+   modification id** from the booking's audit trail so the request and the
+   change are linked, then click **Acknowledge as approved** or **Reject**. A
+   finished stay's approval links its own modification, so the field is not
+   shown; click **Approve and apply** or **Reject**.
+
+### Public Requests — price, quote, and approve a non-member request
+
+1. Switch to the **Public Requests** tab. A badge shows how many verified
+   requests are waiting in the **Queue**. Filter by any request status (Queue,
+   Awaiting verification, Verified, Priced, Quoted, Quote sent, and so on).
+
+   ![Booking Requests, Public Requests tab: the status filter row and the flow explainer for non-member requests](../images/admin/admin-booking-requests-public.png)
+
+   (The screenshot predates the **Guest request form link** field described
+   next, so that field is not in it; recapture is tracked in #2429.)
+
+   At the top of the tab is **Guest request form link** with a **Copy** button.
+   That is the URL of the guest request form (`/booking-requests`).
+
+   **The form is unlisted until you decide otherwise.** Its page ships with an
+   empty menu title, so out of the box nothing on your public site links to it
+   and search engines are told to ignore it (`robots.txt` deliberately does
+   *not* disallow it, so a crawler fetches the page and sees that instruction
+   rather than merely listing the bare URL). On that default this field is how a
+   guest gets to the form; the only other path in is the **Book these dates
+   again** button on a tokenised payment link the club itself emailed a past
+   requester, so it reaches nobody the club has not already dealt with. Send the
+   link to a guest the club has agreed to host, and to nobody else. The field is
+   available to view-only admins too, since sharing the link is not a booking
+   write.
+
+   **To advertise it instead**, open **Site Appearance & Content → Page
+   Content**, edit the **Booking Requests** page, and give it a menu title. It
+   then appears in your site menu and becomes indexable by search engines —
+   those two follow the same field, so the menu and the search-engine
+   instruction can never disagree. Clearing the menu title reverses both.
+
+   Whether the club hosts non-members at all is the club's own policy either
+   way; the public website never states or implies that a non-member can simply
+   book (#2421), and the built-in help copy never names the form, because it is
+   the same text for every club and cannot know which choice yours made.
+
+2. Open a **Verified** request. Set the **Pricing mode** (Overall total or Per
+   guest-night) and enter the price, then **Save quote** and **Send quote** to
+   email the requester a quote link. In **Per guest-night** mode each age-group
+   rate field is **pre-filled from your [Fees](fees.md)** for the season covering
+   the check-in; edit any field before saving. The panel also shows **"Member of
+   another Lodge :"** with the lodge the requester chose on the public form (or
+   **No**). When they named another lodge, the fields pre-fill at your club's
+   **Full-member** rate for each age group instead of the non-member rate (a
+   reciprocal-membership courtesy), with the non-member rate shown underneath for
+   reference. The pre-fill uses the check-in night's rate, so adjust it if a stay
+   crosses a season boundary with different rates.
+
+   **School groups: the group numbers are part of the quote.** A school request
+   carries **Adjust group numbers** (infants, children, youth). Whatever you set
+   there is applied to the request when you press **Save quote**, and everything
+   downstream reads it: the price, the list of attendees the school sees, the
+   guest count in their email, the beds held when you send the quote, and the
+   booking created at approval. The named teachers and parent helpers are kept
+   exactly as submitted, and the group can never exceed the lodge's capacity.
+
+   When the school knows the adult headcount but not every name, use **Correct
+   this request** to enter **Adult names pending** separately from the named
+   teachers. The quote prices those adults as adults and labels them *Adult name
+   pending*; sending it reserves a bed for each one on every lodge night. No
+   teacher, member, school contact or hut-leader PIN is invented for them. Keep
+   at least one real named teacher on the request.
+
+   **Save quote applies the numbers and prices them. It does not reserve any
+   beds.** The beds are reserved when you send the quote, or when you press
+   **Hold slots** — so set the numbers, save, and then reserve. Until you save,
+   both of those buttons are switched off and the panel says why: each would
+   reserve the beds for the numbers still stored on the request, and sending
+   would email the school that headcount too.
+
+   Two refusals to expect. Beds already held for this request are **not**
+   re-sized by a new set of numbers: press **Release hold** first, then save and
+   send again — the panel says so before you click. (A hold that was already
+   cancelled elsewhere does not block you; the panel checks whether the beds are
+   really reserved, not just whether a hold was once placed.) And a club
+   member's link only gets in the way when the new numbers would hand that
+   person's row to somebody else. Adding more youth to the end of the group
+   leaves every earlier row exactly as it was, so a link there is untouched and
+   the save goes straight through; it is the changes that reach the linked row
+   — cutting the group, or swapping children for youth ahead of it — that are
+   refused, rather than moving that member onto somebody else's bed. The panel
+   names the member and the row, so unlink them, save the new numbers, then
+   **link them again** to the right row — otherwise they lose the member rate.
+
+   **Member links only count once they are saved.** Linking a guest to a member
+   stages the change on screen; **Save quote** is what writes it to the request.
+   Approving reads what is written, so the panel now says so before you click:
+   if a **saved** link sits on a row your new numbers would give to somebody
+   else, **Approve** is switched off with the reason (unlinking on screen does
+   not clear it — unlink, save, then re-link), and if you have linked or
+   unlinked anyone without saving, the panel warns that approving would go ahead
+   with the saved links instead. A member you linked but did not save would be
+   invoiced at non-member rates.
+3. When the requester accepts, the request moves to **Accepted** and stays in
+   the Queue with its beds held. Review the accepted quote, then click
+   **Approve & send payment link** (general) or **Approve & invoice school**
+   (school groups) to create the booking. The requester receives a read-only
+   confirmation while they wait; accepting does not create an invoice, payment
+   link, or hut-leader PIN. Use **Decline** with an optional reason to release
+   the held beds and turn it down.
+
+   After school approval, the success message confirms the booking and whether
+   teacher hut-leader assignments were created (they are, only when the
+   booking's lodge ticks **A teacher on the booking** under **Who can be hut
+   leader for school bookings**). It does not confirm email
+   delivery: check invoice progress separately, and ask a support officer to
+   review [Email Deliverability](email-deliverability.md). If the Xero module
+   is off, arrange manual invoicing.
+
+#### Correcting a request before you convert it
+
+A group emails to say the dates were wrong, two more children are coming, a
+teacher has changed, or the school's name was typed badly. You no longer have to
+decline the request and ask them to start again — which lost its history, its
+verification, its place in the queue and any beds held for it. Open the request
+and use **Correct this request**.
+
+You can correct the **dates**, the **party** (the guest list on a general
+request; the teachers and the number of children in each age group on a school
+one), the **catering preference**, and the **contact name, email and phone**. You
+must record **why** you are correcting it; that reason is for the club's own
+record and is never emailed to anybody.
+
+**Saving re-opens the request, always.** Every price and every quote on a request
+was worked out from the details you are changing, so the request drops back to
+**Verified**, the price is cleared, and any draft or sent quote is marked
+**Superseded** — which also stops the requester acting on the quote link they
+already have. Price it and quote it again from the corrected details. There is no
+edit small enough to skip this, deliberately: a quote that still showed
+yesterday's price for today's party is exactly what this is here to prevent.
+
+**Any beds being held are released.** A hold is built out of the request's dates,
+its party and its contact, so once any of those change the hold is for the wrong
+stay. Sending the corrected quote holds beds again automatically, or you can hold
+them yourself. The one exception is a correction that changes **only** the
+catering preference — a hold does not depend on it, so the beds stay put. Those
+kept beds are freed automatically once the request's last quote window lapses,
+the same way a hold behind a query or a change request is — **but only if a quote
+was ever sent on it.** A request you held beds for and never quoted has no such
+window, so nothing frees those beds for you: use **Release hold** when you no
+longer want them.
+
+**If you change who is in the group, the member links go with it.** When you
+have linked one of the guests to a club member, that link points at a PLACE in
+the list — "the second person" — not at a name. Change the group and the list
+shifts, so the second person is now somebody else. Rather than quietly hand one
+member's identity, member rates and night-conflict checks to another guest, a
+correction that changes the party clears every such link and tells you how many
+it cleared. Link the right people again before you price or quote it. A
+correction that only moves the dates, the contact details or the catering leaves
+the list exactly where it was, so it leaves the links alone.
+
+**Once the requester has accepted a quote you cannot correct it.** At that point
+you have an agreement, and changing it underneath them is a new offer rather than
+a correction. Decline that quote or issue a fresh one first, deliberately.
+
+**Naming an already-accepted pending adult is a separate action.** On an
+accepted school request, choose **Name one pending adult**, enter the real first
+and last name, then **Save real name**. Repeat until the count is zero. Each save
+replaces one unnamed held bed with a named guest on the same nights; the
+accepted price, quote and bed total stay fixed, even when a different option or
+a revised quote was chosen. Naming aligns earlier provisional held prices with
+that accepted breakdown. Approval then preserves each person's accepted price
+and held guest identity, including children whose list position shifted as
+adults were named.
+The original quote still shows that the name was pending when the school
+accepted it. **Approve & invoice
+school** stays disabled until every adult has a real name. If a name matches a
+club member, or the held party, reservations and price breakdown cannot be
+mapped to the accepted terms, the save stops: review the rate, consent and terms
+with the school before issuing a new quote. Ordinary **Correct this request** cannot
+change an accepted quote.
+
+Declining or cancelling the request clears its pending adult count and releases
+the held capacity. The original quote snapshot remains as the record of what
+was offered or accepted.
+
+You also cannot correct a request that has already become a booking (edit the
+booking instead), one that is closed, one that a member submitted through the
+whole-lodge door (approve it with the headcount you mean, or decline it), or one
+flagged **Saved details need attention** — see the last row of
+[Troubleshooting](#troubleshooting).
+
+**Correcting a school's name is not a spelling fix.** Approving a school request
+attaches it to the club's own record of that school, and that record owns the
+school's customer in Xero (see
+[What happens in Xero when you approve a school request](#what-happens-in-xero-when-you-approve-a-school-request)).
+So the name you save decides **which school the club is about to invoice**. The
+form asks the server as you type and tells you which of two things you are doing:
+
+- **"The club already has *[name]* on record"** — in the club's own spelling,
+  noting whether it already has an accounting customer and who its contacts are
+  today. The tick reads **"Yes, this is that school."** Approving will invoice
+  that school, on the customer and the invoice history it already has.
+- **"The club has no school on record called *[name]*"** — the tick reads
+  **"Yes, add it as a new school."** Approving will create a new school record
+  and a new accounting customer of its own, so check the spelling first if it is
+  a school you already deal with.
+
+**Save correction stays greyed out until you tick that box**, and retyping the
+name takes the tick back, so you cannot confirm one school and save another. If
+the club's record of the school changed while your form was open, the save is
+refused and names the school rather than guessing.
+
+**Correcting the teachers changes who the club is shown as the school's contact
+people.** Approving makes the booking's teachers the school's contact people,
+replacing whoever is there — so the teachers you leave on a corrected request are
+the ones a treasurer will see in Xero. Where the club already has the school on
+record, the form names its contacts today and says plainly that approving will
+replace them; the audit log records who they were.
+
+Nothing here creates or changes a school record on its own. A correction changes
+what approval will resolve, not what it has already resolved.
+
+#### Dietary/allergy information on a request
+
+A public, school or whole-lodge request never asks for dietary or allergy
+information, and nothing on it collects any. When a request's party names a
+club member (a linked guest), the held or approved booking copies that
+member's profile value onto their guest row while the club collects the field;
+everybody else starts empty, and a booking officer can fill a value in on the
+booking page afterwards (see
+[Bookings](bookings.md#dietaryallergy-information-for-a-stay)). If an approval
+has to rebuild the held party because its size changed, each person keeps their
+own value and nobody inherits somebody else's. One limit: **anything that
+releases the hold** — a correction, **Release hold**, the quote expiring, or a
+cancellation — leaves a value you typed on the held booking with that cancelled
+booking; the next hold creates new guest rows, so enter it again on the new
+one.
+
+#### Member whole-lodge requests
+
+A signed-in member can ask to book the **whole lodge** for their party. These
+requests appear in the same **Public Requests** queue with a **Member** and a
+**Whole lodge requested** badge. Approving one holds the whole lodge for the
+group. Before you approve you set:
+
+- **Headcount to book and price** — confirm the real number with the member; the
+  member's figure is only an estimate.
+- **Total price override (optional)** — a manual total. It is required when no
+  season covers the dates (there is no separate quote step on this path), and it
+  always wins over every other pricing method.
+
+If the covering season has a **flat whole-lodge night rate** set (see
+[Fees](fees.md)), you also get a **How to price this whole-lodge booking**
+choice on that one approval:
+
+- **Price per guest** (the default) — each guest at the season rate, as usual.
+- **Price as whole lodge** — the season's flat rate per night for the whole
+  building, regardless of headcount. The panel shows the total; a stay that
+  crosses a season boundary is charged each night at that night's season rate.
+
+The choice is yours per approval — it is never automatic. A total price override
+still overrides whichever method you pick. Then click **Approve & hold the whole
+lodge**.
+
+**How the member pays.** With the **Internet Banking payments** and **Xero**
+modules both on, approving does not pick the payment method for the member.
+The booking is confirmed and the lodge is held, and the member is emailed the
+amount owing and sent to their booking page, where they see the same choices
+an ordinary booking offers: pay by card, or **Pay by internet banking instead**,
+which raises the Xero invoice at that moment. If the member ticked **Put my
+account credit towards this booking** on the request, the approval applies as
+much of their credit as the total allows (the queue row tells you they asked),
+and they pay only the remainder; credit that covers the whole price settles the
+booking as paid on the spot. With either module off there is no choice to
+offer, so the approval works as it always did: a pay-on-account receivable is
+created and invoiced through Xero, or admins are emailed to invoice by hand.
+
+The queue describes credit against the **current** payment modules. If either
+was turned off after the member submitted their choice, the row says credit
+will not be applied on approval. A paid approval says nothing is owing, whether
+credit covered the price or the officer set a zero price.
+
+Opening card payment and leaving it unfinished does not pay the booking. A
+sanctioned price reduction, such as linking a placeholder to a member below,
+still returns excess applied credit and settles a fully covered booking; an unpaid finished stay still appears in the collection queue.
+
+**If you link a guest row to a real member account** (#2309). A request's guest
+list is free-text names, but you can attach a place to an actual member so it
+prices at member rates. With the **Add another member as a guest** module on,
+that link is now recorded and the member is told:
+
+- Holding beds for the quote, and approving the request, both put a note against
+  the guest row naming **you** as the officer who placed them, and email the
+  member to say they are on a lodge booking created from a booking request. You
+  cannot turn that email off; the booking's **No emails** switch is the only
+  thing that withholds it, and a withheld send is listed on the booking's
+  withheld-emails banner.
+- **Nobody is asked first on this path**, whatever the club's ask-first setting
+  says. A booking request is the club placing somebody, not a member asking a
+  favour, so no bed is held pending an answer.
+- **If you change who is on a place between the quote and the approval**, both
+  people are told — the new person that they are on it, the person you replaced
+  that they are not. That matters because the guest row keeps its identity so
+  pre-assigned beds survive, which means a swap looks like an ordinary edit and
+  would otherwise be silent.
+- **These members cannot take themselves off.** A booking priced by hand refuses
+  guest changes from a member's account, so the email tells them to contact the
+  club and names the real remedies — you cancel the booking, or re-quote the
+  request without them. Expect the call.
+
+With the module off, none of this happens and a linked guest row behaves exactly
+as it did before.
+
+**After you approve: the party is still "Guest 1..N".** A member whole-lodge
+request only asks for an approximate headcount, so the converted booking starts
+with placeholder guests named `Guest 1`, `Guest 2` and so on — exactly as a
+school booking starts with `School Child 1..N`. Left alone, those are the names
+the chore list and arrival roster print at the lodge.
+
+The club chases this automatically. Starting **Attendee first prompt** days
+before check-in (the same **School Attendee Confirmation** timing on
+[Booking Policies](booking-policies.md) that drives the school prompt), the
+member is emailed a reminder asking them to name their party, repeated every
+**reminder** days and escalating to once a day from two days out, with a last
+reminder on the morning they travel. It stops the moment every guest is named. School bookings keep their
+existing tokenized confirmation email and cadence, unchanged.
+
+Any booking still carrying placeholders inside that window — school or
+whole-lodge — is counted on [Stuck States](stuck-states.md) as **Bookings with
+unnamed guests**, so you can see them coming. You or a Booking Officer can also
+edit the names yourself from the booking; a rename keeps the same guest row, so
+chore and bed assignments follow it, and it never changes anybody's age group or
+the price.
+
+**None of this blocks anything.** An unnamed party is chased and made visible,
+never held up: the booking confirms, the roster generates, and the group checks
+in exactly as normal whether or not the names ever arrive. A last-minute
+substitution must never be stranded at the lodge over a name.
+
+**The approved party goes on the bed board like any other booking.** Holding
+beds for a quote and approving a request both put every guest onto
+[Bed Allocation](bed-allocation.md) for each night of the stay, so the group is
+listed as awaiting a bed and the auto-allocator will place them. Until
+August 2026 they were not: a party that arrived through a booking request was
+invisible on the board and uncounted on the dashboard's Bed Allocation card,
+which an officer discovered when the bus turned up. Existing bookings were
+repaired in the same release, so a request you approved months ago is on the
+board now too. Nobody's total changed — the total the requester agreed is the
+total they still owe, and where you set the price yourself the invoice is
+unchanged to the cent. Each night now also records the rate it was charged at,
+so a stay that crosses a rate change reads as what it really was.
+
+One thing that follows from that is worth knowing before you use it. On a member
+whole-lodge booking, linking a placeholder to a real member re-prices that person
+at the member rate — and it used to re-price **everyone else on the booking** at
+today's rates at the same time, quietly replacing the price you negotiated. It no
+longer does: the rest of the party keeps their negotiated price, and only the
+person you linked is re-rated.
+
+### Policy Exceptions — allow a booking rule to be broken, once
+
+A member who is stopped by a minimum-stay rule, or by the requirement that an
+adult member hosts their non-member guests, can ask an officer instead of simply
+being refused. Those asks land here.
+
+1. Open **Booking Requests → Policy Exceptions**. The tab shows a count of
+   everything waiting. Filter by **Requested** (default), **Approved**,
+   **Rejected**, **Cancelled**, **Superseded**, or **All**.
+2. Each card tells you: who asked and **how long ago**, what they proposed
+   (dates, how many guests, and for a change, what they want changed), which
+   rules it breaks — named, with the policy and version that was reviewed —
+   which nights are affected, and what the member said in their own words.
+3. The card also says whether the request is **holding beds** while it waits. A
+   holding request has already reserved the beds it needs, so approving it
+   cannot be beaten to them. A non-holding request has not, so the lodge can
+   fill underneath it. **A request for a booking the member has not made yet
+   never holds beds**, whatever the policy's capacity mode says — there is no
+   booking for the reservation to hang off yet — so those cards always read *No
+   beds held*.
+4. Open **Show the guests** before you decide. Approving puts that exact party
+   on the booking, and the card's guest count cannot tell you that one of them
+   is a member from outside the requester's family (they still have to be asked,
+   or the add is refused), or that the party is minors with no adult (which still
+   goes to a child-safety review, and still blocks check-in until somebody
+   clears it). If the list will not load, do not approve — try again.
+5. Click **Decide this request**. There are **two note fields**, and each one says
+   plainly who reads it before you submit anything:
+   - **Explanation for the member.** The member sees this — on their own request
+     list, and in the email an approval sends. Write it for them.
+   - **Internal note (optional).** Only admins see this. It is never shown to the
+     member, never emailed to them, and never sent to any member-facing screen, so
+     it is where a judgement about the member or a note for the next officer
+     belongs. The audit log records *that* you left one, never its text.
+
+   Then tick the confirmation and click **Approve and apply** or **Refuse**.
+   - An **Explanation for the member** is **required** to refuse and to approve an
+     adult-member hosting exception (that one is recorded on the booking with your
+     name on it). An internal note is never a substitute: refusing without a
+     member-facing explanation is rejected, because a refusal the member cannot
+     read is a refusal they cannot act on.
+   - After a decision, both notes stay on the card, separately labelled, so an
+     officer reading a colleague's decision can see which half the member has
+     already read.
+   - For a change, the form also asks where a **refund** goes — card or account
+     credit — if the change reduces the price of a booking that has already been
+     paid. Leave it on *Not needed* when the price does not drop; if a choice
+     turns out to be needed, the approval says so and you pick one and approve
+     again.
+   - Approving applies the exact proposal on the card. It overrides only the
+     rules listed there — capacity, payment, membership and privacy rules all
+     still apply.
+6. If the lodge has filled since the member asked, the approval does not go
+   through and you are told the request **stays pending**. Nothing was created.
+   The queue refreshes itself, so you can approve it again as soon as space frees
+   up, or refuse it with a reason.
+
+Two things worth knowing:
+
+- **Approving is not a rubber stamp.** Unlike the **Changes** tab, there is no
+  second step: the booking is created, or the change applied, as part of
+  approving. If it could not be done, the request stays exactly as it was.
+- **Check-in is still gated by any pending review.** Approving a policy
+  exception does not clear an unrelated admin review, and a booking with one
+  still cannot check in until that review is cleared. This includes a review your
+  own approval opens: if the approved party is minors with no adult, that
+  child-safety review is left for a human to decide — approving a minimum-stay
+  exception is not a decision about supervision, and you were never asked to make
+  one.
+- **An approved new booking emails the member** what was approved and what is
+  left to pay, because they are not standing in the payment screen the way an
+  ordinary booker is. The amount comes from the money the club has actually
+  received for the booking, not from its status (#4069): what it costs, less
+  account credit applied, less money already held. The email also says whether
+  the beds are held while it waits. A booking that is already covered gets no
+  payment line; a stay a group organiser pays for says so; and where the
+  records cannot prove a figure the email names no amount and sends the member
+  to the booking or the club — see
+  [the five payment lines](email-messages.md#there-is-no-only-if--write-lines-that-always-read-correctly). An
+  approved change is announced by the usual "your booking was changed" email.
+- **A refusal emails the member too**, carrying your member-facing explanation
+  verbatim, the nights it was about, and the fact that nothing was booked and any
+  beds the request held have been released. That is the whole reason the
+  explanation is mandatory, so write it for the member rather than for the file. A
+  refusal about an existing booking is withheld by that booking's "No emails"
+  switch like every other message about it. A kept-pending capacity conflict sends
+  nothing: the request is still open, the member cannot act on it, and their own
+  request list already says the lodge was full.
+- **The member raises and manages these themselves** (#2562). They ask from the
+  booking wizard or the edit screen, and they track, withdraw and replace their
+  requests under **My booking-rule requests** on their own My Bookings page — so a
+  proposal that looks wrong is theirs to correct, and you do not have to raise or
+  amend one on the phone. When a member uses **Replace**, the old request closes as
+  *Superseded* and a new one starts, which is why a card can vanish from
+  **Requested** and reappear under **Superseded**.
+- **One member can have several open requests, and the queue is not duplicating
+  them.** The enforced cap is one open request per *identical* proposal for new
+  bookings (`nbpe:<member>:<proposalHash>`) and one per *booking* for changes
+  (`pe:<booking>:<member>`) — so a member who asks about two different weekends,
+  without using **Replace**, holds two live requests you can approve
+  independently. Approving both creates both. Read the proposal on each card
+  before you decide, and if the two look like the same intent expressed twice, ask
+  the member which one they want before approving either. What they
+  see is documented in
+  [Booking a stay](../user-guide/booking-a-stay.md#asking-to-be-let-past-a-booking-rule).
+
+## Settings reference
+
+This is a work queue. The controls per tab:
+
+Each tab keeps **Reset** visible beside its status choices. Reset restores that
+tab's default queue, while preserving the tab itself, any focused booking or
+request id, and unrelated URL context. A focused Approvals or Changes record
+therefore keeps its **All** context rather than disappearing from view.
+
+| Tab | Filters | Key actions |
+| --- | --- | --- |
+| Approvals | Pending (default), Approved, Rejected, All | Approve; Reject and cancel (Admin notes required to reject) |
+| Changes | Requested (default), Approved, Rejected, All | Acknowledge as approved (stay still running) or Approve and apply (stay finished, #3750), with **Promo code to apply** and, on a promo-only correction, the member email choice (#4533); Reject. Both need the member-facing explanation; optional internal note the member never sees; optional linked modification id (acknowledgement only) |
+| Policy Exceptions | Requested (default), Approved, Rejected, Cancelled, Superseded, All | Approve and apply (confirmation required; member-facing explanation required for an adult-member hosting override); Refuse (member-facing explanation required). Both actions also take an optional internal note the member never sees |
+| Public Requests | Queue (default), Awaiting verification, Verified, Priced, Quoted, Quote sent, Query, Modify, Accepted, Approved, Declined, Cancelled, Converted, All | Save quote; Send quote; Approve & send payment link / Approve & invoice school; Decline; Hold slots (school) |
+
+Notes and constraints:
+
+- Prices are entered in dollars and stored as integer cents; dates are NZ
+  date-only nights.
+- School group requests add per-tier guest counts and a soft group-size cap
+  that warns you to confirm a club member is staying with the group.
+- Verified public requests only appear on this tab — never under Approvals, the
+  Bookings list, or the Waitlist.
+- If any of a request's saved details cannot be read back (an old or imported
+  row with a missing surname, say), the request still appears in the list —
+  including under **All** — under a **Saved details need attention** note. One
+  unreadable row never hides the rest of the queue. The note names only what
+  actually failed: the guest list (names and age groups are then shown as they
+  were saved, so treat them as a rough record), a school's teacher list (its
+  teacher/helper section and derived total are hidden, while any guest badges
+  remain only a rough record), the member links (none are shown), or
+  the saved quote (its options and totals are not shown). A malformed teacher
+  name or email hides the whole teacher list rather than showing a partial
+  party, because the school approval path will not trust any of that list. On a
+  request that is still open, Save quote, Send quote, Hold slots and Approve
+  are turned off in the panel. The school approval path also refuses an
+  unreadable teacher list. There is no screen for repairing the saved data:
+  check what the group wants with the
+  requester, then **Decline** the request so they can submit again, or ask
+  support to repair the stored row. On an already-converted or finalised
+  request nothing is blocked — the note is there so you know the details it
+  shows are not confirmed (#2342).
+- If your admin role is view-only for bookings, a notice explains you can view
+  but not approve, reject, price, hold, or convert requests.
+
+## What happens in Xero when you approve a school request
+
+A school is a thing in its own right, not a person. When you approve a school
+request, the club records the school itself — its name, and the contact details
+the request supplied — and the booking is attached to it. That school record is
+the party the invoice belongs to.
+
+In Xero the school appears as an **organisation**, with the school's name and no
+first or last name, and the teacher named underneath it as a **contact person**.
+So a treasurer opening the contact sees the school, and sees who to talk to,
+without leaving Xero.
+
+Two things follow that are worth knowing before you meet them.
+
+### If the teacher changes
+
+The teacher on the school's Xero contact is refreshed the next time the club
+raises anything against that school — which in practice means **the next
+approval**. Approving a booking for the school records that booking's teacher
+against the school and then raises the invoice, and raising the invoice is what
+pushes the current teacher to Xero. If nothing has changed, nothing is sent.
+
+So a school whose teacher left is corrected by its next booking, and needs no
+action from you. Approving a booking makes **that booking's teachers** the
+school's current contact people — the ones it names are replaced, not added to —
+which is what stops a school that has been coming for years from naming five
+people who have all moved on.
+
+**One case it does not cover, so you know where the edge is.** If a teacher
+leaves and the next request names *nobody* in their place, nothing is sent: the
+club will not tell Xero "this school has no contact person", because on a
+contact the club adopted rather than created that would wipe out anyone a
+treasurer had entered by hand. A departure with a replacement — the ordinary
+case — is corrected as described.
+
+If you need it corrected sooner than the next booking, edit the contact person
+in Xero directly; the club will not overwrite it again until the recorded
+teacher actually changes.
+
+The school's **name** is never rewritten in Xero. Xero requires contact names to
+be unique, and quietly renaming an existing contact is the one thing this club's
+accounting rules forbid. A school that has genuinely changed its name is an
+officer's decision: rename it in Xero, and tell support so the club's own record
+matches.
+
+### Correcting a school's email address or phone number
+
+The school's own email address and phone number are recorded the first time the
+school books. A later booking request never changes them, even if it types
+different ones: the club's record of a school outranks what one request said.
+When the school's office address or number really has changed, or the first
+request had a typo, correct it in the app:
+
+1. On **Bookings**, find one of the school's bookings and press **Edit school
+   details** under the school's name, or open **Correct this request** on one of
+   its requests and press **Edit school details** under the school notice.
+2. Change the email address or phone number and press **Save**. Leave a field
+   empty to clear it.
+
+You need **edit** access to bookings, and you may be asked to confirm it is you.
+The school's name and teachers are not edited here: the name is its Xero
+contact's name, and the teachers are set by its bookings.
+
+What happens next:
+
+- **Emails and invoices to the school use the new details from now on.**
+  Anything already sent is not changed or re-sent. Emails to a teacher or to
+  the person who made a request still go to them.
+- **Xero is updated for you.** The dialog says whether the change is queued,
+  sent, or failed. If Xero refused it, the dialog shows Xero's reason and a
+  **Retry sending to Xero** button; the details stay saved in the app either
+  way. The same failure is on the Xero operations screen, where a finance
+  officer can retry it too.
+- **Clearing the school's email address sends a teacher's to Xero instead.**
+  Xero gets the newest teacher's address (or another named contact's) as the
+  contact's main email, as when the contact was first created; it is blank only
+  when none of them has one.
+- **A school Xero has not met yet** (no invoice raised so far) is not sent
+  anything now. Its Xero contact is created with the corrected details on its
+  first invoice.
+- **If someone else saved the school's details while you had the dialog open,**
+  your save is refused with "Changed by someone else". Press **Reload**, check
+  their change, and save again if yours is still needed. Nobody's change is
+  overwritten without being seen.
+- The change is recorded in the audit log with the old and new values.
+
+### The teacher's name goes to Xero
+
+Approving a school booking sends the teacher's name and email address to Xero as
+part of the school's record. That is deliberate — it is what lets the treasurer
+see who to contact — but it is worth saying plainly, because it is information
+about a person leaving this system for an accounting provider. Nothing else
+about the teacher is sent.
+
+### A school that has booked before
+
+A school that booked before this change already has a contact in Xero, created
+under the old arrangement where a school was recorded as a person. The first time
+the club raises something against that school after the change, **the school's
+own record takes that same contact over**.
+
+Almost nothing happens in Xero when it does. It is the same contact, with the
+same history and the same invoices on it; all that changes is which of the
+club's own records says "this customer is mine". You will see it recorded in the
+audit log. A returning school's invoices therefore keep going to the customer you
+already know, and no second contact is created for it.
+
+The one visible change is that the contact **stops looking like a person**. It
+was created under the old arrangement with the school's name in the first-name
+box and the surname blank, and the club clears those so it reads as an
+organisation like every new school does. If that correction cannot be made for
+any reason, the invoice still goes out and the club tries again next time — so
+a contact that still looks like a person after a booking is worth mentioning to
+support, but it is not stopping anything.
+
+If a school does somehow end up with two contacts in Xero — an old one and a new
+one — **merge them in Xero**. Xero can merge two contacts and this application
+cannot, so that is an ordinary bit of tidying rather than something to report.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Reject is blocked | You left **Admin notes** empty (Approvals), or **Explanation for the member** empty (Changes, where it blocks both decisions) | Add the explanation for the member, then decide |
+| A change I "approved" did not change the booking | For a stay that is still running, approving only acknowledges the review | Open the booking and apply the change on the booking page. A finished stay's approval applies the change itself |
+| **Approve and apply** says the request is still pending | The booking changed since the member asked, the season for those nights is switched off, a guest cannot be booked, the dates of an unpaid invoiced booking would move into a Xero-locked period, or the lodge was full | Nothing was changed. Read the reason on the card: confirm the overbooking, switch the season back on, or reject the request with a note |
+| A new public request is not on the Approvals tab | Public requests live only on the Public Requests tab | Switch to **Public Requests** and check the **Queue** filter |
+| Approve fails with a capacity message | The lodge is full for one or more nights | The dialog lists the full dates; free capacity or adjust the request |
+| Approving a policy exception says the request "stays pending" | The lodge filled up between the member asking and you deciding | Nothing was created. The queue has already refreshed, so approve it again once beds free up, or refuse it with a reason |
+| Approving a policy exception asks you where a refund should go | The change reduces the price of a booking that is already paid, so the money has to go somewhere | Pick **Refund to the card** or **Account credit** on the decision form, then approve again |
+| Approving a policy exception says it was approved "but some follow-up work failed" | The booking really was created or changed — a later step (an email, an accounting hand-off, an audit write) did not finish | The request is APPROVED and the booking is real. Do NOT approve again. Check the booking, and tell the member yourself if they did not get the email |
+| Approving a policy exception says the request changed while you were reviewing it | Someone else decided it, or the member withdrew or replaced it, since your screen loaded | Reload the queue and look at it again |
+| Approving a policy exception says it can no longer be applied as it was reviewed | What would be applied is not what the officer reviewed. Usually the live booking was edited after the member asked — but a corrected date reading can also replay the same request differently, and the system cannot tell those apart, so it no longer guesses | Nothing was changed. Ask the member to submit the request again against the booking as it is now, then review that |
+| Approving a policy exception says the request predates the current approval format | An old request stored before this workflow shipped, so there is nothing to replay — nothing about the booking has changed | Ask the member to submit the request again; it will then approve normally |
+| Approving a policy exception refuses a guest | The party names a member from outside the requester's family, or one who cannot be booked yet | Nothing was created. Tell the requester to drop that guest or to add them from their own booking so consent can be asked |
+| Approving a policy exception says the exceptions it needs are not the ones reviewed | What you would be overriding is not what was reviewed. Usually a rule was edited after the member asked, but the nights a rule trips on can also be re-derived, so the message no longer names a cause it cannot prove | Nothing was changed. Ask the member to submit again; you will then see the current situation |
+| Approve is greyed out on a policy exception | You have not ticked the confirmation, or an adult-member hosting override needs a written reason | Write the reason and tick the confirmation |
+| Cannot price/approve anything | Your role is view-only for bookings | Ask a full admin for bookings edit access |
+| A school's Xero contact names a teacher who has left | The teacher on the contact is refreshed when the club next raises something against that school | Approve the school's next booking and it corrects itself, or edit the contact person in Xero now |
+| A school's email address or phone number is wrong | It was recorded from the school's first request, and later requests never change it | Press **Edit school details** beside one of the school's bookings on **Bookings**, or under the school notice in **Correct this request**, and save the right details. Xero is updated for you |
+| **Edit school details** says "Changed by someone else" | Another officer saved the school's details after you opened the dialog | Press **Reload**, check what they saved, and save yours again if it is still needed |
+| **Edit school details** says Xero did not take the last change | Xero refused the update; the reason is shown | Fix what the reason names (often the email address), then press **Retry sending to Xero**. The details are already saved in the app |
+| A returning school's invoice went to the Xero contact it always used | Correct. The school's own record took that contact over; it is the same customer with the same history | Nothing to do. The hand-over is in the audit log if you want to see it |
+| A school has two contacts in Xero | Something created a second one — usually a name that was typed differently | Merge the two contacts in Xero. This application cannot merge them for you |
+| A request says **Saved details need attention** and its buttons are greyed out | Some saved data could not be read back, so quote, price, hold, and approve controls are disabled in this panel; school approval also refuses unreadable teachers | Confirm what the group wants with the requester, then **Decline** so they can submit again — or ask support to repair the stored row. **Correct this request** is deliberately not offered here: your corrected list would silently become the whole truth about a party nobody can check it against |
+| The requester's dates or party were wrong | They told you after they submitted | **Correct this request**, then price and quote it again — the correction re-opens it and retires the old quote |
+| **Save correction** is greyed out | On a school request you have not yet ticked the box confirming which school the name refers to, or you have not written why you are correcting it | Read what the form says about the school, tick **"Yes, this is that school."** / **"Yes, add it as a new school."**, and record your reason. Retyping the name takes the tick back on purpose |
+| A correction is refused because the requester has already accepted a quote | You have an agreement at that price for those dates; changing it is a new offer, not a correction | Decline that quote or issue a fresh one, then correct the request |
+| **Approve & invoice school** is disabled on an accepted quote | Adult names are still pending, so conversion cannot create real teacher and contact records yet | Use **Name one pending adult** for each real person. If it detects a club member or a changed hold, review the accepted terms before quoting again |
+| A correction is refused because the request "changed while you were correcting it" | Somebody else priced, quoted, declined or accepted it since your screen loaded | Reload the queue, look at the request as it is now, and correct it again |
+| A correction is refused and names the school | The club's record of that school changed while your form was open, or you edited the name after ticking the confirmation | Re-open the correction, read which school it now says the name refers to, confirm that, and save |
+| A correction says it **saved** but something afterwards did not finish | The correction is real and committed; what failed came after it — usually the bed release, because the requester accepted the hold in the same moment | Do NOT correct it again: a second attempt is refused anyway, because the first one really did save. Open the request, check whether it is still holding beds, and use **Release hold** before you quote it again |
+| The correction form says it **could not check which school this is** | The lookup that decides which school record the name refers to did not answer | Press **Try again**. Saving stays blocked until it answers, on purpose — the name decides which school gets invoiced, and that is not a question to answer blind |
+| The **Adjust group numbers** boxes and the correction form's child counts disagree | They do different things: the correction form changes the REQUEST — what the school asked for — while **Adjust group numbers** changes only the booking you are about to quote or approve | Correct the request when the school's numbers changed; adjust the group numbers when you are recording something about this booking alone |
+
+## Related links
+
+- Back to the [documentation hub](../README.md).
+- Sibling guides: [Bookings](bookings.md), [Book on Behalf](book.md),
+  [Booking Policies](booking-policies.md), [Payments](payments.md).
+- Reference: the
+  [booking lifecycle](../STATE_MACHINES.md#booking-lifecycle), the
+  [booking modification lifecycle](../STATE_MACHINES.md#booking-modification-lifecycle),
+  and the
+  [public booking request quote lifecycle](../STATE_MACHINES.md#public-booking-request-quote-lifecycle).

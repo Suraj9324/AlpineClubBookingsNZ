@@ -1,0 +1,3385 @@
+/**
+ * Tests for Issue 2 fix: modification payment collection for price increases.
+ *
+ * Covers:
+ * - modify-dates: price increase creates additional PaymentIntent, returns clientSecret
+ * - modify-dates: price decrease still processes refund (no regression)
+ * - add-guests: price increase creates additional PaymentIntent, returns clientSecret
+ * - stripe webhook: payment_intent.succeeded for additional PI updates payment record
+ * - confirm-modification-payment endpoint: verifies PI and updates DB
+ * - additional-payment-secret endpoint: returns clientSecret for pending additional PI
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+const mockPlanStripeRefundAllocation = vi.hoisted(() => vi.fn());
+import { NextRequest } from "next/server";
+
+// --- Mocks ---
+
+const mockTransaction = vi.fn();
+const mockPaymentFindUnique = vi.fn();
+const mockPaymentUpdate = vi.fn();
+const mockBookingFindUnique = vi.fn();
+const mockBookingUpdate = vi.fn();
+const mockBookingGuestCreate = vi.fn();
+const mockBookingGuestUpdate = vi.fn();
+const mockBookingModCreate = vi.fn();
+const mockSeasonFindMany = vi.fn();
+const mockChoreAssignFindMany = vi.fn();
+const mockChoreAssignDeleteMany = vi.fn();
+const mockProcessedWebhookCreate = vi.fn();
+const mockProcessedWebhookDeleteMany = vi.fn();
+const mockProcessedWebhookFindUnique = vi.fn();
+const mockProcessedWebhookFindFirst = vi.fn();
+const mockProcessedWebhookUpdateMany = vi.fn();
+const mockMemberCount = vi.fn();
+const mockMemberFindUnique = vi.fn();
+const mockAuditCreate = vi.fn();
+const mockUpsertPaymentIntentTransaction = vi.fn();
+const mockRefundPaymentTransactions = vi.fn();
+const mockEnqueueBookingModificationRefundRecovery = vi.fn();
+const mockMarkBookingModificationRefundRecoverySucceeded = vi.fn<(...args: unknown[]) => Promise<{ count: number }>>(async () => ({ count: 1 }));
+// #4992: a refused or part-made own-card refund re-plans the edit's pre-persisted row.
+const mockRecoveryOperationUpdateMany = vi.fn<(...args: unknown[]) => Promise<{ count: number }>>(async () => ({ count: 1 }));
+const mockFindPaymentTransactionByIntentId = vi.fn();
+const mockMarkPaymentIntentTransactionSucceeded = vi.fn();
+const mockMarkPaymentIntentTransactionFailed = vi.fn();
+const mockCompleteCanceledSupersededPaymentIntentRecovery = vi.fn();
+const mockQueueSupersededPaymentIntentRefundRecovery = vi.fn();
+// #3341: the ADDITIONAL supersede runs for REAL (`INV-OPS-015`). These are its
+// I/O: the ledger read of the asks it retires, and the durable cancel it queues.
+const mockPaymentTransactionFindMany = vi.fn();
+const mockRecoveryOperationFindUnique = vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => null);
+const mockEnqueuePaymentIntentCancellationRecovery = vi.fn();
+const mockQueueSupersededPrimaryIntentCancellations = vi.fn();
+const mockEnqueueXeroBookingInvoiceOperation = vi.fn().mockResolvedValue({ queueOperationId: "op_booking", message: "queued" });
+const mockEnqueueXeroBookingInvoiceUpdateOperation = vi.fn().mockResolvedValue({ queueOperationId: "op_booking_update", message: "queued" });
+const mockEnqueueXeroRefundCreditNoteOperation = vi.fn().mockResolvedValue({ queueOperationId: "op_refund", message: "queued" });
+const mockEnqueueXeroSupplementaryInvoiceOperation = vi.fn().mockResolvedValue({ queueOperationId: "op_supplementary", message: "queued" });
+const mockEnqueueXeroModificationCreditNoteOperation = vi.fn().mockResolvedValue({ queueOperationId: "op_mod_credit_note", message: "queued" });
+const mockKickQueuedXeroOutboxOperationsIfConnected = vi.fn().mockResolvedValue(null);
+const mockRecordSkippedXeroBookingInvoiceUpdateOperation = vi.fn().mockResolvedValue({ queueOperationId: "op_skip", message: "skipped" });
+const mockReleaseXeroSupplementaryInvoiceForCapturedPaymentIntent = vi.fn().mockResolvedValue({ released: 1, queueOperationIds: ["op_supplementary"] });
+
+// #3582: an edit's and a review closure's ledger lines are posted by one sync,
+// proved in its own suites and against Postgres; this suite tests what it
+// always tested.
+// #5061 follow-up: no capture here is disputed; the edit's hold is proved in
+// `stripe-dispute-edit.realdb.test.ts`.
+vi.mock("@/lib/stripe-dispute-hold", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/stripe-dispute-hold")),
+  paymentDisputedCaptureCents: async () => ({ cents: 0, disputes: [] }),
+}));
+vi.mock("@/lib/booking-ledger-modification-sync", () => ({
+  postModificationLedgerLines: vi.fn().mockResolvedValue(undefined),
+  postReviewClosureLedgerLines: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    $queryRaw: vi.fn().mockResolvedValue([{ held: true }]),
+    // #4217: the ledger writers lock the Payment row first.
+    $executeRaw: vi.fn(async () => 0),
+    $transaction: (...args: unknown[]) => {
+      const fn = args[0];
+      if (typeof fn === "function") return (mockTransaction as any)(fn);
+      return Promise.resolve();
+    },
+    payment: {
+      findUnique: mockPaymentFindUnique,
+      update: mockPaymentUpdate,
+    },
+    // #2364: the hosting review is reconciled inside the booking write, so
+    // every prisma/tx double a booking path runs against needs this client.
+    adultMemberHostingPolicy: { findMany: vi.fn().mockResolvedValue([]) },
+    booking: {
+      findUnique: mockBookingFindUnique,
+      update: mockBookingUpdate,
+    },
+    // #1982: default lodge capacity is a self-healed DB override (the guest-add
+    // route's early getDefaultLodgeCapacity guard reads it off the singleton).
+    lodgeSettings: { findUnique: async () => ({ capacity: 100 }) },
+    bookingGuest: { create: mockBookingGuestCreate, update: mockBookingGuestUpdate },
+    // #3032: the pending-review fence reads this under the booking-edit locks.
+    // Empty by default - no financial review is open - so every pre-#3032 test
+    // asserts exactly what it asserted before.
+    // #3954: no increase is waiting on its mint's recovery for a reduction to net off.
+    // Final review: a re-issuing door reads its recovery back after commit
+    // (`readReissuedAskRecovery`); none by default.
+    paymentRecoveryOperation: {
+      findMany: vi.fn(async () => []),
+      findUnique: (...args: unknown[]) => mockRecoveryOperationFindUnique(...args),
+      updateMany: (...args: unknown[]) => mockRecoveryOperationUpdateMany(...args),
+    },
+    manualRefundTask: {
+      // #3827 (`INV-PAY-117`): no open edit refund hand-back on file.
+      aggregate: vi.fn(async () => ({ _sum: { amountCents: null } })),
+      findFirst: vi.fn().mockResolvedValue(null),
+      // #3032: the modified email asks whether the club is still working
+      // out an amount on this booking (`bookingHasOpenFinancialReview`).
+      // Empty by default - no review is open - so every pre-#3032
+      // assertion in this file means exactly what it meant before.
+      findMany: vi.fn().mockResolvedValue([]),
+      // #3166: the two calls `raiseEditFinancialReviewTask` makes when the date
+      // path parks. Present on every double rather than only the parking cases,
+      // because a missing model here throws inside the transaction and surfaces
+      // as an opaque 400 — which is how a park looks exactly like a refusal.
+      findUnique: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({ id: "task-1" }),
+    },
+    bookingModification: { create: mockBookingModCreate },
+    bookingRequest: { findFirst: vi.fn().mockResolvedValue(null) },
+    season: { findMany: mockSeasonFindMany },
+    choreAssignment: { findMany: mockChoreAssignFindMany, deleteMany: mockChoreAssignDeleteMany },
+    processedWebhookEvent: {
+      findUnique: mockProcessedWebhookFindUnique,
+      findFirst: mockProcessedWebhookFindFirst,
+      create: mockProcessedWebhookCreate,
+      deleteMany: mockProcessedWebhookDeleteMany,
+      updateMany: mockProcessedWebhookUpdateMany,
+    },
+    member: { count: mockMemberCount, findUnique: mockMemberFindUnique },
+    auditLog: { create: mockAuditCreate },
+    // The real supersede reads the GLOBAL client for the live ADDITIONAL asks it
+    // is about to retire. Empty by default because the default fixture carries
+    // no earlier ask; the #3244 carry case below puts its unpaid row here.
+    paymentTransaction: {
+      findMany: mockPaymentTransactionFindMany,
+      // #3954 round 7: the door re-reads its new intent (`isMintedAskStillLive`).
+      findUnique: vi.fn().mockResolvedValue({ status: "PENDING", withdrawnAt: null }),
+    },
+  },
+}));
+
+// #4516 (M4d): a hand-back's R05 is the journal's (`member-money-hand-backs.test.ts`); here, that the edit asks for it.
+vi.mock("@/lib/member-money/doors", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/member-money/doors")),
+  postHandBackObligation: vi.fn(async () => null),
+}));
+vi.mock("@/lib/auth", () => ({ auth: vi.fn() }));
+const mockRequireActiveSessionUser = vi.fn<(...args: unknown[]) => Promise<Response | null>>(async () => null);
+vi.mock("@/lib/session-guards", () => ({
+  requireActiveSessionUser: (...args: Parameters<typeof mockRequireActiveSessionUser>) => mockRequireActiveSessionUser(...args),
+}));
+vi.mock("@/lib/capacity", () => ({
+  checkCapacity: vi.fn(),
+  checkCapacityForGuestRanges: vi.fn(),
+  getOccupiedBedsForNight: vi.fn().mockReturnValue(0),
+  acquireLodgeCapacityLock: vi.fn().mockResolvedValue(undefined),
+  LODGE_CAPACITY: 29,
+}));
+vi.mock("@/lib/pricing", () => ({
+  calculateBookingPrice: vi.fn(),
+  calculatePromoDiscount: vi.fn().mockReturnValue({ discountCents: 0, freeNightsUsed: 0 }),
+}));
+vi.mock("@/lib/booking-policies", () => ({
+  validateMinimumStay: vi.fn().mockResolvedValue({ valid: true, violations: [] }),
+  formatViolationsDetail: vi.fn().mockReturnValue(""),
+}));
+vi.mock("@/lib/change-fee", () => ({ calculateChangeFee: vi.fn() }));
+vi.mock("@/lib/cancellation", () => ({
+  daysUntilDate: vi.fn().mockReturnValue(30),
+  loadCancellationPolicy: vi.fn().mockResolvedValue([]),
+  getNonMemberHoldDays: vi.fn().mockResolvedValue(7),
+  getNonMemberHoldPolicy: vi.fn().mockResolvedValue({
+    enabled: true,
+    holdDays: 7,
+    source: "default",
+  }),
+  // Date reductions settle through the shared policy machinery (#1024);
+  // default to a 100% tier so existing full-refund expectations hold.
+  calculateDualRefundAmounts: vi.fn((basisAmountCents: number) => ({
+    cardRefundAmountCents: basisAmountCents,
+    cardRefundPercentage: 100,
+    creditRefundAmountCents: basisAmountCents,
+    creditRefundPercentage: 100,
+  })),
+}));
+vi.mock("@/lib/promo", () => ({
+  validatePromoCodeRules: vi.fn().mockReturnValue(null),
+  validateAndCalculatePromoDiscount: vi.fn().mockResolvedValue({
+    discount: { adjustmentTargets: [], discountCents: 0, priceAdjustmentCents: 0, freeNightsUsed: 0, eligibleGuestCount: 0, allocations: [] },
+    beneficiaryMemberIds: [],
+  }),
+  calculatePromoDiscountForGuestRates: vi.fn().mockReturnValue({ discountCents: 0, priceAdjustmentCents: 0, freeNightsUsed: 0, eligibleGuestCount: 0, allocations: [] }),
+  shouldPersistPromoRedemption: vi.fn().mockReturnValue(true),
+  redeemPromoCode: vi.fn(),
+  replacePromoRedemptionAllocations: vi.fn(),
+  // #2299: the promo path row-locks each PromoCode it may charge or
+  // refund before reading or writing any usage cap.
+  lockPromoCodeRowsForUpdate: vi.fn(),
+  lockAndRefreshPromoCodeUsage: vi.fn(
+    async (_tx: unknown, promoCode: unknown) => promoCode
+  ),
+  deletePromoRedemptionAndAdjustCount: vi.fn(),
+  releaseBookingPromoRedemptions: vi.fn().mockResolvedValue(0),
+  releasePromoRedemptions: vi.fn().mockResolvedValue(undefined),
+  getMemberFreeNightsUsed: vi.fn().mockResolvedValue(0),
+}));
+vi.mock("@/lib/stripe", () => ({
+  processRefund: vi.fn(),
+  createPaymentIntent: vi.fn(),
+  findOrCreateCustomer: vi.fn(),
+  getPaymentIntent: vi.fn(),
+  constructWebhookEvent: vi.fn(),
+  listRefundsForCharge: vi.fn().mockResolvedValue([]),
+}));
+// DB-only (#2082): the webhook route resolves its signing secret via
+// stripe-config and records the webhook-verified marker.
+vi.mock("@/lib/stripe-config", () => ({
+  getOperationalStripeWebhookSecret: vi.fn().mockResolvedValue("whsec_test"),
+  recordStripeWebhookVerified: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/audit", () => ({ logAudit: vi.fn() }));
+vi.mock("@/lib/email", () => ({
+  sendBookingModifiedEmail: vi.fn().mockResolvedValue(undefined),
+  sendBookingConfirmedEmail: vi.fn().mockResolvedValue(undefined),
+  sendAdminPaymentFailureAlert: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/xero-supplementary-invoices", () => ({
+  createXeroSupplementaryInvoice: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/xero-modification-credit-notes", () => ({
+  createXeroCreditNoteForModification: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/xero-token-store", () => ({
+  isXeroConnected: vi.fn().mockResolvedValue(false),
+}));
+vi.mock("@/lib/xero-booking-invoices", () => ({
+  createXeroInvoiceForBooking: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/xero-credit-notes", () => ({
+  createXeroCreditNote: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/xero-operation-outbox", () => ({
+  enqueueXeroBookingInvoiceOperation: mockEnqueueXeroBookingInvoiceOperation,
+  enqueueXeroBookingInvoiceUpdateOperation: mockEnqueueXeroBookingInvoiceUpdateOperation,
+  enqueueXeroRefundCreditNoteOperation: mockEnqueueXeroRefundCreditNoteOperation,
+  enqueueXeroModificationCreditNoteOperation: mockEnqueueXeroModificationCreditNoteOperation,
+  kickQueuedXeroOutboxOperationsIfConnected: mockKickQueuedXeroOutboxOperationsIfConnected,
+  recordSkippedXeroBookingInvoiceUpdateOperation: mockRecordSkippedXeroBookingInvoiceUpdateOperation,
+}));
+vi.mock("@/lib/xero-supplementary-invoice-enqueue", () => ({
+  enqueueXeroSupplementaryInvoiceOperation: mockEnqueueXeroSupplementaryInvoiceOperation,
+}));
+vi.mock("@/lib/xero-supplementary-invoice-late-capture", () => ({
+  releaseXeroSupplementaryInvoiceForCapturedPaymentIntent: mockReleaseXeroSupplementaryInvoiceForCapturedPaymentIntent,
+}));
+vi.mock("@/lib/webhook-log", () => ({ recordWebhookLog: vi.fn().mockResolvedValue(undefined) }));
+vi.mock("@/lib/logger", () => ({
+  default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+// #3244: PARTIAL, through `importOriginal`. The whole-module form hid
+// `isCapturedTransactionStatus` — a PURE predicate the confirm-modification
+// route asks for its idempotency short-circuit — so every case in that describe
+// block 500'd the moment the route started calling it. Stubbing a pure
+// predicate would also make the idempotency test assert nothing, so the real
+// one is pulled through and only the I/O below stays mocked.
+vi.mock("@/lib/payment-transactions", async (importActual) => ({
+  ...((await importActual()) as typeof import("@/lib/payment-transactions")),
+  PartialRefundError: class PartialRefundError extends Error {
+    completedRefundCents = 0;
+  },
+  upsertPaymentIntentTransaction: (...args: unknown[]) =>
+    mockUpsertPaymentIntentTransaction(...args),
+  planStripeRefundAllocation: mockPlanStripeRefundAllocation,
+  refundPaymentTransactions: (...args: unknown[]) =>
+    mockRefundPaymentTransactions(...args),
+  findPaymentTransactionByIntentId: (...args: unknown[]) =>
+    mockFindPaymentTransactionByIntentId(...args),
+  markPaymentIntentTransactionSucceeded: (...args: unknown[]) =>
+    mockMarkPaymentIntentTransactionSucceeded(...args),
+  markPaymentIntentTransactionFailed: (...args: unknown[]) =>
+    mockMarkPaymentIntentTransactionFailed(...args),
+  syncRefundsFromStripeCharge: vi.fn(),
+}));
+vi.mock("@/lib/payment-recovery", () => ({
+  enqueueAdditionalPaymentIntentRecovery: vi.fn().mockResolvedValue({ id: "recovery_additional" }),
+  enqueuePaymentIntentCancellationRecovery: (...args: unknown[]) =>
+    mockEnqueuePaymentIntentCancellationRecovery(...args),
+  runPaymentRecoveryOperationNow: vi.fn().mockResolvedValue("succeeded"),
+  // #4070: what an own-card refund the Stripe call could not make still owes.
+  enqueueBookingModificationRefundRecovery: (...args: unknown[]) =>
+    mockEnqueueBookingModificationRefundRecovery(...args),
+  // #4992: the edit's own close of its pre-persisted card refund row.
+  markBookingModificationRefundRecoverySucceeded: (...args: unknown[]) =>
+    mockMarkBookingModificationRefundRecoverySucceeded(...args),
+  completeCanceledSupersededPaymentIntentRecovery: (...args: unknown[]) =>
+    mockCompleteCanceledSupersededPaymentIntentRecovery(...args),
+  queueSupersededPaymentIntentRefundRecovery: (...args: unknown[]) =>
+    mockQueueSupersededPaymentIntentRefundRecovery(...args),
+  getStripePaymentMethodId: (paymentIntent: {
+    payment_method?: string | { id?: string | null } | null;
+  }) =>
+    typeof paymentIntent.payment_method === "string"
+      ? paymentIntent.payment_method
+      : paymentIntent.payment_method?.id ?? null,
+}));
+
+vi.mock("@/lib/booking-payment-cleanup", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/booking-payment-cleanup")),
+  queueSupersededPrimaryIntentCancellations: (...args: unknown[]) =>
+    mockQueueSupersededPrimaryIntentCancellations(...args),
+}));
+
+// #3567: the club's format is resolved through this double so a test can make
+// the club's currency one no card can be charged in. Its default (the
+// file-level beforeEach) is the house fixture, so every other case reads the
+// format it always did.
+const clubFormatMock = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/club-format-server", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/club-format-server")),
+  clubFormatValues: (...a: unknown[]) => clubFormatMock(...a),
+}));
+// #3567 / #3635: `@/lib/additional-intent-currency` is NOT mocked. The re-issue
+// is a minter of an ADDITIONAL ask (`INV-OPS-015`), so it runs for real on its
+// mocked leaves - `createPaymentIntent`, the ledger upsert, the supersede's read
+// and durable cancel - and the reconcile's ledger posting below.
+vi.mock("@/lib/booking-ledger-settlement-sync", () => ({
+  syncBookingLedgerSettlements: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Chore cleanup mock
+vi.mock("@/lib/chore-cleanup", () => ({
+  cleanupChoreAssignmentsForDateChange: vi.fn().mockResolvedValue({ choreWarnings: [] }),
+  cleanupChoreAssignmentsForGuestStayRanges: vi.fn().mockResolvedValue({ choreWarnings: [] }),
+}));
+
+import { auth } from "@/lib/auth";
+import { checkCapacity, checkCapacityForGuestRanges } from "@/lib/capacity";
+import { calculateBookingPrice } from "@/lib/pricing";
+import { calculateChangeFee } from "@/lib/change-fee";
+import { processRefund, createPaymentIntent, findOrCreateCustomer, getPaymentIntent, constructWebhookEvent } from "@/lib/stripe";
+import { calculateDualRefundAmounts } from "@/lib/cancellation";
+import {
+  fenceHostingPolicyFindMany,
+  fenceMemberFindMany,
+  hostingMemberRow,
+  recordingBookingDouble,
+} from "@/lib/__tests__/support/hosting-participant-fence-double";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+import { ORGANISER_REFUND_DEBT_STATES, primeOrganiserRefundDebt } from "./support/organiser-refund-debt-reread";
+import { expectPrePersistedEditRefund, ownCardRefundPlan, OWN_CARD_REFUND_STATES, primeOwnCardRefund } from "./support/own-card-refund-outcome";
+import { UNSUPPORTED_CHARGE_CURRENCY_MEMBER_BODY } from "@/lib/stripe-charge-currency";
+import {
+  ADDITIONAL_PAYMENT_ALREADY_MADE_CODE,
+  ADDITIONAL_PAYMENT_CHANGED_BODY,
+  PAYMENT_PROCESSING_BODY,
+  PAYMENT_PROCESSING_CODE,
+} from "@/lib/payment-recovery-contract";
+import { stripeIdempotencyKeyForAskAmount } from "@/lib/payment-recovery-keys";
+import { NEGATIVE_STORED_GUEST_TOTAL_MESSAGE } from "@/lib/edit-night-valuation";
+
+const mockedAuth = vi.mocked(auth);
+const mockedCalcDualRefund = vi.mocked(calculateDualRefundAmounts);
+const mockedCheckCapacity = vi.mocked(checkCapacity);
+const mockedCheckCapacityForGuestRanges = vi.mocked(checkCapacityForGuestRanges);
+const mockedCalcPrice = vi.mocked(calculateBookingPrice);
+const mockedCalcChangeFee = vi.mocked(calculateChangeFee);
+const mockedProcessRefund = vi.mocked(processRefund);
+const mockedCreatePaymentIntent = vi.mocked(createPaymentIntent);
+const mockedFindOrCreateCustomer = vi.mocked(findOrCreateCustomer);
+const mockedGetPaymentIntent = vi.mocked(getPaymentIntent);
+const mockedConstructWebhookEvent = vi.mocked(constructWebhookEvent);
+
+function makeSession() {
+  return { user: { id: "m1", role: "MEMBER", accessRoles: [{ role: "USER" }], email: "alice@test.com" } };
+}
+
+/**
+ * The bookings below run 2026-08-01 onward and every scenario edits a stay that
+ * has NOT started — the "future" edit mode these routes serve. Left on the real
+ * clock the suite quietly changed meaning once the NZ calendar date reached the
+ * fixture check-in: getBookingEditPolicy then classifies the same booking as
+ * "in-progress" and the routes correctly answer 400 ("Use the full booking edit
+ * flow ..."), so the payment/refund assertions never ran. Pin the clock so the
+ * scenario under test stays the intended one; the in-progress edit path has its
+ * own deliberate coverage in batch-modify-payment.test.ts.
+ *
+ * Only `Date` is faked — real timers still run, so awaited promises resolve
+ * normally. Booking dates are untouched, so every money assertion is unchanged.
+ */
+const FIXED_NOW = new Date("2026-07-15T00:00:00.000Z"); // NZ 2026-07-15 12:00
+
+function makeBooking(overrides: Record<string, unknown> = {}) {
+  const booking = {
+    id: "bk1",
+    memberId: "m1",
+    // Booking.lodgeId is NOT NULL in the schema, so a real row always carries
+    // one. Omitting it here let the hosting participant fence compare
+    // "bk1:m1:undefined" on both sides and pass vacuously (#2619).
+    lodgeId: "lodge-1",
+    checkIn: new Date("2026-08-01"),
+    checkOut: new Date("2026-08-03"),
+    status: "CONFIRMED",
+    totalPriceCents: 10000,
+    discountCents: 0,
+    finalPriceCents: 10000,
+    hasNonMembers: false,
+    nonMemberHoldUntil: null,
+    guests: [
+      {
+        id: "g1",
+        bookingId: "bk1",
+        firstName: "Alice",
+        lastName: "Smith",
+        ageTier: "ADULT",
+        isMember: true,
+        memberId: "m1",
+        // #4317 review H1: the guest's stored total IS the booking's $100
+        // headline, as every writer stores them. It used to be $50 under a $100
+        // headline, a gap the edit doors now carry forward rather than settle,
+        // which would have moved every increase below by $50.
+        priceCents: 10000,
+        /*
+          #2675: with an ACTIVE hosting mode on the tx double below, the
+          reconciler's EVALUATOR now runs against this row rather than bailing
+          out at the mode gate, and `BOOKING_HOSTING_SELECT` /
+          `toHostingParticipants` are the authority on the shape it reads. Every
+          field below is one of theirs.
+
+          `nights` must be an ARRAY — `toHostingParticipants` reads
+          `guest.nights.length`, so an absent one is a TypeError, not a graceful
+          "no nights". Empty is the honest value for this fixture: it persists no
+          `BookingGuestNight` rows, so the evaluator falls back to the guest's own
+          stayStart..stayEnd envelope. It is also inert for the date path, whose
+          `valuedNightLocksForGuest` reads the same field and already treated the
+          absent one as "this guest locked no prices".
+        */
+        stayStart: new Date("2026-08-01"),
+        stayEnd: new Date("2026-08-03"),
+        /*
+          #3166: the two nights this guest holds, carrying what they were sold
+          for and summing to the stored 10000. The date path is now judged on
+          exact stored sold-price evidence, so an EMPTY list is a strand with no
+          readable history at all and every date change on it PARKS for financial
+          review — which is the gate working, not the settlement question this
+          suite is about. Cases that mean to describe unreadable history override
+          this deliberately below.
+        */
+        nights: [
+          { stayDate: new Date("2026-08-01"), priceCents: 5000, priceSource: "SOLD" },
+          { stayDate: new Date("2026-08-02"), priceCents: 5000, priceSource: "SOLD" },
+        ],
+        // No consent was ever needed for an ordinary guest, and `null` is one of
+        // the two values `isOperationallyPresentConsent` treats as present (D-12).
+        consentStatus: null,
+        /*
+          The LIVE Member relation, never the `isMember` snapshot beside it. A
+          guest row claiming membership without one is a shape production cannot
+          emit — the review's select always hydrates `member` — and it does not
+          degrade gracefully: `undefined !== null` is TRUE, so
+          `memberIsInGoodStanding` goes on to read `undefined.active` and the
+          seam throws the moment an active mode lets the evaluator run.
+        */
+        member: hostingMemberRow("m1"),
+      },
+    ],
+    payment: {
+      id: "p1",
+      bookingId: "bk1",
+      amountCents: 10000,
+      source: "STRIPE",
+      status: "SUCCEEDED",
+      stripePaymentIntentId: "pi_original",
+      stripeCustomerId: "cus_123",
+      xeroInvoiceId: "inv_primary",
+      refundedAmountCents: 0,
+      changeFeeCents: 0,
+      additionalPaymentIntentId: null,
+      additionalAmountCents: 0,
+      additionalPaymentStatus: null,
+    },
+    member: { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+    promoRedemptions: [],
+    ...overrides,
+  };
+  // #4317 review H1: an overridden headline is a booking whose guest is priced
+  // to match, as every writer stores them. The edit doors now carry any gap
+  // between the two forward rather than settle it, so a fixture that moved the
+  // headline alone would be modelling a frozen headline it never meant to.
+  if (typeof overrides.totalPriceCents === "number" && !("guests" in overrides)) {
+    const total = overrides.totalPriceCents;
+    const [guest] = booking.guests;
+    booking.guests = [
+      {
+        ...guest,
+        priceCents: total,
+        nights: [
+          { stayDate: new Date("2026-08-01"), priceCents: total - Math.floor(total / 2), priceSource: "SOLD" },
+          { stayDate: new Date("2026-08-02"), priceCents: Math.floor(total / 2), priceSource: "SOLD" },
+        ],
+      },
+    ];
+  }
+  return booking;
+}
+
+function makeTx(booking: ReturnType<typeof makeBooking>) {
+  /*
+    #2619: the hosting participant fence runs inside this very transaction. It
+    locks the source booking's owner/actor Member rows FOR KEY SHARE NOWAIT and
+    then, UNDER that lock, re-reads (1) those Member rows and (2) each source
+    booking's owner and lodge, refusing unless the second read still fingerprints
+    identically to what the caller planned.
+
+    This tx had no `booking.findMany` at all, so the re-read could not even be
+    attempted. The recorder replays exactly what this tx's own `findUnique`
+    served the planner — including an ABSENT lodgeId left absent, since the
+    fingerprint interpolates it and a re-read normalised to null would read as
+    drift against a plan that printed "undefined". So the no-drift case matches
+    by construction, and real drift is still refused.
+  */
+  const fenceBooking = recordingBookingDouble(async () => booking);
+  return {
+    $queryRaw: vi.fn().mockResolvedValue([{ held: true }]),
+    $executeRawUnsafe: vi.fn().mockResolvedValue(undefined),
+    // F1 (#1887): the date path now reads the applied-credit ledger for every
+    // pre-payment modification (gated on status, not the payment mirror) so the
+    // clamp also fires for a card booking with no payment row. These fixtures
+    // carry no applied credit, so the aggregate nets to 0 and the clamp is a
+    // no-op (never taking the ledger lock or writing a row).
+    $executeRaw: vi.fn().mockResolvedValue(undefined),
+    // MG3 (#2308) C1: `markCrossFamilyGuestsOnBooking` re-derives the D-8 marker
+    // over the whole proposed party from the booker's family groups, so the date
+    // path reads these two rows before the person-night guard. This fixture is
+    // about pricing and settlement, and was written when every member-linked
+    // guest on it was the booker's own household — so that is what it says here,
+    // rather than leaving the boundary to fall out of an empty mock.
+    familyGroupMember: {
+      findMany: vi.fn().mockImplementation(async (args: {
+        where?: { familyGroupId?: unknown; memberId?: unknown };
+      }) =>
+        args?.where?.familyGroupId
+          ? [
+              booking.memberId,
+              ...booking.guests.map(
+                (guest: { memberId?: string | null }) => guest.memberId,
+              ),
+            ]
+              .filter((memberId): memberId is string => Boolean(memberId))
+              .map((memberId) => ({ memberId, familyGroupId: "fg-fixture" }))
+          : [{ memberId: booking.memberId, familyGroupId: "fg-fixture" }],
+      ),
+    },
+    memberCredit: {
+      aggregate: vi.fn().mockResolvedValue({ _sum: { amountCents: 0 } }),
+      create: vi.fn().mockResolvedValue({}),
+    },
+    lodge: {
+      findFirst: vi.fn().mockResolvedValue({ id: "lodge-1" }),
+    },
+    // #1982: default lodge capacity is a self-healed DB override.
+    lodgeSettings: { findUnique: async () => ({ capacity: 100 }) },
+    // #2364: the hosting review is reconciled inside the booking write, so
+    // every prisma/tx double a booking path runs against needs this client.
+    // #2623 T5 / #2675: an ACTIVE mode, so the gate that now stands in front of
+    // the participant fence lets these seams reach it. `[]` here resolved to
+    // DISABLED and took the gate's early return, which switched the #2619 fence
+    // off in all eleven modify-dates/guest-add cases below while the fence
+    // doubles beside it still looked like coverage.
+    //
+    // ADMIN_REVIEW_REQUIRED rather than the helper's ENFORCED default: under
+    // ENFORCED a hosting violation REFUSES the booking write outright, which
+    // would change what these money assertions mean; under review-only a
+    // violation would merely queue a review. Neither happens on these fixtures
+    // (their only guest is an adult member in good standing, so nobody needs
+    // hosting), but the weaker consequence is the one that cannot rewrite the
+    // scenario if a fixture ever gains a non-member guest.
+    adultMemberHostingPolicy: {
+      findMany: fenceHostingPolicyFindMany({ mode: "ADMIN_REVIEW_REQUIRED" }),
+    },
+    booking: {
+      findUnique: fenceBooking.findUnique,
+      findMany: fenceBooking.findMany,
+      update: vi.fn().mockImplementation(({ data }) => {
+        return Promise.resolve({ ...booking, ...data, guests: booking.guests, payment: booking.payment });
+      }),
+    },
+    bookingGuest: {
+      // Person-night guard (#1157) queries member-linked guests on the new
+      // range; no other live booking exists in these fixtures, so no conflict.
+      findMany: vi.fn().mockResolvedValue([]),
+      create: vi.fn().mockImplementation(({ data }) => Promise.resolve({ id: "new-g", ...data })),
+      update: vi.fn().mockResolvedValue({}),
+    },
+    groupDiscountSetting: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+    // #3276: the night adjustment build-up writer reads and rewrites these.
+    bookingGuestNightAdjustment: {
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+      createMany: vi.fn().mockResolvedValue({ count: 0 }),
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    bookingGuestNight: {
+      findMany: vi.fn().mockResolvedValue([]),
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+      createMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    // #3032: the pending-review fence reads this under the booking-edit locks.
+    // Empty by default - no financial review is open - so every pre-#3032 test
+    // asserts exactly what it asserted before.
+    // #3954: no increase is waiting on its mint's recovery for a reduction to net off.
+    paymentRecoveryOperation: { findMany: vi.fn(async () => []) },
+    manualRefundTask: {
+      // #3827 (`INV-PAY-117`): no open edit refund hand-back on file.
+      aggregate: vi.fn(async () => ({ _sum: { amountCents: null } })),
+      findFirst: vi.fn().mockResolvedValue(null),
+      // #4516 (M4d): the internet-banking reduction's task, read back for its R05.
+      findUniqueOrThrow: vi.fn().mockResolvedValue({ id: "hand-back-1", amountCents: 3000 }),
+      // #3032: the modified email asks whether the club is still working
+      // out an amount on this booking (`bookingHasOpenFinancialReview`).
+      // Empty by default - no review is open - so every pre-#3032
+      // assertion in this file means exactly what it meant before.
+      findMany: vi.fn().mockResolvedValue([]),
+      // #3166: the two calls `raiseEditFinancialReviewTask` makes when the date
+      // path parks. Present on every double rather than only the parking cases,
+      // because a missing model here throws inside the transaction and surfaces
+      // as an opaque 400 — which is how a park looks exactly like a refusal.
+      findUnique: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({ id: "task-1" }),
+      // #3827 (D-3813-6): an internet-banking reduction's officer refund task.
+      createMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    bookingModification: { create: vi.fn().mockResolvedValue({ id: "mod1" }) },
+    bookingRequest: { findFirst: vi.fn().mockResolvedValue(null) },
+    // #3980: an edit that read no invoice link claims the payment row.
+    payment: {
+      update: vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      // #4442: the mint's queue re-reads the live ask it carries on this transaction - the fixture's own mirror.
+      findUnique: vi.fn(async () => booking.payment ?? null),
+    },
+    // #4442: the supersede's read runs in the mint's queue transaction, answered by the suite's ledger.
+    paymentTransaction: { findMany: (...args: unknown[]) => mockPaymentTransactionFindMany(...args) },
+    season: {
+      findMany: vi.fn().mockResolvedValue([{
+        id: "s1",
+        startDate: new Date("2026-04-01"),
+        endDate: new Date("2026-10-31"),
+        // Membership-type-keyed rates (#1930, E4): FULL members 5000, NON_MEMBER
+        // 7000. The pricing engine (calculateBookingPrice) is mocked in this
+        // suite, so these values only need the re-keyed shape, not the amounts.
+        membershipTypeRates: [
+          { membershipTypeId: "type-full", ageTier: "ADULT", pricePerNightCents: 5000 },
+          { membershipTypeId: "type-nonmember", ageTier: "ADULT", pricePerNightCents: 7000 },
+        ],
+      }]),
+    },
+    promoRedemption: { findUnique: vi.fn().mockResolvedValue(null), findMany: vi.fn().mockResolvedValue([]), findFirst: vi.fn().mockResolvedValue(null), update: vi.fn().mockResolvedValue({}) },
+    choreAssignment: {
+      findMany: vi.fn().mockResolvedValue([]),
+      deleteMany: vi.fn().mockResolvedValue({}),
+    },
+    // Rate-membership-type snapshot resolution (#1930, E4): the modify/guest-add
+    // paths now resolve every guest's rate type before pricing. Provide the
+    // policy-db delegates so the resolver sees the built-in types (member guests
+    // -> FULL/member rate, true non-members -> NON_MEMBER) instead of throwing.
+    member: {
+      // #2619: the fence's own id-only re-read is answered by the shared helper
+      // — every locked id back, in sorted order. Every OTHER member.findMany
+      // (the rate resolver's, below) still gets exactly the rows it always did.
+      findMany: fenceMemberFindMany([], async (args) =>
+        ((args as { where?: { id?: { in?: string[] } } })?.where?.id?.in ?? []).map((id) => ({
+          id,
+          firstName: "Member",
+          lastName: "Test",
+          email: `${id}@test.com`,
+          role: "MEMBER",
+          ageTier: "ADULT",
+        })),
+      ),
+      findUnique: vi.fn().mockResolvedValue(null),
+      count: vi.fn().mockResolvedValue(1),
+    },
+    seasonalMembershipAssignment: { findMany: vi.fn().mockResolvedValue([]) },
+    membershipType: {
+      findMany: vi.fn().mockResolvedValue([
+        { id: "type-full", key: "FULL", bookingBehavior: "MEMBER_RATE", subscriptionBehavior: "REQUIRED", name: "Full", isActive: true, isBuiltIn: true },
+        { id: "type-nonmember", key: "NON_MEMBER", bookingBehavior: "NON_MEMBER_RATE", subscriptionBehavior: "NOT_REQUIRED", name: "Non-Member", isActive: true, isBuiltIn: true },
+      ]),
+    },
+  };
+}
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(FIXED_NOW);
+  mockPaymentTransactionFindMany.mockResolvedValue([]);
+  mockEnqueuePaymentIntentCancellationRecovery.mockResolvedValue({ id: "op_cancel" });
+  clubFormatMock.mockResolvedValue(CLUB_FORMAT_TEST);
+  mockQueueSupersededPrimaryIntentCancellations.mockResolvedValue([]);
+  mockUpsertPaymentIntentTransaction.mockResolvedValue({});
+  mockRefundPaymentTransactions.mockResolvedValue({
+    refunds: [{ refundId: "re_test_1", paymentIntentId: "pi_original", amountCents: 1000 }],
+  });
+  mockFindPaymentTransactionByIntentId.mockResolvedValue({
+    id: "ptx_1",
+    paymentId: "p1",
+    kind: "ADDITIONAL",
+    amountCents: 3000,
+    status: "PENDING",
+    createdAt: new Date(),
+  });
+  mockMarkPaymentIntentTransactionSucceeded.mockResolvedValue({});
+  mockMarkPaymentIntentTransactionFailed.mockResolvedValue({});
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+// ============================================================================
+// modify-dates: price increase creates additional PaymentIntent
+// ============================================================================
+
+describe("PUT /api/bookings/[id]/modify-dates — price increase", () => {
+  let PUT: typeof import("@/app/api/bookings/[id]/modify-dates/route").PUT;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+  mockPlanStripeRefundAllocation.mockImplementation(ownCardRefundPlan);
+    mockMemberCount.mockResolvedValue(1);
+    mockMemberFindUnique.mockResolvedValue({
+      id: "m1",
+      active: true,
+      email: "alice@test.com",
+      firstName: "Alice",
+    } as any);
+    const mod = await import("@/app/api/bookings/[id]/modify-dates/route");
+    PUT = mod.PUT;
+  });
+
+  // #5407 item 42: the first case to call the route pays for loading its module graph; timed out at 5,000ms on a busy host.
+  it("stores the itemised lines behind the delta, summing to priceDiffCents (#3530)", async () => {
+    // A booking whose stored total IS its two sold nights (5000), moved to two
+    // nights at 7500: the delta is +10000, and the lines say which nights went
+    // and which came - never a bare "+$100".
+    const booking = makeBooking({ totalPriceCents: 5000, finalPriceCents: 5000 });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 15000,
+      guests: [
+        {
+          ageTier: "ADULT",
+          isMember: true,
+          rateMembershipTypeId: "rt-member",
+          priceCents: 15000,
+          perNightCents: [7500, 7500],
+          nightDates: [new Date("2026-08-05"), new Date("2026-08-06")],
+        },
+      ],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_additional", client_secret: "s" } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-07" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(200);
+
+    const created = (tx.bookingModification.create as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0]?.data;
+    expect(created.priceDiffCents).toBe(10000);
+    const lines = created.priceLines as Array<{ amountCents: number }>;
+    expect(lines.reduce((sum, line) => sum + line.amountCents, 0)).toBe(created.priceDiffCents);
+    expect(lines).toEqual([
+      expect.objectContaining({ kind: "GUEST_NIGHTS", sign: -1, unitCents: 2500, nightCount: 2, startDate: "2026-08-01", amountCents: -5000, guestNames: ["Alice Smith"] }),
+      expect.objectContaining({ kind: "GUEST_NIGHTS", sign: 1, unitCents: 7500, nightCount: 2, startDate: "2026-08-05", amountCents: 15000 }),
+    ]);
+  }, 30_000);
+
+  // #3954 round 9: the door withholds the secret of an ask a reduction retired
+  // before it was offered; its email must not name that ask as due either.
+  it("MUTATION (round 9): an increase whose ask a reduction retired is not named as due, and offers no secret", async () => {
+    const tx = makeTx(makeBooking());
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({ totalPriceCents: 15000, guests: [{ priceCents: 15000, perNightCents: [7500, 7500] }] } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_additional", client_secret: "s", currency: "nzd" } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    const { prisma } = await import("@/lib/prisma");
+    vi.mocked(prisma.paymentTransaction.findUnique).mockResolvedValueOnce({ status: "FAILED", withdrawnAt: new Date("2026-07-01T00:00:00.000Z") } as never);
+
+    const res = await PUT(
+      new NextRequest("http://localhost/api/bookings/bk1/modify-dates", { method: "PUT", body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-08" }) }),
+      { params: Promise.resolve({ id: "bk1" }) },
+    );
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 5000 }));
+    expect(data.additionalPaymentClientSecret).toBeNull();
+    const { sendBookingModifiedEmail } = await import("@/lib/email");
+    expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ additionalAmountCents: 0, additionalPaymentMethod: undefined }),
+      expect.anything(),
+    );
+  });
+
+  // #4052: a card ask whose mint failed (its retry queued) is still a card ask,
+  // with the primary invoice issued: named as one, never as Internet Banking.
+  it("MUTATION (#4052): a card-paid booking's increase whose mint failed is named as a card payment, at its full figure", async () => {
+    const tx = makeTx(makeBooking());
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({ totalPriceCents: 15000, guests: [{ priceCents: 15000, perNightCents: [7500, 7500] }] } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockedCreatePaymentIntent.mockRejectedValueOnce(new Error("Stripe is down"));
+    mockPaymentUpdate.mockResolvedValue({});
+
+    const res = await PUT(
+      new NextRequest("http://localhost/api/bookings/bk1/modify-dates", { method: "PUT", body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-08" }) }),
+      { params: Promise.resolve({ id: "bk1" }) },
+    );
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.additionalPaymentClientSecret).toBeNull();
+    const { sendBookingModifiedEmail } = await import("@/lib/email");
+    expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ additionalAmountCents: 5000, additionalPaymentMethod: "STRIPE" }),
+      expect.anything(),
+    );
+  });
+
+  // #3954 final review (R1/R2): this date change (R1) shrinks a $50 unpaid ask
+  // to $30 and re-issues it; a later reduction (R2) nets that waiting re-issue
+  // off before R1's door mints it. R2's own email told the member, so R1's must
+  // not name the $30 as due.
+  it("MUTATION (final review): a re-issue a later reduction netted off before the door minted it is named as $0", async () => {
+    const booking = makeBooking({
+      totalPriceCents: 15000,
+      finalPriceCents: 15000,
+      payment: {
+        ...makeBooking().payment,
+        additionalPaymentIntentId: "pi_ask",
+        additionalAmountCents: 5000,
+        additionalPaymentStatus: "PENDING",
+      },
+    });
+    const askRow = {
+      id: "txn_ask",
+      kind: "ADDITIONAL",
+      source: "STRIPE",
+      status: "PENDING",
+      reason: "guest_add_price_increase",
+      amountCents: 5000,
+      carriedAskCents: 0,
+      stripePaymentIntentId: "pi_ask",
+      createdAt: new Date("2026-06-20T00:00:00.000Z"),
+      hadIssuedXeroInvoice: true,
+    };
+    const tx = Object.assign(makeTx(booking), {
+      paymentTransaction: {
+        findMany: vi.fn(async (args: { where?: { kind?: unknown } }) => (args?.where?.kind === "PRIMARY" ? [] : [askRow])),
+        updateMany: vi.fn(async () => ({ count: 1 })),
+      },
+      xeroSyncOperation: { findMany: vi.fn(async () => []), updateMany: vi.fn(async () => ({ count: 0 })) },
+    });
+    Object.assign(tx.bookingModification, { findMany: vi.fn(async () => [{ id: "mod_increase" }]) });
+    Object.assign(tx.payment, { findUnique: vi.fn(async () => null) });
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({ totalPriceCents: 13000, guests: [{ priceCents: 13000, perNightCents: [6500, 6500] }] } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockPaymentUpdate.mockResolvedValue({});
+    const { PENDING_ASK_NETTED_BY_REDUCTION_NOTE } = await import("@/lib/additional-ask-recovery-close");
+    mockRecoveryOperationFindUnique.mockImplementation(async () => ({
+      id: "op_reissue",
+      status: "SUCCEEDED",
+      attempts: 0,
+      processingStartedAt: null,
+      paymentIntentId: "mod_reissued_ask_mod1",
+      amountCents: 3000,
+      createdAt: new Date("2026-07-15T00:00:00.000Z"),
+      lastError: PENDING_ASK_NETTED_BY_REDUCTION_NOTE,
+    }));
+
+    try {
+      const res = await PUT(
+        new NextRequest("http://localhost/api/bookings/bk1/modify-dates", { method: "PUT", body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-07" }) }),
+        { params: Promise.resolve({ id: "bk1" }) },
+      );
+      const data = await res.json();
+
+      expect(res.status).toBe(200);
+      // The edit re-issued $30 of the $50 ask, which R2 netted off before this door minted it.
+      expect(data.additionalAmountCents).toBe(3000);
+      expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+      expect(data.additionalPaymentClientSecret).toBeNull();
+      const { sendBookingModifiedEmail } = await import("@/lib/email");
+      expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+        expect.objectContaining({ additionalAmountCents: 0, additionalPaymentMethod: undefined }),
+        expect.anything(),
+      );
+    } finally {
+      mockRecoveryOperationFindUnique.mockReset();
+      mockRecoveryOperationFindUnique.mockResolvedValue(null);
+    }
+  });
+
+  it("creates additional PaymentIntent and returns clientSecret when price increases", async () => {
+    const booking = makeBooking();
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 15000, // price increased from 10000
+      guests: [{ priceCents: 15000, perNightCents: [7500, 7500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      client_secret: "pi_additional_secret_xxx", currency: "nzd",
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-08" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.additionalAmountCents).toBe(5000);
+    expect(data.additionalPaymentClientSecret).toBe("pi_additional_secret_xxx");
+
+    // Verify PaymentIntent was created with correct amount
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 5000,
+        metadata: expect.objectContaining({
+          bookingId: "bk1",
+          type: "modification_additional",
+        }),
+      })
+    );
+
+    expect(mockUpsertPaymentIntentTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentId: "p1",
+        paymentIntentId: "pi_additional",
+        amountCents: 5000,
+        status: "PENDING",
+      })
+    );
+
+    await Promise.resolve();
+    expect(mockEnqueueXeroSupplementaryInvoiceOperation).toHaveBeenCalledWith(
+      {
+        bookingId: "bk1",
+        priceDiffCents: 5000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod1",
+      },
+      {
+        createdByMemberId: "m1",
+        paymentIntentId: "pi_additional",
+        waitForConfirmedAdditionalPayment: true,
+        recordPayment: true,
+      }
+    );
+    expect(mockEnqueueXeroBookingInvoiceUpdateOperation).not.toHaveBeenCalled();
+    expect(mockRecordSkippedXeroBookingInvoiceUpdateOperation).toHaveBeenCalledWith({
+      bookingId: "bk1",
+      bookingModificationId: "mod1",
+      reason: expect.stringContaining("Skipped primary Xero invoice update"),
+      createdByMemberId: "m1",
+    });
+    expect(mockKickQueuedXeroOutboxOperationsIfConnected).toHaveBeenCalledWith({ limit: 1 });
+  });
+
+  it("uses existing stripeCustomerId if present (no findOrCreateCustomer call)", async () => {
+    const booking = makeBooking(); // has stripeCustomerId: "cus_123"
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 12000,
+      guests: [{ priceCents: 12000, perNightCents: [6000, 6000] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_add2",
+      client_secret: "secret_2", currency: "nzd",
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkOut: "2026-08-05" }),
+    });
+    await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ customerId: "cus_123" })
+    );
+  });
+
+  it("includes change fee in additionalAmountCents", async () => {
+    const booking = makeBooking();
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 10000, // same price, but change fee applies
+      guests: [{ priceCents: 10000, perNightCents: [5000, 5000] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 2000, fromTierRefundPct: 50, toTierRefundPct: 100 }); // $20 change fee
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_fee",
+      client_secret: "fee_secret", currency: "nzd",
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    // Changing check-in from Aug 1 to Aug 2 (still before checkOut Aug 3) — triggers late-notice fee
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkIn: "2026-08-02" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    // priceDiff = 0, changeFee = 2000, total additional = 2000
+    expect(data.additionalAmountCents).toBe(2000);
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 2000 })
+    );
+  });
+
+  /*
+    #3502 (owner decision, 6 Oct 2026): a booking paid wholly with credit is a
+    $0 SUCCEEDED card-source payment with no intent and, at a club without
+    Xero, no invoice. The date door used to ask `hasCapturedPayment` and send
+    the increase to a supplementary invoice that does not exist - nobody was
+    billed. It now asks the member's card, Xero or not.
+  */
+  function zeroDollarPayment(xeroInvoiceId: string | null) {
+    return {
+      id: "p1",
+      bookingId: "bk1",
+      amountCents: 0,
+      source: "STRIPE",
+      status: "SUCCEEDED",
+      stripePaymentIntentId: null,
+      stripeCustomerId: null,
+      xeroInvoiceId,
+      refundedAmountCents: 0,
+      creditAppliedCents: 10000,
+      changeFeeCents: 0,
+      additionalPaymentIntentId: null,
+      additionalAmountCents: 0,
+      additionalPaymentStatus: null,
+    };
+  }
+
+  async function growZeroDollarBooking(xeroInvoiceId: string | null) {
+    const booking = makeBooking({ status: "PAID", payment: zeroDollarPayment(xeroInvoiceId) });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 15000,
+      guests: [{ priceCents: 15000, perNightCents: [7500, 7500] }],
+    } as any);
+    // A $10 change fee, so the fee half of the ask is pinned too.
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 1000, fromTierRefundPct: 50, toTierRefundPct: 100 });
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_new" } as any);
+    // #4036: no stored customer, so the door reads the owner after commit and
+    // resolves the customer as the recovery runner does (`readAskMintPayment`).
+    mockPaymentFindUnique.mockResolvedValue({
+      ...zeroDollarPayment(xeroInvoiceId),
+      booking: {
+        organisationId: null,
+        member: { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+        organisation: null,
+      },
+    });
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_zero_extra",
+      client_secret: "zero_extra_secret", currency: "nzd",
+    } as any);
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-08" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    return { res, data: await res.json(), tx };
+  }
+
+  it("asks a credit-paid ($0) booking's card for the increase with Xero off (#3502)", async () => {
+    const { res, data, tx } = await growZeroDollarBooking(null);
+
+    expect(res.status).toBe(200);
+    // +$50 price and the $10 fee: the figure, not merely "some intent".
+    expect(data.additionalAmountCents).toBe(6000);
+    expect(data.additionalPaymentClientSecret).toBe("zero_extra_secret");
+    // No original intent or customer to reuse: a fresh customer, a fresh intent.
+    expect(mockedFindOrCreateCustomer).toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 6000, customerId: "cus_new" }),
+    );
+    // #3980: no invoice link was read, so the fee rides the edit's claim on the row.
+    expect(tx.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: "p1", xeroInvoiceId: null },
+      data: { changeFeeCents: { increment: 1000 } },
+    });
+    await Promise.resolve();
+    // No invoice exists, so nothing goes to Xero as a supplementary invoice.
+    expect(mockEnqueueXeroSupplementaryInvoiceOperation).not.toHaveBeenCalled();
+  });
+
+  it("with an issued invoice, the supplementary invoice waits for that card payment (#3502)", async () => {
+    const { res, data } = await growZeroDollarBooking("inv_primary");
+
+    expect(res.status).toBe(200);
+    expect(data.additionalAmountCents).toBe(6000);
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 6000 }),
+    );
+    await Promise.resolve();
+    expect(mockEnqueueXeroSupplementaryInvoiceOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ bookingId: "bk1", priceDiffCents: 5000, changeFeeCents: 1000 }),
+      expect.objectContaining({
+        paymentIntentId: "pi_zero_extra",
+        waitForConfirmedAdditionalPayment: true,
+        recordPayment: true,
+      }),
+    );
+  });
+
+  it("processes refund for price decrease (no additional PI created)", async () => {
+    const booking = makeBooking();
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 7000, // price decreased from 10000
+      guests: [{ priceCents: 7000, perNightCents: [3500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkOut: "2026-08-02", settlementMethod: "card" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.refundAmountCents).toBe(3000);
+    expect(data.additionalAmountCents).toBe(0);
+    expect(data.additionalPaymentClientSecret).toBeNull();
+
+    // Refund was processed
+    expect(mockRefundPaymentTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentId: "p1",
+        amountCents: 3000,
+      })
+    );
+
+    // No additional PI created
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    // #3993: a card refund of a price cut is the payment's refund note, not a
+    // modification note the card-paid invoice cannot take.
+    expect(mockEnqueueXeroRefundCreditNoteOperation).toHaveBeenCalledWith("p1", 3000, {
+      refundMethod: "card",
+      createdByMemberId: "m1",
+    });
+    expect(mockEnqueueXeroModificationCreditNoteOperation).not.toHaveBeenCalled();
+  });
+
+  it("limits a captured-payment date reduction to the cancellation-policy tier (#1024)", async () => {
+    // Regression guard: date reductions must settle through the shared policy
+    // core, not refund the full price delta. Here the tier only returns 50%, so
+    // a $30 delta must refund $15 — the pre-#1024 code refunded the full $30.
+    const booking = makeBooking();
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 7000, // price decreased from 10000 → $30 delta
+      guests: [{ priceCents: 7000, perNightCents: [3500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockedCalcDualRefund.mockReturnValueOnce({
+      cardRefundAmountCents: 1500,
+      cardRefundPercentage: 50,
+      creditRefundAmountCents: 1500,
+      creditRefundPercentage: 50,
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkOut: "2026-08-02", settlementMethod: "card" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    // Policy-limited, NOT the full 3000 delta.
+    expect(data.refundAmountCents).toBe(1500);
+    expect(mockRefundPaymentTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentId: "p1", amountCents: 1500 }),
+    );
+
+    await Promise.resolve();
+    // #3993: a card refund of a price cut is the payment's refund note, not a
+    // modification note the card-paid invoice cannot take.
+    expect(mockEnqueueXeroRefundCreditNoteOperation).toHaveBeenCalledWith("p1", 1500, {
+      refundMethod: "card",
+      createdByMemberId: "m1",
+    });
+    expect(mockEnqueueXeroModificationCreditNoteOperation).not.toHaveBeenCalled();
+  });
+
+  // #4057: a joiner's booking the group organiser paid for by card refunds the
+  // reduction to the ORGANISER's card through its debt. The real refund helper
+  // runs that debt and re-reads it after commit; the email says the refund was
+  // made only when the debt says so.
+  it.each(ORGANISER_REFUND_DEBT_STATES)("an organiser child's date reduction emails refund destination: debt $label -> $destination (#4057)", async ({ lookupThrows, reread, runs, destination }) => {
+    const booking = makeBooking({ organiserSettled: true, parentBookingId: "organiser_bk" });
+    const tx = makeTx(booking) as ReturnType<typeof makeTx> & Record<string, unknown>;
+    Object.assign(tx, {
+      groupBookingSettlement: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "settlement_1",
+          stripePaymentIntentId: "pi_combined",
+          amountCents: 20000,
+          status: "SUCCEEDED",
+          refundPlan: null,
+        }),
+      },
+      paymentRefund: { aggregate: vi.fn().mockResolvedValue({ _sum: { amountCents: null } }) },
+      paymentRecoveryOperation: {
+        findUnique: vi.fn().mockResolvedValue(null),
+        findMany: vi.fn().mockResolvedValue([]),
+        create: vi.fn().mockResolvedValue({ id: "op_child", amountCents: 3000 }),
+      },
+    });
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 7000, // price decreased from 10000
+      guests: [{ priceCents: 7000, perNightCents: [3500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+    primeOrganiserRefundDebt(mockRecoveryOperationFindUnique, { bookingModificationId: "mod1", debtId: "op_child", lookupThrows, reread });
+
+    try {
+      const res = await PUT(
+        new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+          method: "PUT",
+          // No settlement method: the organiser's card is the only disposition.
+          body: JSON.stringify({ checkOut: "2026-08-02" }),
+        }),
+        { params: Promise.resolve({ id: "bk1" }) },
+      );
+
+      expect(res.status).toBe(200);
+      expect(mockRefundPaymentTransactions).not.toHaveBeenCalled();
+      const { runPaymentRecoveryOperationNow } = await import("@/lib/payment-recovery");
+      // A lookup that throws leaves nothing to run; the debt stays owed.
+      if (runs) expect(runPaymentRecoveryOperationNow).toHaveBeenCalledWith("op_child", expect.anything());
+      else expect(runPaymentRecoveryOperationNow).not.toHaveBeenCalledWith("op_child", expect.anything());
+      const { sendBookingModifiedEmail } = await import("@/lib/email");
+      expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+        expect.objectContaining({ refundAmountCents: 3000, refundDestination: destination }),
+        expect.anything(),
+      );
+    } finally {
+      mockRecoveryOperationFindUnique.mockReset();
+      mockRecoveryOperationFindUnique.mockResolvedValue(null);
+    }
+  });
+
+  // #4070: a reduction refunded to the member's own card. The email says the
+  // refund was made only when Stripe made it; one the Stripe call could not
+  // make stays owed on the row the edit wrote before it committed (#4992), and
+  // is on its way.
+  it.each(OWN_CARD_REFUND_STATES)("an own-card date reduction emails refund destination: $label -> $destination (#4070)", async ({ answer, destination }) => {
+    const booking = makeBooking();
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 7000, // price decreased from 10000
+      guests: [{ priceCents: 7000, perNightCents: [3500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+    mockEnqueueBookingModificationRefundRecovery.mockResolvedValue({ id: "op_refund" });
+    primeOwnCardRefund(mockRefundPaymentTransactions, answer, mockPlanStripeRefundAllocation);
+
+    const res = await PUT(
+      new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+        method: "PUT",
+        body: JSON.stringify({ checkOut: "2026-08-02", settlementMethod: "card" }),
+      }),
+      { params: Promise.resolve({ id: "bk1" }) },
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockRefundPaymentTransactions).toHaveBeenCalledWith(expect.objectContaining({ paymentId: "p1", amountCents: 3000 }));
+    expectPrePersistedEditRefund(
+      {
+        refund: mockRefundPaymentTransactions,
+        enqueue: mockEnqueueBookingModificationRefundRecovery,
+        close: mockMarkBookingModificationRefundRecoverySucceeded,
+      },
+      { answer, destination, pendingCents: 3000, bookingModificationId: "mod1", reservedInTransaction: true },
+    );
+    const { sendBookingModifiedEmail } = await import("@/lib/email");
+    expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ refundAmountCents: 3000, refundDestination: destination, refundByBankTransfer: null }),
+      expect.anything(),
+    );
+  });
+
+  it("does not send Internet Banking date reductions to Stripe refund recovery", async () => {
+    const booking = makeBooking({
+      payment: {
+        ...makeBooking().payment,
+        source: "INTERNET_BANKING",
+        stripePaymentIntentId: null,
+        stripeCustomerId: null,
+        xeroInvoiceId: "inv_ib_1",
+      },
+    });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 7000,
+      guests: [{ priceCents: 7000, perNightCents: [3500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkOut: "2026-08-02", settlementMethod: "card" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.refundAmountCents).toBe(3000);
+    expect(data.additionalPaymentClientSecret).toBeNull();
+    expect(mockRefundPaymentTransactions).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+    // #3827 (D-3813-6, `INV-PAY-117`): the treasurer is asked to send the
+    // $30 back, and the member is told it is coming by bank transfer.
+    expect(tx.manualRefundTask.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({
+          amountCents: 3000,
+          kind: "CANCELLED_BOOKING_HAND_BACK",
+          occurrenceKey: "edit-refund-hand-back:mod1",
+        }),
+      ],
+      skipDuplicates: true,
+    });
+    // #4516 (M4d): and its refund debt posts beside it.
+    const { postHandBackObligation } = await import("@/lib/member-money/doors");
+    expect(vi.mocked(postHandBackObligation)).toHaveBeenCalledWith(tx, expect.anything(), expect.objectContaining({
+      bookingId: "bk1", taskId: "hand-back-1", amountCents: 3000, debtorRead: "booking-row",
+    }));
+    const { sendBookingModifiedEmail } = await import("@/lib/email");
+    expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+      // #4070: no Stripe refund ran, so the member's own wording stands.
+      expect.objectContaining({ refundAmountCents: 3000, refundByBankTransfer: "member", refundDestination: "own" }),
+      expect.anything(),
+    );
+
+    await Promise.resolve();
+    expect(mockEnqueueXeroModificationCreditNoteOperation).toHaveBeenCalledWith(
+      {
+        bookingId: "bk1",
+        refundAmountCents: 3000,
+        bookingModificationId: "mod1",
+        // `INV-PAY-101`: nothing was captured by Stripe, so the money the member gets back is sent by the club itself.
+        refundMethod: "internet-banking",
+      },
+      {
+        createdByMemberId: "m1",
+      }
+    );
+  });
+
+  it("does not create PI for PENDING bookings (payment not yet taken)", async () => {
+    // For PENDING bookings, no payment has been collected yet.
+    // The booking price update is recorded, but additionalAmountCents stays 0
+    // (the new price will be charged when the booking auto-confirms).
+    const booking = makeBooking({
+      status: "PENDING",
+      payment: {
+        id: "p1",
+        bookingId: "bk1",
+        amountCents: 0,
+        status: "PENDING",
+        stripePaymentIntentId: null,
+        stripeCustomerId: null,
+        refundedAmountCents: 0,
+        changeFeeCents: 0,
+        additionalPaymentIntentId: null,
+        additionalAmountCents: 0,
+        additionalPaymentStatus: null,
+      },
+    });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 15000,
+      guests: [{ priceCents: 15000, perNightCents: [7500, 7500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-08" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    // No additional payment for PENDING bookings - original payment not taken yet
+    expect(data.additionalAmountCents).toBe(0);
+    expect(data.additionalPaymentClientSecret).toBeNull();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("queues a supplementary Xero invoice for invoice-backed unpaid bookings without creating a new PI", async () => {
+    const booking = makeBooking({
+      payment: {
+        id: "p1",
+        bookingId: "bk1",
+        amountCents: 10000,
+        status: "PROCESSING",
+        stripePaymentIntentId: "pi_original",
+        stripeCustomerId: "cus_123",
+        refundedAmountCents: 0,
+        changeFeeCents: 0,
+        additionalPaymentIntentId: null,
+        additionalAmountCents: 0,
+        additionalPaymentStatus: null,
+        xeroInvoiceId: "inv_primary",
+      },
+    });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 15000,
+      guests: [{ priceCents: 15000, perNightCents: [7500, 7500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-08" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.additionalAmountCents).toBe(5000);
+    expect(data.additionalPaymentClientSecret).toBeNull();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    expect(mockEnqueueXeroSupplementaryInvoiceOperation).toHaveBeenCalledWith(
+      {
+        bookingId: "bk1",
+        priceDiffCents: 5000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod1",
+      },
+      {
+        createdByMemberId: "m1",
+        paymentIntentId: null,
+        waitForConfirmedAdditionalPayment: false,
+        recordPayment: false,
+      }
+    );
+  });
+
+  it("queues a Xero credit note for invoice-backed unpaid decreases without refunding Stripe", async () => {
+    const booking = makeBooking({
+      payment: {
+        id: "p1",
+        bookingId: "bk1",
+        amountCents: 10000,
+        status: "PROCESSING",
+        stripePaymentIntentId: "pi_original",
+        stripeCustomerId: "cus_123",
+        refundedAmountCents: 0,
+        changeFeeCents: 0,
+        additionalPaymentIntentId: null,
+        additionalAmountCents: 0,
+        additionalPaymentStatus: null,
+        xeroInvoiceId: "inv_primary",
+      },
+    });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 7000,
+      guests: [{ priceCents: 7000, perNightCents: [3500] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkOut: "2026-08-02" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.refundAmountCents).toBe(0);
+    expect(mockedProcessRefund).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    expect(mockEnqueueXeroModificationCreditNoteOperation).toHaveBeenCalledWith(
+      {
+        bookingId: "bk1",
+        refundAmountCents: 3000,
+        bookingModificationId: "mod1",
+        // `INV-PAY-101` (#3536): an unpaid invoice corrected for the delta refunds
+        // nothing, so the note reads "Invoice correction — nothing refunded" and
+        // names no refund method at all, never the card or bank-transfer one.
+        noteWording: "invoice-correction",
+      },
+      {
+        createdByMemberId: "m1",
+      }
+    );
+  });
+
+  it("queues a primary Xero invoice update for zero-net date changes", async () => {
+    const booking = makeBooking();
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacity.mockResolvedValue({ available: true, availableBeds: 20 } as any);
+    mockedCalcPrice.mockReturnValue({
+      totalPriceCents: 10000,
+      guests: [{ priceCents: 10000, perNightCents: [5000, 5000] }],
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({ feeCents: 0, fromTierRefundPct: 0, toTierRefundPct: 0 });
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+      method: "PUT",
+      body: JSON.stringify({ checkIn: "2026-08-05", checkOut: "2026-08-07" }),
+    });
+    const res = await PUT(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.additionalAmountCents).toBe(0);
+    expect(data.refundAmountCents).toBe(0);
+
+    await Promise.resolve();
+    expect(mockEnqueueXeroSupplementaryInvoiceOperation).not.toHaveBeenCalled();
+    expect(mockEnqueueXeroModificationCreditNoteOperation).not.toHaveBeenCalled();
+    expect(mockEnqueueXeroBookingInvoiceUpdateOperation).not.toHaveBeenCalled();
+    expect(mockRecordSkippedXeroBookingInvoiceUpdateOperation).toHaveBeenCalledWith({
+      bookingId: "bk1",
+      bookingModificationId: "mod1",
+      reason: expect.stringContaining("Skipped primary Xero invoice update"),
+      createdByMemberId: "m1",
+    });
+  });
+});
+
+// ============================================================================
+// POST /api/bookings/[id]/guests — price increase creates additional PI
+// ============================================================================
+
+describe("POST /api/bookings/[id]/guests — price increase", () => {
+  let POST: typeof import("@/app/api/bookings/[id]/guests/route").POST;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockMemberCount.mockResolvedValue(1);
+    mockMemberFindUnique.mockResolvedValue({
+      id: "m1",
+      active: true,
+      email: "alice@test.com",
+      firstName: "Alice",
+    } as any);
+    const mod = await import("@/app/api/bookings/[id]/guests/route");
+    POST = mod.POST;
+  });
+
+  it("stores the itemised lines behind a guest add, summing to priceDiffCents (#3530)", async () => {
+    // Alice holds two sold nights at 2500 (booking total 5000); Bob is added
+    // for the same two nights at 5000. The rows the add WRITES are re-read for
+    // the after side, so the tx double answers that read with what landed.
+    const booking = makeBooking({ totalPriceCents: 5000, finalPriceCents: 5000 });
+    const tx = makeTx(booking);
+    (tx as any).bookingGuest.findMany = vi.fn().mockImplementation(
+      async (args: { select?: { nights?: unknown } }) =>
+        args?.select?.nights
+          ? [
+              {
+                id: "g1",
+                firstName: "Alice",
+                lastName: "Smith",
+                ageTier: "ADULT",
+                isMember: true,
+                rateMembershipTypeId: null,
+                // #4317: the after side is VALUED like the before side, so the
+                // re-read carries the stored total and envelope it values with.
+                priceCents: 5000,
+                stayStart: new Date("2026-08-01"),
+                stayEnd: new Date("2026-08-03"),
+                nights: [
+                  { stayDate: new Date("2026-08-01"), priceCents: 2500, priceSource: "SOLD" },
+                  { stayDate: new Date("2026-08-02"), priceCents: 2500, priceSource: "SOLD" },
+                ],
+              },
+              {
+                id: "g2",
+                firstName: "Bob",
+                lastName: "Jones",
+                ageTier: "ADULT",
+                isMember: true,
+                rateMembershipTypeId: "rt-member",
+                priceCents: 10000,
+                stayStart: new Date("2026-08-01"),
+                stayEnd: new Date("2026-08-03"),
+                nights: [
+                  { stayDate: new Date("2026-08-01"), priceCents: 5000, priceSource: "SOLD" },
+                  { stayDate: new Date("2026-08-02"), priceCents: 5000, priceSource: "SOLD" },
+                ],
+              },
+            ]
+          : [],
+    );
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 15000,
+      guests: guests.map((_g: unknown, i: number) =>
+        i === 0 && guests.length > 1
+          ? { priceCents: 5000, perNightCents: [2500, 2500] }
+          : { priceCents: 10000, perNightCents: [5000, 5000] },
+      ),
+    } as any));
+    mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_guest_extra", client_secret: "s" } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/guests", {
+      method: "POST",
+      body: JSON.stringify({
+        guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }],
+      }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(200);
+
+    const created = (tx.bookingModification.create as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0]?.data;
+    expect(created.priceDiffCents).toBe(10000);
+    const lines = created.priceLines as Array<{ amountCents: number }>;
+    expect(lines.reduce((sum, line) => sum + line.amountCents, 0)).toBe(created.priceDiffCents);
+    expect(lines).toEqual([
+      expect.objectContaining({
+        kind: "GUEST_NIGHTS",
+        sign: 1,
+        unitCents: 5000,
+        nightCount: 2,
+        guestCount: 1,
+        startDate: "2026-08-01",
+        guestNames: ["Bob Jones"],
+        amountCents: 10000,
+      }),
+    ]);
+  });
+
+  it("MUTATION (round 9): a guest add whose ask a reduction retired is not named as due, and offers no secret", async () => {
+    const tx = makeTx(makeBooking());
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_guest_extra", client_secret: "guest_extra_secret", currency: "nzd" } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+    const { prisma } = await import("@/lib/prisma");
+    vi.mocked(prisma.paymentTransaction.findUnique).mockResolvedValueOnce({ status: "FAILED", withdrawnAt: new Date("2026-07-01T00:00:00.000Z") } as never);
+
+    const res = await POST(
+      new NextRequest("http://localhost/api/bookings/bk1/guests", {
+        method: "POST",
+        body: JSON.stringify({ guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }] }),
+      }),
+      { params: Promise.resolve({ id: "bk1" }) },
+    );
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 10000 }));
+    expect(data.additionalPaymentClientSecret).toBeNull();
+    const { sendBookingModifiedEmail } = await import("@/lib/email");
+    expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ additionalAmountCents: 0, additionalPaymentMethod: undefined }),
+      expect.anything(),
+    );
+  });
+
+  it("MUTATION (#4052): a guest add whose card mint failed is named as a card payment, at its full figure", async () => {
+    const tx = makeTx(makeBooking());
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockedCreatePaymentIntent.mockRejectedValueOnce(new Error("Stripe is down"));
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const res = await POST(
+      new NextRequest("http://localhost/api/bookings/bk1/guests", {
+        method: "POST",
+        body: JSON.stringify({ guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }] }),
+      }),
+      { params: Promise.resolve({ id: "bk1" }) },
+    );
+
+    expect(res.status).toBe(200);
+    const { sendBookingModifiedEmail } = await import("@/lib/email");
+    expect(sendBookingModifiedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ additionalAmountCents: 10000, additionalPaymentMethod: "STRIPE" }),
+      expect.anything(),
+    );
+  });
+
+  it("#3949 review round 6: refuses a guest add on a place the organiser paid by Internet Banking while the group cancel is part-way through (409)", async () => {
+    const booking = makeBooking({
+      organiserSettled: true,
+      parentBookingId: "organiser_bk",
+      payment: { ...makeBooking().payment, source: "INTERNET_BANKING" },
+    });
+    const tx = makeTx(booking);
+    // The organiser's group is CANCELLED and this child not yet claimed.
+    (tx as any).groupBooking = { findUnique: vi.fn().mockResolvedValue({ status: "CANCELLED" }) };
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+    const { GROUP_CANCEL_IN_PROGRESS_PRICE_MESSAGE } = await import("@/lib/group-cancel-in-progress");
+
+    const res = await POST(
+      new NextRequest("http://localhost/api/bookings/bk1/guests", {
+        method: "POST",
+        body: JSON.stringify({ guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }] }),
+      }),
+      { params: Promise.resolve({ id: "bk1" }) },
+    );
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe(GROUP_CANCEL_IN_PROGRESS_PRICE_MESSAGE);
+    expect(tx.bookingModification.create).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("creates additional PaymentIntent when adding guest to CONFIRMED booking", async () => {
+    const booking = makeBooking();
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    // New guest price: 5000 per guest for 2 nights = 10000 extra
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_guest_extra",
+      client_secret: "guest_extra_secret", currency: "nzd",
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/guests", {
+      method: "POST",
+      body: JSON.stringify({
+        guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }],
+      }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.additionalAmountCents).toBe(10000);
+    expect(data.additionalPaymentClientSecret).toBe("guest_extra_secret");
+
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 10000,
+        metadata: expect.objectContaining({
+          bookingId: "bk1",
+          type: "modification_additional",
+          reason: "guest_add_price_increase",
+        }),
+      })
+    );
+
+    expect(mockUpsertPaymentIntentTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentId: "p1",
+        paymentIntentId: "pi_guest_extra",
+        amountCents: 10000,
+        status: "PENDING",
+      })
+    );
+    // The real supersede looked for older live asks, excluding this one.
+    expect(mockPaymentTransactionFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          paymentId: "p1",
+          kind: "ADDITIONAL",
+          stripePaymentIntentId: { not: "pi_guest_extra" },
+        }),
+      }),
+    );
+    expect(mockEnqueuePaymentIntentCancellationRecovery).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    expect(mockEnqueueXeroSupplementaryInvoiceOperation).toHaveBeenCalledWith(
+      {
+        bookingId: "bk1",
+        priceDiffCents: 10000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod1",
+      },
+      {
+        createdByMemberId: "m1",
+        paymentIntentId: "pi_guest_extra",
+        waitForConfirmedAdditionalPayment: true,
+        recordPayment: true,
+      }
+    );
+  });
+
+  /**
+   * #3244: the same booking, part-refunded. Owner decision, 17 Sep 2026 — this
+   * door now asks the shared `hasCapturedPayment`, exactly as the batch edit,
+   * the date change and the guest removal already do through
+   * `applyPaymentAdjustments`.
+   *
+   * BEFORE this issue the door asked `payment.status === "SUCCEEDED"` inline,
+   * so a partly-refunded booking read as never paid HERE and as paid at the
+   * other three doors. It was reachable — `PARTIALLY_REFUNDED` is a payment
+   * status and the eligibility gate reads only the booking status — and the
+   * consequence was that the club collected NOTHING for the added guest.
+   */
+  const partlyRefundedPayment = {
+    id: "p1",
+    bookingId: "bk1",
+    // Ledger-balanced on purpose: a real partial refund accompanied a price
+    // REDUCTION, so `finalPriceCents` came down with it (10000 gross captured,
+    // 2500 returned, 7500 owed). An unbalanced fixture would have left a
+    // standing residual and made the assertions below prove less than they
+    // claim — the point is that the ask is the full delta, NOT net of the
+    // refund, and that only reads as evidence if the ledger balanced first.
+    amountCents: 10000,
+    source: "STRIPE",
+    status: "PARTIALLY_REFUNDED",
+    stripePaymentIntentId: "pi_original",
+    stripeCustomerId: "cus_123",
+    xeroInvoiceId: "inv_primary",
+    refundedAmountCents: 2500,
+    changeFeeCents: 0,
+    additionalPaymentIntentId: null,
+    additionalAmountCents: 0,
+    additionalPaymentStatus: null,
+  };
+
+  it("collects the difference on a PARTLY-REFUNDED booking (#3244)", async () => {
+    const booking = makeBooking({
+      payment: partlyRefundedPayment,
+      totalPriceCents: 7500,
+      finalPriceCents: 7500,
+    });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_guest_extra",
+      client_secret: "guest_extra_secret", currency: "nzd",
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/guests", {
+      method: "POST",
+      body: JSON.stringify({
+        guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }],
+      }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    // The whole point of #3244: before it, this was 0 and no intent was minted.
+    //
+    // 12500, not 10000: the booking now owes 7500 after the refund that
+    // accompanied its price reduction, and the new party prices at 20000. The
+    // ask is the full delta from what the booking currently says it costs, and
+    // is deliberately NOT reduced by the 2500 already returned — that refund
+    // went back with a price cut `finalPriceCents` already carries, so netting
+    // it off would under-collect by exactly the refund.
+    expect(data.additionalAmountCents).toBe(12500);
+    expect(data.additionalPaymentClientSecret).toBe("guest_extra_secret");
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 12500,
+        metadata: expect.objectContaining({
+          bookingId: "bk1",
+          type: "modification_additional",
+          reason: "guest_add_price_increase",
+        }),
+      })
+    );
+  });
+
+  /**
+   * #3244: the case the first fixture could not reach, and the one that makes
+   * the changelog's "the figure can differ" sentence true rather than hopeful.
+   *
+   * A part-refunded booking that ALSO carries an unpaid amount from an earlier
+   * change. Before this issue, such a booking took the Xero arm and was billed
+   * the bare price difference on a supplementary invoice. Now it takes the
+   * Stripe arm, and the ask is sized by `sizeAdditionalAsk`, which carries the
+   * outstanding amount into the new request — so the member is asked once for
+   * both, and the intent that replaces the old one supersedes it rather than
+   * stacking beside it.
+   *
+   * That is the correct shape: two live asks against one payment is how a
+   * member ends up paying twice or paying neither. But it IS a different figure
+   * from the one the old arm produced, and a reviewer reading only the
+   * "collects the difference" summary would not expect it.
+   */
+  it("carries an earlier unpaid amount into the new card request (#3244)", async () => {
+    const booking = makeBooking({
+      totalPriceCents: 7500,
+      finalPriceCents: 7500,
+      payment: {
+        ...partlyRefundedPayment,
+        additionalPaymentIntentId: "pi_earlier_extra",
+        additionalAmountCents: 4000,
+        additionalPaymentStatus: "PENDING",
+      },
+    });
+    const tx = makeTx(booking);
+    // The ledger row behind that unpaid 4000: the ask this mint must retire.
+    mockPaymentTransactionFindMany.mockResolvedValue([
+      { id: "txn_earlier_extra", stripePaymentIntentId: "pi_earlier_extra", amountCents: 4000 },
+    ]);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_guest_extra",
+      client_secret: "guest_extra_secret", currency: "nzd",
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/guests", {
+      method: "POST",
+      body: JSON.stringify({
+        guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }],
+      }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    // 12500 for this change, plus the 4000 still unpaid from the last one.
+    expect(data.additionalAmountCents).toBe(16500);
+    // And the earlier intent is retired rather than left live beside this one:
+    // the REAL supersede found its row and queued the durable cancel.
+    expect(mockEnqueuePaymentIntentCancellationRecovery).toHaveBeenCalledWith({
+      bookingId: "bk1",
+      paymentId: "p1",
+      paymentTransactionId: "txn_earlier_extra",
+      paymentIntentId: "pi_earlier_extra",
+      amountCents: 4000,
+      // #4442: queued in the mint's own transaction, beside its row.
+      store: expect.anything(),
+    });
+  });
+
+  /**
+   * #3244 REGRESSION GUARD, and the reason this door asks the STATUS half of
+   * the captured question rather than the whole of `hasCapturedPayment`.
+   *
+   * A zero-dollar booking — a stay fully covered by credit or a 100% promo —
+   * carries `{ amountCents: 0, status: SUCCEEDED }` with a null
+   * `stripePaymentIntentId` and `source` at its STRIPE default. The full
+   * predicate requires `amountCents > 0`, so using it here would have answered
+   * "not settled" and dropped this member into the Xero arm — which collects
+   * NOTHING at a club with the integration off, or in the window before the
+   * outbox has minted the primary invoice. That is a new silent under-
+   * collection at the very door this issue exists to stop under-collecting at.
+   *
+   * The money is collectable and always was: the mint creates a FRESH intent
+   * and only reuses the Stripe customer, so the null intent id is no obstacle.
+   * Two adversarial reviews caught this; the first version of this test
+   * asserted the loss and called it a fix.
+   */
+  it("still asks a ZERO-DOLLAR booking for the added guest's price (#3244)", async () => {
+    const booking = makeBooking({
+      totalPriceCents: 0,
+      finalPriceCents: 0,
+      payment: {
+        ...partlyRefundedPayment,
+        status: "SUCCEEDED",
+        amountCents: 0,
+        refundedAmountCents: 0,
+        stripePaymentIntentId: null,
+        // No primary invoice: the shape where the Xero arm cannot cover the
+        // member, so a card ask is the only way the club is paid.
+        xeroInvoiceId: null,
+      },
+    });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_guest_extra",
+      client_secret: "guest_extra_secret", currency: "nzd",
+    } as any);
+    mockPaymentUpdate.mockResolvedValue({});
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/guests", {
+      method: "POST",
+      body: JSON.stringify({
+        guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }],
+      }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    // The club is still paid. Asserting the FIGURE, not merely that some
+    // intent was minted, is what tells "billed by card" from "billed by
+    // nobody" — the distinction the first version of this test could not make.
+    expect(data.additionalAmountCents).toBe(20000);
+    expect(data.additionalPaymentClientSecret).toBe("guest_extra_secret");
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 20000 }),
+    );
+  });
+
+  it("with an issued invoice, a ZERO-DOLLAR booking's supplementary invoice waits for the card payment (#3502)", async () => {
+    const booking = makeBooking({
+      totalPriceCents: 0,
+      finalPriceCents: 0,
+      payment: {
+        ...partlyRefundedPayment,
+        status: "SUCCEEDED",
+        amountCents: 0,
+        refundedAmountCents: 0,
+        stripePaymentIntentId: null,
+        xeroInvoiceId: "inv_primary",
+      },
+    });
+    const tx = makeTx(booking);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCheckCapacityForGuestRanges.mockResolvedValue({ available: true, minAvailable: 20, nightDetails: [] } as any);
+    mockedCalcPrice.mockImplementation((_ci, _co, guests) => ({
+      totalPriceCents: guests.length === 1 ? 10000 : 20000,
+      guests: guests.map(() => ({ priceCents: 10000, perNightCents: [5000, 5000] })),
+    } as any));
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_guest_extra",
+      client_secret: "guest_extra_secret", currency: "nzd",
+    } as any);
+    mockMemberFindUnique.mockResolvedValue({ active: true, email: "alice@test.com", firstName: "Alice" });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/guests", {
+      method: "POST",
+      body: JSON.stringify({
+        guests: [{ firstName: "Bob", lastName: "Jones", ageTier: "ADULT", isMember: true }],
+      }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.additionalAmountCents).toBe(20000);
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 20000 }),
+    );
+    await Promise.resolve();
+    // Billed once: the invoice records the card payment rather than billing
+    // the member a second time.
+    expect(mockEnqueueXeroSupplementaryInvoiceOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ bookingId: "bk1", priceDiffCents: 20000 }),
+      expect.objectContaining({
+        paymentIntentId: "pi_guest_extra",
+        waitForConfirmedAdditionalPayment: true,
+        recordPayment: true,
+      }),
+    );
+  });
+});
+
+// ============================================================================
+// Stripe webhook — additional PaymentIntent succeeded
+// ============================================================================
+
+describe("Stripe webhook — additional modification payment succeeded", () => {
+  let POST: typeof import("@/app/api/webhooks/stripe/route").POST;
+
+  const makeWebhookRequest = () =>
+    new NextRequest("http://localhost/api/webhooks/stripe", {
+      method: "POST",
+      headers: { "stripe-signature": "test-sig" },
+      body: JSON.stringify({}),
+    });
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockMemberCount.mockResolvedValue(1);
+    mockCompleteCanceledSupersededPaymentIntentRecovery.mockResolvedValue(false);
+    mockQueueSupersededPaymentIntentRefundRecovery.mockResolvedValue(false);
+    process.env.STRIPE_WEBHOOK_SECRET = "whsec_test";
+    const mod = await import("@/app/api/webhooks/stripe/route");
+    POST = mod.POST;
+  });
+
+  it("updates additionalPaymentStatus and amountCents when additional PI succeeds", async () => {
+    mockedConstructWebhookEvent.mockReturnValue({
+      id: "evt_test",
+      type: "payment_intent.succeeded",
+      data: {
+        object: {
+          id: "pi_additional",
+          amount: 3000,
+          metadata: { bookingId: "bk1", type: "modification_additional" },
+          payment_method: "pm_test",
+        },
+      },
+    } as any);
+
+    mockProcessedWebhookFindUnique.mockResolvedValue(null);
+    mockProcessedWebhookCreate.mockResolvedValue({});
+    mockProcessedWebhookDeleteMany.mockResolvedValue({ count: 0 });
+    mockFindPaymentTransactionByIntentId.mockResolvedValueOnce({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      status: "PENDING",
+      createdAt: new Date(),
+    });
+
+    const req = makeWebhookRequest();
+    const res = await POST(req);
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.received).toBe(true);
+
+    expect(mockMarkPaymentIntentTransactionSucceeded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentIntentId: "pi_additional",
+        amountCents: 3000,
+      })
+    );
+    expect(
+      mockReleaseXeroSupplementaryInvoiceForCapturedPaymentIntent
+    ).toHaveBeenCalledWith("pi_additional");
+  });
+
+  it("is idempotent: skips already-SUCCEEDED additional payment", async () => {
+    mockedConstructWebhookEvent.mockReturnValue({
+      id: "evt_test2",
+      type: "payment_intent.succeeded",
+      data: {
+        object: {
+          id: "pi_additional",
+          amount: 3000,
+          metadata: { bookingId: "bk1", type: "modification_additional" },
+          payment_method: "pm_test",
+        },
+      },
+    } as any);
+
+    mockProcessedWebhookFindUnique.mockResolvedValue(null);
+    mockProcessedWebhookCreate.mockResolvedValue({});
+    mockProcessedWebhookDeleteMany.mockResolvedValue({ count: 0 });
+    mockFindPaymentTransactionByIntentId.mockResolvedValueOnce({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      status: "SUCCEEDED",
+      createdAt: new Date(),
+    });
+
+    const req = makeWebhookRequest();
+    const res = await POST(req);
+
+    expect(res.status).toBe(200);
+    expect(mockMarkPaymentIntentTransactionSucceeded).not.toHaveBeenCalled();
+  });
+
+  // #3632: the replay guard asks the PaymentTransaction leaf. A replay of an
+  // ADDITIONAL capture that has since been part- or fully refunded must not be
+  // flipped back to SUCCEEDED, and must still re-release the supplementary
+  // invoice before acknowledging — the same order as the SUCCEEDED replay.
+  it.each(["PARTIALLY_REFUNDED", "REFUNDED"] as const)(
+    "treats a %s additional transaction as an already-recorded capture on replay",
+    async (status) => {
+      mockedConstructWebhookEvent.mockReturnValue({
+        id: `evt_replay_${status}`,
+        type: "payment_intent.succeeded",
+        data: {
+          object: {
+            id: "pi_additional",
+            amount: 3000,
+            metadata: { bookingId: "bk1", type: "modification_additional" },
+            payment_method: "pm_test",
+          },
+        },
+      } as any);
+
+      mockProcessedWebhookFindUnique.mockResolvedValue(null);
+      mockProcessedWebhookCreate.mockResolvedValue({});
+      mockProcessedWebhookDeleteMany.mockResolvedValue({ count: 0 });
+      mockFindPaymentTransactionByIntentId.mockResolvedValueOnce({
+        id: "ptx_1",
+        paymentId: "p1",
+        kind: "ADDITIONAL",
+        amountCents: 3000,
+        status,
+        createdAt: new Date(),
+      });
+
+      const res = await POST(makeWebhookRequest());
+
+      expect(res.status).toBe(200);
+      expect(mockMarkPaymentIntentTransactionSucceeded).not.toHaveBeenCalled();
+      expect(
+        mockReleaseXeroSupplementaryInvoiceForCapturedPaymentIntent
+      ).toHaveBeenCalledWith("pi_additional");
+    },
+  );
+
+  it("does not update payment when additional PI amount mismatches", async () => {
+    mockedConstructWebhookEvent.mockReturnValue({
+      id: "evt_mismatch",
+      type: "payment_intent.succeeded",
+      data: {
+        object: {
+          id: "pi_additional",
+          amount: 2500,
+          metadata: { bookingId: "bk1", type: "modification_additional" },
+          payment_method: "pm_test",
+        },
+      },
+    } as any);
+
+    mockProcessedWebhookCreate.mockResolvedValue({});
+    mockProcessedWebhookDeleteMany.mockResolvedValue({ count: 1 });
+    mockFindPaymentTransactionByIntentId.mockResolvedValueOnce({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      status: "PENDING",
+      createdAt: new Date(),
+    });
+    mockBookingFindUnique.mockResolvedValue({
+      id: "bk1",
+      checkIn: new Date("2026-08-01"),
+      checkOut: new Date("2026-08-03"),
+      member: { firstName: "Alice", lastName: "Smith" },
+    });
+
+    const req = makeWebhookRequest();
+    const res = await POST(req);
+
+    expect(res.status).toBe(500);
+    expect(mockMarkPaymentIntentTransactionSucceeded).not.toHaveBeenCalled();
+    // F16 fence (#1887): the claim release keys on status + the lease token.
+    expect(mockProcessedWebhookDeleteMany).toHaveBeenCalledWith({
+      where: {
+        eventId: "evt_mismatch",
+        source: "stripe",
+        status: "PROCESSING",
+        processingStartedAt: expect.any(Date),
+      },
+    });
+  });
+
+  it("returns success for duplicate Stripe webhook deliveries", async () => {
+    mockedConstructWebhookEvent.mockReturnValue({
+      id: "evt_duplicate",
+      type: "payment_intent.succeeded",
+      data: {
+        object: {
+          id: "pi_additional",
+          amount: 3000,
+          metadata: { bookingId: "bk1", type: "modification_additional" },
+          payment_method: "pm_test",
+        },
+      },
+    } as any);
+
+    mockProcessedWebhookCreate.mockRejectedValueOnce({ code: "P2002" });
+    // F16 (#1887): the existing claim is COMPLETED, so the redelivery ACKs 200.
+    mockProcessedWebhookFindFirst.mockResolvedValue({
+      status: "COMPLETED",
+      processingStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+    });
+
+    const req = makeWebhookRequest();
+    const res = await POST(req);
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.received).toBe(true);
+    expect(mockFindPaymentTransactionByIntentId).not.toHaveBeenCalled();
+    expect(mockProcessedWebhookDeleteMany).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// POST /api/bookings/[id]/confirm-modification-payment
+// ============================================================================
+
+describe("POST /api/bookings/[id]/confirm-modification-payment", () => {
+  let POST: typeof import("@/app/api/bookings/[id]/confirm-modification-payment/route").POST;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockMemberCount.mockResolvedValue(1);
+    mockMemberFindUnique.mockResolvedValue({
+      id: "m1",
+      active: true,
+      email: "alice@test.com",
+      firstName: "Alice",
+    } as any);
+    const mod = await import(
+      "@/app/api/bookings/[id]/confirm-modification-payment/route"
+    );
+    POST = mod.POST;
+  });
+
+  it("returns 401 for unauthenticated requests", async () => {
+    mockedAuth.mockResolvedValue(null as any);
+    const req = new NextRequest("http://localhost/api/bookings/bk1/confirm-modification-payment", {
+      method: "POST",
+      body: JSON.stringify({ paymentIntentId: "pi_additional" }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 400 if paymentIntentId does not match booking", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue({
+      id: "p1",
+      additionalPaymentIntentId: "pi_different",
+      additionalPaymentStatus: "PENDING",
+      additionalAmountCents: 3000,
+      amountCents: 10000,
+      booking: { memberId: "m1" },
+    });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/confirm-modification-payment", {
+      method: "POST",
+      body: JSON.stringify({ paymentIntentId: "pi_wrong" }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(400);
+  });
+
+  it("verifies PI with Stripe and updates payment when succeeded", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue({
+      id: "p1",
+      additionalPaymentIntentId: "pi_additional",
+      additionalPaymentStatus: "PENDING",
+      additionalAmountCents: 3000,
+      amountCents: 10000,
+      booking: { memberId: "m1" },
+    });
+    mockFindPaymentTransactionByIntentId.mockResolvedValue({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      status: "PENDING",
+      createdAt: new Date(),
+    });
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      status: "succeeded",
+      amount: 3000,
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/confirm-modification-payment", {
+      method: "POST",
+      body: JSON.stringify({ paymentIntentId: "pi_additional" }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.success).toBe(true);
+
+    expect(mockMarkPaymentIntentTransactionSucceeded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentIntentId: "pi_additional",
+        amountCents: 3000,
+      })
+    );
+    expect(
+      mockReleaseXeroSupplementaryInvoiceForCapturedPaymentIntent
+    ).toHaveBeenCalledWith("pi_additional");
+  });
+
+  it("returns 400 if Stripe PI has not succeeded yet", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue({
+      id: "p1",
+      additionalPaymentIntentId: "pi_additional",
+      additionalPaymentStatus: "PENDING",
+      additionalAmountCents: 3000,
+      amountCents: 10000,
+      booking: { memberId: "m1" },
+    });
+    mockFindPaymentTransactionByIntentId.mockResolvedValue({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      status: "PENDING",
+      createdAt: new Date(),
+    });
+    mockedGetPaymentIntent.mockResolvedValue({ status: "requires_action" } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/confirm-modification-payment", {
+      method: "POST",
+      body: JSON.stringify({ paymentIntentId: "pi_additional" }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 if Stripe PI amount does not match the modification amount", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue({
+      id: "p1",
+      additionalPaymentIntentId: "pi_additional",
+      additionalPaymentStatus: "PENDING",
+      additionalAmountCents: 3000,
+      amountCents: 10000,
+      booking: { memberId: "m1" },
+    });
+    mockFindPaymentTransactionByIntentId.mockResolvedValue({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      status: "PENDING",
+      createdAt: new Date(),
+    });
+    mockedGetPaymentIntent.mockResolvedValue({ status: "succeeded", amount: 2500 } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/confirm-modification-payment", {
+      method: "POST",
+      body: JSON.stringify({ paymentIntentId: "pi_additional" }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(400);
+    expect(mockMarkPaymentIntentTransactionSucceeded).not.toHaveBeenCalled();
+  });
+
+  it("returns 403 for deactivated members", async () => {
+    mockRequireActiveSessionUser.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "Account is deactivated" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+    mockedAuth.mockResolvedValue(makeSession() as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/confirm-modification-payment", {
+      method: "POST",
+      body: JSON.stringify({ paymentIntentId: "pi_additional" }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(403);
+    expect(mockPaymentFindUnique).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent for already-SUCCEEDED payments", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue({
+      id: "p1",
+      additionalPaymentIntentId: "pi_additional",
+      additionalPaymentStatus: "SUCCEEDED",
+      additionalAmountCents: 3000,
+      amountCents: 13000,
+      booking: { memberId: "m1" },
+    });
+    mockFindPaymentTransactionByIntentId.mockResolvedValue({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      status: "SUCCEEDED",
+      createdAt: new Date(),
+    });
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/confirm-modification-payment", {
+      method: "POST",
+      body: JSON.stringify({ paymentIntentId: "pi_additional" }),
+    });
+    const res = await POST(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.success).toBe(true);
+    // Should not call Stripe or update DB again
+    expect(mockedGetPaymentIntent).not.toHaveBeenCalled();
+    expect(mockMarkPaymentIntentTransactionSucceeded).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// GET /api/bookings/[id]/additional-payment-secret
+// ============================================================================
+
+describe("GET /api/bookings/[id]/additional-payment-secret", () => {
+  let GET: typeof import("@/app/api/bookings/[id]/additional-payment-secret/route").GET;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockMemberCount.mockResolvedValue(1);
+    // #4442: a currency re-issue's queue runs on the same client the route read
+    // the payment from, so its re-read sees that payment's mirror.
+    const { prisma } = await import("@/lib/prisma");
+    mockTransaction.mockImplementation((fn: (store: unknown) => unknown) => fn(prisma));
+    const mod = await import(
+      "@/app/api/bookings/[id]/additional-payment-secret/route"
+    );
+    GET = mod.GET;
+  });
+
+  it("returns 401 for unauthenticated requests", async () => {
+    mockedAuth.mockResolvedValue(null as any);
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(401);
+  });
+
+  /** A live, payable booking unless a test says otherwise. */
+  function additionalPaymentRow(overrides: Record<string, unknown> = {}) {
+    const { booking, ...rest } = overrides as {
+      booking?: Record<string, unknown>;
+    } & Record<string, unknown>;
+    return {
+      id: "p1",
+      additionalPaymentIntentId: "pi_additional",
+      additionalPaymentStatus: "PENDING",
+      additionalAmountCents: 3000,
+      ...rest,
+      booking: { memberId: "m1", status: "PAID", deletedAt: null, ...(booking ?? {}) },
+    };
+  }
+
+  /**
+   * #3635: the payment row, plus the ledger the re-issue's REAL reconcile reads
+   * back - the old ask, and every ADDITIONAL row the re-issue has written by the
+   * time it reads - so the mirror it writes follows what was actually minted.
+   */
+  function withReissueLedger(row: ReturnType<typeof additionalPaymentRow>) {
+    const ledgerRow = (fields: Record<string, unknown>, minute: number) => ({
+      kind: "ADDITIONAL",
+      source: "STRIPE",
+      refundedAmountCents: 0,
+      withdrawnAt: null,
+      paymentMethodId: null,
+      createdAt: new Date(Date.UTC(2026, 6, 1, 0, minute)),
+      ...fields,
+    });
+    mockPaymentFindUnique.mockImplementation(async () => ({
+      amountCents: 0,
+      refundedAmountCents: 0,
+      status: "PENDING",
+      ...row,
+      transactions: [
+        ledgerRow({ stripePaymentIntentId: "pi_additional", amountCents: 3000, status: "PENDING" }, 0),
+        ...mockUpsertPaymentIntentTransaction.mock.calls.map(([written], index) =>
+          ledgerRow(
+            {
+              kind: (written as { kind: string }).kind,
+              stripePaymentIntentId: (written as { paymentIntentId: string }).paymentIntentId,
+              amountCents: (written as { amountCents: number }).amountCents,
+              status: (written as { status: string }).status,
+            },
+            1 + index,
+          ),
+        ),
+      ],
+    }));
+  }
+
+  it("returns 404 if no pending additional payment", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(
+      additionalPaymentRow({
+        additionalPaymentIntentId: null,
+        additionalPaymentStatus: null,
+        additionalAmountCents: 0,
+      })
+    );
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404 if additional payment already SUCCEEDED", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(
+      additionalPaymentRow({ additionalPaymentStatus: "SUCCEEDED" })
+    );
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(404);
+  });
+
+  /*
+    #3340. The amount and the intent id now come from the INTENT, never from the
+    `Payment` column's mirror of it. The fixture deliberately makes the two
+    disagree: `additionalAmountCents` is 3000 while the live intent is 3650, the
+    shape a second booking edit produces between the page's server render and
+    this fetch. Reading the column is what let the page display one figure while
+    Stripe charged another.
+  */
+  it("returns the INTENT's own secret, amount and id, not the Payment column's", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(additionalPaymentRow());
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      amount: 3650,
+      client_secret: "pi_additional_secret_xyz", currency: "nzd",
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.clientSecret).toBe("pi_additional_secret_xyz");
+    expect(data.amountCents).toBe(3650);
+    expect(data.paymentIntentId).toBe("pi_additional");
+  });
+
+  /*
+    #2350. Cancelling a booking marks the additional intent FAILED and leaves
+    `additionalAmountCents` alone, and the cancel path only asks Stripe to cancel
+    an intent that was still OUTSTANDING — an intent that had already failed (a
+    declined card) is left confirmable. So an intent-id-and-status gate handed
+    the owner of a cancelled booking a live client secret they could confirm with
+    a different card, and the member was charged for a booking that no longer
+    existed. Stripe is never even asked here now.
+  */
+  it("refuses the secret for a booking whose lifecycle cannot collect it", async () => {
+    for (const status of ["CANCELLED", "BUMPED", "DRAFT", "WAITLISTED"]) {
+      mockedGetPaymentIntent.mockClear();
+      mockedAuth.mockResolvedValue(makeSession() as any);
+      mockPaymentFindUnique.mockResolvedValue(
+        additionalPaymentRow({
+          additionalPaymentStatus: "FAILED",
+          booking: { status },
+        })
+      );
+
+      const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+      const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+      expect(res.status).toBe(404);
+      expect(mockedGetPaymentIntent).not.toHaveBeenCalled();
+    }
+  });
+
+  it("refuses the secret for a soft-deleted booking", async () => {
+    mockedGetPaymentIntent.mockClear();
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(
+      additionalPaymentRow({ booking: { deletedAt: new Date() } })
+    );
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(404);
+    expect(mockedGetPaymentIntent).not.toHaveBeenCalled();
+  });
+
+  /*
+    PAYMENT_PENDING is deliberately IN the payable list even though the admin
+    owed queues drop it: they drop it only so their counts can be summed with the
+    unpaid-finished-stays queue without double-counting, and a PAYMENT_PENDING
+    booking can genuinely carry a delta (adding a guest to a booking with an
+    issued Xero invoice raises one). Hiding the member's own pay button for a
+    counting reason would strand real money.
+  */
+  it("still serves a PAYMENT_PENDING booking, which the admin queues exclude", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(
+      additionalPaymentRow({ booking: { status: "PAYMENT_PENDING" } })
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      client_secret: "pi_additional_secret_xyz", currency: "nzd",
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(200);
+  });
+
+  /*
+    #3641 (`INV-PAY-104`): Stripe's half of the pay door. A cancelled intent
+    still carries a client secret, so handing it out showed a form Stripe.js
+    then rejected; money Stripe already took must not be offered a second form.
+  */
+  it("refuses an intent Stripe cancelled, or no longer has, with 404", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(
+      additionalPaymentRow({ additionalPaymentStatus: "FAILED" })
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      status: "canceled",
+      client_secret: "pi_additional_secret_xyz",
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const cancelled = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(cancelled.status).toBe(404);
+
+    mockedGetPaymentIntent.mockRejectedValue(
+      Object.assign(new Error("No such payment_intent"), { code: "resource_missing" })
+    );
+    const missing = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(missing.status).toBe(404);
+  });
+
+  it("answers 409 for an intent Stripe has already captured, never a second form", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(additionalPaymentRow());
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      status: "succeeded",
+      client_secret: "pi_additional_secret_xyz",
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.clientSecret).toBeUndefined();
+    // #3635: coded, so the card shows "paid" for THIS 409 and no other.
+    expect(body.code).toBe(ADDITIONAL_PAYMENT_ALREADY_MADE_CODE);
+  });
+
+  /*
+    #3635: a `processing` intent keeps its invoice at the door (#3641 - the Xero
+    reaper relies on that), but the member is told to WAIT, not that it is paid:
+    a processing payment can still fail and come back payable.
+  */
+  it("answers PAYMENT_PROCESSING for a same-currency intent Stripe is still processing", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(additionalPaymentRow());
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      amount: 3000,
+      status: "processing",
+      client_secret: "pi_additional_secret_xyz",
+      currency: "nzd",
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toEqual(PAYMENT_PROCESSING_BODY);
+  });
+
+  /*
+    #3567 re-review: the old-currency intent is superseded only while unpaid. A
+    member who has paid (a 3DS return, a refresh before the webhook) must not
+    have the paid intent cancelled — its processor would refund it — nor be
+    asked to pay again.
+  */
+  it.each([
+    // #3641's pay door answers these before the currency check: money Stripe
+    // has taken (or is taking) is refused a second form, a cancelled intent is
+    // closed. Either way the paid intent is never superseded.
+    ["succeeded", 409, /already been made/],
+    // #3635: still processing is not paid; the member waits (PAYMENT_PROCESSING).
+    ["processing", 409, /being processed/],
+    ["canceled", 404, /No pending additional payment/],
+  ])("does NOT re-issue an old-currency intent that is %s: answers %s", async (status, code, message) => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(additionalPaymentRow({ stripeCustomerId: "cus_1" }));
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      amount: 3000,
+      status,
+      client_secret: "pi_additional_secret_aud", currency: "aud",
+    } as any);
+
+    const res = await GET(new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret"), {
+      params: Promise.resolve({ id: "bk1" }),
+    });
+
+    expect(res.status).toBe(code);
+    const body = (await res.json()) as { error: string; code?: string };
+    expect(body.error).toMatch(message);
+    if (status === "processing") expect(body.code).toBe(PAYMENT_PROCESSING_CODE);
+    // Nothing minted, nothing written, nothing retired.
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+    expect(mockUpsertPaymentIntentTransaction).not.toHaveBeenCalled();
+    expect(mockEnqueuePaymentIntentCancellationRecovery).not.toHaveBeenCalled();
+  });
+
+  it.each(["requires_confirmation", "requires_action"])(
+    "re-issues an old-currency intent that is still %s (unpaid) (#3567 re-review)",
+    async (status) => {
+      mockedAuth.mockResolvedValue(makeSession() as any);
+      withReissueLedger(additionalPaymentRow({ stripeCustomerId: "cus_1" }));
+      mockedGetPaymentIntent.mockResolvedValue({
+        id: "pi_additional",
+        amount: 3000,
+        status,
+        client_secret: "pi_additional_secret_aud", currency: "aud",
+      } as any);
+      mockFindPaymentTransactionByIntentId.mockResolvedValue(null);
+      mockedCreatePaymentIntent.mockResolvedValue({
+        id: "pi_reissued",
+        amount: 3000,
+        client_secret: "pi_reissued_secret_nzd", currency: "nzd",
+      } as any);
+
+      const res = await GET(new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret"), {
+        params: Promise.resolve({ id: "bk1" }),
+      });
+
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toMatchObject({ paymentIntentId: "pi_reissued" });
+      expect(mockedCreatePaymentIntent).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("re-issues an ask minted in another currency and returns the NEW intent's secret, never the old one (#3567)", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    withReissueLedger(additionalPaymentRow({ stripeCustomerId: "cus_1" }));
+    // The old ask is live on the ledger, so the real supersede retires it.
+    mockPaymentTransactionFindMany.mockResolvedValue([
+      { id: "ptx_1", stripePaymentIntentId: "pi_additional", amountCents: 3000 },
+    ]);
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      amount: 3000,
+      status: "requires_payment_method",
+      client_secret: "pi_additional_secret_aud", currency: "aud",
+    } as any);
+    mockFindPaymentTransactionByIntentId.mockResolvedValue({
+      id: "ptx_1",
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      amountCents: 3000,
+      carriedAskCents: 1000,
+      reason: "edit_financial_review_charge",
+      status: "PENDING",
+      createdAt: new Date(),
+    });
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_reissued",
+      amount: 3000,
+      client_secret: "pi_reissued_secret_nzd", currency: "nzd",
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data).toEqual({
+      clientSecret: "pi_reissued_secret_nzd",
+      amountCents: 3000,
+      paymentIntentId: "pi_reissued",
+    });
+    // #3635: the re-issue ran for REAL. The ask is restated unchanged - the same
+    // total on a NEW intent in the club's currency, under a key discriminated by
+    // the intent it replaces...
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledTimes(1);
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith({
+      format: CLUB_FORMAT_TEST,
+      amountCents: 3000,
+      customerId: "cus_1",
+      metadata: {
+        bookingId: "bk1",
+        type: "modification_additional",
+        reason: "edit_financial_review_charge",
+      },
+      idempotencyKey: stripeIdempotencyKeyForAskAmount("pi_additional_reissue_nzd", 3000),
+    });
+    // ...its ADDITIONAL row keeps the carried part and the request's reason...
+    expect(mockUpsertPaymentIntentTransaction).toHaveBeenCalledTimes(1);
+    expect(mockUpsertPaymentIntentTransaction).toHaveBeenCalledWith({
+      paymentId: "p1",
+      kind: "ADDITIONAL",
+      paymentIntentId: "pi_reissued",
+      amountCents: 3000,
+      carriedAskCents: 1000,
+      status: "PENDING",
+      reason: "edit_financial_review_charge",
+      stripeCustomerId: "cus_1",
+      // #4442: written in the re-issue's queue transaction.
+      store: expect.anything(),
+    });
+    // ...the old-currency ask is retired through the durable cancel...
+    expect(mockEnqueuePaymentIntentCancellationRecovery).toHaveBeenCalledWith({
+      bookingId: "bk1",
+      paymentId: "p1",
+      paymentTransactionId: "ptx_1",
+      paymentIntentId: "pi_additional",
+      amountCents: 3000,
+      store: expect.anything(),
+    });
+    // ...and the payment's outstanding ask now names the new intent.
+    expect(mockPaymentUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "p1" },
+        data: expect.objectContaining({
+          additionalPaymentIntentId: "pi_reissued",
+          additionalAmountCents: 3000,
+        }),
+      }),
+    );
+  });
+
+  /** An old-currency ask the route will re-issue; `mirror` is the Payment's own record of it. */
+  function staleCurrencyAsk(mirror: Record<string, unknown>) {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    withReissueLedger(additionalPaymentRow({ stripeCustomerId: "cus_1", ...mirror }));
+    mockPaymentTransactionFindMany.mockResolvedValue([
+      { id: "ptx_1", stripePaymentIntentId: "pi_additional", amountCents: 3000 },
+    ]);
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      amount: 3000,
+      status: "requires_payment_method",
+      client_secret: "pi_additional_secret_aud", currency: "aud",
+    } as any);
+    mockFindPaymentTransactionByIntentId.mockResolvedValue({
+      id: "ptx_1", paymentId: "p1", kind: "ADDITIONAL", amountCents: 3000, carriedAskCents: 0,
+      reason: "edit_financial_review_charge", status: "PENDING", createdAt: new Date(),
+    });
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_reissued", amount: 3000, client_secret: "pi_reissued_secret_nzd", currency: "nzd",
+    } as any);
+  }
+
+  it("#4442 review M1: re-issues when the Payment mirror and the intent's amount disagree, sizing the carried balance off the mirror", async () => {
+    // The intent asks $30.00; the mirror the route read says $25.00 is owed. The
+    // re-issue keeps the intent's figure, and its queue's re-read compares the
+    // mirror with the mirror - so the member is not stranded on a 500.
+    staleCurrencyAsk({ additionalAmountCents: 2500 });
+    const res = await GET(new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret"), {
+      params: Promise.resolve({ id: "bk1" }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).paymentIntentId).toBe("pi_reissued");
+    expect(mockUpsertPaymentIntentTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentIntentId: "pi_reissued", amountCents: 3000, kind: "ADDITIONAL" }),
+    );
+  });
+
+  it("#4442 review M1: answers 409 reload, writing nothing, when the ask was paid while it was being re-issued", async () => {
+    staleCurrencyAsk({});
+    // The route reads the ask unpaid; by the time the re-issue's queue re-reads
+    // it under its locks, a stale tab has paid it.
+    const routeRead = mockPaymentFindUnique.getMockImplementation()!;
+    mockPaymentFindUnique.mockImplementation(async (args: { select?: Record<string, unknown> }) =>
+      args?.select?.additionalAmountCents
+        ? { additionalAmountCents: 3000, additionalPaymentStatus: "SUCCEEDED" }
+        : routeRead(args),
+    );
+    const res = await GET(new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret"), {
+      params: Promise.resolve({ id: "bk1" }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual(ADDITIONAL_PAYMENT_CHANGED_BODY);
+    expect(mockUpsertPaymentIntentTransaction).not.toHaveBeenCalled();
+    expect(mockEnqueuePaymentIntentCancellationRecovery).not.toHaveBeenCalled();
+  });
+
+  it("does not re-issue an intent already in the club's currency (#3567)", async () => {
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(additionalPaymentRow());
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      amount: 3000,
+      client_secret: "pi_additional_secret_nzd", currency: " NZD ",
+    } as any);
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ clientSecret: "pi_additional_secret_nzd" });
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("refuses with a 409 in a club currency without two decimal places before reading the payment (#3567)", async () => {
+    clubFormatMock.mockResolvedValue({ currencyCode: "JPY", locale: "ja-JP" });
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockPaymentFindUnique.mockResolvedValue(additionalPaymentRow());
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+
+    expect(res.status).toBe(409);
+    // #3635: coded, so the card shows it as an error with the ask still owing.
+    await expect(res.json()).resolves.toEqual(UNSUPPORTED_CHARGE_CURRENCY_MEMBER_BODY);
+    expect(mockPaymentFindUnique).not.toHaveBeenCalled();
+    expect(mockedGetPaymentIntent).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("returns 403 for a different member trying to access", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "other-member", role: "MEMBER", accessRoles: [{ role: "USER" }] } } as any);
+    mockPaymentFindUnique.mockResolvedValue(additionalPaymentRow());
+
+    const req = new NextRequest("http://localhost/api/bookings/bk1/additional-payment-secret");
+    const res = await GET(req, { params: Promise.resolve({ id: "bk1" }) });
+    expect(res.status).toBe(403);
+  });
+});
+
+// ============================================================================
+// #4317 (epic #4302): the date path prices a blank night from stored data
+// ============================================================================
+
+/**
+ * `modifyBookingDates` locks every night a guest holds at its VALUED figure
+ * (`valuedNightLocksForGuest`, `INV-MOD-028`), so a blank night is neither
+ * repriced at today's rate nor written back as NULL: it carries what the
+ * guest's stored total has left for it (R2). #3166 parked these date changes;
+ * #4317 prices them. Only nights the new range adds price at today's rate.
+ */
+describe("#4317 modify-dates prices a blank night from the guest's stored total", () => {
+  let PUT: typeof import("@/app/api/bookings/[id]/modify-dates/route").PUT;
+
+  /**
+   * Two nights, one sold at $25 and one BLANK, against a stored $50. That is
+   * what a parked edit left behind before #4317. R2 values the blank at $25.
+   */
+  function bookingWithABlankNight() {
+    const booking = makeBooking({ totalPriceCents: 5000, finalPriceCents: 5000 });
+    (booking.guests as Array<Record<string, unknown>>)[0].nights = [
+      { stayDate: new Date("2026-08-01"), priceCents: 2500, priceSource: "SOLD" },
+      { stayDate: new Date("2026-08-02"), priceCents: null, priceSource: "UNKNOWN" },
+    ];
+    return booking;
+  }
+
+  /**
+   * The pricing engine's own lock rule, at today's $75 a night: a night with a
+   * lock keeps it, any other is today's rate. Mocked so the door is measured,
+   * not the engine — and so a lock the door fails to pass shows up as $75.
+   */
+  function pricesAtTodaysRateHonouringLocks(
+    _checkIn: Date,
+    _checkOut: Date,
+    guests: Array<{
+      nights?: ReadonlyArray<Date> | null;
+      lockedNightPrices?: ReadonlyArray<{ stayDate: Date | string; priceCents: number }> | null;
+    }>,
+  ) {
+    const key = (value: Date | string) =>
+      typeof value === "string" ? value.slice(0, 10) : value.toISOString().slice(0, 10);
+    const breakdowns = guests.map((guest) => {
+      const locks = new Map(
+        (guest.lockedNightPrices ?? []).map((lock) => [key(lock.stayDate), lock.priceCents]),
+      );
+      const nightDates: Date[] = [];
+      if (guest.nights && guest.nights.length > 0) {
+        nightDates.push(...guest.nights);
+      } else {
+        for (let night = new Date(_checkIn); night < _checkOut; night = new Date(night.getTime() + 86_400_000)) {
+          nightDates.push(night);
+        }
+      }
+      const perNightCents = nightDates.map((night) => locks.get(key(night)) ?? 7500);
+      return {
+        priceCents: perNightCents.reduce((sum, cents) => sum + cents, 0),
+        perNightCents,
+        nightDates,
+      };
+    });
+    return {
+      totalPriceCents: breakdowns.reduce((sum, guest) => sum + guest.priceCents, 0),
+      guests: breakdowns,
+    };
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockMemberCount.mockResolvedValue(1);
+    mockMemberFindUnique.mockResolvedValue({
+      id: "m1",
+      active: true,
+      email: "alice@test.com",
+      firstName: "Alice",
+    } as any);
+    mockedAuth.mockResolvedValue(makeSession() as any);
+    mockedCheckCapacity.mockResolvedValue({
+      available: true,
+      availableBeds: 20,
+    } as any);
+    mockedCalcChangeFee.mockReturnValue({
+      feeCents: 0,
+      fromTierRefundPct: 0,
+      toTierRefundPct: 0,
+    });
+    mockPaymentUpdate.mockResolvedValue({});
+    mockedCalcPrice.mockImplementation(pricesAtTodaysRateHonouringLocks as never);
+    const mod = await import("@/app/api/bookings/[id]/modify-dates/route");
+    PUT = mod.PUT;
+  });
+
+  function moveTheDates(checkIn: string, checkOut: string) {
+    return PUT(
+      new NextRequest("http://localhost/api/bookings/bk1/modify-dates", {
+        method: "PUT",
+        body: JSON.stringify({ checkIn, checkOut }),
+      }),
+      { params: Promise.resolve({ id: "bk1" }) },
+    );
+  }
+
+  function writtenRows(tx: ReturnType<typeof makeTx>) {
+    return (
+      tx.bookingGuestNight.createMany.mock.calls[0][0] as {
+        data: Array<{ stayDate: Date; priceCents: number | null; priceSource: string }>;
+      }
+    ).data.map((row) => ({
+      date: row.stayDate.toISOString().slice(0, 10),
+      priceCents: row.priceCents,
+      priceSource: row.priceSource,
+    }));
+  }
+
+  it("T7: keeps the sold night at $25, values the blank night at $25, and buys the new night at today's $75", async () => {
+    const tx = makeTx(bookingWithABlankNight());
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+
+    // 1 Aug is kept; 2 Aug (the blank) is kept; 3 Aug is new.
+    const res = await moveTheDates("2026-08-01", "2026-08-04");
+    expect(res.status).toBe(200);
+
+    expect(writtenRows(tx)).toEqual([
+      { date: "2026-08-01", priceCents: 2500, priceSource: "SOLD" },
+      { date: "2026-08-02", priceCents: 2500, priceSource: "EVEN_SPLIT" },
+      { date: "2026-08-03", priceCents: 7500, priceSource: "SOLD" },
+    ]);
+    // Never NULL, and never 0.
+    expect(writtenRows(tx).every((row) => typeof row.priceCents === "number" && row.priceCents > 0)).toBe(true);
+    expect(tx.manualRefundTask.create).not.toHaveBeenCalled();
+  });
+
+  it("T5: a whole-stay move gives back both valued nights and buys the new ones fresh, raising nothing", async () => {
+    const tx = makeTx(bookingWithABlankNight());
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+
+    const res = await moveTheDates("2026-08-05", "2026-08-07");
+    const data = await res.json();
+    expect(res.status).toBe(200);
+
+    // The stay MOVED, so no night matches a stored one: both are bought now.
+    expect(writtenRows(tx)).toEqual([
+      { date: "2026-08-05", priceCents: 7500, priceSource: "SOLD" },
+      { date: "2026-08-06", priceCents: 7500, priceSource: "SOLD" },
+    ]);
+    // The guest's $50 (worth $25 + $25) is given back and $150 bought: the
+    // guest goes to $150, and the booking's total is the strands' $150.
+    expect(tx.bookingGuest.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ priceCents: 15000 }) }),
+    );
+    expect(tx.booking.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ totalPriceCents: 15000, finalPriceCents: 15000 }),
+      }),
+    );
+    // From a $50 headline, a $100 increase.
+    expect(data.priceDiffCents).toBe(10000);
+    expect(tx.manualRefundTask.create).not.toHaveBeenCalled();
+  });
+
+  it("H1: a headline a parked edit froze keeps its gap; the move charges only its own $100", async () => {
+    // The same $50 guest, under a $100 headline a parked edit left frozen
+    // (the $50 gap is money an open or declined review still holds). The move
+    // buys $150 for a guest stored at $50, so it changes the guests by +$100.
+    // Read as the bare sum of the guests, the new total would be $150 and the
+    // edit would charge $50, settling the frozen $50 as a refund nobody asked
+    // for (#4317 review H1). Carried forward, the total is $200 and the edit
+    // charges exactly its own $100.
+    const booking = bookingWithABlankNight();
+    booking.totalPriceCents = 10000;
+    booking.finalPriceCents = 10000;
+    const tx = makeTx(booking);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      client_secret: "pi_additional_secret_xxx", currency: "nzd",
+    } as any);
+
+    const res = await moveTheDates("2026-08-05", "2026-08-07");
+    const data = await res.json();
+    expect(res.status).toBe(200);
+
+    expect(tx.bookingGuest.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ priceCents: 15000 }) }),
+    );
+    expect(tx.booking.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ totalPriceCents: 20000, finalPriceCents: 20000 }),
+      }),
+    );
+    expect(data.priceDiffCents).toBe(10000);
+  });
+
+  it("D11: a negative stored guest total refuses the date change, writing nothing (#4317 review M2)", async () => {
+    // Unreachable on a live database (`BookingGuest_price_nonnegative`, which no
+    // row has ever failed). Pricing one would have to write the negative figure
+    // back, which that constraint rejects, so the door refuses before any write.
+    const booking = makeBooking({ totalPriceCents: -500, finalPriceCents: -500 });
+    const tx = makeTx(booking);
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+
+    const res = await moveTheDates("2026-08-01", "2026-08-04");
+    const data = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(data.error).toBe(NEGATIVE_STORED_GUEST_TOTAL_MESSAGE);
+    expect(tx.bookingGuestNight.createMany).not.toHaveBeenCalled();
+    expect(tx.bookingGuest.update).not.toHaveBeenCalled();
+    expect(tx.booking.update).not.toHaveBeenCalled();
+  });
+
+  it("CONTROL: the same date change on a fully readable booking prices the same way", async () => {
+    const tx = makeTx(makeBooking());
+    mockTransaction.mockImplementation((fn: any) => fn(tx));
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_additional",
+      client_secret: "pi_additional_secret_xxx", currency: "nzd",
+    } as any);
+
+    const res = await moveTheDates("2026-08-05", "2026-08-07");
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(tx.manualRefundTask.create).not.toHaveBeenCalled();
+    expect(data.priceDiffCents).toBe(5000);
+    const rows = (
+      tx.bookingGuestNight.createMany.mock.calls[0][0] as {
+        data: Array<{ priceCents: number | null }>;
+      }
+    ).data;
+    expect(rows.map((row) => row.priceCents)).toEqual([7500, 7500]);
+  });
+});

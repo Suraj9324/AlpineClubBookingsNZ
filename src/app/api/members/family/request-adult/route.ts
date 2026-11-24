@@ -1,0 +1,195 @@
+import { NextRequest, NextResponse } from "next/server";
+import { auth } from "@/lib/auth";
+import { requireActiveSessionUser } from "@/lib/session-guards";
+import { prisma } from "@/lib/prisma";
+import { applyRateLimit, rateLimiters } from "@/lib/rate-limit";
+import { computeAgeTier, getSeasonStartDate } from "@/lib/age-tier";
+import { clubTimeZone } from "@/lib/club-time/server";
+import { clubSeasonYear } from "@/lib/financial-year";
+import { parseDateOnly } from "@/lib/date-only";
+import { dateOnlyInstantOf } from "@/lib/club-time";
+import { clubTime } from "@/lib/club-time/server";
+import { logAudit } from "@/lib/audit";
+import logger from "@/lib/logger";
+import { sendAdminFamilyGroupRequestAlert } from "@/lib/email";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { familyAdultRequestSchema } from "@/lib/family-group-request-schemas";
+import { connectionJson } from "@/lib/mcp-connection-request";
+import { FAMILY_REQUEST_SUBMITTED_CONNECTION_SHAPE } from "@/lib/connection-shapes";
+
+/**
+ * POST /api/members/family/request-adult
+ * Request admin approval to add a same-email non-login adult to a family group.
+ */
+export async function POST(req: NextRequest) {
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+  }
+  const inactiveResponse = await requireActiveSessionUser(session.user.id);
+  if (inactiveResponse) {
+    return inactiveResponse;
+  }
+
+  const rateLimited = await applyRateLimit(rateLimiters.familyGroupJoinRequest, req);
+  if (rateLimited) return rateLimited;
+
+  const jsonBody = await parseJsonRequestBody(req, { error: "Invalid JSON" });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = familyAdultRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      { status: 422 }
+    );
+  }
+
+  const firstName = parsed.data.firstName.trim();
+  const lastName = parsed.data.lastName.trim();
+  const notes = parsed.data.notes?.trim() || null;
+  const dateOfBirth = parseDateOnly(parsed.data.dateOfBirth);
+  if (Number.isNaN(dateOfBirth.getTime())) {
+    return NextResponse.json({ error: "Invalid date of birth" }, { status: 422 });
+  }
+  // CT-4 (#2870): "in the future" means a later CLUB calendar day, taken from
+  // the persisted ClubTimeSettings zone and not the container's TZ
+  // (INV-CONFIG-002, INV-DATE-019). The date of birth takes no zone at all
+  // (INV-DATE-010), and both sides stay UTC-midnight date-only values.
+  const today = dateOnlyInstantOf((await clubTime()).today());
+  if (dateOfBirth > today) {
+    return NextResponse.json(
+      { error: "Date of birth cannot be in the future" },
+      { status: 422 }
+    );
+  }
+
+  const ageTier = await computeAgeTier(
+    dateOfBirth,
+    getSeasonStartDate(clubSeasonYear(await clubTimeZone())),
+  );
+  if (ageTier !== "ADULT") {
+    return NextResponse.json(
+      { error: "Use the infant/child/youth request flow for members under 18" },
+      { status: 422 }
+    );
+  }
+
+  const requester = await prisma.member.findUnique({
+    where: { id: session.user.id },
+    select: {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      active: true,
+      ageTier: true,
+      canLogin: true,
+      familyGroupMemberships: {
+        where: { familyGroupId: parsed.data.familyGroupId },
+        select: { familyGroupId: true },
+      },
+    },
+  });
+
+  if (!requester || !requester.active) {
+    return NextResponse.json({ error: "Member not found" }, { status: 404 });
+  }
+  if (!requester.canLogin || requester.ageTier !== "ADULT") {
+    return NextResponse.json(
+      { error: "Only adult members with login accounts can request same-email adult additions" },
+      { status: 403 }
+    );
+  }
+  if (requester.familyGroupMemberships.length === 0) {
+    return NextResponse.json(
+      { error: "You are not a member of this family group" },
+      { status: 403 }
+    );
+  }
+
+  const existingRequest = await prisma.familyGroupJoinRequest.findFirst({
+    where: {
+      familyGroupId: parsed.data.familyGroupId,
+      requesterId: requester.id,
+      type: "ADULT_REQUEST",
+      status: "PENDING",
+      requestedFirstName: { equals: firstName, mode: "insensitive" },
+      requestedLastName: { equals: lastName, mode: "insensitive" },
+      requestedDateOfBirth: dateOfBirth,
+    },
+  });
+
+  if (existingRequest) {
+    return NextResponse.json(
+      { error: "A request for this adult is already pending review" },
+      { status: 422 }
+    );
+  }
+
+  const request = await prisma.familyGroupJoinRequest.create({
+    data: {
+      familyGroupId: parsed.data.familyGroupId,
+      requesterId: requester.id,
+      type: "ADULT_REQUEST",
+      requestedFirstName: firstName,
+      requestedLastName: lastName,
+      requestedDateOfBirth: dateOfBirth,
+      requestedEmail: requester.email.toLowerCase().trim(),
+      requestNotes: notes,
+    },
+  });
+
+  logAudit({
+    action: "FAMILY_GROUP_ADULT_REQUEST",
+    memberId: requester.id,
+    targetId: parsed.data.familyGroupId,
+    subjectMemberId: requester.id,
+    entityType: "FamilyGroupJoinRequest",
+    entityId: request.id,
+    category: "family",
+    outcome: "success",
+    summary: "Adult family group request submitted",
+    details: JSON.stringify({
+      requestId: request.id,
+      requestedName: `${firstName} ${lastName}`,
+      requestedDateOfBirth: parsed.data.dateOfBirth,
+    }),
+    metadata: {
+      familyGroupId: parsed.data.familyGroupId,
+      requestedName: `${firstName} ${lastName}`,
+      requestedDateOfBirth: parsed.data.dateOfBirth,
+    },
+  });
+
+  const groupInfo = await prisma.familyGroup.findUnique({
+    where: { id: parsed.data.familyGroupId },
+    select: { name: true },
+  });
+
+  sendAdminFamilyGroupRequestAlert({
+    requestType: "Same-email Adult Request",
+    requesterName: `${requester.firstName} ${requester.lastName}`,
+    groupName: groupInfo?.name ?? "Unnamed Group",
+    details: `Wants to add ${firstName} ${lastName} as a non-login adult sharing ${requester.email}`,
+  }).catch((err) => {
+    logger.error({ err, requestId: request.id }, "Failed to send admin adult-request alert");
+  });
+
+  logger.info(
+    { requestId: request.id, requesterId: requester.id, familyGroupId: parsed.data.familyGroupId },
+    "Same-email adult family group request submitted"
+  );
+
+  // Also the AI app action `request_family_adult` (ALP-795).
+  return connectionJson(
+    req,
+    {
+      message: "Request submitted. An admin will review the adult addition.",
+      requestId: request.id,
+    },
+    FAMILY_REQUEST_SUBMITTED_CONNECTION_SHAPE,
+    { status: 201 }
+  );
+}

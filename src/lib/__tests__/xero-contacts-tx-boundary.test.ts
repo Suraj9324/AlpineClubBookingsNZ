@@ -1,0 +1,600 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// -----------------------------------------------------------------------------
+// F7 (#1355): Xero API calls (OAuth refresh, searches, creates, and their
+// up-to-120s retry sleeps) must run OUTSIDE the advisory-locked transaction.
+// Pre-#1355 the whole resolution ran inside prisma.$transaction with the 5s
+// interactive default: a slow Xero call aborted the transaction AFTER the
+// external side effect (contact created in Xero, local link rolled back), and
+// op-log writes on the global client recorded SUCCEEDED for rolled-back work.
+// -----------------------------------------------------------------------------
+
+const mocks = vi.hoisted(() => ({
+  memberFindUnique: vi.fn(),
+  txMemberFindUnique: vi.fn(),
+  txMemberFindFirst: vi.fn(),
+  txMemberUpdate: vi.fn(),
+  txXeroOperationFindFirst: vi.fn(),
+  // #2623 T7: the phase-2 link transaction closes any provider-created
+  // recovery whose own contact is the one it just linked.
+  txXeroOperationFindMany: vi.fn(),
+  txXeroOperationUpdateMany: vi.fn(),
+  txExecuteRaw: vi.fn(),
+  txQueryRaw: vi.fn(),
+  organisationFindFirst: vi.fn(),
+  transaction: vi.fn(),
+  getContacts: vi.fn(),
+  createContacts: vi.fn(),
+  getAuthenticatedXeroClient: vi.fn(),
+  startXeroSyncOperation: vi.fn(),
+  completeXeroSyncOperation: vi.fn(),
+  failXeroSyncOperation: vi.fn(),
+  upsertXeroObjectLink: vi.fn(),
+  syncManagedXeroContactGroupForMember: vi.fn(),
+  recordProviderCreatedContactPendingLocalLink: vi.fn(),
+  environmentSafetySettingsFindUnique: vi.fn(),
+  containmentFindUnique: vi.fn(),
+  containmentUpsert: vi.fn(),
+}));
+
+vi.mock("@/lib/xero-contact-create-recovery", async (importOriginal) => {
+  const actual =
+    (await importOriginal()) as typeof import("@/lib/xero-contact-create-recovery");
+  return {
+    ...actual,
+    recordProviderCreatedContactPendingLocalLink:
+      mocks.recordProviderCreatedContactPendingLocalLink,
+  };
+});
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    member: {
+      findUnique: mocks.memberFindUnique,
+    },
+    // #3367 (INV-INT-018): phase 2 refuses to link a contact an ORGANISATION
+    // already holds — the two-homes rule. A missing delegate here is an
+    // undefined-property throw before the boundary this suite is about; `null`
+    // is the ordinary answer, which is "no organisation holds it".
+    organisation: { findFirst: mocks.organisationFindFirst },
+    $transaction: mocks.transaction,
+    // #3034/#3036: the funnel asks which installation this is before it does
+    // anything. A MISSING delegate is an UNREADABLE override, which resolves
+    // UNKNOWN whatever the declaration says, and #3036 then refuses every Xero
+    // write — so without this the suite would test the refusal path instead of
+    // the transaction boundary it is about. Inline, because `vi.mock` factories
+    // are hoisted above this file's imports.
+    environmentSafetySettings: {
+      findUnique: mocks.environmentSafetySettingsFindUnique,
+    },
+    xeroSandboxContactContainment: {
+      findUnique: mocks.containmentFindUnique,
+      upsert: mocks.containmentUpsert,
+    },
+  },
+}));
+
+vi.mock("@/lib/xero-sync", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/xero-sync");
+  return {
+    ...actual,
+    buildXeroIdempotencyKey: vi.fn((...parts: unknown[]) => parts.join(":")),
+    startXeroSyncOperation: mocks.startXeroSyncOperation,
+    completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+    failXeroSyncOperation: mocks.failXeroSyncOperation,
+    upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+  };
+});
+
+vi.mock("@/lib/xero-api-client", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/xero-api-client");
+  return {
+    ...actual,
+    getAuthenticatedXeroClient: mocks.getAuthenticatedXeroClient,
+    callXeroApi: vi.fn((fn: () => unknown) => fn()),
+  };
+});
+
+vi.mock("@/lib/xero-contact-groups", () => ({
+  syncManagedXeroContactGroupForMember:
+    mocks.syncManagedXeroContactGroupForMember,
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
+
+import {
+  findOrCreateXeroContact,
+  XeroContactProviderAnswerUnavailableError,
+} from "@/lib/xero-contacts";
+import {
+  declareEnvironmentRole,
+  expectEnvironmentRolePremise,
+} from "@/lib/__tests__/helpers/environment-role";
+
+const MEMBER = {
+  id: "member-1",
+  firstName: "Alice",
+  lastName: "Example",
+  email: "alice@example.org",
+  phoneNumber: null,
+  phoneCountryCode: null,
+  phoneAreaCode: null,
+  xeroContactId: null,
+};
+
+/**
+ * Every double this file's funnel calls need, in ONE place.
+ *
+ * It was a `beforeEach` body until #2939 added a second `describe` here. A
+ * sibling block does not inherit another's hook, so the setup has to be a
+ * function both call — otherwise the second block runs against whatever state
+ * the first block's last test happened to leave behind, which is a suite that
+ * passes or fails on test ORDER.
+ */
+function setUpFunnelDoubles(): void {
+  vi.clearAllMocks();
+    // The club's LIVE site, where #3036's containment is a no-op — so this
+    // suite still measures exactly the transaction boundary it always did.
+    declareEnvironmentRole("production");
+    mocks.environmentSafetySettingsFindUnique.mockResolvedValue(null);
+    mocks.containmentFindUnique.mockResolvedValue(null);
+    mocks.containmentUpsert.mockResolvedValue({});
+    mocks.memberFindUnique.mockResolvedValue({ ...MEMBER });
+    mocks.getAuthenticatedXeroClient.mockResolvedValue({
+      xero: {
+        accountingApi: {
+          getContacts: mocks.getContacts,
+          createContacts: mocks.createContacts,
+        },
+      },
+      tenantId: "tenant-1",
+    });
+    mocks.getContacts.mockResolvedValue({ body: { contacts: [] } });
+    mocks.createContacts.mockResolvedValue({
+      body: { contacts: [{ contactID: "contact-new", name: "Alice Example" }] },
+    });
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "op-1" });
+    mocks.completeXeroSyncOperation.mockResolvedValue(undefined);
+    mocks.failXeroSyncOperation.mockResolvedValue(undefined);
+    mocks.upsertXeroObjectLink.mockResolvedValue({ id: "link-1" });
+    mocks.syncManagedXeroContactGroupForMember.mockResolvedValue(undefined);
+    mocks.recordProviderCreatedContactPendingLocalLink.mockResolvedValue(undefined);
+    mocks.txExecuteRaw.mockResolvedValue(1);
+    mocks.txQueryRaw.mockImplementation(
+      async (_strings: TemplateStringsArray, memberId: string) => [{ id: memberId }],
+    );
+    mocks.txMemberFindUnique.mockResolvedValue({
+      ...MEMBER,
+      passwordHash: null,
+    });
+    mocks.txMemberFindFirst.mockResolvedValue(null);
+    mocks.txXeroOperationFindFirst.mockResolvedValue(null);
+    mocks.txXeroOperationFindMany.mockResolvedValue([]);
+    mocks.txXeroOperationUpdateMany.mockResolvedValue({ count: 0 });
+    mocks.txMemberUpdate.mockResolvedValue({ id: "member-1" });
+    mocks.transaction.mockImplementation(
+      async (fn: (tx: unknown) => Promise<unknown>) =>
+        fn({
+          $executeRaw: mocks.txExecuteRaw,
+          $queryRaw: mocks.txQueryRaw,
+          member: {
+            findUnique: mocks.txMemberFindUnique,
+            findFirst: mocks.txMemberFindFirst,
+            update: mocks.txMemberUpdate,
+          },
+          xeroSyncOperation: {
+            findFirst: mocks.txXeroOperationFindFirst,
+            findMany: mocks.txXeroOperationFindMany,
+            updateMany: mocks.txXeroOperationUpdateMany,
+          },
+          // #3367 (INV-INT-018): phase 2 refuses a contact an ORGANISATION
+          // already holds, so the tx double needs the delegate or it throws
+          // before the boundary this suite is about.
+          organisation: { findFirst: mocks.organisationFindFirst },
+        })
+    );
+}
+
+describe("findOrCreateXeroContact transaction boundary (#1355)", () => {
+  beforeEach(setUpFunnelDoubles);
+
+  it("commits the reservation before create and keeps the provider outside both short transactions", async () => {
+    await expectEnvironmentRolePremise("PRODUCTION");
+    await expect(findOrCreateXeroContact("member-1")).resolves.toBe(
+      "contact-new"
+    );
+
+    // The Xero search AND create both complete before prisma.$transaction is
+    // ever entered — a slow provider call can no longer blow the 5s
+    // interactive-transaction budget or roll back local state after the
+    // external side effect.
+    expect(mocks.transaction).toHaveBeenCalledTimes(2);
+    const reservationTxOrder = mocks.transaction.mock.invocationCallOrder[0];
+    const linkTxOrder = mocks.transaction.mock.invocationCallOrder[1];
+    expect(mocks.getContacts.mock.invocationCallOrder[0]).toBeLessThan(
+      reservationTxOrder,
+    );
+    expect(mocks.createContacts.mock.invocationCallOrder[0]).toBeGreaterThan(
+      reservationTxOrder,
+    );
+    expect(mocks.createContacts.mock.invocationCallOrder[0]).toBeLessThan(
+      linkTxOrder,
+    );
+    // The short transaction still takes the per-member advisory lock and
+    // writes the link.
+    expect(mocks.txExecuteRaw).toHaveBeenCalled();
+    expect(mocks.txMemberUpdate).toHaveBeenCalledWith({
+      where: { id: "member-1" },
+      data: { xeroContactId: "contact-new" },
+    });
+    // Op-log completion is post-commit and references the committed contact.
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-1" }),
+      expect.objectContaining({ xeroObjectId: "contact-new" })
+    );
+    expect(
+      mocks.completeXeroSyncOperation.mock.invocationCallOrder[0]
+    ).toBeGreaterThan(linkTxOrder);
+  });
+
+  it("keeps first-writer-wins when a concurrent resolver linked while our Xero work ran", async () => {
+    // The reservation re-read still sees no link. Phase 2 then sees the
+    // DIFFERENT contact that won while provider work ran.
+    // #2597: the reservation now builds the Xero contact payload from the
+    // LOCKED row rather than a stale pre-lock read, so this re-read must carry
+    // the full contact shape or payload validation fails before the boundary
+    // this test is about.
+    mocks.txMemberFindUnique
+      .mockResolvedValueOnce({ ...MEMBER, passwordHash: null })
+      .mockResolvedValueOnce({ xeroContactId: "contact-other" });
+
+    await expect(findOrCreateXeroContact("member-1")).resolves.toBe(
+      "contact-other"
+    );
+
+    // No overwrite of the winner's link.
+    expect(mocks.txMemberUpdate).not.toHaveBeenCalled();
+    // The operation is closed HONESTLY: the created contact exists in Xero
+    // but was superseded locally — never recorded as a plain success with a
+    // link it does not have.
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-1" }),
+      expect.objectContaining({
+        responsePayload: expect.objectContaining({
+          resolution: "superseded_by_concurrent_link",
+          linkedContactId: "contact-other",
+        }),
+      })
+    );
+  });
+
+  it("records the operation FAILED (never SUCCEEDED) when the local link fails after the Xero create", async () => {
+    // Pre-#1355 this was the op-log lie: the tx aborted post-create, the
+    // local link rolled back, and the op stayed SUCCEEDED.
+    mocks.transaction
+      .mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) =>
+        fn({
+          $executeRaw: mocks.txExecuteRaw,
+          $queryRaw: mocks.txQueryRaw,
+          member: {
+            findUnique: mocks.txMemberFindUnique,
+            findFirst: mocks.txMemberFindFirst,
+            update: mocks.txMemberUpdate,
+          },
+          xeroSyncOperation: {
+            findFirst: mocks.txXeroOperationFindFirst,
+            findMany: mocks.txXeroOperationFindMany,
+            updateMany: mocks.txXeroOperationUpdateMany,
+          },
+          // #3367 (INV-INT-018): phase 2 refuses a contact an ORGANISATION
+          // already holds, so the tx double needs the delegate or it throws
+          // before the boundary this suite is about.
+          organisation: { findFirst: mocks.organisationFindFirst },
+        }),
+      )
+      .mockRejectedValueOnce(new Error("transaction aborted"));
+
+    await expect(findOrCreateXeroContact("member-1")).rejects.toThrow(
+      "transaction aborted"
+    );
+
+    expect(mocks.completeXeroSyncOperation).not.toHaveBeenCalled();
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-1" }),
+      expect.objectContaining({ message: "transaction aborted" }),
+      expect.objectContaining({
+        phase: "local_link_after_xero_resolution",
+        providerContactCreated: true,
+      })
+    );
+  });
+
+  it("records matched-existing local-link failures as not provider-created", async () => {
+    mocks.getContacts
+      .mockResolvedValueOnce({ body: { contacts: [] } })
+      .mockResolvedValueOnce({
+        body: {
+          contacts: [
+            { contactID: "contact-matched", name: "Alice Example" },
+          ],
+        },
+      });
+    mocks.createContacts.mockRejectedValue({
+      response: { statusCode: 400 },
+      message: JSON.stringify({
+        body: {
+          Message: "A validation exception occurred",
+          Elements: [
+            {
+              ValidationErrors: [
+                {
+                  Message:
+                    "The contact name Alice Example is already assigned to another contact. The contact name must be unique across all active contacts.",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    });
+    mocks.transaction
+      .mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) =>
+        fn({
+          $executeRaw: mocks.txExecuteRaw,
+          $queryRaw: mocks.txQueryRaw,
+          member: {
+            findUnique: mocks.txMemberFindUnique,
+            findFirst: mocks.txMemberFindFirst,
+            update: mocks.txMemberUpdate,
+          },
+          xeroSyncOperation: {
+            findFirst: mocks.txXeroOperationFindFirst,
+            findMany: mocks.txXeroOperationFindMany,
+            updateMany: mocks.txXeroOperationUpdateMany,
+          },
+          // #3367 (INV-INT-018): phase 2 refuses a contact an ORGANISATION
+          // already holds, so the tx double needs the delegate or it throws
+          // before the boundary this suite is about.
+          organisation: { findFirst: mocks.organisationFindFirst },
+        }),
+      )
+      .mockRejectedValueOnce(new Error("transaction aborted"));
+
+    await expect(findOrCreateXeroContact("member-1")).rejects.toThrow(
+      "transaction aborted"
+    );
+
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-1" }),
+      expect.objectContaining({ message: "transaction aborted" }),
+      expect.objectContaining({
+        phase: "local_link_after_xero_resolution",
+        resolvedContactId: "contact-matched",
+        providerContactCreated: false,
+      })
+    );
+  });
+
+  it("links an email match through the short transaction without creating anything", async () => {
+    mocks.getContacts.mockResolvedValue({
+      body: { contacts: [{ contactID: "contact-matched", name: "Alice Example" }] },
+    });
+
+    await expect(findOrCreateXeroContact("member-1")).resolves.toBe(
+      "contact-matched"
+    );
+
+    expect(mocks.createContacts).not.toHaveBeenCalled();
+    expect(mocks.startXeroSyncOperation).not.toHaveBeenCalled();
+    // linkMatchedXeroContact ran inside the tx: conflict check + link write.
+    expect(mocks.txMemberFindFirst).toHaveBeenCalled();
+    expect(mocks.txMemberUpdate).toHaveBeenCalledWith({
+      where: { id: "member-1" },
+      data: { xeroContactId: "contact-matched" },
+    });
+    expect(mocks.getContacts.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.transaction.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("rechecks the steady-state member under the row fence before refreshing its canonical link", async () => {
+    mocks.memberFindUnique.mockResolvedValue({
+      ...MEMBER,
+      xeroContactId: "contact-existing",
+    });
+    mocks.txMemberFindUnique.mockResolvedValue({
+      ...MEMBER,
+      passwordHash: null,
+      xeroContactId: "contact-existing",
+    });
+
+    await expect(findOrCreateXeroContact("member-1")).resolves.toBe(
+      "contact-existing"
+    );
+
+    expect(mocks.transaction).toHaveBeenCalledTimes(1);
+    expect(mocks.getAuthenticatedXeroClient).not.toHaveBeenCalled();
+    expect(mocks.upsertXeroObjectLink).toHaveBeenCalledWith(
+      expect.objectContaining({ xeroObjectId: "contact-existing" }),
+      expect.objectContaining({ store: expect.anything() }),
+    );
+  });
+});
+
+
+/**
+ * #2939 — `requireAuthoritativeMatch`, the option a BULK caller passes.
+ *
+ * The funnel's defaults are tuned for a document writer, where the expensive
+ * outcome is a blocked invoice: a failed search falls through to a create, and
+ * a create Xero refuses on its contact-name uniqueness rule is recovered by
+ * adopting the existing same-named contact — on the normalised NAME ALONE,
+ * with no email comparison. Both trades invert for a bulk seeding run: nothing
+ * is blocked, and a wrong contact is permanent in a ledger with no merge API.
+ *
+ * These pin both directions, because the default behaviour is load-bearing for
+ * every other caller and the option must change nothing for them.
+ */
+describe("requireAuthoritativeMatch (#2939)", () => {
+  const NAME_TAKEN = {
+    response: {
+      body: {
+        Elements: [
+          {
+            ValidationErrors: [
+              { Message: "The contact name Alice Example is already assigned to another contact" },
+            ],
+          },
+        ],
+      },
+    },
+  };
+
+  beforeEach(() => {
+    setUpFunnelDoubles();
+    /*
+      `vi.clearAllMocks()` clears CALLS, not queued `…Once` implementations, so
+      a rejection queued by one of these tests would otherwise be consumed by
+      the next. Reset the two provider doubles this block queues on, then let
+      the shared setup's defaults stand again.
+    */
+    mocks.getContacts.mockReset();
+    mocks.createContacts.mockReset();
+    mocks.getContacts.mockResolvedValue({ body: { contacts: [] } });
+    mocks.createContacts.mockResolvedValue({
+      body: { contacts: [{ contactID: "contact-new", name: "Alice Example" }] },
+    });
+  });
+
+  it("still falls through to a create on a failed search WITHOUT the option", async () => {
+    mocks.getContacts.mockRejectedValueOnce(new Error("socket hang up"));
+
+    await expect(findOrCreateXeroContact("member-1")).resolves.toBe(
+      "contact-new",
+    );
+    expect(mocks.createContacts).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses instead of creating when the search fails and the option is set", async () => {
+    mocks.getContacts.mockRejectedValueOnce(new Error("socket hang up"));
+
+    await expect(
+      findOrCreateXeroContact("member-1", { requireAuthoritativeMatch: true }),
+    ).rejects.toBeInstanceOf(XeroContactProviderAnswerUnavailableError);
+    // The point of the refusal: nothing was minted, so the member is exactly
+    // where they were and the next run picks them up unchanged.
+    expect(mocks.createContacts).not.toHaveBeenCalled();
+    expect(mocks.startXeroSyncOperation).not.toHaveBeenCalled();
+  });
+
+  it("names the phase, so a caller can tell the two refusals apart", async () => {
+    mocks.getContacts.mockRejectedValueOnce(new Error("socket hang up"));
+
+    await expect(
+      findOrCreateXeroContact("member-1", { requireAuthoritativeMatch: true }),
+    ).rejects.toMatchObject({ phase: "EMAIL_SEARCH", memberId: "member-1" });
+  });
+
+  it("still adopts a same-named contact WITHOUT the option", async () => {
+    // The default recovery: Xero refuses the create, the funnel searches by
+    // exact name and links what it finds.
+    mocks.createContacts.mockRejectedValueOnce(NAME_TAKEN);
+    mocks.getContacts
+      .mockResolvedValueOnce({ body: { contacts: [] } })
+      .mockResolvedValueOnce({
+        body: { contacts: [{ contactID: "contact-old", name: "Alice Example" }] },
+      });
+
+    await expect(findOrCreateXeroContact("member-1")).resolves.toBe(
+      "contact-old",
+    );
+  });
+
+  it("refuses the name-only adoption when the option is set", async () => {
+    /*
+      THE SILENT WRONG LINK this option exists to prevent: a new member called
+      Alice Example and a fifteen-year-old "Alice Example" at another address.
+      The default adopts; a bulk caller must not, because nothing compares the
+      two addresses and every future invoice would land on the old account.
+    */
+    mocks.createContacts.mockRejectedValueOnce(NAME_TAKEN);
+    mocks.getContacts
+      .mockResolvedValueOnce({ body: { contacts: [] } })
+      .mockResolvedValueOnce({
+        body: { contacts: [{ contactID: "contact-old", name: "Alice Example" }] },
+      });
+
+    await expect(
+      findOrCreateXeroContact("member-1", { requireAuthoritativeMatch: true }),
+    ).rejects.toMatchObject({ phase: "DUPLICATE_NAME_RECOVERY" });
+    // The name search is never even made: there is nothing an answer could
+    // change, so the refusal costs one provider call less than the recovery.
+    expect(mocks.getContacts).toHaveBeenCalledTimes(1);
+    // And the reserved operation is closed as failed rather than left RUNNING.
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op-1" }),
+      expect.any(XeroContactProviderAnswerUnavailableError),
+      expect.objectContaining({
+        refusedRecovery: "name_match_requires_operator_decision",
+      }),
+    );
+  });
+
+  it("changes nothing on the ordinary path", async () => {
+    // The option only ever turns a fallback into a refusal, so it can create or
+    // link nothing the default would not.
+    await expect(
+      findOrCreateXeroContact("member-1", { requireAuthoritativeMatch: true }),
+    ).resolves.toBe("contact-new");
+    expect(mocks.createContacts).toHaveBeenCalledTimes(1);
+  });
+
+  it("adopts an EMAIL match exactly as before", async () => {
+    mocks.getContacts.mockResolvedValueOnce({
+      body: { contacts: [{ contactID: "contact-existing", name: "Alice Example" }] },
+    });
+
+    await expect(
+      findOrCreateXeroContact("member-1", { requireAuthoritativeMatch: true }),
+    ).resolves.toBe("contact-existing");
+    expect(mocks.createContacts).not.toHaveBeenCalled();
+  });
+});
+
+describe("#4374: contact completions send deferred alerts after commit", () => {
+  beforeEach(setUpFunnelDoubles);
+
+  // #5394: create and update share one completer, completeMemberContactOperation.
+  it("flushes a contact completion's alert only after the enclosing commit", async () => {
+    const { completeMemberContactOperation } = await import("@/lib/xero-contact-create-recovery");
+    const { xeroClaim } = await import("./helpers/xero-claim");
+    let committed = false;
+    const deferredPostCommit = vi.fn(async () => { expect(committed).toBe(true); });
+    mocks.completeXeroSyncOperation.mockResolvedValue({ deferredPostCommit });
+    mocks.txMemberFindUnique.mockResolvedValue({ ...MEMBER, xeroContactId: "contact-new", passwordHash: null });
+    mocks.transaction.mockImplementation(async (fn) => {
+      const result = await fn({ $executeRaw: mocks.txExecuteRaw, member: { findUnique: mocks.txMemberFindUnique } });
+      expect(deferredPostCommit).not.toHaveBeenCalled();
+      committed = true;
+      return result;
+    });
+    await completeMemberContactOperation("member-1", "contact-new", xeroClaim("op-1"), {});
+    expect(deferredPostCommit).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not flush a contact completion's alert when commit fails", async () => {
+    const { completeMemberContactOperation } = await import("@/lib/xero-contact-create-recovery");
+    const { xeroClaim } = await import("./helpers/xero-claim");
+    const deferredPostCommit = vi.fn();
+    mocks.completeXeroSyncOperation.mockResolvedValue({ deferredPostCommit });
+    mocks.txMemberFindUnique.mockResolvedValue({ ...MEMBER, xeroContactId: "contact-new", passwordHash: null });
+    mocks.transaction.mockImplementation(async (fn) => {
+      await fn({ $executeRaw: mocks.txExecuteRaw, member: { findUnique: mocks.txMemberFindUnique } });
+      throw new Error("commit failed");
+    });
+    await expect(completeMemberContactOperation("member-1", "contact-new", xeroClaim("op-1"), {})).rejects.toThrow("commit failed");
+    expect(deferredPostCommit).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,101 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+# This repository installs with pnpm (#3673); an npm lockfile is always a
+# mistake, so it can never be committed by accident. CI also refuses one.
+/package-lock.json
+/npm-shrinkwrap.json
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/.vitest/
+/.stryker-tmp/
+/reports/mutation/
+/playwright-report/
+/test-results/
+/e2e/.auth/
+
+# next.js
+/.next/
+/out/
+
+# Generated build artifacts (AID-3 deployed-code knowledge bundle, #2372).
+# Regenerated deterministically pre-build by `pnpm run diagnostics:bundle`; never
+# committed (a source-excerpt bundle would conflict on every source PR).
+/.artifacts/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+# Claude Code local state is ignored at any depth; only the repository's
+# shared subagent roles (.claude/agents/ at the root) and its shared settings
+# (the agent-rule hooks, #4462) are tracked.
+*/**/.claude/
+.claude/*
+!.claude/agents/
+!.claude/settings.json
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env
+.env.local
+.env.*.local
+.env.staging
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+/src/generated/prisma
+
+# review fix runner logs
+review-fixes.log
+/logs/review-fixes/
+
+# generated accessibility evidence
+/reports/lighthouse/
+# Private deployment overlay
+/config/club.json
+/config/features.json
+# Optional AID-3 diagnostics knowledge overlay (#2372): a deployment-owned file
+# that WIDENS/narrows the bundle allowlist for a private fork. Generic contract —
+# public code never mandates its contents. See docs/diagnostics/KNOWLEDGE_BUNDLE.md.
+/config/diagnostics-knowledge.json
+/public/branding/favicon.ico
+/public/branding/favicon.png
+/public/branding/logo.png
+/public/branding/og-image.png
+/public/branding/lodge.jpg
+/public/branding/ski-field.jpg
+/public/branding/snowboarder.jpg
+/public/branding/sunset.jpg
+/seeds/tokoroa/
+.vscode/
+.github/agents/
+public/images/
+.env.capture
+
+# Isolated #2352/#2663 measurement stack secrets (never committed, never in a PR).
+measurement/stack/.env.measure
+
+# Local audit output (scripts/audit/fragility-*.mjs)
+/tmp/

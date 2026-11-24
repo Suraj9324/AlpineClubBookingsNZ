@@ -1,0 +1,700 @@
+import type { ManualRefundTaskKind, ManualRefundTaskStatus } from "@prisma/client";
+
+import { getRemainingRefundableCentsNetOf } from "@/lib/booking-payment-state";
+import { sumInternetBankingLateCashCreditCents } from "@/lib/internet-banking-late-cash-credit";
+import { openCardRefundOwedCents, type CardRefundOwedPaymentRow } from "@/lib/open-card-refund-owed";
+import { BANK_REFUND_VOID_FOLLOW_UP_KEY_PREFIX, isBankRefundVoidFollowUpTask } from "@/lib/bank-refund-void-follow-up-key";
+import { isLateCaptureHandBackTask } from "@/lib/late-capture-hand-back-task";
+
+/**
+ * #3213 (epic #2797): WHICH FINANCE-QUEUE ITEMS CAN BE SETTLED AT ALL, and the
+ * sentence an officer gets when one cannot.
+ *
+ * Two layers have to agree about this and they cannot share a module otherwise:
+ * `manual-refund-task-resolution.ts` is `server-only`, so the settle screen
+ * cannot import the rule from where it is enforced, and a copy written beside
+ * the screen would drift from the one the server throws. That is the same split
+ * `manual-refund-task-copy.ts` records for the zero refusal - and the reason
+ * this is a module of its own rather than another section of that one is that a
+ * RULE is not COPY: the screen consults this to decide whether a control exists
+ * at all, which is a question about behaviour rather than about words.
+ *
+ * `INV-SSOT`. Before this, "a withheld share cannot be completed" would have
+ * been decided twice - once by the door and once by the card - and the failure
+ * mode of that arrangement is not a visible disagreement but a silent one: a
+ * card that keeps offering a control the server has started refusing.
+ *
+ * THE RULE ITSELF HAS ONE HOME AND IT IS NOT THIS FILE. `INV-PAY-051`
+ * (`docs/invariants/payment-and-settlement.md`) states why `COMPLETED` is
+ * refused on this kind, which is the part a reader needs to understand rather
+ * than to call.
+ */
+
+/**
+ * #3643 (`INV-PAY-107`): IS THIS TASK A PART-PAYMENT REVIEW? The one spelling of
+ * that question for every server reader - the resolution door, the audit, the
+ * queue payload and the repair loader - so a new door
+ * asks it here rather than inventing a sixth test of the marker. A review is a
+ * `CANCELLED_BOOKING_HAND_BACK` like any other hand-back, so its kind cannot
+ * say it; only the marker can. The browser reads the payload's boolean, which
+ * this computes.
+ */
+export function isPartPaymentReviewTask<
+  T extends { partPaymentReviewPaymentId: string | null },
+>(task: T): task is T & { partPaymentReviewPaymentId: string } {
+  // Present-or-absent, not `!== null`: a row read without the column selected
+  // carries undefined, which is no review.
+  return Boolean(task.partPaymentReviewPaymentId);
+}
+
+/**
+ * #3827 (owner decision D-3813-6, `INV-PAY-117`): THE OCCURRENCE-KEY PREFIX of
+ * an edit refund hand-back — the task an internet-banking (or cash) price
+ * reduction raises so the treasurer sends the money back. One per
+ * `BookingModification`, so the key is the duplicate fence and, with the kind,
+ * the marker. The one spelling, read by the writer and by every reader below.
+ */
+export const EDIT_REFUND_HAND_BACK_KEY_PREFIX = "edit-refund-hand-back:";
+
+/** The one occurrence key of one edit's refund hand-back (`INV-PAY-117`). */
+export function editRefundHandBackOccurrenceKey(bookingModificationId: string): string {
+  return `${EDIT_REFUND_HAND_BACK_KEY_PREFIX}${bookingModificationId}`;
+}
+
+/**
+ * #3827 (owner decision D-3813-7, `INV-PAY-118`): THE OCCURRENCE-KEY PREFIX of
+ * a refund-request hand-back - the task an approved refund request (appeal)
+ * raises for the part of its amount no card refund can carry, so the treasurer
+ * sends it by bank transfer. One per `RefundRequest`: the key is the duplicate
+ * fence and, with the kind, the marker.
+ */
+export const REFUND_REQUEST_HAND_BACK_KEY_PREFIX = "refund-request-hand-back:";
+
+/** The one occurrence key of one refund request's hand-back (`INV-PAY-118`). */
+export function refundRequestHandBackOccurrenceKey(refundRequestId: string): string {
+  return `${REFUND_REQUEST_HAND_BACK_KEY_PREFIX}${refundRequestId}`;
+}
+
+/**
+ * #4097 (`INV-PAY-129`): THE OCCURRENCE-KEY PREFIX of a cancellation's card
+ * refund shortfall - the part of an own-card cancel's refund that its frozen
+ * card refund plan could not carry, raised in the cancel's claim so the
+ * treasurer pays it by bank transfer. A cancellation's OWN hand-back, so it is
+ * deliberately not in the non-cancellation list below. One per booking (a
+ * booking is cancelled once): the key is the duplicate fence and, with the
+ * kind, the marker.
+ */
+export const CANCEL_CARD_SHORTFALL_KEY_PREFIX = "cancel-card-shortfall:";
+
+/**
+ * #4097 (`INV-PAY-129`): the two parts a cancellation's card refund shortfall
+ * is split into when it is raised. `bank`: what the payment's captured
+ * non-card charges still hold, owed by bank transfer. `check`: anything
+ * beyond that - the payment's records show it already refunded, or nothing
+ * holds it - which an officer checks before paying.
+ */
+export type CancelCardShortfallPart = "bank" | "check";
+const CANCEL_CARD_SHORTFALL_CHECK_SUFFIX = ":check";
+
+/** The one occurrence key of one part of one cancellation's card refund shortfall (`INV-PAY-129`). */
+export function cancelCardShortfallOccurrenceKey(bookingId: string, part: CancelCardShortfallPart = "bank"): string {
+  return `${CANCEL_CARD_SHORTFALL_KEY_PREFIX}${bookingId}${part === "check" ? CANCEL_CARD_SHORTFALL_CHECK_SUFFIX : ""}`;
+}
+
+/**
+ * #4125: where a cancel's card refund stands, read live from its recovery row
+ * (`cardRefundRowState`): made (`settled`), still being sent (`on-its-way`),
+ * closed as "Paid another way" (`INV-PAY-122`), or `stalled` - the row is dead
+ * (its retries are spent, or it failed with no retry scheduled), so nothing
+ * will send it without the club.
+ */
+export type CardRefundState = "settled" | "on-its-way" | "paid-another-way" | "stalled";
+
+/**
+ * #4097: where a card refund shortfall's cancel stands, read by the booking and
+ * payment-link pages and handed to the pure narrative: each part's task status,
+ * and the card part's own refund (#4125: a dead one too, `stalled`).
+ */
+export type CardShortfallTaskStatuses = Partial<Record<CancelCardShortfallPart, "OPEN" | "COMPLETED" | "DISMISSED">> & {
+  card?: CardRefundState;
+};
+
+/** Which part of a card refund shortfall this task is, or null for any other task. */
+export function cancelCardShortfallPart(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): CancelCardShortfallPart | null {
+  if (!isCancelCardShortfallTask(task)) return null;
+  return task.occurrenceKey?.endsWith(CANCEL_CARD_SHORTFALL_CHECK_SUFFIX) ? "check" : "bank";
+}
+
+/**
+ * #4097 (`INV-PAY-129`): IS THIS TASK A CANCELLATION'S CARD REFUND SHORTFALL?
+ * Its money goes back by bank transfer on a card payment that has no refund
+ * row for it, so its completion posts the booking ledger's `BANK_REFUND` line
+ * itself (`postHandBackLedgerLine`, `INV-MONEY-035`).
+ */
+export function isCancelCardShortfallTask(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): boolean {
+  return (
+    task.kind === "CANCELLED_BOOKING_HAND_BACK" &&
+    (task.occurrenceKey?.startsWith(CANCEL_CARD_SHORTFALL_KEY_PREFIX) ?? false)
+  );
+}
+
+/**
+ * #4097: a COMPLETED card refund shortfall, as a where fragment. Its bank
+ * transfer has no refund row, so the Xero refund-note pipeline reads it as it
+ * reads a "Paid another way" close (`card-refund-paid-another-way-cash.ts`).
+ */
+export const COMPLETED_CANCEL_CARD_SHORTFALL_TASK_WHERE = {
+  kind: "CANCELLED_BOOKING_HAND_BACK" satisfies ManualRefundTaskKind,
+  status: "COMPLETED" satisfies ManualRefundTaskStatus,
+  occurrenceKey: { startsWith: CANCEL_CARD_SHORTFALL_KEY_PREFIX },
+} as const;
+
+/**
+ * #3372 (owner, 7 Oct 2026: "Count + add close action"; #3924 round 4, M2,
+ * `INV-PAY-122`): THE OCCURRENCE-KEY PREFIX of the record a "Paid another way"
+ * close writes - a card refund Stripe gave up on, which the treasurer paid back
+ * by bank transfer instead (`closeCardRefundPaidAnotherWay`). One per
+ * `PaymentRecoveryOperation`: with the kind, the key is the marker, and the
+ * close's status-guarded claim is its single flight. The row is born COMPLETED
+ * and never OPEN: it records money already sent, so the booking ledger's
+ * hand-back line has a completed task to stand on and the Xero cash evidence
+ * can tell it from a card refund.
+ *
+ * #3924 round 5 (owner, 8 Oct 2026: "Raise a refund note for all"): the key
+ * also records how the close's Xero refund note is raised
+ * (`PaidAnotherWayXeroNote`), so the cash evidence reads the close's own
+ * answer, never the invoice as it stands later - an invoice linked after the
+ * close never makes the nightly self-heal raise a card note for bank money:
+ *
+ * - `now` (no suffix): queued with the close, where there is an invoice to
+ *   credit;
+ * - `after-receipt` (`:note-after-receipt`; #3924 round 6, owner, 8 Oct 2026:
+ *   "Record receipt, then credit"): a late card charge Xero holds no receipt
+ *   for. The close queues the charge's receipt, and the receipt's worker raises
+ *   the note once the receipt is in Xero (`INV-PAY-110`, `INV-PAY-122`);
+ * - `none` (`:no-xero-note`): nothing to credit, and no receipt the app can
+ *   record.
+ */
+export const CARD_REFUND_PAID_ANOTHER_WAY_KEY_PREFIX = "card-refund-paid-another-way:";
+const CARD_REFUND_PAID_ANOTHER_WAY_NO_NOTE_SUFFIX = ":no-xero-note";
+const CARD_REFUND_PAID_ANOTHER_WAY_NOTE_AFTER_RECEIPT_SUFFIX = ":note-after-receipt";
+
+/** How a paid-another-way close's bank-transfer Xero refund note is raised; see the key's docblock. */
+export type PaidAnotherWayXeroNote = "now" | "after-receipt" | "none";
+
+const PAID_ANOTHER_WAY_KEY_SUFFIX: Record<PaidAnotherWayXeroNote, string> = {
+  now: "",
+  "after-receipt": CARD_REFUND_PAID_ANOTHER_WAY_NOTE_AFTER_RECEIPT_SUFFIX,
+  none: CARD_REFUND_PAID_ANOTHER_WAY_NO_NOTE_SUFFIX,
+};
+
+/** The one occurrence key of one card refund operation's paid-another-way close. */
+export function cardRefundPaidAnotherWayOccurrenceKey(
+  paymentRecoveryOperationId: string,
+  { xeroRefundNote }: { xeroRefundNote: PaidAnotherWayXeroNote },
+): string {
+  return `${CARD_REFUND_PAID_ANOTHER_WAY_KEY_PREFIX}${paymentRecoveryOperationId}${PAID_ANOTHER_WAY_KEY_SUFFIX[xeroRefundNote]}`;
+}
+
+/**
+ * Every key a close of this card refund operation can carry, one per way its
+ * note is raised: the one way to find a close's record by the operation it
+ * closed (#3924 round 8, `INV-SSOT`).
+ */
+export function closeKeysOf(paymentRecoveryOperationId: string): string[] {
+  return (Object.keys(PAID_ANOTHER_WAY_KEY_SUFFIX) as PaidAnotherWayXeroNote[]).map((xeroRefundNote) =>
+    cardRefundPaidAnotherWayOccurrenceKey(paymentRecoveryOperationId, { xeroRefundNote }),
+  );
+}
+
+/**
+ * #4120: what a paid-another-way close owed but did not pay back - the amount
+ * still owed when it closed (`raisedAmountCents`) less what was paid back,
+ * never below nothing. A full close leaves nothing; a part close the rest.
+ */
+export function paidAnotherWayUnpaidCents(close: { amountCents: number | null; raisedAmountCents: number | null }): number {
+  return Math.max(0, (close.raisedAmountCents ?? 0) - (close.amountCents ?? 0));
+}
+
+/**
+ * #3827 (`INV-PAY-117`): the key prefixes of every hand-back that is NOT a
+ * cancellation's - money promised back by bank transfer on a decision other
+ * than a cancel (an edit's reduction, an approved refund request). The one
+ * list the predicate and both query fragments below are built from.
+ *
+ * #3924 round 4 (M2): also a card refund's paid-another-way close. It is not a
+ * cancellation's hand-back in the sense these readers ask - no cancellation
+ * raised it, it is never OPEN, and its Xero note is queued by the close
+ * itself, not by a hand-back's completion - so
+ * the readers that select a cancellation's hand-backs by kind leave it out
+ * (the booking repair tool's late-cash evidence, the organisation hand-back's
+ * duplicate check), and the readers census polices any new one.
+ */
+export const NON_CANCELLATION_HAND_BACK_KEY_PREFIXES = [
+  EDIT_REFUND_HAND_BACK_KEY_PREFIX,
+  REFUND_REQUEST_HAND_BACK_KEY_PREFIX,
+  CARD_REFUND_PAID_ANOTHER_WAY_KEY_PREFIX,
+  BANK_REFUND_VOID_FOLLOW_UP_KEY_PREFIX,
+] as const;
+
+function hasKeyPrefix(occurrenceKey: string | null, prefix: string): boolean {
+  return occurrenceKey?.startsWith(prefix) ?? false;
+}
+
+/**
+ * #3924 round 4 (M2): IS THIS TASK A CARD REFUND'S PAID-ANOTHER-WAY CLOSE? The
+ * kind and the key prefix together, as the other non-cancellation hand-backs
+ * are asked. Never `lastError`'s wording: this row is the persisted evidence.
+ */
+export function isCardRefundPaidAnotherWayTask(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): boolean {
+  return (
+    task.kind === "CANCELLED_BOOKING_HAND_BACK" &&
+    hasKeyPrefix(task.occurrenceKey, CARD_REFUND_PAID_ANOTHER_WAY_KEY_PREFIX)
+  );
+}
+
+/** A paid-another-way record's key, split into the operation it closed and how its note is raised. */
+function readPaidAnotherWayKey(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): { operationId: string; xeroRefundNote: PaidAnotherWayXeroNote } | null {
+  if (!isCardRefundPaidAnotherWayTask(task) || task.occurrenceKey === null) return null;
+  const rest = task.occurrenceKey.slice(CARD_REFUND_PAID_ANOTHER_WAY_KEY_PREFIX.length);
+  for (const xeroRefundNote of ["after-receipt", "none"] as const) {
+    const suffix = PAID_ANOTHER_WAY_KEY_SUFFIX[xeroRefundNote];
+    if (rest.endsWith(suffix)) {
+      const operationId = rest.slice(0, -suffix.length);
+      return operationId.length > 0 ? { operationId, xeroRefundNote } : null;
+    }
+  }
+  return rest.length > 0 ? { operationId: rest, xeroRefundNote: "now" } : null;
+}
+
+/** The operation a paid-another-way record closed, read off its key; null for any other task. */
+export function paymentRecoveryOperationIdOfPaidAnotherWay(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): string | null {
+  return readPaidAnotherWayKey(task)?.operationId ?? null;
+}
+
+/** How a paid-another-way close's Xero refund note is raised, read off its key; null for any other task. */
+export function paidAnotherWayCloseXeroNote(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): PaidAnotherWayXeroNote | null {
+  return readPaidAnotherWayKey(task)?.xeroRefundNote ?? null;
+}
+
+/** The same question as a `ManualRefundTask` where fragment: every paid-another-way record. */
+export const CARD_REFUND_PAID_ANOTHER_WAY_TASK_WHERE = {
+  kind: "CANCELLED_BOOKING_HAND_BACK" satisfies ManualRefundTaskKind,
+  status: "COMPLETED" satisfies ManualRefundTaskStatus,
+  occurrenceKey: { startsWith: CARD_REFUND_PAID_ANOTHER_WAY_KEY_PREFIX },
+} as const;
+
+/** #4210 review (C3, `INV-SSOT`): the one where clause for the records above keyed on any of these rows (`closeKeysOf`). */
+export const cardRefundPaidAnotherWayClosesWhere = (operationIds: Iterable<string>) => ({ ...CARD_REFUND_PAID_ANOTHER_WAY_TASK_WHERE, occurrenceKey: { in: [...operationIds].flatMap(closeKeysOf) } });
+
+/**
+ * #3827 (`INV-PAY-117`): IS THIS TASK AN EDIT REFUND HAND-BACK? It is a
+ * `CANCELLED_BOOKING_HAND_BACK` — reused rather than a new label for the reason
+ * #3639 and #3643 give: the previous app version cannot read a label it does
+ * not know, and lists this kind as money to pay back by hand, which is what it
+ * is — marked by its occurrence key, whose prefix no cancellation writer sets
+ * (the group organiser's hand-back, #4042, has a prefix of its own). So the
+ * kind cannot say it; this can. Every server reader that treats a hand-back as
+ * a CANCELLATION's (its Xero note, the repair tool's late-cash evidence, the
+ * organisation hand-back's duplicate check) asks it here.
+ */
+export function isEditRefundHandBackTask(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): boolean {
+  return (
+    task.kind === "CANCELLED_BOOKING_HAND_BACK" &&
+    hasKeyPrefix(task.occurrenceKey, EDIT_REFUND_HAND_BACK_KEY_PREFIX)
+  );
+}
+
+/** #3827 (D-3813-7), #4215: THE one definition of an approved refund request's hand-back, for a query and (below) a row. */
+const REFUND_REQUEST_HAND_BACK_WHERE = { kind: "CANCELLED_BOOKING_HAND_BACK" satisfies ManualRefundTaskKind, occurrenceKey: { startsWith: REFUND_REQUEST_HAND_BACK_KEY_PREFIX } } as const;
+/** #4215 (`INV-PAY-118`): one marked paid back. Its `amountCents` is what its completion moved `refundedAmountCents` by. */
+export const COMPLETED_REFUND_REQUEST_HAND_BACK_TASK_WHERE = { ...REFUND_REQUEST_HAND_BACK_WHERE, status: "COMPLETED" satisfies ManualRefundTaskStatus } as const;
+/** Is this task an approved refund request's hand-back? The fragment above, for a row. */
+export function isRefundRequestHandBackTask(task: { kind: ManualRefundTaskKind | string | null; occurrenceKey: string | null }): boolean {
+  return task.kind === REFUND_REQUEST_HAND_BACK_WHERE.kind && hasKeyPrefix(task.occurrenceKey, REFUND_REQUEST_HAND_BACK_WHERE.occurrenceKey.startsWith);
+}
+
+/**
+ * #3827 (D-3813-8, `INV-PAY-118`): the refund request a refund-request
+ * hand-back was raised for, read off its occurrence key - or null for any
+ * other task. Its completion queues THAT request's own Xero refund credit
+ * note, keyed by the request.
+ */
+export function refundRequestIdOfHandBack(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): string | null {
+  if (!isRefundRequestHandBackTask(task) || task.occurrenceKey === null) return null;
+  const id = task.occurrenceKey.slice(REFUND_REQUEST_HAND_BACK_KEY_PREFIX.length);
+  return id.length > 0 ? id : null;
+}
+
+/**
+ * #3827 (`INV-PAY-117`): IS THIS HAND-BACK SOMETHING OTHER THAN A CANCELLATION'S - an edit's refund, an approved refund
+ * request's (or #4162, a bank refund to re-confirm)? Money promised back by bank transfer whose `refundedAmountCents`
+ * moves only when the treasurer marks the task paid back: each takes `lock(1)` to close and is netted from refundable
+ * cash while open. On completion an edit's owes Xero nothing (the edit queued its note); a refund request's queues that
+ * request's own refund note (D-3813-8, `refundRequestIdOfHandBack`), and a re-confirmed refund its own. Every server
+ * reader that asks "is this a CANCELLATION's hand-back?" asks this.
+ */
+export function isNonCancellationHandBackTask(task: {
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): boolean {
+  return isEditRefundHandBackTask(task) || isRefundRequestHandBackTask(task) || isCardRefundPaidAnotherWayTask(task) || isBankRefundVoidFollowUpTask(task);
+}
+
+/**
+ * #3827 (`INV-PAY-117`): AN EDIT REFUND HAND-BACK ON A CANCELLED BOOKING IS
+ * SETTLED BY PAYING IT, NEVER BY CHANGING ITS STATE THE OTHER WAY. A paid
+ * cancellation sizes its refund and the club's kept figure from the cash net of
+ * the edit refunds still OPEN (`refundableCashNetOfOpenHandBacks`): an open
+ * one is money the cancellation counted as going back, a dismissed one money it
+ * counted as never owed. Dismissing the first, or reopening the second, after
+ * the cancel would leave the cancellation's kept figure and ledger lines saying
+ * the opposite of what happened - and let a refund appeal re-promise the same
+ * money. So both are refused once the booking is cancelled; completing an open
+ * one is untouched. One sentence each, for the doors that throw them.
+ *
+ * NOT a refund-request hand-back (D-3813-7). An appeal exists only on a
+ * cancelled booking, so its task is always raised AFTER the cancel, which
+ * never counted it; dismissing one (with its required note) releases the cash
+ * for a later appeal, and reopening one is capped at the net cash like any.
+ */
+export const EDIT_REFUND_HAND_BACK_DISMISS_AFTER_CANCEL_MESSAGE =
+  "This booking has been cancelled since this edit refund was raised, and the cancellation's refund was worked out on the basis that this money goes back to the member. Send it and mark it paid back. If the club has decided not to pay it, that changes the cancellation's own figures, so take it to the treasurer to correct the cancelled booking rather than dismissing the task here.";
+
+export const EDIT_REFUND_HAND_BACK_REOPEN_AFTER_CANCEL_MESSAGE =
+  "This booking has been cancelled since this edit refund was dismissed, and the cancellation's refund was worked out without it. Putting it back on the queue would promise the member money the cancellation already accounted for. If more is owed, raise it against the cancelled booking, for example as a refund appeal.";
+
+/**
+ * #3827 (`INV-PAY-117`): the same question as a query fragment, for the server
+ * readers that select a CANCELLATION's hand-backs by kind and must not count an
+ * edit's or an approved refund request's. Spread into a `ManualRefundTask`
+ * where clause beside the kind.
+ */
+export const NOT_NON_CANCELLATION_HAND_BACK_WHERE = {
+  OR: [
+    { occurrenceKey: null },
+    {
+      AND: NON_CANCELLATION_HAND_BACK_KEY_PREFIXES.map((prefix) => ({
+        NOT: { occurrenceKey: { startsWith: prefix } },
+      })),
+    },
+  ],
+};
+
+/**
+ * #3827 (`INV-PAY-117`): the POSITIVE form - the non-cancellation hand-backs
+ * themselves, for a reader that sizes money already promised back by hand
+ * (`openNonCancellationHandBackCents`). The kind and the key prefixes together,
+ * as `isNonCancellationHandBackTask` asks them.
+ */
+export const NON_CANCELLATION_HAND_BACK_WHERE = {
+  kind: "CANCELLED_BOOKING_HAND_BACK" satisfies ManualRefundTaskKind,
+  OR: NON_CANCELLATION_HAND_BACK_KEY_PREFIXES.map((prefix) => ({
+    occurrenceKey: { startsWith: prefix },
+  })),
+} as const;
+
+/**
+ * #3827 (`INV-PAY-117`): the OPEN non-cancellation hand-backs on a payment, as a
+ * relation fragment for a read that loads the payment anyway (the cancel
+ * preview). Paired with `sumOpenNonCancellationHandBackCents`
+ * and `getRemainingRefundableCentsNetOf`, it gives a reader the same figure the
+ * server's `refundableCashNetOfOpenHandBacks` enforces.
+ */
+export const OPEN_NON_CANCELLATION_HAND_BACKS_SELECT = {
+  where: { status: "OPEN", ...NON_CANCELLATION_HAND_BACK_WHERE },
+  select: { amountCents: true },
+} as const;
+
+/** The money those rows promise back, in cents. Unpriced rows count as zero. */
+export function sumOpenNonCancellationHandBackCents(
+  tasks: readonly { amountCents: number | null }[] | null | undefined,
+): number {
+  return (tasks ?? []).reduce((sum, task) => sum + (task.amountCents ?? 0), 0);
+}
+
+/**
+ * #3827 (`INV-PAY-118`): WHAT A REFUND APPEAL MAY STILL PROMISE. An appeal is
+ * sized from the payment's refundable cash, which two other hand-backs leave
+ * overstated, so its ceiling subtracts both - and only an appeal's does:
+ *
+ * - EVERY open hand-back on the payment, of any kind. The edit and earlier
+ *   appeals' (as `INV-PAY-117`), and also a CANCELLATION's own - the hand-back
+ *   an organisation's late bank transfer raises (#3369), whose money moves
+ *   `refundedAmountCents` only when it is paid back. An edit or a cancel sizes
+ *   its refund EXCLUDING the cancellation's task, by design: that task is the
+ *   cancellation's own refund. An appeal comes after it and must not repeat it.
+ * - the member credit already minted from the payment's late cash
+ *   (`internet-banking-late-cash-credit.ts`), which never moves
+ *   `refundedAmountCents` at all.
+ *
+ * The relation fragment below is the first half for a read that loads the
+ * payment anyway; the booking's `creditsFromCancellation` is the second.
+ * `refundableCashForRefundAppeal` is the server's figure; this is the screen's.
+ */
+export const OPEN_HAND_BACKS_FOR_REFUND_APPEAL_SELECT = {
+  where: { status: "OPEN", kind: "CANCELLED_BOOKING_HAND_BACK" satisfies ManualRefundTaskKind },
+  select: { amountCents: true },
+} as const;
+
+/**
+ * A screen's refund-appeal ceiling (`INV-PAY-118`), from those two reads and
+ * (#4124) the payment's open card-refund debts (`netCollectedCardRefundSelect`),
+ * netted as `refundAppealHandedBackParts` nets them on the server, so a screen
+ * offers the ceiling the route enforces. `cardRefundOwedCents` is what that debt
+ * actually took off (never more than the ceiling held without it), for the line
+ * saying why the ceiling is lower.
+ */
+export function refundAppealCeilingParts(
+  payment: (CardRefundOwedPaymentRow & { manualRefundTasks?: readonly { amountCents: number | null }[] }) | null | undefined,
+  creditsFromCancellation: readonly { amountCents: number; description: string | null; type?: string | null }[] | null | undefined,
+  /** #4872 (`INV-PAY-150`): a live superseded capture's hold-back (`readSupersededCaptureHeldBack().totalCents`), which the approval nets too. */
+  supersededHeldBackCents = 0,
+): { ceilingCents: number; cardRefundOwedCents: number } {
+  const promisedCents =
+    sumOpenNonCancellationHandBackCents(payment?.manualRefundTasks) +
+    sumInternetBankingLateCashCreditCents(creditsFromCancellation) +
+    supersededHeldBackCents;
+  const cardDebtCents = payment ? openCardRefundOwedCents(payment) : 0;
+  const withoutCardDebtCents = getRemainingRefundableCentsNetOf(payment, promisedCents);
+  return {
+    ceilingCents: getRemainingRefundableCentsNetOf(payment, promisedCents + cardDebtCents),
+    cardRefundOwedCents: Math.min(cardDebtCents, withoutCardDebtCents),
+  };
+}
+
+/**
+ * #3827 (`INV-PAY-117`): the snapshot discriminator on the REFUNDED booking
+ * event an edit refund hand-back's completion writes. The booking is LIVE when
+ * that money goes back, so the event is the settlement of an EDIT, never of a
+ * cancellation - and the booking narrative takes the first REFUNDED event as a
+ * later cancellation's settlement sentence. It excludes these the way it
+ * excludes the #2008 duplicate-capture and #3340 supersede refunds. The
+ * event's `reason` stays `manual_refund_completed`, so nothing that reads the
+ * reason sees a new value.
+ */
+export const EDIT_REFUND_HAND_BACK_COMPLETED_EVENT_KIND = "edit_refund_hand_back_completed" as const;
+
+/** The snapshot an edit refund hand-back's completion event carries. */
+export function editRefundHandBackCompletedSnapshot(manualRefundTaskId: string): {
+  kind: typeof EDIT_REFUND_HAND_BACK_COMPLETED_EVENT_KIND;
+  manualRefundTaskId: string;
+} {
+  return { kind: EDIT_REFUND_HAND_BACK_COMPLETED_EVENT_KIND, manualRefundTaskId };
+}
+
+/**
+ * #3827 (D-3813-7): the same discriminator for a refund-request hand-back's
+ * completion. The booking is already cancelled, but this money is the
+ * appeal's, decided after the cancel, so it is not the cancellation's
+ * settlement either - a Stripe appeal refund writes no booking event at all.
+ */
+export const REFUND_REQUEST_HAND_BACK_COMPLETED_EVENT_KIND = "refund_request_hand_back_completed" as const;
+
+/** The snapshot a non-cancellation hand-back's completion event carries. */
+export function nonCancellationHandBackCompletedSnapshot(task: {
+  id: string;
+  kind: ManualRefundTaskKind | string | null;
+  occurrenceKey: string | null;
+}): {
+  kind: typeof EDIT_REFUND_HAND_BACK_COMPLETED_EVENT_KIND | typeof REFUND_REQUEST_HAND_BACK_COMPLETED_EVENT_KIND;
+  manualRefundTaskId: string;
+} {
+  return isRefundRequestHandBackTask(task)
+    ? { kind: REFUND_REQUEST_HAND_BACK_COMPLETED_EVENT_KIND, manualRefundTaskId: task.id }
+    : editRefundHandBackCompletedSnapshot(task.id);
+}
+
+/** Is this booking event a non-cancellation hand-back's completion? */
+export function isNonCancellationHandBackCompletedEvent(event: { type: string; snapshot: unknown }): boolean {
+  if (event.type !== "REFUNDED" || typeof event.snapshot !== "object" || event.snapshot === null) {
+    return false;
+  }
+  const kind = (event.snapshot as { kind?: unknown }).kind;
+  return (
+    kind === EDIT_REFUND_HAND_BACK_COMPLETED_EVENT_KIND ||
+    kind === REFUND_REQUEST_HAND_BACK_COMPLETED_EVENT_KIND
+  );
+}
+
+/**
+ * May a task of this kind be closed as money that moved?
+ *
+ * FALSE FOR EXACTLY ONE KIND. `UNCOLLECTED_EDIT_REVIEW_SHARE` is a notice that
+ * the club may not have ASKED for money, so there is nothing for a settlement to
+ * record - and a `COMPLETED` close whose `settlementDirection` is null reads as
+ * `REFUND_TO_MEMBER` on every kind older than `EDIT_FINANCIAL_REVIEW`, so
+ * completing one would assert a refund the club never made and reach the refund
+ * allocation path with an amount that is not a refund at all.
+ *
+ * TAKES A LOOSE STRING, because the browser's copy of a task's kind is one: a
+ * cached client bundle reading a newer row must degrade rather than throw. An
+ * unrecognised kind - including a row written before the column existed, which
+ * carries null - answers TRUE, so this can only ever CLOSE a door, never open
+ * one the server would refuse.
+ */
+export function manualRefundTaskKindAllowsSettlement(
+  kind: ManualRefundTaskKind | string | null | undefined,
+  /**
+   * #3643: the task is a part-payment review (`partPaymentReviewPaymentId`
+   * set). Its kind is the ordinary hand-back one, so the kind alone cannot say
+   * it records money the club settles in Xero rather than here; a review is
+   * closed by DISMISSED only, and the database refuses a COMPLETED one
+   * (`ManualRefundTask_part_payment_review_shape`). `INV-PAY-107`.
+   * REQUIRED, never defaulted: a caller that forgot it would be told a review
+   * may be settled (`isPartPaymentReviewTask` answers it).
+   */
+  partPaymentReview: boolean,
+): boolean {
+  return kind !== "UNCOLLECTED_EDIT_REVIEW_SHARE" && !partPaymentReview;
+}
+
+/**
+ * The refusal the completion door raises, or null when this close is allowed.
+ *
+ * ONE CALL RATHER THAN A PREDICATE PLUS A STRING, because the door has to ask
+ * both questions together and a caller that asked only one would either refuse
+ * a dismissal or complete a withheld share. Answering `null` for every
+ * dismissal is part of the rule, not a caller's business: DISMISSED is how one
+ * of these items IS closed.
+ *
+ * IT NAMES THE WAY OUT, which is what the owner's 31 Aug 2026 decision on the
+ * zero refusal asks of every refusal on this screen. Here the way out is the
+ * whole job: check Xero, bill only what is missing, then close the item.
+ */
+export function manualRefundTaskSettlementRefusal(
+  kind: ManualRefundTaskKind | string | null | undefined,
+  resolution: "completed" | "dismissed",
+  /** #3643: required, as on `manualRefundTaskKindAllowsSettlement`. */
+  partPaymentReview: boolean,
+): string | null {
+  if (resolution !== "completed") return null;
+  if (manualRefundTaskKindAllowsSettlement(kind, partPaymentReview)) return null;
+  if (partPaymentReview) {
+    return "This item records a payment the club settles in Xero, so it cannot be closed as an amount settled here - nothing about it moves money. Settle the payment in Xero (refund it or apply it), clear what the invoice still owes, then close this item with a note saying what you did.";
+  }
+  return "This item records money the club may not have asked for, so it cannot be closed as an amount settled here - nothing about it moves money. Check the booking's Xero invoices, bill any shortfall by hand, then close it with a note saying what you found and what you billed.";
+}
+
+/** The `ManualRefundTask` fields `openHandBackOwedCents` reads. */
+export type HandBackTaskRow = {
+  status: ManualRefundTaskStatus | string;
+  kind: ManualRefundTaskKind | string | null;
+  amountCents: number | null;
+  partPaymentReviewPaymentId: string | null;
+  occurrenceKey: string | null;
+  /** #4848: names a legacy NULL-kind late capture (`isLateCaptureHandBackTask`). */
+  reason: string;
+};
+
+const OPEN_TASK_STATUS = "OPEN" satisfies ManualRefundTaskStatus;
+const HAND_BACK_KIND = "CANCELLED_BOOKING_HAND_BACK" satisfies ManualRefundTaskKind;
+
+/**
+ * THE REFUND STILL OWED BY HAND: money the club has promised back and not yet
+ * paid. Owner decisions on #3372: 3 Oct 2026 for a cancelled booking ("subtract
+ * the refund owed"), 7 Oct 2026 for a live one ("subtract it immediately":
+ * money promised back isn't the club's). Read through `openTaskOwedCents`,
+ * which also answers the late captures below, by `getNetCollectedCashParts`
+ * (off a payment's Net Collected straight away) and by the "Refunds owed"
+ * figure (`readRefundsAndCreditsOwed`, club-wide until each task is paid).
+ *
+ * Every task promising money back by hand is a `CANCELLED_BOOKING_HAND_BACK`:
+ * a cancellation's (`booking-cancel.ts`), an edit's refund (`INV-PAY-117`) and
+ * an approved refund request's (`INV-PAY-118`), told apart only by occurrence
+ * key (`isNonCancellationHandBackTask`). All count, on any booking, so this
+ * reads kind and status, never the occurrence key. Only COMPLETING a task writes
+ * `refundedAmountCents` (`manual-refund-task-resolution.ts`), so an open one is not yet off the payment.
+ *
+ * - OPEN tasks only: a COMPLETED one is on `refundedAmountCents`; DISMISSED moved nothing.
+ * - A part-payment review shares the kind but carries no amount and records
+ *   money settled in Xero (`isPartPaymentReviewTask`), so it owes nothing here.
+ * - A task with no kind (`kind` null) counts too. The column was added on
+ *   19 Aug 2026 with no backfill, so such a row is a cancellation's hand-back -
+ *   or, carrying a late-capture reason sentence, a #2700 late capture
+ *   (`isLateCaptureAwaitingDecisionTask`), which `openTaskOwedCents` takes out
+ *   before asking this, so no row counts twice.
+ * - Not an `EDIT_FINANCIAL_REVIEW`: an officer has still to price it, and
+ *   "nothing is due" (DISMISSED) is a legitimate close, so it is not yet owed.
+ */
+export function openHandBackOwedCents(
+  tasks: ReadonlyArray<HandBackTaskRow>,
+): number {
+  return tasks
+    .filter(
+      (task) =>
+        task.status === OPEN_TASK_STATUS &&
+        (task.kind === HAND_BACK_KIND || task.kind === null) &&
+        !isPartPaymentReviewTask(task),
+    )
+    .reduce((sum, task) => sum + Math.max(0, task.amountCents ?? 0), 0);
+}
+
+/**
+ * #3372 (owner, 7 Oct 2026: "count as owed"): IS THIS A LATE CARD CHARGE
+ * AWAITING THE TREASURER'S REFUND-OR-KEEP DECISION? The one home for that
+ * question. Such a charge counts in "Refunds owed" until the treasurer keeps
+ * it (dismisses the task) or refunds it (completes it).
+ *
+ * - An OPEN `DELETED_BOOKING_LATE_CAPTURE`: a capture held for a treasurer on a
+ *   cancelled booking (#3639, `lateCaptureApprovalIntentId` set,
+ *   `INV-PAY-106`), or a change payment captured on a deleted booking (#2700,
+ *   `INV-ADDPAY-036`). Both kinds of row ask the same question.
+ * - An OPEN task with no kind carrying a late-capture reason sentence: a #2700
+ *   row raised before the kind column existed (`isLateCaptureHandBackTask`,
+ *   #4848). Not "no kind on a deleted booking": a cancellation's hand-back on a
+ *   booking deleted later is still a hand-back.
+ *
+ * The capture is recorded on the payment before the task is raised, so its
+ * money is inside `amountCents` and Net Collected takes it off while it waits
+ * (`getNetCollectedCashParts`); once kept it counts as collected.
+ */
+export function isLateCaptureAwaitingDecisionTask(task: Pick<HandBackTaskRow, "status" | "kind" | "reason">): boolean {
+  return task.status === OPEN_TASK_STATUS && isLateCaptureHandBackTask(task);
+}
+
+/**
+ * What a booking's open tasks owe back, in two parts that never overlap: late
+ * charges awaiting the treasurer (`isLateCaptureAwaitingDecisionTask`) and
+ * refunds still owed by hand (`openHandBackOwedCents`, over the rest). Net
+ * Collected and "Refunds owed" both read it, so a task is never counted in one
+ * part by one figure and the other part by the other.
+ */
+export function openTaskOwedCents(
+  tasks: ReadonlyArray<HandBackTaskRow>,
+): { handBackCents: number; lateCaptureCents: number } {
+  const lateCaptures = tasks.filter((task) => isLateCaptureAwaitingDecisionTask(task));
+  return {
+    handBackCents: openHandBackOwedCents(
+      tasks.filter((task) => !isLateCaptureAwaitingDecisionTask(task)),
+    ),
+    lateCaptureCents: lateCaptures.reduce(
+      (sum, task) => sum + Math.max(0, task.amountCents ?? 0),
+      0,
+    ),
+  };
+}

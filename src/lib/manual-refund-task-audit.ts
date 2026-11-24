@@ -1,0 +1,163 @@
+import "server-only";
+
+import type { ManualRefundTaskKind, Prisma } from "@prisma/client";
+
+import type { ResolvedBankRefundVoidAnswer } from "@/lib/bank-refund-void-answer";
+import { bookingOwner } from "@/lib/booking-owner";
+import { createAuditLog } from "@/lib/audit";
+import {
+  completionSettlementShape,
+  completionSummary,
+} from "@/lib/manual-refund-task-copy";
+import {
+  isPartPaymentReviewTask,
+  manualRefundTaskKindAllowsSettlement,
+} from "@/lib/manual-refund-task-settlement-rules";
+import type { EditReviewSettlementRoute } from "@/lib/edit-financial-review-settlement";
+import type { SettlementDirectionValue } from "@/lib/stored-night-price-repair";
+
+/**
+ * What CLOSING a manual refund task records, and the one place that entry is
+ * composed.
+ *
+ * Lifted out of `manual-refund-task-resolution.ts` (#3191) when that module -
+ * the completion DOOR - crossed its size budget. The seam is a real one rather
+ * than a line-count dodge, and it is the same seam that module already draws
+ * twice: it validates, claims and returns, while WHERE the money goes lives in
+ * `edit-financial-review-settlement.ts` and what a repaired night price does
+ * lives in `stored-night-price-repair-store.ts`. This is the third of those -
+ * what the closure SAYS about itself - and it is the one a reader auditing the
+ * record needs to be able to check without reading the transaction around it.
+ *
+ * ONE ENTRY, DELIBERATELY, and there is a second entry it does NOT absorb.
+ * #3191's stored-night-price record sits beside its own write in
+ * `stored-night-price-repair-store.ts`, because it is a different act on a
+ * different entity and it can happen on a DISMISSAL - whose entry below says in
+ * as many words that nothing moved. Folding it in would put a price change
+ * inside a row whose summary denies one.
+ */
+export async function recordManualRefundTaskClosureAudit({
+  task,
+  resolution,
+  actingMemberId,
+  note,
+  settlement,
+  settlementRoute,
+  settlementDirection,
+  bankRefundVoidAnswer = null,
+  store,
+}: {
+  task: {
+    id: string;
+    bookingId: string;
+    paymentId: string | null;
+    amountCents: number | null;
+    raisedAmountCents: number | null;
+    kind: ManualRefundTaskKind | null;
+    /** #3643: set on a part-payment review. Required, so no caller can forget it. */
+    partPaymentReviewPaymentId: string | null;
+    /**
+     * The booking OWNER, null when it is owned by an Organisation (#3369), and (#5197) its status as the closure
+     * read it under its locks: a dismissal on a cancelled booking is what lets a late win reopen an edit's refund.
+     */
+    booking: { memberId: string | null; status?: string };
+  };
+  resolution: "completed" | "dismissed";
+  actingMemberId: string;
+  note: string | null;
+  /** What this closure settled at, or null on a dismissal. */
+  settlement: { amountCents: number; amended: boolean } | null;
+  settlementRoute: EditReviewSettlementRoute | null;
+  settlementDirection: SettlementDirectionValue;
+  /** #4162: a re-confirmed bank refund's answer, recorded with its closure. */
+  bankRefundVoidAnswer?: ResolvedBankRefundVoidAnswer | null;
+  store: Prisma.TransactionClient;
+}): Promise<void> {
+  await createAuditLog(
+    {
+      action:
+        resolution === "completed"
+          ? "booking-payment.manual-refund-task.complete"
+          : "booking-payment.manual-refund-task.dismiss",
+      memberId: actingMemberId,
+      actorMemberId: actingMemberId,
+      subjectMemberId: bookingOwner(task.booking).memberId,
+      targetId: task.bookingId,
+      entityType: "ManualRefundTask",
+      entityId: task.id,
+      category: "payment",
+      severity: "important",
+      outcome: "success",
+      // #3213: THE DISMISSAL ARM IS KIND-AWARE, and it is the durable half of
+      // the same correction the officer's toast gets (`dismissalMessage`). A
+      // withheld share is closed by DISMISSED - that is how one of these items
+      // is closed at all - but the officer who closes it has just checked Xero
+      // and billed a shortfall by hand, so "refund task dismissed" would write
+      // the wrong act, in the wrong direction, into the booking's permanent
+      // history. Asked of the shared settlement rule rather than of the label,
+      // because "cannot be settled" and "nothing here moves money" are one fact
+      // with one home (`INV-SSOT`); an unrecognised kind answers TRUE there and
+      // keeps the wording every row has always had.
+      // #3213 (fix round): THE COMPLETION ARM IS ROUTE-AWARE, for the same
+      // reason the dismissal arm is kind-aware. Since #3170 a completion can go
+      // down the additional-charge route, where the member was asked to PAY THE
+      // CLUB - and a flat "refund paid back by hand" wrote the opposite money
+      // direction into a durable, member-adjacent record while the officer's
+      // toast, which goes away, said it correctly. The route is classified in
+      // ONE place and both sentences read it (`completionSettlementShape`), so
+      // the transient message and the permanent record cannot say different
+      // things about which way the money went (`INV-SSOT`). A hand-back still
+      // reads exactly as it always has.
+      summary:
+        resolution === "completed"
+          ? completionSummary(completionSettlementShape(settlementRoute))
+          : isPartPaymentReviewTask(task)
+            ? "Part payment settled in Xero closed as dealt with, no money moved here"
+            : manualRefundTaskKindAllowsSettlement(task.kind, false)
+            ? "Manual booking refund task dismissed"
+            : "Uncollected booking amount closed as dealt with, no money moved",
+      details: note,
+      metadata: {
+        taskId: task.id,
+        bookingId: task.bookingId,
+        paymentId: task.paymentId,
+        bookingStatusAtClosure: task.booking.status ?? null,
+        ...(bankRefundVoidAnswer
+          ? {
+              bankRefundVoidAnswer: bankRefundVoidAnswer.answer,
+              ...(bankRefundVoidAnswer.answer === "recorded-in-xero"
+                ? { handMadeCreditNoteId: bankRefundVoidAnswer.note.creditNoteId, handMadeCreditNoteNumber: bankRefundVoidAnswer.note.creditNoteNumber }
+                : {}),
+            }
+          : {}),
+        // #3030: three amounts, not one, because "audited amendment" (owner
+        // decision D2) is only auditable if the entry says what the figure was
+        // before and after. `raisedAmountCents` is what the task was raised
+        // with, `previousAmountCents` what it carried when this admin opened it,
+        // and `amountCents` what it closed at.
+        amountCents: settlement?.amountCents ?? null,
+        previousAmountCents: task.amountCents,
+        raisedAmountCents: task.raisedAmountCents,
+        amountAmended: settlement?.amended ?? false,
+        kind: task.kind,
+        resolution,
+        // #3032: WHICH settlement path this amount went down, and the anchor it
+        // settled against. Without these the entry says an amount was closed but
+        // not whether that meant a card refund, a ledger mirror of a hand-back,
+        // or freshly minted account credit - three materially different claims
+        // about the club's money.
+        settlementRoute: settlementRoute?.kind ?? null,
+        settlementBookingModificationId:
+          settlementRoute && settlementRoute.kind !== "local-allocation"
+            ? settlementRoute.bookingModificationId
+            : null,
+        // #3170: WHICH WAY, recorded beside the route. The route says how the
+        // money travelled and the direction says who ended up with it, and
+        // "additional-charge" is the only route where those two answers differ
+        // from every entry written before this issue.
+        settlementDirection: settlement ? settlementDirection : null,
+      },
+    },
+    store,
+  );
+}

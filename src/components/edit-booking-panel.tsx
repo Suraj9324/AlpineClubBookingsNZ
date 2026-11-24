@@ -1,0 +1,2138 @@
+"use client";
+
+import type { AgeTier } from "@prisma/client";
+import { useState, useCallback, useMemo, useRef } from "react";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { NotifyChoiceDialog } from "@/components/admin/notify-choice-dialog";
+import { bookingOwner } from "@/lib/booking-owner";
+import { mergeChangeRequestGuests } from "@/lib/booking-change-request-input";
+import { useAgeTierOptions } from "@/lib/use-age-tier-options";
+// The create wizard's own prediction + column translation, imported rather than
+// re-implemented (MG4 #2309). The first cut of this panel wrote its own copy of
+// both and the two immediately disagreed about an admin add — see
+// `predictMemberGuestConsent`'s note on `actorKind`.
+import {
+  partyNeedsSupervisionJustification,
+  predictMemberGuestConsent,
+} from "@/components/book/member-guest-preview";
+import type { MemberGuestCandidate } from "@/lib/member-guest-find";
+import { BookingNoEmailsNotice } from "@/components/booking-no-emails-notice";
+import { HostingCoverageOverridePrompt } from "@/components/hosting-coverage-override-prompt";
+import {
+  RequestOfficerApprovalCard,
+  type ExceptionRequestSubmitResult,
+} from "@/components/booking/request-officer-approval-card";
+import {
+  readExceptionOffer,
+  type ExceptionOffer,
+} from "@/lib/booking-exception-offer";
+import { countNightsDateOnly, parseDateOnly } from "@/lib/date-only";
+import { promoChangeNotAppliedHeading } from "@/lib/promo-change-not-applied";
+import { type PromoResult } from "@/components/promo-code-input";
+import { promoCodeListEntries } from "@/components/promo-code-list-client";
+import {
+  hostingCoverageMutationSignature,
+  readHostingCoverageOverridePrompt,
+} from "@/lib/hosting-coverage-override-client";
+
+import { AccountCreditCard } from "@/components/edit-booking/account-credit-card";
+import { AdminOverrideCard } from "@/components/edit-booking/admin-override-card";
+import { ChangeRequestCard } from "@/components/edit-booking/change-request-card";
+import type { ChangeRequestAddGuest } from "@/lib/booking-change-request-guests";
+import { EditDatesCard } from "@/components/edit-booking/edit-dates-card";
+import { EditGuestsCard } from "@/components/edit-booking/edit-guests-card";
+import { EditDependantIdentityQuestion } from "@/components/edit-booking/edit-dependant-identity-question";
+import { useEditDependantIdentity } from "@/components/edit-booking/hooks/use-edit-dependant-identity";
+import {
+  isDependantIdentityRefusalCode,
+} from "@/lib/booking-dependant-identity";
+import {
+  dependantIdentitySpeaksOnBehalf,
+  renamedGuestsForDependantCheck,
+} from "@/lib/booking-dependant-identity-doors";
+import { PriceSummaryCard } from "@/components/edit-booking/price-summary-card";
+import { LinkedMoveSettlementMethod } from "@/components/edit-booking/linked-move-settlement-method";
+import {
+  editPriceChangedMessage,
+  readEditPriceChangedFigures,
+} from "@/components/edit-booking/edit-price-changed";
+import { useClubFormat } from "@/components/club-format-provider";
+import { hasSeveralPromoCodes, PromoCodeCard } from "@/components/edit-booking/promo-code-card";
+import {
+  FinishedStayPromoCorrectionCard,
+  promoActionAsCorrection,
+} from "@/components/edit-booking/finished-stay-promo-correction-card";
+import { ReviewJustificationField } from "@/components/edit-booking/review-justification-field";
+import {
+  exceptionProposalSignature,
+  exceptionRequestPayloadFromModification,
+} from "@/components/edit-booking/exception-request-payload";
+import { eachNightKey, shiftDateKey } from "@/components/edit-booking/stay-nights";
+import { buildEditGuestStays } from "@/components/edit-booking/guest-stay-payload";
+import type {
+  BookingData,
+  FamilyMember,
+  Guest,
+  NewGuest,
+  PartnerSharingCandidate,
+} from "@/components/edit-booking/types";
+import { useAvailablePromoCodes } from "@/components/edit-booking/hooks/use-available-promo-codes";
+import { useEditRerates } from "@/components/edit-booking/hooks/use-edit-rerates";
+import { useBookingFamilyOptions } from "@/components/edit-booking/hooks/use-booking-family-options";
+import { useGuestDateModes } from "@/components/edit-booking/hooks/use-guest-date-modes";
+import {
+  useHostingCoverageOverride,
+  type HostingOverrideState,
+} from "@/components/edit-booking/hooks/use-hosting-coverage-override";
+import {
+  useHostingCoverageLinkedMove,
+  type HostingLinkedMoveState,
+} from "@/components/edit-booking/hooks/use-hosting-coverage-linked-move";
+import { HostingCoverageLinkedMovePrompt } from "@/components/hosting-coverage-linked-move-prompt";
+import {
+  hostingCoverageLinkedMoveAnswer,
+  readHostingCoverageLinkedMovePrompt,
+} from "@/lib/hosting-coverage-linked-move-client";
+import { useMemberGuestFinder } from "@/components/edit-booking/hooks/use-member-guest-finder";
+import { useOtherLodgeRate } from "@/components/edit-booking/hooks/use-other-lodge-rate";
+import {
+  useDebouncedModificationQuote,
+  useModificationQuoteState,
+} from "@/components/edit-booking/hooks/use-modification-quote";
+import {
+  promoActionPayload,
+  usePromoBeneficiaryReset,
+  usePromoSelectionState,
+} from "@/components/edit-booking/hooks/use-promo-selection";
+import { useReviewJustificationLatch } from "@/components/edit-booking/hooks/use-review-justification-latch";
+
+/**
+ * The edit-booking panel's shell: the pending edit's state, the mutations, and
+ * the composition of the concern cards.
+ *
+ * #2690 split this file by concern. What stayed here is what genuinely
+ * orchestrates: the editable state several concerns share, the reset an admin
+ * override performs across all of them, the save and its refusal handling, the
+ * exception-request submission, and the admin notify dialog. The effect-driven
+ * data and reset flows live in named hooks under `edit-booking/hooks/`, and each
+ * card under `edit-booking/` renders one concern and decides nothing about the
+ * others.
+ */
+export function EditBookingPanel({
+  booking,
+  canAdminOverride = false,
+  replaceExceptionRequestId = null,
+  onDone,
+}: {
+  booking: BookingData;
+  /**
+   * #2562: the open policy-exception request this edit is here to REPLACE, from
+   * `/bookings/<id>?replaceRequest=<id>` — the link the member's request area
+   * renders. Passed through as `supersedeRequestId`; the service does the guarded
+   * claim, so a stale or foreign id loses it and creates nothing.
+   */
+  replaceExceptionRequestId?: string | null;
+  // Issue #1668: admin override lifts the date-window locks for this booking.
+  // (Whether the standard self-service path is available is expressed by the
+  // booking.editPolicy fields the panel already reads.)
+  canAdminOverride?: boolean;
+  onDone: () => void;
+}) {
+  const router = useRouter();
+  const ageTierOptions = useAgeTierOptions();
+
+  // Editable state
+  const [checkIn, setCheckIn] = useState(booking.checkIn);
+  const [checkOut, setCheckOut] = useState(booking.checkOut);
+  const [removedGuestIds, setRemovedGuestIds] = useState<Set<string>>(new Set());
+  const [addedGuests, setAddedGuests] = useState<NewGuest[]>([]);
+  // Seeded per-guest state, extracted so the admin-override toggle (#1668) can
+  // restore the exact stored baseline — resetting to {} instead would let the
+  // night grid's all-nights-on fallback silently collapse a guest's gaps.
+  const seedExistingGuestRanges = () =>
+    Object.fromEntries(
+      booking.guests.map((guest) => [
+        guest.id,
+        {
+          stayStart: guest.stayStart ?? booking.checkIn,
+          stayEnd: guest.stayEnd ?? booking.checkOut,
+        },
+      ])
+    );
+  const seedExistingGuestNights = () =>
+    Object.fromEntries(
+      booking.guests.map((guest) => [
+        guest.id,
+        guest.nights && guest.nights.length > 0
+          ? [...guest.nights].sort()
+          : eachNightKey(
+              guest.stayStart ?? booking.checkIn,
+              guest.stayEnd ?? booking.checkOut
+            ),
+      ])
+    );
+  const [existingGuestRanges, setExistingGuestRanges] = useState<
+    Record<string, { stayStart: string; stayEnd: string }>
+  >(seedExistingGuestRanges);
+  // Per existing-guest night set (keyed by guest id), seeded from stored nights
+  // or the contiguous range so toggling the grid never wipes a guest's gaps.
+  const [existingGuestNights, setExistingGuestNights] = useState<
+    Record<string, string[]>
+  >(seedExistingGuestNights);
+  const [guestNameEdits, setGuestNameEdits] = useState<
+    Record<string, { firstName: string; lastName: string }>
+  >(() =>
+    Object.fromEntries(
+      booking.guests.map((guest) => [
+        guest.id,
+        { firstName: guest.firstName, lastName: guest.lastName },
+      ])
+    )
+  );
+  // MG4 (#2309): the server's neutral D-8 refusal for the last member-guest
+  // add, kept separate from `quoteError` so it can be drawn beside the person it
+  // is about instead of only in the panel's page-level error line.
+  const [memberGuestAddError, setMemberGuestAddError] = useState<string | null>(
+    null,
+  );
+
+  const familyOptions = useBookingFamilyOptions({
+    bookingId: booking.id,
+    viewerRole: booking.viewerRole,
+  });
+  const { familyMembers, familyMembersLoaded, partnerCandidates } = familyOptions;
+  const availablePromoCodes = useAvailablePromoCodes(booking.viewerRole);
+
+  // #2266: account credit. `useCredit` is seeded from the stored election
+  // (#2265) so re-opening a draft shows the saved choice; `creditTouched`
+  // separates "the member changed their mind" from "the panel recomputed".
+  const credit = booking.credit ?? null;
+  const storedElectionCents = credit?.electionCents ?? 0;
+  const [useCredit, setUseCredit] = useState(storedElectionCents > 0);
+  const [creditTouched, setCreditTouched] = useState(false);
+
+  // Issue #1668: admin date override. When enabled, the member-facing date
+  // locks are bypassed and the admin chooses how pricing is handled. Every
+  // override edit is date-only, audited, and confirmed if over capacity.
+  // The override control renders only when the server says this viewer may
+  // override (canAdminOverride) AND the serialised edit policy agrees (#1668).
+  const adminOverrideAvailable =
+    canAdminOverride && booking.editPolicy.adminOverrideAvailable !== false;
+  const [overrideEnabled, setOverrideEnabled] = useState(false);
+  const [overridePricingMode, setOverridePricingMode] = useState<
+    "shift" | "recalculate" | null
+  >(null);
+  const [confirmOverCapacity, setConfirmOverCapacity] = useState(false);
+  // Belt-and-braces (a stale quote): an apply 409 re-surfaces the confirm flow.
+  const [saveOverCapacityNights, setSaveOverCapacityNights] = useState<
+    { date: string; availableBeds: number }[] | null
+  >(null);
+  // Owner decision (#1668 review): every override save asks the admin whether
+  // the member should receive the change-notification email.
+  const [notifyDialogOpen, setNotifyDialogOpen] = useState(false);
+  const originalNights = useMemo(
+    () => eachNightKey(booking.checkIn, booking.checkOut).length,
+    [booking.checkIn, booking.checkOut],
+  );
+  const shiftMode = overrideEnabled && overridePricingMode === "shift";
+
+  // Quote state. Declared before the payload builder because the builder reads
+  // the current quote (through `desiredElectionCents`); the debounced fetch that
+  // writes it is armed further down, once the payload exists.
+  const format = useClubFormat();
+  const quoteState = useModificationQuoteState();
+  const { quote, quoteLoading, quoteError } = quoteState;
+  // Other Lodges epic: the reciprocal other-club rate election. Offered only when
+  // the server shipped the partner-lodge registry, which it does for admins.
+  const otherLodgeRate = useOtherLodgeRate(booking);
+  /**
+   * The per-person fees the pending edit would write, keyed by guest id.
+   *
+   * Straight off the quote — never recomputed here — so the fee shown beside a
+   * name is the one the save will charge, for the same reason the totals are
+   * read off the quote rather than added up on the client. Empty while no quote
+   * has landed, and on an in-progress edit, where the guest rows keep showing
+   * their stored fees.
+   */
+  const quotedGuestPriceCents = useMemo(
+    () =>
+      new Map(
+        (quote?.guestPrices ?? []).map((entry) => [
+          entry.guestId,
+          entry.priceCents,
+        ]),
+      ),
+    [quote],
+  );
+  const [settlementMethod, setSettlementMethod] = useState<"card" | "credit" | null>(null);
+  /**
+   * #3232: where the money coming back on the OTHER booking should go.
+   *
+   * A SECOND SLOT, AND IT HAS TO BE. `settlementMethod` above is part of the save
+   * payload, and the payload is what the linked-move offer's proposal signature is
+   * taken over — so setting it would retire the very offer that asked the
+   * question, taking the member's chosen arm with it. This one is injected into
+   * the body AFTER that signature is captured, exactly as the offer's own answer
+   * is, so answering the question cannot invalidate it. Only one of the two is
+   * ever on screen: this control is drawn only when this booking's own quote asks
+   * for no choice.
+   */
+  const [linkedMoveSettlementMethod, setLinkedMoveSettlementMethod] = useState<
+    "card" | "credit" | null
+  >(null);
+  /**
+   * #2562 — the server-confirmed offer to ask a Booking Officer, or null.
+   *
+   * Set ONLY from a refusal the SERVER classified as reviewable, through the one
+   * shared rule in `readExceptionOffer`, and set from BOTH refusal points on this
+   * path: the quote (modify-quote answers 409 PAID_UP_ADULT_MEMBER_REQUIRED instead
+   * of a quote) and the save (the modify paths hard-block a minimum-stay breach with
+   * a 400 carrying the frozen review). A hard failure — a full lodge, invalid dates,
+   * a consent or authority refusal — can never open it.
+   *
+   * STORED WITH THE PROPOSAL IT BELONGS TO (#2562 re-review). The signature is the
+   * refused proposal's own identity, compared during render below, so an offer
+   * cannot outlive the dates and party it was refused for. See
+   * `exceptionProposalSignature`.
+   */
+  const [exceptionOfferState, setExceptionOfferState] = useState<{
+    offer: ExceptionOffer;
+    proposalSignature: string;
+  } | null>(null);
+
+  // #2337: the placeholder→member links this edit will apply, keyed by the
+  // existing guest row id. `linkFinderGuestId` is the row currently choosing a
+  // member through the reused member finder.
+  const [linkedGuestMembers, setLinkedGuestMembers] = useState<
+    Record<string, MemberGuestCandidate>
+  >({});
+  const [linkFinderGuestId, setLinkFinderGuestId] = useState<string | null>(null);
+  // The link control is fenced to exactly the audience + booking class the save
+  // path honours, and requires the member finder (the reused member search).
+  // #2534: it is also hidden on an in-progress (mid-stay) edit, because the save
+  // path REFUSES a placeholder→member link mid-stay (the in-progress pricing
+  // path re-rates the original rows, not the link-modified ones, so an in-place
+  // re-rate would silently no-op — see the modify-quote in-progress guard). The
+  // officer is pointed to remove-and-re-add, which settles correctly mid-stay,
+  // rather than being offered a control that only ever returns a quote-time
+  // refusal. `booking.editPolicy.mode === "in-progress"` is the same signal
+  // `isInProgressEdit` derives from below (declared after this line); using it
+  // directly keeps the fence self-contained here.
+  const memberLinkEnabled =
+    Boolean(booking.memberWholeLodge) &&
+    booking.viewerRole === "ADMIN" &&
+    Boolean(booking.memberGuest?.enabled) &&
+    !overrideEnabled &&
+    booking.editPolicy.mode !== "in-progress";
+
+  // Add guest form
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [addFirstName, setAddFirstName] = useState("");
+  const [addLastName, setAddLastName] = useState("");
+  const [addAgeTier, setAddAgeTier] = useState<AgeTier>("ADULT");
+
+  // Save state
+  const [saving, setSaving] = useState(false);
+  const saveInFlightRef = useRef(false);
+  const [saveError, setSaveError] = useState("");
+  // #2390: the coverage the SAVE came back with, when it differs from what the
+  // preview showed. The preview reads the promotion's counters unlocked and the
+  // save re-reads them under the row lock, so another booking can take the last
+  // slot in between — and then the price the member gets is not the price the
+  // panel explained. Holding the panel open with the server's own sentence
+  // keeps the explanation at the moment of the edit, which is the whole point
+  // of the owner decision; without it the member first learns from the email.
+  const [savedPromoCoverage, setSavedPromoCoverage] = useState<string | null>(
+    null,
+  );
+  /**
+   * #3179: the sentence the SAVE came back with when the edit could not carry
+   * the promo-code change the member asked for.
+   *
+   * Held in its own state, and shown even when the preview already said the
+   * same thing, unlike `savedPromoCoverage` above. The two are different
+   * situations: a coverage split that has not changed since the preview is not
+   * news, whereas this one is the member's own request not happening, and the
+   * owner's decision on #3179 accepted a partial save only on the condition
+   * that it is impossible to miss. So it replaces Save with an acknowledgement
+   * rather than closing the panel out from under them.
+   */
+  const [savedPromoChangeNotApplied, setSavedPromoChangeNotApplied] = useState<
+    string | null
+  >(null);
+  const [requestReason, setRequestReason] = useState("");
+  const [requestSubmitting, setRequestSubmitting] = useState(false);
+  const [requestError, setRequestError] = useState("");
+  const [requestSuccess, setRequestSuccess] = useState("");
+
+  const today = booking.editPolicy.today;
+  const minEditableDate = booking.editPolicy.editableFrom ?? today;
+  // Issue #1668: an active override lifts the check-in lock and the in-progress
+  // clamps entirely (the edit is date-only), and hides the promo controls.
+  const checkInLocked = overrideEnabled
+    ? false
+    : !booking.editPolicy.checkInEditable;
+  const isInProgressEdit =
+    !overrideEnabled && booking.editPolicy.mode === "in-progress";
+  // In-progress and override edits never touch promo codes. A booking carrying
+  // several codes is NOT locked here: the card shows the list editor where the
+  // club's `multiPromoCodes` switch is on, and C3's read-only card otherwise.
+  const promoLocked = isInProgressEdit || overrideEnabled;
+
+  function handleCheckInChange(value: string) {
+    setCheckIn(value);
+    // Shift mode keeps the stay length fixed: deriving the other bound so the
+    // preview and apply both see the same night count (parity is required).
+    if (shiftMode && value) {
+      setCheckOut(shiftDateKey(value, originalNights));
+    }
+  }
+
+  function handleCheckOutChange(value: string) {
+    setCheckOut(value);
+    if (shiftMode && value) {
+      setCheckIn(shiftDateKey(value, -originalNights));
+    }
+  }
+
+  // Check if anything has changed
+  const remainingGuests = useMemo(
+    () => booking.guests.filter((g) => !removedGuestIds.has(g.id)),
+    [booking.guests, removedGuestIds],
+  );
+  const canEditPerGuestDates =
+    !isInProgressEdit && !overrideEnabled && totalGuestCountCandidate() > 1;
+  function totalGuestCountCandidate() {
+    return remainingGuests.length + addedGuests.length;
+  }
+
+  const {
+    perGuestDatesEnabled,
+    setPerGuestDatesEnabled,
+    multiDateRangesEnabled,
+    setMultiDateRangesEnabled,
+  } = useGuestDateModes({
+    guests: booking.guests,
+    bookingCheckIn: booking.checkIn,
+    bookingCheckOut: booking.checkOut,
+    canEditPerGuestDates,
+  });
+
+  // State only. Its reset effect is armed further down, at the position that
+  // effect has always occupied — see `usePromoSelectionState`'s note.
+  const {
+    promoAction,
+    setPromoAction,
+    appliedNewPromo,
+    setAppliedNewPromo,
+    prefillPromoCode,
+    setPrefillPromoCode,
+    appliedPromoList,
+    setAppliedPromoList,
+    retirePromoSelection,
+  } = usePromoSelectionState();
+
+  const getExistingGuestRange = useCallback((guest: Guest) => {
+    return (
+      existingGuestRanges[guest.id] ?? {
+        stayStart: guest.stayStart ?? booking.checkIn,
+        stayEnd: guest.stayEnd ?? booking.checkOut,
+      }
+    );
+  }, [booking.checkIn, booking.checkOut, existingGuestRanges]);
+
+  function updateExistingGuestRange(
+    guestId: string,
+    field: "stayStart" | "stayEnd",
+    value: string
+  ) {
+    setExistingGuestRanges((prev) => ({
+      ...prev,
+      [guestId]: {
+        stayStart: prev[guestId]?.stayStart ?? booking.checkIn,
+        stayEnd: prev[guestId]?.stayEnd ?? booking.checkOut,
+        [field]: value,
+      },
+    }));
+  }
+
+  function getGuestNameEdit(guest: Guest) {
+    return (
+      guestNameEdits[guest.id] ?? {
+        firstName: guest.firstName,
+        lastName: guest.lastName,
+      }
+    );
+  }
+
+  function updateGuestName(
+    guestId: string,
+    field: "firstName" | "lastName",
+    value: string
+  ) {
+    setGuestNameEdits((prev) => ({
+      ...prev,
+      [guestId]: {
+        firstName:
+          prev[guestId]?.firstName ??
+          booking.guests.find((guest) => guest.id === guestId)?.firstName ??
+          "",
+        lastName:
+          prev[guestId]?.lastName ??
+          booking.guests.find((guest) => guest.id === guestId)?.lastName ??
+          "",
+        [field]: value,
+      },
+    }));
+  }
+
+  function updateAddedGuestRange(
+    key: string,
+    field: "stayStart" | "stayEnd",
+    value: string
+  ) {
+    setAddedGuests((prev) =>
+      prev.map((guest) =>
+        guest.key === key
+          ? {
+              ...guest,
+              [field]: value,
+            }
+          : guest
+      )
+    );
+  }
+
+  const guestRangesChanged =
+    perGuestDatesEnabled &&
+    remainingGuests.some((guest) => {
+      const range = getExistingGuestRange(guest);
+      return (
+        range.stayStart !== (guest.stayStart ?? booking.checkIn) ||
+        range.stayEnd !== (guest.stayEnd ?? booking.checkOut)
+      );
+    });
+  const nonMemberGuestNamesEditable =
+    booking.canEditNonMemberGuestNames || booking.canFixNonMemberGuestNameTypos;
+  const guestNameUpdates = useMemo(
+    () =>
+      nonMemberGuestNamesEditable
+        ? booking.guests
+            .filter((guest) => !guest.isMember && !removedGuestIds.has(guest.id))
+            .map((guest) => {
+              const edit = guestNameEdits[guest.id] ?? {
+                firstName: guest.firstName,
+                lastName: guest.lastName,
+              };
+              return {
+                guestId: guest.id,
+                firstName: edit.firstName.trim(),
+                lastName: edit.lastName.trim(),
+                changed:
+                  edit.firstName.trim() !== guest.firstName ||
+                  edit.lastName.trim() !== guest.lastName,
+              };
+            })
+            .filter((update) => update.changed)
+            .map((update) => ({
+              guestId: update.guestId,
+              firstName: update.firstName,
+              lastName: update.lastName,
+            }))
+        : [],
+    [
+      nonMemberGuestNamesEditable,
+      booking.guests,
+      guestNameEdits,
+      removedGuestIds,
+    ]
+  );
+  const guestNamesChanged = guestNameUpdates.length > 0;
+  // #3451 (`INV-GUEST-019`): an ADDED guest, or an existing one RENAMED, named
+  // as one of the owner's recorded dependants is asked about, as create asks.
+  const dependantIdentity = useEditDependantIdentity({
+    addedGuests,
+    setAddedGuests,
+    renamedGuests: renamedGuestsForDependantCheck(
+      booking.guests,
+      guestNameUpdates,
+      [...removedGuestIds],
+    ),
+    replaceRenamedGuest: (guestId, familyMember) => {
+      handleRemoveGuest(guestId);
+      handleAddFamilyMember(familyMember);
+    },
+    ...familyOptions,
+  });
+  // A night toggle in the grid (issue #713) is a change even when it leaves the
+  // guest's overall envelope unchanged (e.g. switching off a middle night).
+  const guestNightsChanged =
+    multiDateRangesEnabled &&
+    !isInProgressEdit &&
+    remainingGuests.some((guest) => {
+      const original =
+        guest.nights && guest.nights.length > 0
+          ? [...guest.nights].sort()
+          : eachNightKey(
+              guest.stayStart ?? booking.checkIn,
+              guest.stayEnd ?? booking.checkOut
+            );
+      const current = existingGuestNights[guest.id] ?? original;
+      return current.join(",") !== original.join(",");
+    });
+  // #2266: account-credit derivations. When the member TOUCHES the control,
+  // the checkbox carries the create-flow semantics — "put my credit towards
+  // this booking, up to its price" — so the newly elected amount is
+  // min(balance, what is still uncovered). An UNTOUCHED stored election is
+  // different (MED-3): it is the member's saved choice, stored RAW with the
+  // clamp living at the pay-time consumer (#2265/#2319), so the panel may
+  // follow only the booking-local PRICE (a reprice this very edit causes) and
+  // NEVER the live balance — otherwise an unrelated guest-name fix while the
+  // balance happened to be low would silently rewrite (or clear) the stored
+  // value, contradicting the card's own "it will only apply if credit returns
+  // before you pay" copy. The election is STORED on the booking (#2265) and
+  // consumed at payment; nothing moves here.
+  const quoteFinalPriceCents =
+    quote?.newFinalPriceCents ?? booking.finalPriceCents;
+  const availableCreditCents =
+    quote?.availableCreditCents ?? credit?.availableCents ?? 0;
+  const ledgerAppliedCreditCents = credit?.appliedCents ?? 0;
+  const uncoveredPriceCents = Math.max(
+    0,
+    quoteFinalPriceCents - ledgerAppliedCreditCents,
+  );
+  const desiredElectionCents = useCredit
+    ? creditTouched
+      ? Math.min(availableCreditCents, uncoveredPriceCents)
+      : Math.min(storedElectionCents, uncoveredPriceCents)
+    : 0;
+  // Send the election when the member changed it, or when a stored election
+  // must follow a reprice (untouched but the price cap moved) — never invent
+  // one, and never rewrite a stored value for a balance change.
+  const includeCreditInPayload =
+    Boolean(credit) &&
+    !overrideEnabled &&
+    desiredElectionCents !== storedElectionCents &&
+    (creditTouched || storedElectionCents > 0);
+  const creditChanged =
+    Boolean(credit) &&
+    !overrideEnabled &&
+    creditTouched &&
+    desiredElectionCents !== storedElectionCents;
+  const creditCardVisible =
+    Boolean(credit) &&
+    !overrideEnabled &&
+    (availableCreditCents > 0 ||
+      storedElectionCents > 0 ||
+      ledgerAppliedCreditCents > 0);
+
+  // #4533: the changes other than the promo code, which a finished stay's
+  // promo correction request cannot carry.
+  const hasNonPromoChanges =
+    checkIn !== booking.checkIn ||
+    checkOut !== booking.checkOut ||
+    removedGuestIds.size > 0 ||
+    addedGuests.length > 0 ||
+    guestRangesChanged ||
+    guestNightsChanged ||
+    guestNamesChanged ||
+    otherLodgeRate.changed ||
+    creditChanged;
+  const hasChanges = hasNonPromoChanges || promoAction.type !== "keep";
+  // #4533: an officer on a finished stay — Save cannot apply here, so the panel
+  // says so and offers the promo correction request instead.
+  const finishedStayLocked =
+    booking.editPolicy.finishedStayPromoCorrection === true && !overrideEnabled;
+
+  // #4202: the officer re-rates, read ONCE for the payload and the promo box.
+  const editRerates = useEditRerates({
+    linkedGuestMembers,
+    otherLodgePayloadFields: otherLodgeRate.payloadFields,
+    removedGuestIds,
+    guestNameUpdates,
+  });
+
+  // #4199: the stays this edit sends, read ONCE for the payload and the promo
+  // card, so the promo preview prices the nights the quote and the save price.
+  const guestStays = useMemo(
+    () =>
+      buildEditGuestStays({
+        multiDateRangesEnabled,
+        perGuestDatesEnabled,
+        isInProgressEdit,
+        booking: { checkIn: booking.checkIn, checkOut: booking.checkOut },
+        checkIn,
+        checkOut,
+        remainingGuests,
+        addedGuests,
+        existingGuestNights,
+        getExistingGuestRange,
+      }),
+    [
+      multiDateRangesEnabled,
+      perGuestDatesEnabled,
+      isInProgressEdit,
+      booking.checkIn,
+      booking.checkOut,
+      checkIn,
+      checkOut,
+      remainingGuests,
+      addedGuests,
+      existingGuestNights,
+      getExistingGuestRange,
+    ],
+  );
+
+  const buildModificationPayload = useCallback(() => {
+    // Issue #1668: an admin override is strictly date-only. Send only the dates,
+    // the override flags, and the capacity confirm — never guest/promo inputs,
+    // which the route/service reject anyway.
+    if (overrideEnabled && overridePricingMode) {
+      const overrideBody: Record<string, unknown> = {
+        adminOverride: true,
+        pricingMode: overridePricingMode,
+      };
+      if (checkIn !== booking.checkIn) overrideBody.checkIn = checkIn;
+      if (checkOut !== booking.checkOut) overrideBody.checkOut = checkOut;
+      if (confirmOverCapacity) overrideBody.confirmOverCapacity = true;
+      return overrideBody;
+    }
+
+    const body: Record<string, unknown> = {};
+    // #4199: every guest's stay through the one reading the promo card shares.
+    const rangeAwareAddedGuests = addedGuests.map((g, index) => ({
+      firstName: g.firstName,
+      lastName: g.lastName,
+      ageTier: g.ageTier,
+      isMember: g.isMember,
+      memberId: g.memberId,
+      ...guestStays.added[index],
+    }));
+    if (guestStays.existing) body.guestStayRanges = guestStays.existing;
+    if (guestStays.checkIn !== booking.checkIn) body.checkIn = guestStays.checkIn;
+    if (guestStays.checkOut !== booking.checkOut) body.checkOut = guestStays.checkOut;
+    if (addedGuests.length > 0) {
+      body.addGuests = rangeAwareAddedGuests;
+      // #1746: partner-sharer flags for admin-added partner guests still in
+      // the proposal — capacity then runs through the reserved double slots.
+      const partnerSharedGuests = addedGuests
+        .filter((g) => g.memberId && g.partnerSharedWithMemberId)
+        .map((g) => ({
+          memberId: g.memberId as string,
+          partnerMemberId: g.partnerSharedWithMemberId as string,
+        }));
+      if (partnerSharedGuests.length > 0) {
+        body.partnerSharedGuests = partnerSharedGuests;
+      }
+    }
+    // #3451: only the answers that still describe a live collision travel.
+    if (dependantIdentity.declarationsPayload) {
+      body.dependantIdentityDeclarations = dependantIdentity.declarationsPayload;
+    }
+    Object.assign(body, editRerates); // re-rates, removals, renames (#4202)
+    // #2266 / #3492: the promo choice, bound to guests the way the server binds them.
+    Object.assign(body, promoActionPayload(promoAction, remainingGuests));
+
+    // #2266: the credit election (#2265) — stored on the booking, applied when
+    // the member confirms. 0 clears a saved election.
+    if (includeCreditInPayload) {
+      body.applyCreditCents = desiredElectionCents;
+    }
+
+    return body;
+  }, [
+    addedGuests,
+    dependantIdentity.declarationsPayload,
+    booking.checkIn,
+    booking.checkOut,
+    checkIn,
+    checkOut,
+    guestStays,
+    editRerates,
+    promoAction,
+    remainingGuests,
+    overrideEnabled,
+    overridePricingMode,
+    confirmOverCapacity,
+    includeCreditInPayload,
+    desiredElectionCents,
+  ]);
+
+  // Under an override the pricing-mode radio must be chosen before the quote
+  // fires — otherwise a member-shaped quote would run and (for a fully-past
+  // booking) error, confusing the admin.
+  const overrideQuoteReady = !overrideEnabled || Boolean(overridePricingMode);
+  const modificationPayloadJson =
+    hasChanges && overrideQuoteReady
+      ? JSON.stringify(buildModificationPayload())
+      : null;
+  /**
+   * What an exception request would DROP from the pending edit, and whether any of
+   * it moved the price (#2562 review).
+   *
+   * Computed from the SAME builder the quote and the request itself use, once per
+   * render, so the card's disclosure list, its figure and the payload that is
+   * actually posted cannot disagree. `omitsPricedChange` is what suppresses the
+   * quote's `netChargeCents` — that number prices the whole payload, promo and
+   * credit included, and the frozen proposal carries neither.
+   */
+  const exceptionOmissions = exceptionRequestPayloadFromModification(
+    buildModificationPayload(),
+  );
+  /**
+   * The offer, but ONLY while it still describes the proposal on screen.
+   *
+   * A mismatch means the member changed the dates, the party or a guest's nights
+   * after the refusal, so the offer describes something they are no longer
+   * proposing — and the figure beside it was priced on those old nights. Answering
+   * null retires both in the same render the change lands in: no effect, no
+   * cleared-too-late window, and no dependence on the debounced quote resolving
+   * (which is what left the stale card up).
+   */
+  const exceptionOffer =
+    exceptionOfferState &&
+    // `exceptionProposalSignature` applied to the payload the omissions above were
+    // derived from, so the render builds the modification payload once.
+    exceptionOfferState.proposalSignature ===
+      JSON.stringify(exceptionOmissions.payload)
+      ? exceptionOfferState.offer
+      : null;
+
+  const { requote, quoteIsFor } = useDebouncedModificationQuote({
+    bookingId: booking.id,
+    modificationPayloadJson,
+    setQuote: quoteState.setQuote,
+    setQuoteLoading: quoteState.setQuoteLoading,
+    setQuoteError: quoteState.setQuoteError,
+    setMemberGuestAddError,
+    setExceptionOfferState,
+    setSaveOverCapacityNights,
+    setSettlementMethod,
+    onDependantIdentityRefusal: dependantIdentity.handleRefusal,
+  });
+
+  const {
+    memberGuestFinderOpen,
+    setMemberGuestFinderOpen,
+    lastMemberGuestAttempt,
+    setLastMemberGuestAttempt,
+    memberGuestTriggerRef,
+    closeMemberGuestFinder,
+  } = useMemberGuestFinder(memberGuestAddError);
+
+  usePromoBeneficiaryReset({
+    promoAction,
+    guests: booking.guests,
+    removedGuestIds,
+    addedGuests,
+    retirePromoSelection,
+  });
+
+  function handleRemoveGuest(guestId: string) {
+    setRemovedGuestIds((prev) => new Set([...prev, guestId]));
+  }
+
+  function handleUndoRemoveGuest(guestId: string) {
+    setRemovedGuestIds((prev) => {
+      const next = new Set(prev);
+      next.delete(guestId);
+      return next;
+    });
+  }
+
+  // #2337: record that a placeholder row is now linked to a member. Clears the
+  // settlement choice and the promo (a re-rate changes the total), exactly as
+  // adding a member guest does — the quote is refetched from the serialised
+  // payload, and neither is recomputed by that refetch.
+  function handleLinkGuestToMember(guestId: string, candidate: MemberGuestCandidate) {
+    setAppliedNewPromo(null);
+    setPromoAction({ type: "keep" });
+    setSettlementMethod(null);
+    setLinkedGuestMembers((prev) => ({ ...prev, [guestId]: candidate }));
+    setLinkFinderGuestId(null);
+  }
+
+  function handleUnlinkGuest(guestId: string) {
+    setSettlementMethod(null);
+    setLinkedGuestMembers((prev) => {
+      const next = { ...prev };
+      delete next[guestId];
+      return next;
+    });
+  }
+
+  function handleAddGuest() {
+    if (!addFirstName.trim() || !addLastName.trim()) return;
+    setAddedGuests((prev) => [
+      ...prev,
+      {
+        key: crypto.randomUUID(),
+        firstName: addFirstName.trim(),
+        lastName: addLastName.trim(),
+        ageTier: addAgeTier,
+        isMember: false,
+        ...(perGuestDatesEnabled && !isInProgressEdit
+          ? { stayStart: checkIn, stayEnd: checkOut }
+          : {}),
+      },
+    ]);
+    setAddFirstName("");
+    setAddLastName("");
+    setShowAddForm(false);
+  }
+
+  function handleAddFamilyMember(familyMember: FamilyMember) {
+    const alreadyAdded = booking.guests.some((guest) => guest.memberId === familyMember.id)
+      || addedGuests.some((guest) => guest.memberId === familyMember.id);
+    if (alreadyAdded) {
+      return;
+    }
+
+    setAddedGuests((prev) => [
+      ...prev,
+      {
+        key: crypto.randomUUID(),
+        firstName: familyMember.firstName,
+        lastName: familyMember.lastName,
+        ageTier: familyMember.ageTier,
+        isMember: true,
+        memberId: familyMember.id,
+        ...(perGuestDatesEnabled && !isInProgressEdit
+          ? { stayStart: checkIn, stayEnd: checkOut }
+          : {}),
+      },
+    ]);
+  }
+
+  function handleAddPartnerCandidate(candidate: PartnerSharingCandidate) {
+    const alreadyAdded = booking.guests.some((guest) => guest.memberId === candidate.id)
+      || addedGuests.some((guest) => guest.memberId === candidate.id);
+    if (alreadyAdded) {
+      return;
+    }
+
+    setAddedGuests((prev) => [
+      ...prev,
+      {
+        key: crypto.randomUUID(),
+        firstName: candidate.firstName,
+        lastName: candidate.lastName,
+        ageTier: "ADULT" as AgeTier,
+        isMember: true,
+        memberId: candidate.id,
+        partnerSharedWithMemberId: candidate.partnerOfMemberId,
+        ...(perGuestDatesEnabled && !isInProgressEdit
+          ? { stayStart: checkIn, stayEnd: checkOut }
+          : {}),
+      },
+    ]);
+  }
+
+  /**
+   * Add a member the booker (or an officer) found through MG3's finder.
+   *
+   * THE INVALIDATION LIST IS THE FAMILY QUICK-ADD'S, and it has to be: a member
+   * guest changes the party in exactly the same ways a family member does — it
+   * prices at member rates, counts toward the group discount, and can collide on
+   * person-nights — so it must reset exactly the same derived state. The panel's
+   * quote is refetched from the serialised payload, so adding the guest is what
+   * invalidates it; the promo and the settlement choice are cleared explicitly
+   * because neither is recomputed by that refetch.
+   *
+   * The consent PREDICTION is computed here rather than on the server for the
+   * same reason the create wizard computes it: nothing has been written, so
+   * there is no row to read. It is undefined when the target is in the booking
+   * owner's own family group — a parent CAN type their child's household address
+   * into the finder, and a family-scope add is consent-free under D-6, so
+   * promising "waiting for Mia to approve" over one would describe an email that
+   * is never sent and a hold that does not exist.
+   */
+  function handleAddMemberGuest(candidate: MemberGuestCandidate) {
+    const alreadyAdded =
+      booking.guests.some((guest) => guest.memberId === candidate.memberId) ||
+      addedGuests.some((guest) => guest.memberId === candidate.memberId);
+    if (alreadyAdded) return;
+
+    const memberGuest = booking.memberGuest;
+    // THE SHARED PREDICATE, not a second copy of it (MG4 #2309). The panel's
+    // first cut inlined the rule here and dropped the admin branch, so an
+    // officer on an ask-first club read "Waiting for consent — the bed is held
+    // until they answer" beside a card that said the member would be added
+    // immediately. Undefined for a family-scope add and for an unknown family
+    // list — see `predictMemberGuestConsent` for both. The list is the booking
+    // OWNER's on both paths: a member fetches their own family, an officer
+    // fetches the booking's `eligible-family`, which is the owner's.
+    const consentPreview = memberGuest
+      ? predictMemberGuestConsent({
+          candidateMemberId: candidate.memberId,
+          familyMemberIds: familyMembers.map((member) => member.id),
+          familyMembersLoaded,
+          approvalRequired: memberGuest.approvalRequired,
+          actorKind: booking.viewerRole === "ADMIN" ? "ADMIN" : "MEMBER",
+        })
+      : undefined;
+
+    setMemberGuestAddError(null);
+    setAppliedNewPromo(null);
+    setPromoAction({ type: "keep" });
+    setSettlementMethod(null);
+    setAddedGuests((prev) => [
+      ...prev,
+      {
+        key: crypto.randomUUID(),
+        firstName: candidate.firstName,
+        lastName: candidate.lastName,
+        ageTier: candidate.ageTier,
+        isMember: true,
+        memberId: candidate.memberId,
+        ...(consentPreview
+          ? { memberGuestConsentPreview: consentPreview }
+          : {}),
+        ...(perGuestDatesEnabled && !isInProgressEdit
+          ? { stayStart: checkIn, stayEnd: checkOut }
+          : {}),
+      },
+    ]);
+  }
+
+  function handleRemoveAddedGuest(key: string) {
+    setAddedGuests((prev) => prev.filter((g) => g.key !== key));
+  }
+
+  // #2266: the shared PromoCodeInput validated (or cleared) a new code.
+  function handleNewPromoApplied(result: PromoResult | null) {
+    // #3828: the one-code request would release a several-code booking's
+    // other codes (and the server refuses it), so it is never staged there.
+    if (promoLocked || hasSeveralPromoCodes(booking)) return;
+    setAppliedNewPromo(result);
+    setPrefillPromoCode(undefined);
+    if (result?.code) {
+      setPromoAction({
+        type: "new",
+        code: result.code,
+        guestIndexes: result.selectedGuestIndexes,
+      });
+    } else {
+      // Cleared: fall back to the stored promo (kept) or no promo at all.
+      setPromoAction({ type: "keep" });
+    }
+  }
+
+  // #3492: the several-code list changed (add, remove or reorder).
+  function handlePromoListChange(next: PromoResult[]) {
+    if (promoLocked) return;
+    setAppliedPromoList(next);
+    setPromoAction({ type: "list", codes: promoCodeListEntries(next) });
+  }
+
+  /**
+   * An admin override edit is date-only, so turning it ON discards every pending
+   * guest, range, night, promo and credit edit — otherwise a stacked edit would
+   * be silently dropped by the date-only payload and the cards would show
+   * something the save does not send. Ranges and night sets go back to their
+   * stored SEEDS (not {}), so a later grid edit still sees each guest's real
+   * gaps. The reset spans every concern on the screen, which is why it lives
+   * here rather than inside the override card.
+   */
+  function handleOverrideEnabledChange(enabled: boolean) {
+    setOverrideEnabled(enabled);
+    if (enabled) {
+      setRemovedGuestIds(new Set());
+      setAddedGuests([]);
+      setGuestNameEdits({});
+      setExistingGuestRanges(seedExistingGuestRanges());
+      setExistingGuestNights(seedExistingGuestNights());
+      setPromoAction({ type: "keep" });
+      setAppliedNewPromo(null);
+      setPrefillPromoCode(undefined);
+      // #2266: credit is not part of a date-only override edit —
+      // restore the stored election's state.
+      setUseCredit(storedElectionCents > 0);
+      setCreditTouched(false);
+      setShowAddForm(false);
+      // An override edit is date-only, and the other-club rate election is a
+      // guest change — discarded here with the rest of them.
+      otherLodgeRate.reset();
+    } else {
+      setOverridePricingMode(null);
+      setConfirmOverCapacity(false);
+      setSaveOverCapacityNights(null);
+    }
+  }
+
+  function handleOverridePricingModeChange(mode: "shift" | "recalculate") {
+    setOverridePricingMode(mode);
+    setConfirmOverCapacity(false);
+    setSaveOverCapacityNights(null);
+  }
+
+  function handleMultiDateRangesChange(enabled: boolean) {
+    setMultiDateRangesEnabled(enabled);
+    if (enabled) setPerGuestDatesEnabled(false);
+  }
+
+  function handleToggleGuestNight(rowIndex: number, nightKey: string) {
+    const toggle = (current: string[]) =>
+      current.includes(nightKey)
+        ? current.filter((key) => key !== nightKey)
+        : [...current, nightKey].sort();
+    if (rowIndex < remainingGuests.length) {
+      const guest = remainingGuests[rowIndex];
+      // rowIndex is always in range here by construction — the grid renders
+      // one row per entry of `remainingGuests` and passes back that entry's
+      // own index — but the type can't see that from the length check above.
+      if (!guest) return;
+      setExistingGuestNights((prev) => {
+        const base = prev[guest.id] ?? eachNightKey(checkIn, checkOut);
+        const next = toggle(base);
+        if (next.length === 0) return prev;
+        return { ...prev, [guest.id]: next };
+      });
+    } else {
+      const addedIndex = rowIndex - remainingGuests.length;
+      setAddedGuests((prev) =>
+        prev.map((g, i) => {
+          if (i !== addedIndex) return g;
+          const base = g.nights ?? eachNightKey(checkIn, checkOut);
+          const next = toggle(base);
+          if (next.length === 0) return g;
+          return { ...g, nights: next };
+        }),
+      );
+    }
+  }
+
+  // Issue #1696: an admin/booking-officer save goes through the notify dialog
+  // first (on EVERY edit, not just overrides); the dialog's two actions call
+  // handleSave with the admin's explicit email choice. viewerRole is the same
+  // booking-management role the /modify route resolves as actorRole, so the
+  // dialog shows exactly when the server will honour the choice. Member
+  // self-edits keep the immediate always-notify save.
+  const actingAsAdmin = booking.viewerRole === "ADMIN";
+  // #2259: read only alongside the admin dialog path below, so a member editing
+  // their own booking never renders anything derived from the switch.
+  const noEmailsOn = actingAsAdmin && booking.noEmails === true;
+
+  // #2104: does the post-edit guest set (remaining + added) leave minors with no
+  // adult? The server (resolveModifyReviewUpdate) only demands a written reason
+  // on the FIRST trip, so an already-flagged/reviewed booking never re-prompts.
+  // The server's own rule (#3770): a kept row states its stored consent, an
+  // added row the consent its add will produce.
+  const postEditTripsReview = partyNeedsSupervisionJustification([
+    ...remainingGuests,
+    ...addedGuests,
+  ]);
+  const bookingAlreadyUnderReview =
+    Boolean(booking.requiresAdminReview) && (booking.adminReviewStatus ?? null) !== null;
+
+  const {
+    memberReviewJustification,
+    setMemberReviewJustification,
+    reviewJustificationError,
+    setReviewJustificationError,
+    serverRequiresJustification,
+    setServerRequiresJustification,
+    reviewJustificationRef,
+    scrollToError,
+  } = useReviewJustificationLatch({ remainingGuests, addedGuests });
+
+  // An admin acts through the notify dialog and auto-approves the review, so the
+  // field is member-only. serverRequiresJustification covers client/server drift
+  // (the reactive REVIEW_JUSTIFICATION_REQUIRED path).
+  const showReviewJustification =
+    (postEditTripsReview && !actingAsAdmin && !bookingAlreadyUnderReview) ||
+    serverRequiresJustification;
+
+  function buildSavePayload(notifyMemberChoice?: boolean) {
+    const body = buildModificationPayload();
+    if (showReviewJustification) {
+      body.memberReviewJustification =
+        memberReviewJustification.trim() || undefined;
+    }
+    if (settlementMethod) body.settlementMethod = settlementMethod;
+    if (notifyMemberChoice !== undefined) body.notifyMember = notifyMemberChoice;
+    return body;
+  }
+
+  const {
+    setHostingOverrideState,
+    hostingOverrideConfirmed,
+    setHostingOverrideConfirmed,
+    hostingOverrideReason,
+    setHostingOverrideReason,
+    activeHostingOverrideState,
+  } = useHostingCoverageOverride(buildSavePayload);
+
+  // #3232: the member's answer to the linked-move offer. Its own hook rather than
+  // a slot on the override one, because the two are different questions asked of
+  // different people — the officer is asked to explain overriding somebody else's
+  // stranding, the member is asked to decide about their own two bookings — and
+  // only one of them can be open on any given save.
+  const {
+    setLinkedMoveState,
+    linkedMoveChoice,
+    setLinkedMoveChoice,
+    activeLinkedMoveState,
+  } = useHostingCoverageLinkedMove(buildSavePayload);
+
+  function handleSaveClick() {
+    if (activeLinkedMoveState) {
+      // NO DEFAULT ANSWER. Saving without a choice would answer a money question
+      // on the member's behalf in one direction and strand a booking in the other.
+      if (!linkedMoveChoice) {
+        setSaveError("Choose whether to move both bookings or only this one.");
+        return;
+      }
+      void handleSave(
+        activeLinkedMoveState.notifyMemberChoice,
+        null,
+        activeLinkedMoveState,
+      );
+      return;
+    }
+    if (activeHostingOverrideState) {
+      if (!hostingOverrideConfirmed || hostingOverrideReason.trim().length < 10) {
+        setSaveError(
+          "Confirm the affected bookings and give a private override reason of at least 10 characters.",
+        );
+        return;
+      }
+      void handleSave(
+        activeHostingOverrideState.notifyMemberChoice,
+        activeHostingOverrideState,
+      );
+      return;
+    }
+    if (actingAsAdmin) {
+      setNotifyDialogOpen(true);
+      return;
+    }
+    void handleSave();
+  }
+
+  /**
+   * Send the exception request the current refusal opened the door to (#2562).
+   *
+   * The delta is the SAME payload the refused quote or save sent, narrowed by
+   * `exceptionRequestPayloadFromModification` to the five fields a proposal is
+   * made of. Narrowed rather than rebuilt, so the proposal an officer freezes is
+   * the change that was actually refused; the fields a proposal cannot carry are
+   * named to the member on the card before they submit.
+   *
+   * Throws an Error carrying the server's own sentence, plus its `code` where it
+   * sent one, so the card can name the right next step for the two 409s whose
+   * remedy is not "try again".
+   */
+  async function submitExceptionRequest(input: {
+    memberMessage: string;
+    supersedeRequestId: string | null;
+  }): Promise<ExceptionRequestSubmitResult> {
+    const { payload } = exceptionRequestPayloadFromModification(
+      buildModificationPayload(),
+    );
+    const res = await fetch(`/api/bookings/${booking.id}/exception-requests`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...payload,
+        memberMessage: input.memberMessage,
+        supersedeRequestId: input.supersedeRequestId ?? undefined,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const failure = new Error(
+        typeof data?.error === "string" && data.error
+          ? data.error
+          : "The request could not be sent. Try again.",
+      ) as Error & { code?: string };
+      if (typeof data?.code === "string") failure.code = data.code;
+      // #3451: put the own-dependant question back, as the quote and save do.
+      if (isDependantIdentityRefusalCode(data?.code)) {
+        dependantIdentity.handleRefusal(data.code);
+      }
+      throw failure;
+    }
+    return {
+      id: String(data.id),
+      proposal: data.proposal,
+      capacityHeld: data.capacityHeld === true,
+      // The frozen aggregate, for the receipt's capacity sentence: on this path
+      // "nothing held" means "needs nothing" only under HOLD.
+      capacityMode:
+        data.aggregateCapacityMode === "HOLD" ||
+        data.aggregateCapacityMode === "NO_HOLD"
+          ? data.aggregateCapacityMode
+          : null,
+    };
+  }
+
+  async function handleSave(
+    notifyMemberChoice?: boolean,
+    overrideState: HostingOverrideState | null = null,
+    linkedMoveState: HostingLinkedMoveState | null = null,
+  ) {
+    setSaveError("");
+    // #2104: block submission with an inline error adjacent to the field (not the
+    // bottom saveError slot) when a required justification is missing, and bring
+    // the field into view.
+    if (showReviewJustification && !memberReviewJustification.trim()) {
+      setReviewJustificationError(
+        "Please add a reason so an admin can review this booking.",
+      );
+      scrollToError(reviewJustificationRef);
+      return;
+    }
+    if (quote?.settlementOptions?.requiresSettlementMethod && !settlementMethod) {
+      setSaveError("Choose a refund or account credit before saving");
+      return;
+    }
+    // #3232: and the same block when it is the OTHER booking's money that needs
+    // the choice, so the linked move is never submitted into the server's 400.
+    //
+    // ON THE ACCEPTING ARM ONLY (fix round). The other booking's money moves
+    // because the other booking moves; a member who chose "Move only this booking"
+    // is being asked where a refund that will never happen should go, and could not
+    // save until they answered it.
+    if (
+      linkedMoveSettlementRequired &&
+      linkedMoveChoice === "MOVE_BOTH" &&
+      !linkedMoveSettlementMethod
+    ) {
+      setSaveError("Choose a refund or account credit before saving");
+      return;
+    }
+    // #4924 (`INV-MOD-062`): Save pressed inside the quote's debounce would
+    // carry the PREVIOUS edit's figures and be refused for a price nobody
+    // changed. Price this edit now instead; the member saves what it shows.
+    if (quote?.quotedFigures && !quoteIsFor(modificationPayloadJson)) {
+      setSaveError("Updating the price for your latest change. Check it, then save again.");
+      requote();
+      return;
+    }
+    if (saveInFlightRef.current) return;
+    saveInFlightRef.current = true;
+    setSaving(true);
+    // A fresh save attempt retires the previous refusal's offer (#2562).
+    setExceptionOfferState(null);
+
+    try {
+      const body = buildSavePayload(notifyMemberChoice);
+      const refusedHostingProposalSignature =
+        hostingCoverageMutationSignature(body);
+      // #4924 (`INV-MOD-062`): the figures the member is looking at, sent back
+      // unchanged so the save refuses rather than settle a different amount.
+      // Added after the signature, like the linked-move answers below: a
+      // re-priced preview is not a different proposal and must not retire an
+      // open prompt. No preview, no figures — the save then prices as before.
+      const previewedFigures = quote?.quotedFigures ?? null;
+      if (previewedFigures) body.quotedFigures = previewedFigures;
+      if (overrideState) {
+        body.hostingCoverageOverride = {
+          acknowledged: true,
+          reason: hostingOverrideReason.trim(),
+          strandedStateKey: overrideState.prompt.strandedStateKey,
+        };
+      }
+      // #3232: the arm the member chose decides WHICH state key travels —
+      // accepting is bound to the moves and the money, declining only to the
+      // stranded set — so the key comes off the prompt rather than being picked
+      // here. A null answer means the arm is not answerable (the offer said there
+      // are not beds for both), and the save then carries no answer at all so the
+      // server re-prompts rather than acting on half of one.
+      if (linkedMoveState && linkedMoveChoice) {
+        const answer = hostingCoverageLinkedMoveAnswer(
+          linkedMoveState.prompt,
+          linkedMoveChoice,
+        );
+        if (answer) body.hostingCoverageLinkedMove = answer;
+        // #3232: and the return method for the other booking's refund, added HERE
+        // rather than in the payload builder for the reason its state slot gives —
+        // in the builder it would change the proposal signature and retire this
+        // very offer.
+        //
+        // KEYED ON THE CHOSEN ARM, NOT ON THE OFFER'S FLAG (fix round). Gating it on
+        // `linkedMoveSettlementRequired` meant the member's answer was DROPPED the
+        // moment a re-quote came back with the flag off — the server then priced the
+        // dependent on card again, the flag came back on, and the panel and the
+        // server swapped states forever with neither booking moving. It also
+        // attached the answer on the decline arm, where nothing it answers happens.
+        if (linkedMoveChoice === "MOVE_BOTH" && linkedMoveSettlementMethod) {
+          body.settlementMethod = linkedMoveSettlementMethod;
+        }
+      }
+
+      const res = await fetch(`/api/bookings/${booking.id}/modify`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        // #4924: the price moved since the preview, so nothing was saved. Say
+        // what changed, keep the edit open and price it again.
+        const freshFigures = readEditPriceChangedFigures(data);
+        if (freshFigures) {
+          setSaveError(editPriceChangedMessage(previewedFigures, freshFigures, format));
+          requote();
+          return;
+        }
+        // #3232, BEFORE the officer's override prompt: a linked-move offer is
+        // raised for the BOOKING'S OWN MEMBER, admin or not, so it must not be
+        // gated on `actingAsAdmin` the way the override prompt is. The two bodies
+        // carry different codes, so only one reader can ever match.
+        const linkedMovePrompt = readHostingCoverageLinkedMovePrompt(data);
+        if (linkedMovePrompt) {
+          setLinkedMoveState({
+            prompt: linkedMovePrompt,
+            proposalSignature: refusedHostingProposalSignature,
+            notifyMemberChoice,
+          });
+          setLinkedMoveChoice(null);
+          setSaveError(
+            "Choose whether to move both bookings or only this one, then save again.",
+          );
+          return;
+        }
+        const hostingPrompt = actingAsAdmin
+          ? readHostingCoverageOverridePrompt(data)
+          : null;
+        if (hostingPrompt) {
+          setHostingOverrideState({
+            prompt: hostingPrompt,
+            proposalSignature: refusedHostingProposalSignature,
+            notifyMemberChoice,
+          });
+          setHostingOverrideConfirmed(false);
+          setHostingOverrideReason("");
+          setSaveError(
+            "Review the affected bookings and nights, then explicitly confirm the private hosting override.",
+          );
+          return;
+        }
+        // The proposal this save attempt actually sent, for any offer its refusal
+        // opens (#2562 re-review). Same rule as the quote path: the offer belongs to
+        // the payload the server refused, and the render comparison retires it the
+        // moment the member proposes something else.
+        const refusedProposalSignature = exceptionProposalSignature(body);
+        const recordExceptionOffer = (offer: ExceptionOffer | null) =>
+          setExceptionOfferState(
+            offer
+              ? { offer, proposalSignature: refusedProposalSignature }
+              : null,
+          );
+        // #2104: the server tripped the no-adult review rule but the local
+        // predicate missed it (client/server drift). Reveal the justification
+        // field, show the message adjacent to it, and bring it into view.
+        if (data.code === "REVIEW_JUSTIFICATION_REQUIRED") {
+          // The effect keyed on serverRequiresJustification scrolls/focuses the
+          // field after it mounts on the next commit.
+          setServerRequiresJustification(true);
+          setReviewJustificationError(
+            data.error ||
+              "Please add a reason so an admin can review this booking.",
+          );
+          return;
+        }
+        // Belt-and-braces (#1668): a stale quote can miss an over-capacity
+        // target the apply then rejects. Re-surface the confirm flow.
+        if (data.code === "OVER_CAPACITY_CONFIRM_REQUIRED") {
+          setSaveOverCapacityNights(
+            Array.isArray(data.nightDetails) ? data.nightDetails : [],
+          );
+          setConfirmOverCapacity(false);
+          setSaveError(
+            data.error ??
+              "These nights are over lodge capacity. Confirm the override to proceed.",
+          );
+          return;
+        }
+        // #2363: the save path now hard-blocks a member whose edited dates
+        // break a minimum-stay rule, and the 400 carries the frozen review.
+        // Surface the rule itself rather than the bare prose so the member can
+        // see which nights and which policy stopped the change — the advisory
+        // banner above may be stale, or absent entirely if the quote never ran.
+        if (data.code === "MINIMUM_STAY_VIOLATION") {
+          const violationMessages: string[] = Array.isArray(data.violations)
+            ? (data.violations as Array<{ message?: unknown }>)
+                .map((violation) => violation?.message)
+                .filter((message): message is string => typeof message === "string")
+            : [];
+          setSaveError(
+            violationMessages.length > 0
+              ? `These dates do not meet the minimum-stay rules, so the change was not saved. ${violationMessages.join(" ")}`
+              : data.error ||
+                  "These dates do not meet the minimum-stay rules, so the change was not saved.",
+          );
+          // #2562: this refusal is exactly what the workflow exists for, so offer
+          // the request — subject, as always, to the shared rule's own gates.
+          recordExceptionOffer(readExceptionOffer(data));
+          return;
+        }
+        // #3451: put the own-dependant question back (and re-read the list it
+        // is drawn from); the server's sentence is shown as the save error.
+        if (isDependantIdentityRefusalCode(data.code)) {
+          dependantIdentity.handleRefusal(data.code);
+        }
+        setSaveError(data.error || "Failed to save changes");
+        // Every other refusal goes through the same shared rule, which answers null
+        // for all of them: the reviewable codes are an explicit allowlist and no
+        // hard-stop code is on it.
+        recordExceptionOffer(readExceptionOffer(data));
+        return;
+      }
+
+      setSaveOverCapacityNights(null);
+      setHostingOverrideState(null);
+      setHostingOverrideConfirmed(false);
+      setHostingOverrideReason("");
+
+      // #2390: same shape as the stale-quote handling above, for the same
+      // reason — the preview and the apply can disagree, and the member must
+      // hear it here rather than from the invoice. Only when it differs from
+      // the sentence they already read before pressing Save; an unchanged
+      // notice is not news and should not hold the panel open.
+      const savedCoverageMessage =
+        typeof data?.promoCoverage?.message === "string"
+          ? (data.promoCoverage.message as string)
+          : null;
+      const holdForCoverage =
+        savedCoverageMessage !== null &&
+        savedCoverageMessage !== (quote?.promoCoverage?.message ?? null);
+
+      // #3179: the edit saved without the promo-code change it carried. Always
+      // held, never compared against the preview — see the state's own note.
+      const savedPromoChangeMessage =
+        typeof data?.promoChangeNotApplied?.message === "string"
+          ? (data.promoChangeNotApplied.message as string)
+          : null;
+
+      // BOTH are set before either return, and the two conditions are evaluated
+      // together rather than as a chain of early exits. The save cannot produce
+      // both today — a parked edit re-runs no cap, so it has no coverage split
+      // to report — but an early return on the first would silently swallow the
+      // second if that ever changed, which is the exact class of bug this whole
+      // change exists to remove.
+      if (holdForCoverage) setSavedPromoCoverage(savedCoverageMessage);
+      if (savedPromoChangeMessage) {
+        setSavedPromoChangeNotApplied(savedPromoChangeMessage);
+      }
+      if (holdForCoverage || savedPromoChangeMessage) {
+        router.refresh();
+        return;
+      }
+
+      router.refresh();
+      onDone();
+    } catch {
+      setSaveError("Failed to save changes");
+    } finally {
+      saveInFlightRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  async function handleSubmitChangeRequest(cardAddGuests: ChangeRequestAddGuest[]) {
+    setRequestError("");
+    setRequestSuccess("");
+    setRequestSubmitting(true);
+
+    try {
+      const body = mergeChangeRequestGuests(buildModificationPayload(), cardAddGuests);
+
+      const res = await fetch(`/api/bookings/${booking.id}/change-requests`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...body,
+          reason: requestReason.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setRequestError(data.error || "Failed to submit request");
+        return false;
+      }
+
+      setRequestReason("");
+      setRequestSuccess("Request sent to admins");
+      return true;
+    } catch {
+      setRequestError("Failed to submit request");
+      return false;
+    } finally {
+      setRequestSubmitting(false);
+    }
+  }
+
+  function isLockedChangeError(message: string) {
+    return /locked|in-progress|check-in cannot be changed/i.test(message);
+  }
+
+  const totalGuestCount = totalGuestCountCandidate();
+  const showChangeRequestPath =
+    (booking.editPolicy.mode === "in-progress" && !hasChanges) ||
+    (hasChanges &&
+      (booking.editPolicy.mode === "future" ||
+        booking.editPolicy.mode === "in-progress") &&
+      (isLockedChangeError(quoteError) || isLockedChangeError(saveError)));
+  const settlementRequired = quote?.settlementOptions?.requiresSettlementMethod ?? false;
+  /**
+   * #3232: the LINKED MOVE needs the card-or-credit choice and this booking's own
+   * quote does not ask for it.
+   *
+   * The chooser in the price summary belongs to THIS booking's money and appears
+   * only when this booking's net is a reduction. The other booking's compelled
+   * move has its own money, so whenever this booking needs no choice — it is
+   * unpaid, or its price went up — and the other one's price falls, the member was
+   * asked to choose a refund or account credit with no control anywhere on the
+   * page, and could then move neither booking. The control is drawn here, directly
+   * above the offer it belongs to.
+   *
+   * IT STAYS IN THE PANEL RATHER THAN MOVING INSIDE THE OFFER COMPONENT, decided
+   * deliberately. The answer travels as the top-level `settlementMethod` field of
+   * the save body, injected after the proposal signature is captured (see the
+   * state slot above for why that is not optional), and the offer component is
+   * presentational with no access to either. Moving the radios inside it would
+   * thread this state through it and change nothing else, so the offer's own money
+   * sentence is worded neutrally about WHERE the choice is made instead — which is
+   * also what makes it true in the bare 409 message a surface without this control
+   * falls back to.
+   */
+  const linkedMoveSettlementRequired =
+    Boolean(activeLinkedMoveState?.prompt.settlementMethodRequired) &&
+    !settlementRequired;
+  /**
+   * #5303 review: the mirror case. This booking's own quote asks, so the linked
+   * control above stays hidden and the price summary's one radio answers for the
+   * linked bookings too; its label must cover their refund route as well.
+   */
+  const priceSummaryLinkedRefundRoute =
+    settlementRequired &&
+    activeLinkedMoveState?.prompt.settlementMethodRequired &&
+    linkedMoveChoice !== "LEAVE_UNCOVERED"
+      ? activeLinkedMoveState.prompt.refundRoute
+      : null;
+
+  // Issue #1668: over-capacity under an admin override is a confirmable warning,
+  // not a hard block. The signal can come from the quote (preview) or from a
+  // stale-quote apply 409 (saveOverCapacityNights).
+  const overCapacityConfirmActive =
+    Boolean(quote?.overCapacityConfirmRequired) || Boolean(saveOverCapacityNights);
+  // #2930: no client re-filter — both sources ARE `overCapacityNights()` output
+  // already, and that one home is what excludes held nights (`INV-SSOT-001`).
+  const overCapacityNightList = quote?.overCapacityConfirmRequired
+    ? quote.nightDetails ?? []
+    : saveOverCapacityNights ?? [];
+  const capacityOk = quote
+    ? overCapacityConfirmActive
+      ? confirmOverCapacity
+      : quote.capacityAvailable
+    : false;
+  const showQuoteSummary = Boolean(
+    quote && (quote.capacityAvailable || (overCapacityConfirmActive && confirmOverCapacity)),
+  );
+
+  return (
+    <div className="space-y-6">
+      {/* Admin override (issue #1668) */}
+      {adminOverrideAvailable && (
+        <AdminOverrideCard
+          overrideEnabled={overrideEnabled}
+          overridePricingMode={overridePricingMode}
+          onOverrideEnabledChange={handleOverrideEnabledChange}
+          onPricingModeChange={handleOverridePricingModeChange}
+        />
+      )}
+
+      {/* Dates */}
+      <EditDatesCard
+        checkIn={checkIn}
+        checkOut={checkOut}
+        bookingCheckIn={booking.checkIn}
+        bookingCheckOut={booking.checkOut}
+        today={today}
+        minEditableDate={minEditableDate}
+        overrideEnabled={overrideEnabled}
+        checkInLocked={checkInLocked}
+        isInProgressEdit={isInProgressEdit}
+        shiftMode={shiftMode}
+        originalNights={originalNights}
+        onCheckInChange={handleCheckInChange}
+        onCheckOutChange={handleCheckOutChange}
+      />
+
+      {/* Guests */}
+      <EditGuestsCard
+        booking={booking}
+        ageTierOptions={ageTierOptions}
+        memberGuestTriggerRef={memberGuestTriggerRef}
+        mode={{
+          overrideEnabled,
+          isInProgressEdit,
+          minEditableDate,
+          checkIn,
+          checkOut,
+          nonMemberGuestNamesEditable,
+          memberLinkEnabled,
+        }}
+        party={{
+          remainingGuests,
+          addedGuests,
+          removedGuestIds,
+          totalGuestCount,
+        }}
+        memberGuest={{
+          finderOpen: memberGuestFinderOpen,
+          addError: memberGuestAddError,
+          lastAttempt: lastMemberGuestAttempt,
+          onToggleFinder: () => setMemberGuestFinderOpen((open) => !open),
+          onAdd: (candidate) => {
+            setLastMemberGuestAttempt(candidate);
+            handleAddMemberGuest(candidate);
+            closeMemberGuestFinder();
+          },
+          onCancel: closeMemberGuestFinder,
+        }}
+        otherLodge={{
+          available: otherLodgeRate.available,
+          lodges: otherLodgeRate.lodges,
+          enabled: otherLodgeRate.enabled,
+          lodgeId: otherLodgeRate.lodgeId,
+          flaggedGuestIds: otherLodgeRate.flaggedGuestIds,
+          eligibleGuestIds: otherLodgeRate.eligibleGuestIds,
+          guestTicksEnabled: otherLodgeRate.guestTicksEnabled,
+          quotedGuestPriceCents,
+          onEnabledChange: otherLodgeRate.onEnabledChange,
+          onLodgeIdChange: otherLodgeRate.onLodgeIdChange,
+          onGuestToggle: otherLodgeRate.onGuestToggle,
+        }}
+        memberLink={{
+          linkFinderGuestId,
+          linkedGuestMembers,
+          onStartLink: setLinkFinderGuestId,
+          onLink: handleLinkGuestToMember,
+          onUnlink: handleUnlinkGuest,
+          onCancelLink: () => setLinkFinderGuestId(null),
+        }}
+        quickAdd={{
+          familyMembers,
+          partnerCandidates,
+          onAddFamilyMember: handleAddFamilyMember,
+          onAddPartnerCandidate: handleAddPartnerCandidate,
+        }}
+        dateModes={{
+          canEditPerGuestDates,
+          perGuestDatesEnabled,
+          multiDateRangesEnabled,
+          existingGuestNights,
+          onPerGuestDatesChange: setPerGuestDatesEnabled,
+          onMultiDateRangesChange: handleMultiDateRangesChange,
+          onToggleNight: handleToggleGuestNight,
+          getExistingGuestRange,
+          onUpdateExistingGuestRange: updateExistingGuestRange,
+          onUpdateAddedGuestRange: updateAddedGuestRange,
+        }}
+        guestEdits={{
+          getGuestNameEdit,
+          onUpdateGuestName: updateGuestName,
+          onRemoveGuest: handleRemoveGuest,
+          onUndoRemoveGuest: handleUndoRemoveGuest,
+          onRemoveAddedGuest: handleRemoveAddedGuest,
+        }}
+        addForm={{
+          open: showAddForm,
+          firstName: addFirstName,
+          lastName: addLastName,
+          ageTier: addAgeTier,
+          onOpen: () => setShowAddForm(true),
+          onFirstNameChange: setAddFirstName,
+          onLastNameChange: setAddLastName,
+          onAgeTierChange: setAddAgeTier,
+          onAdd: handleAddGuest,
+          onCancel: () => setShowAddForm(false),
+        }}
+        dependantIdentityQuestion={
+          <EditDependantIdentityQuestion
+            bookingId={booking.id}
+            speaksOnBehalf={dependantIdentitySpeaksOnBehalf({
+              actorIsAdmin: actingAsAdmin,
+              // The owner's own panel, whatever their role (#3451 review):
+              // ownership, as the server decides it.
+              actorId: booking.viewerIsBookingOwner
+                ? bookingOwner(booking).memberId
+                : undefined,
+              ownerMemberId: bookingOwner(booking).memberId ?? null,
+            })}
+            answers={dependantIdentity}
+            familyMembers={familyMembers}
+            party={[...remainingGuests, ...addedGuests]}
+          />
+        }
+      />
+
+      {/* Promo Code(s) */}
+      {!promoLocked && (
+        <PromoCodeCard
+          bookingId={booking.id}
+          promo={booking.promo}
+          promoLines={booking.promoLines}
+          appliedPromoList={appliedPromoList}
+          onPromoListChange={handlePromoListChange}
+          onKeepPromoList={retirePromoSelection}
+          promoAdjustmentCents={booking.promoAdjustmentCents}
+          promoAction={promoAction}
+          availablePromoCodes={availablePromoCodes}
+          appliedNewPromo={appliedNewPromo}
+          prefillPromoCode={prefillPromoCode}
+          guestStays={guestStays}
+          remainingGuests={remainingGuests}
+          addedGuests={addedGuests}
+          quote={quote}
+          forMemberId={
+            booking.viewerRole === "ADMIN" ? bookingOwner(booking).memberId : undefined
+          }
+          lodgeId={booking.lodgeId}
+          editRerates={editRerates}
+          onRemovePromo={() => setPromoAction({ type: "remove" })}
+          onKeepPromo={() => setPromoAction({ type: "keep" })}
+          onPrefillCode={setPrefillPromoCode}
+          onPromoApplied={handleNewPromoApplied}
+        />
+      )}
+
+      {creditCardVisible && (
+        <AccountCreditCard
+          actingAsAdmin={actingAsAdmin}
+          ledgerAppliedCreditCents={ledgerAppliedCreditCents}
+          availableCreditCents={availableCreditCents}
+          uncoveredPriceCents={uncoveredPriceCents}
+          useCredit={useCredit}
+          desiredElectionCents={desiredElectionCents}
+          creditChanged={creditChanged}
+          storedElectionCents={storedElectionCents}
+          onUseCreditChange={(checked) => {
+            setUseCredit(checked);
+            setCreditTouched(true);
+          }}
+        />
+      )}
+
+      {/* Price Summary — #4533: not on a finished stay, whose edit cannot be
+          quoted; the finished-stay card below says why instead. */}
+      {hasChanges && !finishedStayLocked && (
+        <PriceSummaryCard
+          quote={quote}
+          quoteLoading={quoteLoading}
+          quoteError={quoteError}
+          bookingFinalPriceCents={booking.finalPriceCents}
+          promo={booking.promo}
+          promoAction={promoAction}
+          overCapacityConfirmActive={overCapacityConfirmActive}
+          overCapacityNightList={overCapacityNightList}
+          confirmOverCapacity={confirmOverCapacity}
+          showQuoteSummary={showQuoteSummary}
+          ledgerAppliedCreditCents={ledgerAppliedCreditCents}
+          useCredit={useCredit}
+          desiredElectionCents={desiredElectionCents}
+          actingAsAdmin={actingAsAdmin}
+          settlementMethod={settlementMethod}
+          onConfirmOverCapacityChange={setConfirmOverCapacity}
+          onSettlementMethodChange={setSettlementMethod}
+          linkedMoveRefundRoute={priceSummaryLinkedRefundRoute}
+        />
+      )}
+
+      {finishedStayLocked && hasChanges ? (
+        <FinishedStayPromoCorrectionCard
+          bookingId={booking.id}
+          promoChange={promoActionAsCorrection(promoAction, remainingGuests)}
+          otherChanges={hasNonPromoChanges}
+          promoRemoved={promoAction.type === "remove"}
+        />
+      ) : null}
+
+      {showChangeRequestPath && (
+        <ChangeRequestCard
+          reason={requestReason}
+          submitting={requestSubmitting}
+          error={requestError}
+          success={requestSuccess}
+          hasEditorChanges={hasChanges}
+          editorChanges={buildModificationPayload()}
+          guestContext={{ booking, ageTierOptions, familyMembers }}
+          onReasonChange={setRequestReason}
+          onSubmit={handleSubmitChangeRequest}
+        />
+      )}
+
+      {/* #2104: required justification when the edit leaves minors with no adult.
+          Rendered above the save footer; the inline error sits with the field
+          (not the bottom saveError slot) so a member cannot miss it. */}
+      {showReviewJustification && (
+        <ReviewJustificationField
+          value={memberReviewJustification}
+          error={reviewJustificationError}
+          fieldRef={reviewJustificationRef}
+          onChange={setMemberReviewJustification}
+          onClearError={() => setReviewJustificationError("")}
+        />
+      )}
+
+      {/* #2390: the save came back saying the promotion reaches fewer people
+          than the preview did — another booking took the last slot between the
+          two reads. The change IS saved, so Save is replaced by an
+          acknowledgement rather than offered again; the member reads why their
+          total differs here, at the edit, instead of on the invoice. */}
+      {savedPromoCoverage || savedPromoChangeNotApplied ? (
+        <div className="space-y-3">
+          {savedPromoCoverage ? (
+            <div
+              className="rounded-md bg-warning-3 p-3 text-sm text-warning-11"
+              role="status"
+              data-testid="saved-promo-coverage-notice"
+            >
+              <p className="font-medium">Your change is saved</p>
+              <p className="mt-1">{savedPromoCoverage}</p>
+            </div>
+          ) : null}
+          {/* #3179: the promo-code half of the request did not happen. The
+              heading says so before the sentence does, because "Your change is
+              saved" on its own is exactly the impression the owner named as
+              the cost of this decision. */}
+          {savedPromoChangeNotApplied ? (
+            <div
+              className="rounded-md bg-warning-3 p-3 text-sm text-warning-11"
+              role="status"
+              data-testid="saved-promo-change-not-applied-notice"
+            >
+              <p className="font-medium">
+                {promoChangeNotAppliedHeading("saved")}
+              </p>
+              <p className="mt-1">{savedPromoChangeNotApplied}</p>
+            </div>
+          ) : null}
+          <div className="flex gap-3">
+            <Button onClick={onDone}>Done</Button>
+          </div>
+        </div>
+      ) : (
+        <>
+          {linkedMoveSettlementRequired &&
+          linkedMoveChoice !== "LEAVE_UNCOVERED" ? (
+            <LinkedMoveSettlementMethod
+              prompt={activeLinkedMoveState?.prompt ?? null}
+              method={linkedMoveSettlementMethod}
+              disabled={saving}
+              onChange={setLinkedMoveSettlementMethod}
+            />
+          ) : null}
+          <HostingCoverageLinkedMovePrompt
+            prompt={activeLinkedMoveState ? activeLinkedMoveState.prompt : null}
+            choice={linkedMoveChoice}
+            disabled={saving}
+            busy={saving}
+            idPrefix={`edit-booking-${booking.id}`}
+            onChoiceChange={setLinkedMoveChoice}
+          />
+          <HostingCoverageOverridePrompt
+            prompt={
+              actingAsAdmin && activeHostingOverrideState
+                ? activeHostingOverrideState.prompt
+                : null
+            }
+            confirmed={hostingOverrideConfirmed}
+            reason={hostingOverrideReason}
+            disabled={saving}
+            idPrefix={`edit-booking-${booking.id}-hosting-override`}
+            onConfirmedChange={setHostingOverrideConfirmed}
+            onReasonChange={setHostingOverrideReason}
+          />
+          {/* Action buttons */}
+          <div className="flex gap-3">
+            <Button variant="outline" onClick={onDone}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSaveClick}
+              disabled={
+                !hasChanges ||
+                // #4533: said by the finished-stay card above, never silent.
+                finishedStayLocked ||
+                saving ||
+                quoteLoading ||
+                !quote ||
+                !capacityOk || Boolean(quote.chargeRefusal) /* #3653 */ || Boolean(quote.priceChangeRefusal) /* #3949 */ ||
+                (settlementRequired && !settlementMethod) ||
+                (linkedMoveSettlementRequired &&
+                  linkedMoveChoice === "MOVE_BOTH" &&
+                  !linkedMoveSettlementMethod) ||
+                // #3232: no arm chosen is not a save. Matching the officer-override
+                // arm below rather than the weaker bottom-slot error it used to
+                // take: that slot is where a member is LEAST likely to notice, it
+                // renders below Save while the radios sit above it, and the offer
+                // component's own docblock already promised this mechanism.
+                (Boolean(activeLinkedMoveState) && !linkedMoveChoice) ||
+                (Boolean(activeHostingOverrideState) &&
+                  (!hostingOverrideConfirmed ||
+                    hostingOverrideReason.trim().length < 10))
+              }
+            >
+              {saving
+                ? "Saving..."
+                : activeHostingOverrideState
+                  ? "Confirm hosting override and save"
+                  : "Save Changes"}
+            </Button>
+          </div>
+
+          {/* #3232: PERMANENTLY MOUNTED ASSERTIVE REGION, for the reason both
+              hosting prompts give — inserting an already-populated role=alert is
+              missed by some screen-reader and browser pairs. Before this, a member
+              using a screen reader pressed Save, the server refused, and nothing
+              was announced at all. */}
+          <div role="alert" aria-atomic="true">
+            {saveError && (
+              <div className="rounded-md bg-danger-3 p-3 text-sm text-danger-11">{saveError}</div>
+            )}
+          </div>
+
+          {/* #2562 — the exception-request door, drawn ONLY when the server's own
+              refusal said every blocking failure is reviewable. It sits under Save
+              because at this point saving cannot succeed: the member's next honest
+              move is to change the proposal or to ask. */}
+          {exceptionOffer ? (
+            <RequestOfficerApprovalCard
+              source="MODIFICATION"
+              offer={exceptionOffer}
+              replaceRequestId={replaceExceptionRequestId}
+              onSubmit={submitExceptionRequest}
+              proposal={{
+                lodgeName: null,
+                checkIn,
+                checkOut,
+                envelopeNightCount: countNightsDateOnly(
+                  parseDateOnly(checkIn),
+                  parseDateOnly(checkOut),
+                ),
+                base: {
+                  checkIn: booking.checkIn,
+                  checkOut: booking.checkOut,
+                  guestCount: booking.guests.length,
+                },
+                // The server's own figure when it produced one, and ONLY when the
+                // request carries everything that figure was priced on. A refusal
+                // answered INSTEAD of a quote leaves this null; so does a quote
+                // whose payload included a promo, a credit election or anything
+                // else the proposal drops (#2562 review) — `netChargeCents` bakes
+                // those in, so it is not the number an approval would produce. In
+                // both cases the card falls back to saying how pricing actually
+                // works rather than showing a figure nobody will ever charge.
+                priceImpact:
+                  quote && !exceptionOmissions.omitsPricedChange
+                    ? {
+                        label:
+                          quote.netChargeCents >= 0
+                            ? "Extra to pay if this is approved"
+                            : "Refund due if this is approved",
+                        amountCents: Math.abs(quote.netChargeCents),
+                      }
+                    : null,
+                omittedChanges: exceptionOmissions.omittedChanges,
+                guests: [
+                  ...remainingGuests.map((guest) => ({
+                    firstName: guest.firstName,
+                    lastName: guest.lastName,
+                    ageTierLabel:
+                      ageTierOptions.find((option) => option.tier === guest.ageTier)
+                        ?.label ?? guest.ageTier,
+                    isMember: guest.isMember,
+                    nights: existingGuestNights[guest.id] ?? [],
+                    stay:
+                      guest.stayStart && guest.stayEnd
+                        ? { start: guest.stayStart, end: guest.stayEnd }
+                        : null,
+                  })),
+                  ...addedGuests.map((guest) => ({
+                    firstName: guest.firstName,
+                    lastName: guest.lastName,
+                    ageTierLabel:
+                      ageTierOptions.find((option) => option.tier === guest.ageTier)
+                        ?.label ?? guest.ageTier,
+                    isMember: guest.isMember,
+                    nights: guest.nights ?? [],
+                    stay:
+                      guest.stayStart && guest.stayEnd
+                        ? { start: guest.stayStart, end: guest.stayEnd }
+                        : null,
+                  })),
+                ],
+              }}
+            />
+          ) : null}
+        </>
+      )}
+
+      {/* Owner decision (#1668/#1696): the admin explicitly chooses, per edit,
+          whether the member is emailed. Both choices save the booking; the
+          choice itself is recorded in the audit log.
+
+          #2259: with the booking's "No emails" switch on there is no choice to
+          make — the mailer withholds the change notification either way — so
+          the dialog states that and offers only the send-nothing action. */}
+      <NotifyChoiceDialog
+        open={notifyDialogOpen}
+        onOpenChange={setNotifyDialogOpen}
+        submitting={saving}
+        title={
+          noEmailsOn ? "Save this change?" : "Email the member about this change?"
+        }
+        description={
+          noEmailsOn
+            ? "The booking will be updated."
+            : "The booking will be updated either way. Choose whether the member receives the standard change-notification email — your choice is recorded in the audit log."
+        }
+        notice={noEmailsOn ? <BookingNoEmailsNotice /> : null}
+        actions={
+          noEmailsOn
+            ? {
+                kind: "single",
+                action: {
+                  label: "Save changes",
+                  variant: "outline",
+                  onSelect: () => {
+                    setNotifyDialogOpen(false);
+                    // #2259 H1: with the switch on, send NO choice rather than
+                    // notifyMember:false. `false` makes the route skip the
+                    // send, so the mailer's gate never runs and no withheld row
+                    // is recorded — the banner would then omit the very change
+                    // just made.
+                    void handleSave(undefined);
+                  },
+                },
+              }
+            : {
+                kind: "choice",
+                withoutEmail: {
+                  label: "Save without emailing",
+                  variant: "outline",
+                  onSelect: () => {
+                    setNotifyDialogOpen(false);
+                    void handleSave(false);
+                  },
+                },
+                withEmail: {
+                  label: "Save and email member",
+                  onSelect: () => {
+                    setNotifyDialogOpen(false);
+                    void handleSave(true);
+                  },
+                },
+              }
+        }
+      />
+    </div>
+  );
+}

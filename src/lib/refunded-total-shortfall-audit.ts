@@ -1,0 +1,273 @@
+/**
+ * Read-only audit of payments whose stored refunded total is BELOW what the
+ * books say left the payment (#3640).
+ *
+ * Before #3640 a Stripe card refund was folded into `refundedAmountCents` with
+ * `max(stored, card refunds on record)`, so a card refund made AFTER an
+ * account-credit settlement vanished from the total: $100 credit then a $50
+ * card refund stored $100, not $150. #3640 stops new cases (`INV-PAY-103`) and
+ * does not touch old ones. This lists them, so the owner can decide on a repair
+ * with the evidence in front of them.
+ *
+ * For each captured payment:
+ *
+ *   expected floor = min(captured, counted card refunds + account-credit dispositions
+ *                        + "Paid another way" bank cash + card refund shortfalls paid back)
+ *   shortfall      = expected floor - stored refunded total   (reported when > 0)
+ *
+ * - Counted card refunds: the payment's `PaymentRefund` rows in a counted status
+ *   (`isRecordedRefundStatus`), the same rows the mirror's own writer counts.
+ * - Account-credit dispositions: `ACCOUNT_CREDIT_DISPOSITION_WHERE`, the one
+ *   definition `stripe-cash-refund-evidence.ts` also reads.
+ * - #4280, #4488: the bank cash a card refund's bank records hold - "Paid
+ *   another way" closes and completed card refund shortfalls, a cancel's or a
+ *   capacity race's (`readCardRefundBankCashByPayment`), the one reader the
+ *   card-refund writer's floor also reads. Before #4280 (a close) and #4488 (a
+ *   shortfall) a late card refund's failure could take that cash out of the
+ *   total; such a payment is listed here, short for another reason, and never
+ *   rewritten by code.
+ *
+ * It is a FLOOR, not an identity: the mirror also carries value no row records
+ * (pre-ledger card refunds, #1491's folded modification credit notes), so a
+ * stored total ABOVE the floor is normal and never reported. A shortfall is a
+ * payment whose refundable headroom is overstated by that amount - the money a
+ * later cancel or refund could pay out a second time.
+ *
+ * ATTRIBUTION. The old `max` could lose money only where a card refund met a
+ * credit, and at most the smaller of the two. So only
+ * `min(card refunds, account credit, shortfall)`, and only with a card refund,
+ * is attributed to it. Anything more is reported apart, as short for ANOTHER
+ * reason: the credit rows are chosen by type, and some were never folded into
+ * the mirror at all - a credit minted with no payment, or internet-banking cash
+ * that landed on an already-cancelled booking and became credit. The other
+ * cause: a card refund the old arithmetic never added (it met a credit) that
+ * later FAILED - its row no longer counts, so nothing card-side is left to
+ * attribute. Since #3640 the writer's floor stops such a subtraction going
+ * below the credit, so this can only predate the fix. Those need a person's
+ * reading, not the #3640 repair. So does (#4280, #4488) any part of a
+ * shortfall only a close's or a paid-back card refund shortfall's bank cash
+ * explains: attribution is measured against the floor without either, so a
+ * payment's #3640 figure is what it was before.
+ *
+ * REPORT ONLY - IT NEVER WRITES AND NEVER REPAIRS. It issues typed SELECTs
+ * through Prisma (`INV-OPS-001`), and calls no provider. #4280: in ONE
+ * read-only snapshot (`withReadOnlySnapshot`), so a refund, credit or close
+ * committing between its reads cannot pair a stored total from before it with
+ * evidence from after it and report a shortfall that never was.
+ */
+import type { Prisma } from "@prisma/client";
+
+import { CAPTURED_PAYMENT_STATUS_LIST } from "@/lib/booking-payment-state";
+import type { ClubFormat } from "@/lib/club-format";
+import {
+  type CardRefundBankCash,
+  expectedRefundedFloorCents,
+  isRecordedRefundStatus,
+  NO_CARD_REFUND_BANK_CASH,
+} from "@/lib/payment-transaction-status";
+import { prisma } from "@/lib/prisma";
+import { readCardRefundBankCashByPayment } from "@/lib/card-refund-paid-another-way-cash";
+import { withReadOnlySnapshot } from "@/lib/read-only-snapshot";
+import { ACCOUNT_CREDIT_DISPOSITION_WHERE } from "@/lib/stripe-cash-refund-evidence";
+import { formatCents } from "@/lib/utils";
+
+/**
+ * #4280, #4488: with the bank cash its card refund's bank records hold, by kind
+ * (`paidAnotherWayCents`, `shortfallPaybackCents`).
+ */
+export interface RefundedTotalShortfallRow extends CardRefundBankCash {
+  paymentId: string;
+  bookingId: string;
+  amountCents: number;
+  refundedAmountCents: number;
+  /** Counted `PaymentRefund` rows on the payment. */
+  cardRefundCents: number;
+  /** Account-credit dispositions sourced from the payment's booking. */
+  accountCreditCents: number;
+}
+
+export interface RefundedTotalShortfallFinding extends RefundedTotalShortfallRow {
+  expectedFloorCents: number;
+  shortfallCents: number;
+  /** The part the old refund arithmetic can account for (see ATTRIBUTION). */
+  attributableCents: number;
+  /** The rest: short for another reason. */
+  unattributedCents: number;
+}
+
+export interface RefundedTotalShortfallAuditResult {
+  scannedPayments: number;
+  findings: RefundedTotalShortfallFinding[];
+  totalAttributableCents: number;
+  totalUnattributedCents: number;
+}
+
+export function deriveRefundedTotalShortfall(
+  row: RefundedTotalShortfallRow
+): RefundedTotalShortfallFinding | null {
+  const expectedFloorCents = expectedRefundedFloorCents({ ...row, bankCash: row });
+  const shortfallCents = expectedFloorCents - row.refundedAmountCents;
+  if (shortfallCents <= 0) {
+    return null;
+  }
+  // #4280, #4488: only the shortfall below the floor WITHOUT the card refunds'
+  // bank cash is the old arithmetic's to explain; what that cash adds is
+  // another reason.
+  const shortfallBeforeBankCashCents =
+    expectedRefundedFloorCents({ ...row, bankCash: NO_CARD_REFUND_BANK_CASH }) - row.refundedAmountCents;
+  const attributableCents =
+    row.cardRefundCents > 0
+      ? Math.max(0, Math.min(row.cardRefundCents, row.accountCreditCents, shortfallBeforeBankCashCents))
+      : 0;
+  return {
+    ...row,
+    expectedFloorCents,
+    shortfallCents,
+    attributableCents,
+    unattributedCents: shortfallCents - attributableCents,
+  };
+}
+
+export async function auditRefundedTotalShortfalls(options?: {
+  db?: typeof prisma;
+}): Promise<RefundedTotalShortfallAuditResult> {
+  // A whole-table read: give it room, and fail rather than queue forever.
+  return withReadOnlySnapshot(options?.db ?? prisma, auditInSnapshot, { maxWait: 10_000, timeout: 120_000 });
+}
+
+async function auditInSnapshot(db: Prisma.TransactionClient): Promise<RefundedTotalShortfallAuditResult> {
+  const payments = await db.payment.findMany({
+    where: {
+      // A payment that has captured money, and so can have a refunded total
+      // at all: the aggregate's one captured list (#3635 F3, INV-SSOT).
+      status: { in: [...CAPTURED_PAYMENT_STATUS_LIST] },
+      amountCents: { gt: 0 },
+    },
+    select: {
+      id: true,
+      bookingId: true,
+      amountCents: true,
+      refundedAmountCents: true,
+    },
+    orderBy: { id: "asc" },
+  });
+
+  const refundGroups = await db.paymentRefund.groupBy({
+    by: ["paymentId", "status"],
+    _sum: { amountCents: true },
+  });
+  const cardRefundCentsByPayment = new Map<string, number>();
+  for (const group of refundGroups) {
+    if (!isRecordedRefundStatus(group.status)) continue;
+    cardRefundCentsByPayment.set(
+      group.paymentId,
+      (cardRefundCentsByPayment.get(group.paymentId) ?? 0) +
+        Math.max(0, group._sum.amountCents ?? 0)
+    );
+  }
+
+  const creditGroups = await db.memberCredit.groupBy({
+    by: ["sourceBookingId"],
+    where: { ...ACCOUNT_CREDIT_DISPOSITION_WHERE, sourceBookingId: { not: null } },
+    _sum: { amountCents: true },
+  });
+  const accountCreditCentsByBooking = new Map<string, number>();
+  for (const group of creditGroups) {
+    if (!group.sourceBookingId) continue;
+    accountCreditCentsByBooking.set(
+      group.sourceBookingId,
+      Math.max(0, group._sum.amountCents ?? 0)
+    );
+  }
+
+  const bankCashByPayment = await readCardRefundBankCashByPayment(db, "all");
+
+  const result: RefundedTotalShortfallAuditResult = {
+    scannedPayments: payments.length,
+    findings: [],
+    totalAttributableCents: 0,
+    totalUnattributedCents: 0,
+  };
+  for (const payment of payments) {
+    const finding = deriveRefundedTotalShortfall({
+      paymentId: payment.id,
+      bookingId: payment.bookingId,
+      amountCents: payment.amountCents,
+      refundedAmountCents: payment.refundedAmountCents,
+      cardRefundCents: cardRefundCentsByPayment.get(payment.id) ?? 0,
+      accountCreditCents: accountCreditCentsByBooking.get(payment.bookingId) ?? 0,
+      ...(bankCashByPayment.get(payment.id) ?? NO_CARD_REFUND_BANK_CASH),
+    });
+    if (finding) {
+      result.findings.push(finding);
+      result.totalAttributableCents += finding.attributableCents;
+      result.totalUnattributedCents += finding.unattributedCents;
+    }
+  }
+  result.findings.sort(
+    (a, b) =>
+      b.attributableCents - a.attributableCents ||
+      b.shortfallCents - a.shortfallCents ||
+      a.paymentId.localeCompare(b.paymentId)
+  );
+  return result;
+}
+
+export function formatRefundedTotalShortfallReport(
+  result: RefundedTotalShortfallAuditResult,
+  format: ClubFormat
+): string {
+  const attributed = result.findings.filter((finding) => finding.attributableCents > 0);
+  const other = result.findings.filter((finding) => finding.unattributedCents > 0);
+  const describe = (finding: RefundedTotalShortfallFinding) =>
+    `(captured ${formatCents(finding.amountCents, format)}, stored refunded ${formatCents(finding.refundedAmountCents, format)},` +
+    ` card refunds ${formatCents(finding.cardRefundCents, format)}, account credit ${formatCents(finding.accountCreditCents, format)},` +
+    ` paid another way ${formatCents(finding.paidAnotherWayCents, format)},` +
+    ` card refund shortfall paid back ${formatCents(finding.shortfallPaybackCents, format)})`;
+
+  const lines = [
+    "Refunded-total shortfall audit (#3640, INV-PAY-103) - read only",
+    "",
+    `${result.scannedPayments} captured payment(s) scanned.`,
+    `${attributed.length} short because a card refund met an account credit under the old refund arithmetic, ${formatCents(result.totalAttributableCents, format)} in all.`,
+    `${other.length} short for another reason, ${formatCents(result.totalUnattributedCents, format)} in all - not caused by the old arithmetic.`,
+  ];
+  if (attributed.length > 0) {
+    lines.push("", "## Short because of the old refund arithmetic (#3640)");
+    for (const finding of attributed) {
+      lines.push(
+        `  ${finding.paymentId}  booking ${finding.bookingId}  short ${formatCents(finding.attributableCents, format)}  ${describe(finding)}`
+      );
+    }
+  }
+  if (other.length > 0) {
+    lines.push(
+      "",
+      "## Short for another reason - read before acting",
+      "  Any of these, which the figures alone cannot tell apart:",
+      "  - a credit here was never folded into the refunded total (a credit minted with no",
+      "    payment, or internet-banking cash that became credit on a cancelled booking);",
+      "  - a card refund the old arithmetic never added later failed and was taken out;",
+      "  - (#4280) a late card refund failed after a Paid another way close and took the close's",
+      "    bank cash with it;",
+      "  - (#4488) a late card refund failed after a card refund shortfall was paid back by bank",
+      "    and took that bank cash with it;",
+      "  - a #3640 loss that a later close's or shortfall's cash masked: it counts here, not above;",
+      "  - on a payment with several charges, a close and a counted card refund that paid the same",
+      "    charge (the member paid twice): see Stuck States' \"paid twice\" list. A late card refund",
+      "    still pending is transient - re-run once Stripe settles it."
+    );
+    for (const finding of other) {
+      lines.push(
+        `  ${finding.paymentId}  booking ${finding.bookingId}  short ${formatCents(finding.unattributedCents, format)}  ${describe(finding)}`
+      );
+    }
+  }
+  if (result.findings.length > 0) {
+    lines.push(
+      "",
+      "Each shortfall is refundable headroom that may not really be there. Nothing here is repaired; a person decides."
+    );
+  }
+  return lines.join("\n");
+}

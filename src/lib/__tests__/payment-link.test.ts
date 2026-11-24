@@ -1,0 +1,2708 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { BookingEventType, BookingStatus, PaymentStatus } from "@prisma/client";
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    paymentLink: {
+      findUnique: vi.fn(),
+      findFirst: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+      create: vi.fn(),
+    },
+    payment: {
+      upsert: vi.fn(),
+      // #3638: the attach re-reads the payment's source under lock(1).
+      findUnique: vi.fn(),
+      // #4145: a card refund closed "Paid another way" reads what its payment's refunds made.
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    booking: {
+      findUnique: vi.fn(),
+    },
+    // #3750: the link charges what the booking owes, net of applied credit.
+    memberCredit: {
+      aggregate: vi.fn().mockResolvedValue({ _sum: { amountCents: null } }),
+    },
+    // #2258: the withheld-send audit row (written at most once per booking).
+    emailLog: {
+      findFirst: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({ id: "emaillog-1" }),
+    },
+    bookingEvent: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    lodge: {
+      findFirst: vi.fn().mockResolvedValue({ id: "lodge-1" }),
+    },
+    // #4097: a cancelled booking's card refund shortfall tasks; none here.
+    manualRefundTask: {
+      findMany: vi.fn().mockResolvedValue([]),
+      count: vi.fn().mockResolvedValue(0),
+      // #4145, #4516: a card refund row's "Paid another way" close record, and a still-owed rest's.
+      findFirst: vi.fn().mockResolvedValue(null),
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+    // #4300: the superseded-intent check reads the intent's own ledger row; none by default.
+    paymentTransaction: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+    paymentRecoveryOperation: {
+      // #4300: the superseded-intent check before a succeeded intent settles; none by default.
+      findFirst: vi.fn().mockResolvedValue(null),
+      findUnique: vi.fn().mockResolvedValue(null),
+      // #4125: a cancelled booking's card refund rows; none here.
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    $transaction: vi.fn(),
+    $executeRaw: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/stripe", () => ({
+  createPaymentIntent: vi.fn(),
+  findOrCreateCustomer: vi.fn(),
+  getPaymentIntent: vi.fn(),
+  // #3638: a refused attach cancels the intent it minted.
+  cancelPaymentIntentIfCancellableWithResult: vi.fn().mockResolvedValue({
+    paymentIntent: { id: "pi_orphan", status: "canceled" },
+    canceled: true,
+  }),
+}));
+
+vi.mock("@/lib/email", () => ({
+  // #2265 (#2319 door 1): the operator alert raised when a link refuses a
+  // booking that still carries an unconsumed credit election.
+  sendAdminPaymentFailureAlert: vi.fn().mockResolvedValue(undefined),
+  sendBookingRequestApprovedEmail: vi
+    .fn()
+    .mockResolvedValue({ status: "sent", emailLogId: "log-1", messageId: null }),
+  sendSplitGuestPaymentLinkEmail: vi
+    .fn()
+    .mockResolvedValue({ status: "sent", emailLogId: "log-2", messageId: null }),
+}));
+
+vi.mock("@/lib/payment-reconciliation", () => ({
+  markBookingPaymentSucceeded: vi.fn(),
+}));
+
+vi.mock("@/lib/booking-payment-cleanup", () => ({
+  queueSupersededPrimaryIntentCancellations: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("@/lib/payment-transactions", () => ({
+  findPaymentTransactionByIntentId: vi.fn().mockResolvedValue(null),
+  upsertPaymentIntentTransaction: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("@/lib/capacity", () => ({
+  checkCapacityForGuestRanges: vi.fn(),
+  acquireLodgeCapacityLock: vi.fn().mockResolvedValue(undefined),
+}));
+
+const { loadEffectiveModuleFlagsMock, queueXeroInvoiceForPaidBookingMock } = vi.hoisted(() => ({
+  loadEffectiveModuleFlagsMock: vi.fn(),
+  queueXeroInvoiceForPaidBookingMock: vi.fn(),
+}));
+// Partial-mock so the module's other exports stay intact for transitive imports.
+vi.mock("@/lib/module-settings", async () => {
+  const actual = (await vi.importActual("@/lib/module-settings")) as typeof import("@/lib/module-settings");
+  return { ...actual, loadEffectiveModuleFlags: loadEffectiveModuleFlagsMock };
+});
+
+vi.mock("@/lib/xero-booking-invoice-queue", () => ({
+  queueXeroInvoiceForPaidBooking: queueXeroInvoiceForPaidBookingMock,
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
+
+// #3567: the club's format is resolved through this double so a test can make
+// the club's currency one no card can be charged in. Its default (beforeEach
+// below) is the house fixture, so every other case reads the format it always did.
+const clubFormatMock = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/club-format-server", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/club-format-server")),
+  clubFormatValues: (...a: unknown[]) => clubFormatMock(...a),
+}));
+
+import { prisma } from "@/lib/prisma";
+import {
+  cancelPaymentIntentIfCancellableWithResult,
+  createPaymentIntent,
+  findOrCreateCustomer,
+  getPaymentIntent,
+} from "@/lib/stripe";
+import { markBookingPaymentSucceeded } from "@/lib/payment-reconciliation";
+import {
+  BELOW_STRIPE_MINIMUM_CODE,
+  BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE,
+  STRIPE_MINIMUM_AMOUNT_CENTS,
+} from "@/lib/stripe-charge-currency";
+import {
+  findPaymentTransactionByIntentId,
+  upsertPaymentIntentTransaction,
+} from "@/lib/payment-transactions";
+import { checkCapacityForGuestRanges } from "@/lib/capacity";
+import { hashActionToken, issueActionToken } from "@/lib/action-tokens";
+import {
+  sendAdminPaymentFailureAlert,
+  sendBookingRequestApprovedEmail,
+  sendSplitGuestPaymentLinkEmail,
+} from "@/lib/email";
+import { bindClubTime, requireClubTimeZone } from "@/lib/club-time";
+import { resolveBookingNarrative } from "@/lib/booking-narrative";
+import {
+  FINANCIAL_REVIEW_NOTHING_MOVED,
+  FINANCIAL_REVIEW_AMOUNT_PREDATES_THE_CHANGE,
+  FINANCIAL_REVIEW_NOT_IN_THAT_FIGURE,
+  FINANCIAL_REVIEW_WORKING_IT_OUT,
+} from "@/lib/booking-financial-review-copy";
+import {
+  resolvePaymentLink,
+  revokePaymentLinkById,
+  revokePaymentLinksForBooking,
+} from "@/lib/payment-link";
+import { getPaymentLinkContext } from "@/lib/payment-link-context";
+import { givenCardRefundPaidInPart, type CardRefundReadFakes } from "./support/card-refund-paid-in-part";
+import { reissuePaymentLinkForToken } from "@/lib/payment-link-reissue";
+import { createPaymentIntentForPaymentLink } from "@/lib/payment-link-intent";
+import {
+  issueSplitGuestPaymentLink,
+  mintSplitGuestPaymentLinkIfAbsent,
+} from "@/lib/payment-link-split-guest";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+import { BOOKING_ALREADY_PAID_CODE, SWITCHED_TO_INTERNET_BANKING_BODY } from "@/lib/payment-recovery-contract";
+import { UNSUPPORTED_CHARGE_CURRENCY_MEMBER_MESSAGE } from "@/lib/stripe-charge-currency";
+
+const mockedFindUnique = vi.mocked(prisma.paymentLink.findUnique);
+const mockedUpdate = vi.mocked(prisma.paymentLink.update);
+const mockedUpdateMany = vi.mocked(prisma.paymentLink.updateMany);
+const mockedBookingEventFindMany = vi.mocked(prisma.bookingEvent.findMany);
+const mockedTransaction = vi.mocked(prisma.$transaction);
+const mockedGetPaymentIntent = vi.mocked(getPaymentIntent);
+const mockedCreatePaymentIntent = vi.mocked(createPaymentIntent);
+const mockedFindOrCreateCustomer = vi.mocked(findOrCreateCustomer);
+const mockedMarkSucceeded = vi.mocked(markBookingPaymentSucceeded);
+const mockedFindPaymentTransaction = vi.mocked(
+  findPaymentTransactionByIntentId,
+);
+const mockedUpsertPaymentIntentTransaction = vi.mocked(
+  upsertPaymentIntentTransaction,
+);
+const mockedCheckCapacity = vi.mocked(checkCapacityForGuestRanges);
+
+const RAW_TOKEN = issueActionToken().token;
+
+function baseLink(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: "link-1",
+    bookingId: "booking-1",
+    bookingRequestId: "req-1",
+    tokenHash: hashActionToken(RAW_TOKEN),
+    revokedAt: null,
+    usedAt: null,
+    expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+    createdAt: new Date("2026-06-01T00:00:00.000Z"),
+    booking: baseBooking(),
+    ...overrides,
+  };
+}
+
+/**
+ * This suite's bookings check in on 2026-08-01, and `reissuePaymentLinkForToken`
+ * refuses a stay whose dates have already passed — read from the REAL clock. Left
+ * unpinned the whole file went red on 2 August 2026 with nothing in any diff to
+ * blame, which is the signature that gets written off as an environment flake
+ * (#2426, #2401, #2443 are the same class; this is the fourth instance).
+ *
+ * Pin the clock a comfortable distance before the fixtures so "these dates are
+ * still in the future" stays the intended scenario for good. Only `Date` is
+ * faked, so real timers still drive any awaited promise. 2026-07-01T00:00:00Z
+ * reads as 1 July in NZ (12:00 NZST) and in UTC alike, so the pinned "today"
+ * does not depend on the runner's own zone.
+ */
+const FIXED_NOW = new Date("2026-07-01T00:00:00.000Z");
+
+beforeAll(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(FIXED_NOW);
+});
+
+afterAll(() => {
+  vi.useRealTimers();
+});
+
+beforeEach(() => {
+  clubFormatMock.mockResolvedValue(CLUB_FORMAT_TEST);
+});
+
+function baseBooking(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: "booking-1",
+    memberId: "member-1",
+    status: BookingStatus.PENDING,
+    checkIn: new Date("2026-08-01T00:00:00.000Z"),
+    checkOut: new Date("2026-08-03T00:00:00.000Z"),
+    finalPriceCents: 12000,
+    deletedAt: null,
+    member: { id: "member-1", email: "tara@example.com", firstName: "Tara", lastName: "Tester" },
+    guests: [{ id: "guest-1" }],
+    payment: null,
+    parentBookingId: null,
+    groupBookingJoin: null,
+    // #2919: the pay page names the booking's own lodge, so the record the
+    // narrative context is built from carries it.
+    lodgeId: "lodge-1",
+    lodge: { name: "Default Lodge" },
+    ...overrides,
+  };
+}
+
+describe("resolvePaymentLink", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("rejects tokens that are not 64-char hex without a DB lookup", async () => {
+    await expect(resolvePaymentLink("not-a-token")).rejects.toMatchObject({ status: 404 });
+    expect(mockedFindUnique).not.toHaveBeenCalled();
+  });
+
+  it("returns a generic 404 for an unknown token", async () => {
+    mockedFindUnique.mockResolvedValue(null);
+    await expect(resolvePaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("returns a generic 404 when the booking has been soft-deleted", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ deletedAt: new Date() }) }) as never
+    );
+    await expect(resolvePaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("returns 410 for a revoked link", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink({ revokedAt: new Date() }) as never);
+    await expect(resolvePaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 410 });
+  });
+
+  it("returns 410 for a used link on a booking that isn't PAID", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ usedAt: new Date(), booking: baseBooking({ status: BookingStatus.PENDING }) }) as never
+    );
+    await expect(resolvePaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 410 });
+  });
+
+  it("returns 410 for an expired link on a booking that isn't PAID", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ expiresAt: new Date("2000-01-01T00:00:00.000Z") }) as never
+    );
+    await expect(resolvePaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 410 });
+  });
+
+  it("allows a used/expired link through when the booking is already PAID (idempotent paid view)", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        usedAt: new Date(),
+        expiresAt: new Date("2000-01-01T00:00:00.000Z"),
+        booking: baseBooking({ status: BookingStatus.PAID }),
+      }) as never
+    );
+    const link = await resolvePaymentLink(RAW_TOKEN);
+    expect(link.booking.status).toBe(BookingStatus.PAID);
+  });
+
+  it("looks up the link by the hash of the supplied token, not the raw token", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    await resolvePaymentLink(RAW_TOKEN);
+    expect(mockedFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { tokenHash: hashActionToken(RAW_TOKEN) } })
+    );
+  });
+});
+
+/**
+ * The financial-review read `getPaymentLinkContext` now REQUIRES (#3194).
+ *
+ * A spy rather than a literal, so every case below has to state its own answer
+ * and the call itself can be asserted. The parameter has no default in the
+ * source for the same reason: a silent "no" about a member's money is what this
+ * issue is removing, not something to reintroduce as a convenience.
+ */
+function reviewReader(answer: boolean) {
+  return vi.fn<(bookingId: string) => Promise<boolean>>(async () => answer);
+}
+
+const noReview = () => ({ readOpenFinancialReview: reviewReader(false) });
+
+describe("getPaymentLinkContext", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedBookingEventFindMany.mockResolvedValue([] as never);
+    // Internet Banking module on by default.
+    loadEffectiveModuleFlagsMock.mockResolvedValue({
+      xeroIntegration: true,
+      internetBankingPayments: true,
+    });
+  });
+
+  it("returns a payable context for a PENDING booking without marking the link used", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("payable");
+    expect(context.payable?.amountCents).toBe(12000);
+    expect(context.payable?.status).toBe(BookingStatus.PENDING);
+    // Internet Banking is on, so the bank-transfer reference is offered.
+    expect(context.payable?.internetBankingReference).toBe("BOOKING-BOOKING-");
+    expect(context.narrative.message).toContain("$120.00");
+    expect(mockedUpdate).not.toHaveBeenCalled();
+  });
+
+  // #3955 round 3 (`INV-PAY-119`): the page quotes what the link's intent
+  // charges — price plus a recorded change fee, less applied credit.
+  it("quotes the amount owed, not the bare price", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          status: BookingStatus.PAYMENT_PENDING,
+          payment: { id: "pay-1", source: "STRIPE", status: PaymentStatus.PENDING, changeFeeCents: 2500 },
+        }),
+      }) as never
+    );
+    // $30 of account credit applied: 120.00 + 25.00 - 30.00.
+    vi.mocked(prisma.memberCredit.aggregate).mockResolvedValueOnce({ _sum: { amountCents: -3000 } } as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.payable?.amountCents).toBe(11500);
+    expect(context.narrative.message).toContain("$115.00");
+  });
+
+  it("says there is nothing to pay, and offers no payment or fresh link, when credit covers what is owed", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        expiresAt: new Date("2026-06-01T00:00:00.000Z"),
+        booking: baseBooking({ status: BookingStatus.PAYMENT_PENDING }),
+      }) as never
+    );
+    vi.mocked(prisma.memberCredit.aggregate).mockResolvedValueOnce({ _sum: { amountCents: -12000 } } as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("nothing_to_pay");
+    expect(context.payable).toBeNull();
+    expect(context.canRequestFreshLink).toBe(false);
+    expect(context.narrative.headline).toBe("Nothing to pay");
+    expect(context.narrative.message).toContain("the account credit applied to it covers what it owes");
+  });
+
+  // #3955 round 4 (finding 5): the credit is named only where some is applied.
+  it("says there is nothing to pay without naming credit when none is applied", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        expiresAt: new Date("2026-06-01T00:00:00.000Z"),
+        booking: baseBooking({ status: BookingStatus.PAYMENT_PENDING, finalPriceCents: 0 }),
+      }) as never
+    );
+    vi.mocked(prisma.memberCredit.aggregate).mockResolvedValueOnce({ _sum: { amountCents: null } } as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("nothing_to_pay");
+    expect(context.narrative.message).toMatch(/has nothing left to pay\.$/);
+    expect(context.narrative.message).not.toContain("credit");
+  });
+
+  // #3638 delta D4: a switched booking's link page offers no card and keeps
+  // its bank-transfer details, even if the module has since been turned off.
+  it("offers card payment on an ordinary payable booking", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.payable?.cardPaymentAvailable).toBe(true);
+  });
+
+  it("offers no card payment on a booking switched to Internet Banking, and still shows its reference", async () => {
+    loadEffectiveModuleFlagsMock.mockResolvedValue({
+      xeroIntegration: true,
+      internetBankingPayments: false,
+    });
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          status: BookingStatus.PAYMENT_PENDING,
+          payment: {
+            id: "pay-1",
+            source: "INTERNET_BANKING",
+            status: PaymentStatus.PENDING,
+            stripePaymentIntentId: null,
+          },
+        }),
+      }) as never
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.payable?.cardPaymentAvailable).toBe(false);
+    expect(context.payable?.internetBankingReference).toBe("BOOKING-BOOKING-");
+  });
+
+  // #2919: the public pay page's confirmation copy used to name the club's
+  // DEFAULT lodge because the context carried no lodge at all. A booking at a
+  // non-default lodge must come back naming that lodge.
+  it("carries the booking's own lodge name, not the club default", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          lodgeId: "lodge-2",
+          lodge: { name: "Second Lodge" },
+        }),
+      }) as never
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.lodgeName).toBe("Second Lodge");
+  });
+
+  it("asks the database for the booking's lodge name and nothing else about the lodge", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+
+    await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    const include = mockedFindUnique.mock.calls[0]?.[0] as unknown as {
+      include: { booking: { include: Record<string, unknown> } };
+    };
+    // Name only — a token-authenticated public surface must never pull the
+    // lodge's door code or travel note along with it.
+    expect(include.include.booking.include.lodge).toEqual({
+      select: { name: true },
+    });
+  });
+
+  it("omits the internet banking reference when the module is off", async () => {
+    loadEffectiveModuleFlagsMock.mockResolvedValue({
+      xeroIntegration: false,
+      internetBankingPayments: false,
+    });
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("payable");
+    expect(context.payable?.internetBankingReference).toBeUndefined();
+  });
+
+  it("returns a paid context and marks the link as used for a PAID booking", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.PAID }) }) as never
+    );
+    mockedUpdate.mockResolvedValue({} as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("paid");
+    expect(context.payable).toBeNull();
+    expect(mockedUpdate).toHaveBeenCalledWith({
+      where: { id: "link-1" },
+      data: { usedAt: expect.any(Date) },
+    });
+  });
+
+  it("treats a COMPLETED booking like PAID (no 'already used' error) and marks the link used", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        usedAt: new Date(),
+        expiresAt: new Date("2000-01-01T00:00:00.000Z"),
+        booking: baseBooking({ status: BookingStatus.COMPLETED }),
+      }) as never
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("paid");
+    // Link already marked used — not re-marked.
+    expect(mockedUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not re-mark a PAID booking's link as used if already marked", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        usedAt: new Date(),
+        booking: baseBooking({ status: BookingStatus.PAID }),
+      }) as never
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("paid");
+    expect(mockedUpdate).not.toHaveBeenCalled();
+  });
+
+  it("shows an expired-but-payable narrative (not an error) when the link has expired", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ expiresAt: new Date("2000-01-01T00:00:00.000Z") }) as never
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("expired_payable");
+    expect(context.canRequestFreshLink).toBe(true);
+    expect(context.payable).toBeNull();
+  });
+
+  it("shows a bumped narrative (not an error) once the booking was bumped", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.CANCELLED }) }) as never
+    );
+    mockedBookingEventFindMany.mockResolvedValue([
+      {
+        type: "BUMPED",
+        occurredAt: new Date("2026-07-01T00:00:00.000Z"),
+        amountCents: null,
+        reason: null,
+        snapshot: { flagged: false },
+      },
+    ] as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("bumped");
+    expect(context.narrative.message).toMatch(/filled up/i);
+  });
+
+  it("shows a clear cancelled narrative (not an error) once the booking is CANCELLED", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.CANCELLED }) }) as never
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("cancelled_pre_payment");
+    expect(context.narrative.message).toMatch(/cancelled/i);
+  });
+
+  // #4097 (`INV-PAY-129`): the parts of a card refund shortfall that are done read as done here too.
+  it("MUTATION: reads a cancelled booking's card refund shortfall parts, so a part paid back says so", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink({ booking: baseBooking({ status: BookingStatus.CANCELLED }) }) as never);
+    mockedBookingEventFindMany.mockResolvedValue([
+      { type: BookingEventType.MEMBER_PAID, occurredAt: new Date("2026-05-02T00:00:00.000Z"), amountCents: 12000, reason: null, snapshot: null },
+      {
+        type: BookingEventType.CANCELLED,
+        occurredAt: new Date("2026-05-05T00:00:00.000Z"),
+        amountCents: 12000,
+        reason: null,
+        snapshot: { refundMethod: "card", refundPercentage: 100, paidAmountCents: 12000, settledAmountCents: 12000, retainedAmountCents: 0, cardShortfall: { cardCents: 8000, bankCents: 4000, checkCents: 0 } },
+      },
+      { type: BookingEventType.REFUNDED, occurredAt: new Date("2026-05-05T01:00:00.000Z"), amountCents: 8000, reason: null, snapshot: null },
+    ] as never);
+    vi.mocked(prisma.manualRefundTask.findMany).mockResolvedValueOnce([
+      { kind: "CANCELLED_BOOKING_HAND_BACK", occurrenceKey: "cancel-card-shortfall:booking-1", status: "COMPLETED" },
+    ] as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.narrative.message).toContain("$40.00 was refunded to you by bank transfer");
+  });
+
+  // #4125: a card refund no REFUNDED event records says where its recovery row
+  // stands - a dead capacity-race refund is the club's to follow up, never "on its way".
+  it("MUTATION: reads a cancelled booking's card refund row, so a dead refund says the club will be in touch", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink({ booking: baseBooking({ status: BookingStatus.CANCELLED }) }) as never);
+    mockedBookingEventFindMany.mockResolvedValue([
+      { type: BookingEventType.MEMBER_PAID, occurredAt: new Date("2026-05-02T00:00:00.000Z"), amountCents: 12000, reason: null, snapshot: null },
+      {
+        type: BookingEventType.CANCELLED,
+        occurredAt: new Date("2026-05-05T00:00:00.000Z"),
+        amountCents: 12000,
+        reason: null,
+        snapshot: { refundMethod: "card", cancelledBecause: "capacity_race", refundPercentage: 100, paidAmountCents: 12000, settledAmountCents: 12000, retainedAmountCents: 0 },
+      },
+    ] as never);
+    vi.mocked(prisma.paymentRecoveryOperation.findMany).mockResolvedValueOnce([
+      { id: "op-1", idempotencyKey: "capacity_claim_failed_refund_recovery_booking-1_pi_1", status: "FAILED", attempts: 5, nextRetryAt: null },
+    ] as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.narrative.message).toContain("$120.00 is being refunded to you; the club will be in touch about the card refund.");
+    expect(context.narrative.message).not.toContain("on its way");
+  });
+
+  // #4516 (round-3 review 1): a dead card refund the treasurer paid back in part, the rest still owed - the page says
+  // both parts, never the whole as still owed; once a later close pays the rest, all that was paid back.
+  describe("a card refund paid back in part, the rest still owed (#4516)", () => {
+    const fakes = {
+      rows: vi.mocked(prisma.paymentRecoveryOperation.findMany),
+      row: vi.mocked(prisma.paymentRecoveryOperation.findUnique),
+      closeRecord: vi.mocked(prisma.manualRefundTask.findFirst),
+      record: vi.mocked(prisma.manualRefundTask.findUnique),
+      payments: vi.mocked(prisma.payment.findMany),
+    } as unknown as CardRefundReadFakes;
+    afterEach(() => {
+      fakes.rows.mockResolvedValue([]);
+      fakes.row.mockResolvedValue(null);
+      fakes.closeRecord.mockResolvedValue(null);
+      fakes.record.mockResolvedValue(null);
+    });
+
+    it.each([
+      ["while the rest is still owed", false, "$40.00 could not go back to your card and was paid back to you another way and $80.00 is being refunded to you; the club will be in touch about the card refund."],
+      ["once a later close paid the rest", true, "$120.00 could not go back to your card and was paid back to you another way."],
+    ] as const)("MUTATION: says what was paid back %s", async (_when, restClosed, said) => {
+      mockedFindUnique.mockResolvedValue(baseLink({ booking: baseBooking({ status: BookingStatus.CANCELLED }) }) as never);
+      mockedBookingEventFindMany.mockResolvedValue([
+        { type: BookingEventType.MEMBER_PAID, occurredAt: new Date("2026-05-02T00:00:00.000Z"), amountCents: 12000, reason: null, snapshot: null },
+        {
+          type: BookingEventType.CANCELLED,
+          occurredAt: new Date("2026-05-05T00:00:00.000Z"),
+          amountCents: 12000,
+          reason: null,
+          snapshot: { refundMethod: "card", refundPercentage: 100, paidAmountCents: 12000, settledAmountCents: 12000, retainedAmountCents: 0 },
+        },
+      ] as never);
+      givenCardRefundPaidInPart(fakes, { bookingId: "booking-1", refundCents: 12000, paidBackCents: 4000, restClosed });
+
+      const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+      expect(context.narrative.message).toContain(`Under the cancellation policy in effect at the time, ${said}`);
+    });
+  });
+});
+
+/**
+ * #3194 (epic #2797): THE PAYMENT LINK MUST NOT TELL A MEMBER THEIR BOOKING IS
+ * SETTLED WHILE THE CLUB IS STILL WORKING OUT WHAT THEY OWE.
+ *
+ * The booking's own page has said so since #3033. This page did not, because
+ * `bookingHasOpenFinancialReview` is `server-only` and nobody threaded the
+ * answer through - so one member got two answers about one booking, and the
+ * reassuring one was the uninformed one.
+ *
+ * Every case here carries its CONTROL: the same fixture with the review closed
+ * must produce the context this route has always produced, because "a booking
+ * with no open review is completely unchanged" is an acceptance criterion and
+ * not an assumption.
+ */
+describe("getPaymentLinkContext under an open financial review", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedBookingEventFindMany.mockResolvedValue([] as never);
+    loadEffectiveModuleFlagsMock.mockResolvedValue({
+      xeroIntegration: true,
+      internetBankingPayments: true,
+    });
+  });
+
+  it("asks the injected reader about THIS booking, exactly once", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    const readOpenFinancialReview = reviewReader(false);
+
+    await getPaymentLinkContext(RAW_TOKEN, { readOpenFinancialReview });
+
+    expect(readOpenFinancialReview).toHaveBeenCalledTimes(1);
+    expect(readOpenFinancialReview).toHaveBeenCalledWith("booking-1");
+  });
+
+  it("stops a PAID booking saying there is nothing more to do", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.PAID }) }) as never,
+    );
+    mockedUpdate.mockResolvedValue({} as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, {
+      readOpenFinancialReview: reviewReader(true),
+    });
+
+    expect(context.financialReviewPending).toBe(true);
+    expect(context.state).toBe("financial_review_pending");
+    expect(
+      `${context.narrative.message} ${context.narrative.nextStep}`,
+    ).not.toMatch(/nothing more to do/i);
+    expect(context.narrative.message).toContain(FINANCIAL_REVIEW_WORKING_IT_OUT);
+    expect(context.narrative.message).toContain(FINANCIAL_REVIEW_NOTHING_MOVED);
+    // No amount, anywhere: the epic's rule, and the post-edit total on the
+    // booking is exactly the authoritative-looking figure it forbids.
+    expect(
+      `${context.narrative.headline} ${context.narrative.message} ${context.narrative.nextStep}`,
+    ).not.toContain("$");
+  });
+
+  /*
+    THE QUESTION THIS PAGE EXISTS TO ANSWER: "did my payment go through?"
+
+    The case above has no payment event, so the paid narrative names no figure
+    and the page loses nothing by it. This one is the real member: they paid by
+    internet banking, the club recorded it, and they opened the link to check.
+    `getPaymentLinkContext` reads through `loadPaymentLinkRecord`, so a link
+    already marked used still renders - and `PaymentForm` returns to this same URL
+    after a redirect-based method, so the page is re-fetched seconds after paying
+    on it.
+
+    Before #3194's fix the whole page was the standalone review narrative, which
+    says nothing about a payment: same member, same booking, minutes apart, the
+    payment confirmed on the way in and unmentioned on the way back.
+  */
+  it("still confirms the payment on a PAID booking under review", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.PAID }) }) as never,
+    );
+    mockedUpdate.mockResolvedValue({} as never);
+    mockedBookingEventFindMany.mockResolvedValue([
+      {
+        type: BookingEventType.MEMBER_PAID,
+        occurredAt: new Date("2026-06-20T02:00:00.000Z"),
+        amountCents: 12000,
+        reason: null,
+        snapshot: null,
+      },
+    ] as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, {
+      readOpenFinancialReview: reviewReader(true),
+    });
+
+    expect(context.state).toBe("financial_review_pending");
+    expect(context.narrative.headline).toBe("Payment received");
+    expect(context.narrative.message).toContain(
+      "we've received your payment of $120.00",
+    );
+    // And the review is disclosed in the same breath, with the sentence that
+    // keeps the two amounts apart.
+    expect(context.narrative.message).toContain(
+      FINANCIAL_REVIEW_NOT_IN_THAT_FIGURE,
+    );
+    expect(context.narrative.message).toContain(FINANCIAL_REVIEW_WORKING_IT_OUT);
+    expect(
+      `${context.narrative.message} ${context.narrative.nextStep}`,
+    ).not.toMatch(/nothing more to do/i);
+    // Exactly one figure: money the club HAS. No amount is invented for the
+    // change, which is the thing nobody knows yet.
+    expect(context.narrative.message.match(/\$/g)).toHaveLength(1);
+  });
+
+  it("CONTROL: the same paid booking with no review says only that it is paid", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.PAID }) }) as never,
+    );
+    mockedUpdate.mockResolvedValue({} as never);
+    mockedBookingEventFindMany.mockResolvedValue([
+      {
+        type: BookingEventType.MEMBER_PAID,
+        occurredAt: new Date("2026-06-20T02:00:00.000Z"),
+        amountCents: 12000,
+        reason: null,
+        snapshot: null,
+      },
+    ] as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("paid");
+    expect(context.narrative.message).toContain(
+      "we've received your payment of $120.00",
+    );
+    expect(context.narrative.message).not.toContain(
+      FINANCIAL_REVIEW_NOT_IN_THAT_FIGURE,
+    );
+    expect(context.narrative.nextStep).toMatch(/nothing more to do/i);
+  });
+
+  it("CONTROL: the same PAID booking with no open review is unchanged", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.PAID }) }) as never,
+    );
+    mockedUpdate.mockResolvedValue({} as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.financialReviewPending).toBe(false);
+    expect(context.state).toBe("paid");
+    expect(context.narrative.nextStep).toMatch(/nothing more to do/i);
+  });
+
+  /*
+    THE CASE THAT COSTS A MEMBER THEIR BOOKING IF IT IS GOT WRONG.
+
+    A CONFIRMED-unpaid booking can carry an open review: one edit can surrender
+    nights that cannot be valued while adding nights that price normally. The
+    booking's stored price is still due and this link is the only way this member
+    can pay it - though that stored price is the PRE-change one, which is why the
+    wording says so rather than presenting it as settled (#3194 fix round).
+
+    If the review flag were allowed to decide whether the
+    page can take money, they would be shown a card saying "pay below" with
+    nothing below it, pay nothing, and lose the booking when the hold expired -
+    while not one cent of the money under review had moved either way.
+  */
+  it("keeps a CONFIRMED-unpaid booking payable, with the review disclosed", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({ status: BookingStatus.CONFIRMED }),
+      }) as never,
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, {
+      readOpenFinancialReview: reviewReader(true),
+    });
+
+    expect(context.financialReviewPending).toBe(true);
+    expect(context.state).toBe("financial_review_pending");
+    // The payment card's own data survives intact.
+    expect(context.payable).not.toBeNull();
+    expect(context.payable?.amountCents).toBe(12000);
+    expect(context.payable?.status).toBe(BookingStatus.CONFIRMED);
+    expect(context.payable?.internetBankingReference).toBe("BOOKING-BOOKING-");
+    // And both facts are in the wording: the amount due, and - since the #3194
+    // fix round - that the amount is the one from BEFORE this member's change,
+    // because a parked edit writes `finalPriceCents` back unchanged while saving
+    // the new dates and deleting the departing guest's row. "Not part of that
+    // figure" is the sentence for money already RECEIVED, which cannot go stale.
+    expect(context.narrative.message).toContain("$120.00");
+    expect(context.narrative.message).toContain(
+      FINANCIAL_REVIEW_AMOUNT_PREDATES_THE_CHANGE,
+    );
+    expect(context.narrative.message).not.toContain(
+      FINANCIAL_REVIEW_NOT_IN_THAT_FIGURE,
+    );
+  });
+
+  it("CONTROL: the same CONFIRMED booking with no open review is unchanged", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({ status: BookingStatus.CONFIRMED }),
+      }) as never,
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+
+    expect(context.state).toBe("payable");
+    expect(context.payable?.amountCents).toBe(12000);
+    expect(context.narrative.message).not.toContain(
+      FINANCIAL_REVIEW_NOT_IN_THAT_FIGURE,
+    );
+    expect(context.narrative.message).not.toContain(
+      FINANCIAL_REVIEW_AMOUNT_PREDATES_THE_CHANGE,
+    );
+  });
+
+  it("keeps the fresh-link offer on an expired link that is under review", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ expiresAt: new Date("2000-01-01T00:00:00.000Z") }) as never,
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, {
+      readOpenFinancialReview: reviewReader(true),
+    });
+
+    // The wording state moves; the LINK's own state does not, and the member
+    // still needs the button that emails them a new one.
+    expect(context.state).toBe("financial_review_pending");
+    expect(context.canRequestFreshLink).toBe(true);
+    expect(context.narrative.message).toMatch(/expired/i);
+    expect(context.narrative.message).toContain(FINANCIAL_REVIEW_WORKING_IT_OUT);
+  });
+
+  it("leaves a CANCELLED booking's own narrative in charge", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({ status: BookingStatus.CANCELLED }),
+      }) as never,
+    );
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, {
+      readOpenFinancialReview: reviewReader(true),
+    });
+
+    // What happened to the booking outranks the review, which assumes a stay
+    // that is still going ahead (#3033's ordering, unchanged here).
+    expect(context.state).toBe("cancelled_pre_payment");
+    expect(context.financialReviewPending).toBe(true);
+  });
+
+  /*
+    WHAT THIS CHECKS, EXACTLY (renamed in review, #3194): that this module hands
+    the review answer to the shared resolver and then adds NO WORDING OF ITS OWN.
+    Both sides below are the same pure function over the same facts, so it is a
+    pin on `payment-link-context.ts`, not on the booking-detail page - it renders none of
+    that page and would not notice a change to it.
+
+    It is kept rather than deleted because the second assertion gives it teeth:
+    the same resolver asked WITHOUT the review returns something different, so a
+    payment link that stopped threading the flag - or that composed its own
+    sentences on top - fails here rather than passing on a tautology.
+
+    The claim the acceptance criteria actually rest on, that the two SURFACES
+    cannot come to say different things, is held by
+    `booking-financial-review-copy.test.ts`, which derives what each narrative
+    adds and pins the pay page's own composition against it.
+  */
+  it("hands the review flag to the shared resolver and adds no wording of its own", async () => {
+    const booking = baseBooking({ status: BookingStatus.PAID });
+    mockedFindUnique.mockResolvedValue(baseLink({ booking }) as never);
+    mockedUpdate.mockResolvedValue({} as never);
+
+    const context = await getPaymentLinkContext(RAW_TOKEN, {
+      readOpenFinancialReview: reviewReader(true),
+    });
+
+    const resolverInput = {
+      club: bindClubTime(requireClubTimeZone("Pacific/Auckland"), CLUB_FORMAT_TEST),
+      booking: {
+        status: booking.status,
+        finalPriceCents: booking.finalPriceCents,
+        amountOwed: { owedCents: booking.finalPriceCents, dueCents: booking.finalPriceCents, appliedCreditCents: 0 },
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        firstName: booking.member.firstName,
+        adminReviewStatus: null,
+        adminReviewNotes: null,
+        adminReviewReason: null,
+      },
+      events: [],
+    };
+
+    expect(context.narrative).toEqual(
+      resolveBookingNarrative({ ...resolverInput, financialReviewPending: true }, CLUB_FORMAT_TEST),
+    );
+    // The flag really reached it: the same facts without the review resolve to
+    // different wording, so this cannot pass on a dropped flag.
+    expect(context.narrative).not.toEqual(
+      resolveBookingNarrative({ ...resolverInput, financialReviewPending: false }, CLUB_FORMAT_TEST),
+    );
+  });
+});
+
+describe("reissuePaymentLinkForToken", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedTransaction.mockImplementation(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma)
+    );
+    mockedUpdateMany.mockResolvedValue({ count: 1 } as never);
+    vi.mocked(prisma.paymentLink.create).mockResolvedValue({} as never);
+  });
+
+  it("issues a fresh link and emails it for an expired-but-payable booking", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ expiresAt: new Date("2000-01-01T00:00:00.000Z") }) as never
+    );
+
+    const result = await reissuePaymentLinkForToken(RAW_TOKEN);
+
+    expect(result.emailed).toBe(true);
+    expect(vi.mocked(prisma.paymentLink.create)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ bookingId: "booking-1" }),
+      })
+    );
+    expect(sendBookingRequestApprovedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ email: "tara@example.com" }), CLUB_FORMAT_TEST
+    );
+  });
+
+  // #4058 (`INV-PAY-119`): the email is about the page it links to, so it quotes
+  // what that page asks - price plus a recorded change fee, less applied credit.
+  it("quotes the amount owed in the re-issued booking-request email, matching the pay page", async () => {
+    const record = baseLink({
+      expiresAt: new Date("2000-01-01T00:00:00.000Z"),
+      booking: baseBooking({
+        finalPriceCents: 30000,
+        payment: { id: "pay-1", source: "STRIPE", status: PaymentStatus.PENDING, changeFeeCents: 2500 },
+      }),
+    });
+    mockedFindUnique.mockResolvedValue(record as never);
+
+    await reissuePaymentLinkForToken(RAW_TOKEN);
+
+    // 300.00 + 25.00 recorded fee = 325.00, never the bare 300.00.
+    expect(sendBookingRequestApprovedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ priceCents: 30000, amountDueCents: 32500 }),
+      CLUB_FORMAT_TEST,
+    );
+    // The page for the same booking asks the same figure.
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: { ...record.booking, status: BookingStatus.PAYMENT_PENDING } }) as never,
+    );
+    const context = await getPaymentLinkContext(RAW_TOKEN, noReview());
+    expect(context.payable?.amountCents).toBe(32500);
+  });
+
+  it("quotes price plus recorded fee less applied credit in the re-issued email", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        expiresAt: new Date("2000-01-01T00:00:00.000Z"),
+        booking: baseBooking({
+          finalPriceCents: 30000,
+          payment: { id: "pay-1", source: "STRIPE", status: PaymentStatus.PENDING, changeFeeCents: 2500 },
+        }),
+      }) as never
+    );
+    vi.mocked(prisma.memberCredit.aggregate).mockResolvedValueOnce({ _sum: { amountCents: -5000 } } as never);
+
+    await reissuePaymentLinkForToken(RAW_TOKEN);
+
+    expect(sendBookingRequestApprovedEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ priceCents: 30000, amountDueCents: 27500 }),
+      CLUB_FORMAT_TEST,
+    );
+  });
+
+  it("quotes the amount owed in the re-issued split-guest email", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        bookingRequestId: null,
+        expiresAt: new Date("2000-01-01T00:00:00.000Z"),
+        booking: baseBooking({
+          finalPriceCents: 30000,
+          parentBookingId: "parent-1",
+          groupBookingJoin: null,
+          payment: { id: "pay-1", source: "STRIPE", status: PaymentStatus.PENDING, changeFeeCents: 2500 },
+        }),
+      }) as never
+    );
+
+    await reissuePaymentLinkForToken(RAW_TOKEN);
+
+    expect(sendSplitGuestPaymentLinkEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ priceCents: 30000, amountDueCents: 32500 }),
+      CLUB_FORMAT_TEST,
+    );
+  });
+
+  it("returns emailed:false when the requester's address is actively suppressed (F25, #1885)", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ expiresAt: new Date("2000-01-01T00:00:00.000Z") }) as never
+    );
+    // sendEmail suppressed the delivery (prior SES bounce/complaint): nothing
+    // was sent, so the caller must not be told an email is on the way.
+    vi.mocked(sendBookingRequestApprovedEmail).mockResolvedValueOnce({
+      status: "suppressed",
+      emailLogId: "log-1",
+      emailSuppressionId: "sup-1",
+      reason: "BOUNCE",
+    } as never);
+
+    const result = await reissuePaymentLinkForToken(RAW_TOKEN);
+
+    expect(result.emailed).toBe(false);
+    // The fresh link itself is still minted; only the email claim changes.
+    expect(vi.mocked(prisma.paymentLink.create)).toHaveBeenCalled();
+  });
+
+  it("refuses to re-issue a link for a booking that can no longer be paid", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.CANCELLED }) }) as never
+    );
+
+    await expect(reissuePaymentLinkForToken(RAW_TOKEN)).rejects.toMatchObject({
+      status: 410,
+    });
+    expect(sendBookingRequestApprovedEmail).not.toHaveBeenCalled();
+  });
+
+  it("re-issues a split child's expired link with the split-guest template, never the booking-request one (#1967 FIX-7)", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        // A split-child link has no originating booking request...
+        bookingRequestId: null,
+        expiresAt: new Date("2000-01-01T00:00:00.000Z"),
+        booking: baseBooking({
+          // ...and its booking is a genuine split child (parent-linked, no
+          // #796 group-join row).
+          parentBookingId: "parent-1",
+          groupBookingJoin: null,
+        }),
+      }) as never
+    );
+
+    const result = await reissuePaymentLinkForToken(RAW_TOKEN);
+
+    expect(result.emailed).toBe(true);
+    expect(sendSplitGuestPaymentLinkEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ email: "tara@example.com", bookingId: "booking-1" }), CLUB_FORMAT_TEST
+    );
+    expect(sendBookingRequestApprovedEmail).not.toHaveBeenCalled();
+  });
+
+  it("keeps the booking-request template for a #796 group joiner's link (pre-existing behaviour)", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        bookingRequestId: null,
+        expiresAt: new Date("2000-01-01T00:00:00.000Z"),
+        booking: baseBooking({
+          parentBookingId: "organiser-1",
+          groupBookingJoin: { id: "join-1" },
+        }),
+      }) as never
+    );
+
+    await reissuePaymentLinkForToken(RAW_TOKEN);
+
+    expect(sendBookingRequestApprovedEmail).toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe("revokePaymentLinksForBooking", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("revokes only active, unused links for the booking", async () => {
+    mockedUpdateMany.mockResolvedValue({ count: 1 } as never);
+
+    const count = await revokePaymentLinksForBooking("booking-1");
+
+    expect(count).toBe(1);
+    expect(mockedUpdateMany).toHaveBeenCalledWith({
+      where: { bookingId: "booking-1", revokedAt: null, usedAt: null },
+      data: { revokedAt: expect.any(Date) },
+    });
+  });
+});
+
+describe("createPaymentIntentForPaymentLink", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queueXeroInvoiceForPaidBookingMock.mockResolvedValue({
+      queueOperationId: "xero-op-1",
+      message: "queued",
+    });
+    mockedTransaction.mockImplementation(async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+      fn(prisma)
+    );
+    mockedCheckCapacity.mockResolvedValue({ available: true, minAvailable: 5, nightDetails: [] } as never);
+  });
+
+  it("throws USED_LINK_MESSAGE when the booking is already PAID", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.PAID }) }) as never
+    );
+
+    // #4955: coded, so the pay page reads it as the server saying "paid".
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 410, code: BOOKING_ALREADY_PAID_CODE });
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+  });
+
+  it("#99: refuses an amount below the card minimum with a coded 409, before any customer lookup or mint", async () => {
+    const booking = baseBooking({ finalPriceCents: STRIPE_MINIMUM_AMOUNT_CENTS - 1 });
+    mockedFindUnique.mockResolvedValue(baseLink({ booking }) as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(booking as never);
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+      status: 409,
+      code: BELOW_STRIPE_MINIMUM_CODE,
+      message: BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE,
+    });
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("throws NOT_PAYABLE_MESSAGE for a CANCELLED booking", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({ booking: baseBooking({ status: BookingStatus.CANCELLED }) }) as never
+    );
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 410 });
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["requires_payment_method", "mints a fresh intent"],
+    ["processing", "answers PAYMENT_PROCESSING"],
+  ])("#4300: a superseded intent at the matching amount (%s) is never handed out again: %s", async (status) => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_superseded", status: PaymentStatus.PENDING },
+        }),
+      }) as never,
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_superseded",
+      status,
+      client_secret: "secret_superseded", currency: "nzd",
+      amount: 12000,
+      payment_method: null,
+    } as never);
+    // Its cancel row is still live: Stripe was down for the edit's cancel.
+    vi.mocked(prisma.paymentRecoveryOperation.findFirst).mockResolvedValueOnce({ id: "op-cancel" } as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(baseBooking({ guests: [{ id: "guest-1" }] }) as never);
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_fresh", client_secret: "secret_fresh", currency: "nzd" } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    try {
+      if (status === "processing") {
+        await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+          status: 409,
+          code: "PAYMENT_PROCESSING",
+          message: expect.stringMatching(/out-of-date amount is still processing/),
+        });
+        expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+      } else {
+        await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).resolves.toEqual({
+          type: "clientSecret",
+          clientSecret: "secret_fresh",
+          paymentIntentId: "pi_fresh",
+        });
+      }
+    } finally {
+      // A queued once-answer a mutant never consumes must not leak into later cases.
+      vi.mocked(prisma.paymentRecoveryOperation.findFirst).mockReset().mockResolvedValue(null);
+    }
+  });
+
+  it("#4300: the payer's just-paid intent, the pointer since moved past it, is said to be going back - this booking's only", async () => {
+    const primeMovedPointer = (metadataBookingId: string) => {
+      mockedFindUnique.mockResolvedValue(
+        baseLink({ booking: baseBooking({ payment: { id: "pay-1", stripePaymentIntentId: "pi_fresh", status: PaymentStatus.PENDING } }) }) as never,
+      );
+      mockedGetPaymentIntent.mockImplementation(async (id: string) =>
+        (id === "pi_fresh"
+          ? { id: "pi_fresh", status: "requires_payment_method", client_secret: "secret_fresh", currency: "nzd", amount: 12000, payment_method: null }
+          : { id: "pi_paid", status: "succeeded", amount: 12000, payment_method: "pm_1", metadata: { bookingId: metadataBookingId } }) as never,
+      );
+      // The paid intent's superseded refund row owns it (the fresh one has none).
+      vi.mocked(prisma.paymentRecoveryOperation.findFirst).mockImplementation((async (args: { where: { paymentIntentId?: string; type?: unknown } }) =>
+        args.where.paymentIntentId === "pi_paid" && typeof args.where.type === "object" ? { id: "op-refund" } : null) as never);
+    };
+    try {
+      primeMovedPointer("booking-1");
+      await expect(createPaymentIntentForPaymentLink(RAW_TOKEN, { paidPaymentIntentId: "pi_paid" })).resolves.toEqual({
+        type: "clientSecret",
+        clientSecret: "secret_fresh",
+        paymentIntentId: "pi_fresh",
+        previousPaymentRefunding: true,
+      });
+      primeMovedPointer("booking-2");
+      await expect(createPaymentIntentForPaymentLink(RAW_TOKEN, { paidPaymentIntentId: "pi_paid" })).resolves.toEqual({
+        type: "clientSecret",
+        clientSecret: "secret_fresh",
+        paymentIntentId: "pi_fresh",
+      });
+    } finally {
+      vi.mocked(prisma.paymentRecoveryOperation.findFirst).mockReset().mockResolvedValue(null);
+      mockedGetPaymentIntent.mockReset();
+    }
+  });
+
+  it("#4300: a capture the settle refuses as superseded is reported as refunding, never as paid", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_raced", status: PaymentStatus.PENDING },
+        }),
+      }) as never,
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_raced", status: "succeeded", client_secret: "secret_raced", currency: "nzd", amount: 12000, payment_method: "pm_1",
+    } as never);
+    mockedMarkSucceeded.mockResolvedValue({ outcome: "superseded_capture", bookingId: "booking-1", bumpedBookingIds: [] } as never);
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({ kind: "superseded_capture_refunding" });
+    expect(queueXeroInvoiceForPaidBookingMock).not.toHaveBeenCalled();
+  });
+
+  it("reuses an existing PaymentIntent's client secret instead of creating a new one", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_existing", status: PaymentStatus.PENDING },
+        }),
+      }) as never
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_existing",
+      status: "requires_payment_method",
+      client_secret: "secret_existing", currency: "nzd",
+      amount: 12000,
+      payment_method: null,
+    } as never);
+
+    const result = await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    expect(result).toEqual({ type: "clientSecret", clientSecret: "secret_existing", paymentIntentId: "pi_existing" });
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("supersedes a stale-amount intent and mints a fresh one at the current price (#1161)", async () => {
+    const { queueSupersededPrimaryIntentCancellations } = await import(
+      "@/lib/booking-payment-cleanup"
+    );
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_stale", status: PaymentStatus.PENDING },
+        }),
+      }) as never
+    );
+    // Minted at $100 before the unpaid booking was edited to $120.
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_stale",
+      status: "requires_payment_method",
+      client_secret: "secret_stale", currency: "nzd",
+      amount: 10000,
+      payment_method: null,
+    } as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }] }) as never
+    );
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_new",
+      client_secret: "secret_new", currency: "nzd",
+      amount: 12000,
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    const result = await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    // The stale secret is never disclosed; a fresh intent carries the
+    // current price and the stale one is queued for cancellation.
+    expect(result).toEqual({
+      type: "clientSecret",
+      clientSecret: "secret_new",
+      paymentIntentId: "pi_new",
+    });
+    expect(vi.mocked(queueSupersededPrimaryIntentCancellations)).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        bookingId: "booking-1",
+        paymentId: "pay-1",
+        newFinalPriceCents: 12000,
+      },
+    );
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 12000 }),
+    );
+  });
+
+  it("supersedes a same-amount intent minted in another currency and mints a fresh one (#3567)", async () => {
+    const { queueSupersededPrimaryIntentCancellations } = await import(
+      "@/lib/booking-payment-cleanup"
+    );
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_aud", status: PaymentStatus.PENDING },
+        }),
+      }) as never
+    );
+    // The right amount, but minted in AUD before the club moved to NZD.
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_aud",
+      status: "requires_payment_method",
+      client_secret: "secret_aud", currency: "aud",
+      amount: 12000,
+      payment_method: null,
+    } as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }] }) as never
+    );
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_nzd",
+      client_secret: "secret_nzd", currency: "nzd",
+      amount: 12000,
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    const result = await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    expect(result).toEqual({
+      type: "clientSecret",
+      clientSecret: "secret_nzd",
+      paymentIntentId: "pi_nzd",
+    });
+    expect(vi.mocked(queueSupersededPrimaryIntentCancellations)).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        bookingId: "booking-1",
+        paymentId: "pay-1",
+        newFinalPriceCents: 12000,
+        wrongCurrencyPaymentIntentId: "pi_aud",
+      },
+    );
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 12000 }),
+    );
+  });
+
+  it("answers 409 for an old-currency intent still processing, and neither supersedes it nor mints (#3567 final check)", async () => {
+    const { queueSupersededPrimaryIntentCancellations } = await import(
+      "@/lib/booking-payment-cleanup"
+    );
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_aud", status: PaymentStatus.PENDING },
+        }),
+      }) as never
+    );
+    // A bank debit in AUD, submitted before the club moved to NZD, not yet settled.
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_aud",
+      status: "processing",
+      client_secret: "secret_aud", currency: "aud",
+      amount: 12000,
+      payment_method: null,
+    } as never);
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+      name: "PaymentLinkError",
+      status: 409,
+      code: "PAYMENT_PROCESSING",
+      message: "This payment is being processed. Refresh the page in a minute to see it confirmed.",
+    });
+    expect(vi.mocked(queueSupersededPrimaryIntentCancellations)).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("refuses a club currency without two decimal places with a 409 before resolving the link (#3567)", async () => {
+    clubFormatMock.mockResolvedValue({ currencyCode: "JPY", locale: "ja-JP" });
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+      status: 409,
+      message: UNSUPPORTED_CHARGE_CURRENCY_MEMBER_MESSAGE,
+    });
+    expect(mockedFindUnique).not.toHaveBeenCalled();
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("reports alreadyPaid and reconciles when the existing PaymentIntent already succeeded", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_existing", status: PaymentStatus.PENDING },
+        }),
+      }) as never
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_existing",
+      status: "succeeded",
+      client_secret: "secret_existing", currency: "nzd",
+      amount: 12000,
+      payment_method: "pm_123",
+    } as never);
+    mockedMarkSucceeded.mockResolvedValue({ outcome: "confirmed" } as never);
+
+    const result = await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    expect(result).toEqual({ type: "alreadyPaid" });
+    expect(mockedMarkSucceeded).toHaveBeenCalledWith(
+      expect.objectContaining({ bookingId: "booking-1", paymentIntentId: "pi_existing" })
+    );
+    expect(queueXeroInvoiceForPaidBookingMock).toHaveBeenCalledWith({
+      bookingId: "booking-1",
+    });
+  });
+
+  it.each([PaymentStatus.REFUNDED, PaymentStatus.PARTIALLY_REFUNDED])(
+    "never reuses an equal-amount succeeded intent's client secret when its transaction is %s",
+    async (refundedStatus) => {
+      mockedFindUnique.mockResolvedValue(
+        baseLink({
+          booking: baseBooking({
+            payment: {
+              id: "pay-1",
+              stripePaymentIntentId: "pi_refunded",
+              status: PaymentStatus.SUCCEEDED,
+            },
+          }),
+        }) as never,
+      );
+      mockedGetPaymentIntent.mockResolvedValue({
+        id: "pi_refunded",
+        status: "succeeded",
+        // Stripe retains the client secret after success/refund. Keeping this
+        // production-shaped is the mutation proof: removing the explicit repay
+        // bypass would return this old secret before the fresh mint below.
+        client_secret: "secret_refunded_must_not_be_reused", currency: "nzd",
+        amount: 12000,
+        payment_method: "pm_old",
+      } as never);
+      mockedFindPaymentTransaction.mockResolvedValueOnce({
+        status: refundedStatus,
+      } as never);
+      vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+        baseBooking({ guests: [{ id: "guest-1" }] }) as never,
+      );
+      mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+      mockedCreatePaymentIntent.mockResolvedValue({
+        id: "pi_repay",
+        client_secret: "secret_repay", currency: "nzd",
+      } as never);
+      vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+      await expect(
+        createPaymentIntentForPaymentLink(RAW_TOKEN),
+      ).resolves.toEqual({
+        type: "clientSecret",
+        clientSecret: "secret_repay",
+        paymentIntentId: "pi_repay",
+      });
+      expect(mockedMarkSucceeded).not.toHaveBeenCalled();
+      expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          amountCents: 12000,
+          idempotencyKey: "pl_pi_booking-1_repay_pi_refunded_12000_nzd",
+        }),
+      );
+      expect(mockedUpsertPaymentIntentTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          paymentIntentId: "pi_repay",
+          reason: "payment_link_repay_after_refund",
+        }),
+      );
+    },
+  );
+
+  it("#4300: repays, never reconciles, a capture on an intent the superseded machinery is refunding", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", stripePaymentIntentId: "pi_superseded", status: PaymentStatus.PENDING },
+        }),
+      }) as never,
+    );
+    // An edit superseded it and the price came back to its amount.
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_superseded",
+      status: "succeeded",
+      client_secret: "secret_superseded_must_not_be_reused", currency: "nzd",
+      amount: 12000,
+      payment_method: "pm_old",
+    } as never);
+    mockedFindPaymentTransaction.mockResolvedValueOnce({ status: PaymentStatus.SUCCEEDED } as never);
+    // Its cancel row already handed the capture off; its refund row still owns it.
+    vi.mocked(prisma.paymentRecoveryOperation.findFirst)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "op-superseded-refund" } as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(baseBooking({ guests: [{ id: "guest-1" }] }) as never);
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_repay", client_secret: "secret_repay", currency: "nzd" } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).resolves.toEqual({
+      type: "clientSecret",
+      clientSecret: "secret_repay",
+      paymentIntentId: "pi_repay",
+      // The payer is told the earlier payment is going back.
+      previousPaymentRefunding: true,
+    });
+    expect(mockedMarkSucceeded).not.toHaveBeenCalled();
+    expect(queueXeroInvoiceForPaidBookingMock).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 12000, idempotencyKey: "pl_pi_booking-1_repay_pi_superseded_12000_nzd" }),
+    );
+  });
+
+  it("does not claim receipt when the succeeded prior intent cannot be classified", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: {
+            id: "pay-1",
+            stripePaymentIntentId: "pi_unknown",
+            status: PaymentStatus.PENDING,
+          },
+        }),
+      }) as never,
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_unknown",
+      status: "succeeded",
+      amount: 12000,
+      payment_method: "pm_old",
+    } as never);
+    mockedFindPaymentTransaction.mockRejectedValueOnce(
+      new Error("database detail must stay private"),
+    );
+
+    await expect(
+      createPaymentIntentForPaymentLink(RAW_TOKEN),
+    ).rejects.toMatchObject({ kind: "existing_card_status_unconfirmed" });
+    expect(mockedMarkSucceeded).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("classifies an ordinary post-capture failure without exposing provider detail", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: {
+            id: "pay-1",
+            stripePaymentIntentId: "pi_captured",
+            status: PaymentStatus.PENDING,
+          },
+        }),
+      }) as never,
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_captured",
+      status: "succeeded",
+      amount: 12000,
+      payment_method: "pm_old",
+    } as never);
+    mockedMarkSucceeded.mockRejectedValueOnce(
+      new Error("sk_test_private provider detail"),
+    );
+
+    await expect(
+      createPaymentIntentForPaymentLink(RAW_TOKEN),
+    ).rejects.toMatchObject({ kind: "payment_received_status_unconfirmed" });
+  });
+
+  it("classifies participant contention after capture as finalisation pending", async () => {
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: {
+            id: "pay-1",
+            stripePaymentIntentId: "pi_captured",
+            status: PaymentStatus.PENDING,
+          },
+        }),
+      }) as never,
+    );
+    mockedGetPaymentIntent.mockResolvedValue({
+      id: "pi_captured",
+      status: "succeeded",
+      amount: 12000,
+      payment_method: "pm_old",
+    } as never);
+    mockedMarkSucceeded.mockRejectedValueOnce({
+      code: "HOSTING_COVERAGE_PARTICIPANT_RETRY",
+      message: "private contention detail",
+    });
+
+    await expect(
+      createPaymentIntentForPaymentLink(RAW_TOKEN),
+    ).rejects.toMatchObject({
+      kind: "payment_received_finalisation_pending",
+      message: "Payment-link card status requires recovery",
+    });
+  });
+
+  /**
+   * #2265 (#2319 door 1). A stored credit election is a member's standing request
+   * to spend their own account-credit balance. This route is authenticated by a
+   * bearer token routinely held by SOMEONE ELSE — a booking requester, a group
+   * joiner, a non-member guest — with no member session and no surface on which
+   * to show the member that their election was clamped. So it refuses, rather
+   * than either charging the pre-credit price (which would ignore the choice) or
+   * consuming the credit (which would spend a member's balance on a third
+   * party's token). Refusing loses nothing: the member's own pay step still
+   * honours the election.
+   *
+   * No mint path in the app attaches a link to a booking that can carry an
+   * election, so this is an assertion of that invariant rather than a routine
+   * branch — which is exactly why it must alert loudly instead of failing quietly.
+   */
+  it("refuses to mint an intent for a booking carrying an unconsumed credit election (#2265)", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }], creditElectionCents: 4500 }) as never
+    );
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+      status: 409,
+    });
+
+    // Nothing was charged and no Stripe object was even created.
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+    expect(vi.mocked(prisma.payment.upsert)).not.toHaveBeenCalled();
+    // The election is left exactly where it was: this route never writes the
+    // Booking row, so the member can still pay from their own bookings page and
+    // have the credit applied there. (The prisma double has no booking.update at
+    // all, so any attempt to clear it would have thrown.)
+    expect(prisma.booking).not.toHaveProperty("update");
+    // Loud: an officer is told, with the figure, because this state is not
+    // supposed to be reachable.
+    expect(vi.mocked(sendAdminPaymentFailureAlert)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 4500,
+        paymentIntentId: "booking-1",
+        errorMessage: expect.stringContaining("$45.00"),
+      }), CLUB_FORMAT_TEST
+    );
+  });
+
+  it("mints normally for a booking whose election is explicitly NULL (#2265)", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }], creditElectionCents: null }) as never
+    );
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_1" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_new",
+      client_secret: "secret_new", currency: "nzd",
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    const result = await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    // NULL is the column's "nothing outstanding" state, which every pre-#2265
+    // row is already in — so the guard must be a no-op here, with the full price
+    // charged exactly as before.
+    expect(result).toEqual({
+      type: "clientSecret",
+      clientSecret: "secret_new",
+      paymentIntentId: "pi_new",
+    });
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 12000 })
+    );
+    expect(vi.mocked(sendAdminPaymentFailureAlert)).not.toHaveBeenCalled();
+  });
+
+  it("revalidates capacity under the advisory lock and refuses when beds are gone", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }] }) as never
+    );
+    mockedCheckCapacity.mockResolvedValue({ available: false, minAvailable: -1, nightDetails: [] } as never);
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 409 });
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+  });
+
+  // #1771 — a booking deliberately admitted over the ceiling by an admin carries
+  // a persisted capacityOverriddenAt marker. The payment-link capacity re-check
+  // must NOT 409 it: the payment proceeds and a fresh intent is minted.
+  it("pays an over-capacity booking with a persisted capacity override instead of 409ing (#1771)", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({
+        guests: [{ id: "guest-1" }],
+        capacityOverriddenAt: new Date("2026-06-01T00:00:00.000Z"),
+        capacityOverriddenByMemberId: "admin-1",
+      }) as never
+    );
+    mockedCheckCapacity.mockResolvedValue({ available: false, minAvailable: -1, nightDetails: [] } as never);
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_new",
+      client_secret: "secret_new", currency: "nzd",
+      amount: 12000,
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    const result = await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    expect(result).toMatchObject({ type: "clientSecret", paymentIntentId: "pi_new" });
+    // The payment proceeded rather than 409ing.
+    expect(mockedFindOrCreateCustomer).toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).toHaveBeenCalled();
+  });
+
+  it("consumes the POST-lock re-read (not the pre-lock read) for the capacity check (H3)", async () => {
+    // Pre-lock read is a lodgeId-only key select; the buggy order consumed its
+    // stale dates/guests. Make the two in-transaction reads differ and prove
+    // the capacity check ran against the POST-lock snapshot.
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    let readCount = 0;
+    vi.mocked(prisma.booking.findUnique).mockImplementation((async () =>
+      readCount++ === 0
+        ? {
+            lodgeId: "lodge-1",
+            checkIn: new Date("2026-01-01T00:00:00.000Z"),
+            checkOut: new Date("2026-01-03T00:00:00.000Z"),
+          }
+        : baseBooking({
+            checkIn: new Date("2026-05-20T00:00:00.000Z"),
+            checkOut: new Date("2026-05-22T00:00:00.000Z"),
+            guests: [{ id: "g-post" }],
+          })) as never);
+    mockedCheckCapacity.mockResolvedValue({ available: true, minAvailable: 5, nightDetails: [] } as never);
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_new",
+      client_secret: "secret_new", currency: "nzd",
+      amount: 12000,
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    // Pre-lock read selects only the lock key.
+    expect(vi.mocked(prisma.booking.findUnique)).toHaveBeenNthCalledWith(1, {
+      where: { id: "booking-1" },
+      select: { lodgeId: true },
+    });
+    // The capacity check ran against the POST-lock (May) dates + guest set.
+    expect(mockedCheckCapacity).toHaveBeenCalledWith(
+      "lodge-1",
+      new Date("2026-05-20T00:00:00.000Z"),
+      new Date("2026-05-22T00:00:00.000Z"),
+      [{ id: "g-post" }],
+      "booking-1",
+      expect.anything()
+    );
+  });
+
+  it("creates a new PaymentIntent for a fresh payable booking", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }] }) as never
+    );
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_new",
+      client_secret: "secret_new", currency: "nzd",
+      amount: 12000,
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    const result = await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    expect(result).toEqual({ type: "clientSecret", clientSecret: "secret_new", paymentIntentId: "pi_new" });
+    expect(mockedFindOrCreateCustomer).toHaveBeenCalledWith(
+      expect.objectContaining({ email: "tara@example.com", memberId: "member-1" })
+    );
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 12000,
+        metadata: expect.objectContaining({ bookingId: "booking-1", paymentLinkId: "link-1" }),
+      })
+    );
+  });
+
+  it("#3955 F2: sizes the intent, its payment row and its transaction at what the booking owes", async () => {
+    // Price 12000, a 2500 fee recorded on the payment by a finished-stay
+    // correction, 1500 of account credit applied: the link charges 13000.
+    mockedFindUnique.mockResolvedValue(
+      baseLink({
+        booking: baseBooking({
+          payment: { id: "pay-1", status: PaymentStatus.PENDING, changeFeeCents: 2500, stripePaymentIntentId: null },
+        }),
+      }) as never,
+    );
+    vi.mocked(prisma.memberCredit.aggregate).mockResolvedValueOnce({ _sum: { amountCents: -1500 } } as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(baseBooking({ guests: [{ id: "guest-1" }] }) as never);
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_new",
+      client_secret: "secret_new", currency: "nzd",
+      amount: 13000,
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 13000 }));
+  });
+
+  // #3638 (`INV-PAY-102`): the link is the third card door. A booking switched
+  // to Internet Banking has an emailed invoice, and a card intent recorded
+  // beside it also flips the payment's source back to STRIPE, hiding a later
+  // bank payment from the inbound loop — so the link refuses before minting,
+  // and again under lock(1) where it attaches.
+  describe("a booking being paid by Internet Banking (#3638)", () => {
+    // clearAllMocks keeps implementations; do not leak a "switched" payment
+    // into the rest of the suite.
+    afterEach(() => {
+      vi.mocked(prisma.payment.findUnique).mockReset();
+    });
+
+    it("refuses before any Stripe call when the booking has already switched", async () => {
+      mockedFindUnique.mockResolvedValue(
+        baseLink({
+          booking: baseBooking({
+            status: BookingStatus.PAYMENT_PENDING,
+            payment: {
+              id: "pay-1",
+              source: "INTERNET_BANKING",
+              status: PaymentStatus.PENDING,
+              stripePaymentIntentId: null,
+            },
+          }),
+        }) as never
+      );
+
+      // The shared body's message AND code (delta D4: one definition).
+      await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+        status: 409,
+        message: SWITCHED_TO_INTERNET_BANKING_BODY.error,
+        code: SWITCHED_TO_INTERNET_BANKING_BODY.code,
+      });
+      expect(mockedGetPaymentIntent).not.toHaveBeenCalled();
+      expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+      expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+      expect(mockedTransaction).not.toHaveBeenCalled();
+    });
+
+    it("refuses, attaches nothing and cancels the new intent when the switch committed during the mint", async () => {
+      mockedFindUnique.mockResolvedValue(baseLink() as never);
+      vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+        baseBooking({ guests: [{ id: "guest-1" }] }) as never
+      );
+      // Under the attach lock the payment now reads as switched.
+      vi.mocked(prisma.payment.findUnique).mockResolvedValue({
+        source: "INTERNET_BANKING",
+      } as never);
+      mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+      mockedCreatePaymentIntent.mockResolvedValue({
+        id: "pi_new",
+        client_secret: "secret_new",
+        amount: 12000,
+      } as never);
+
+      await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+        status: 409,
+        message: SWITCHED_TO_INTERNET_BANKING_BODY.error,
+        code: SWITCHED_TO_INTERNET_BANKING_BODY.code,
+      });
+      expect(prisma.payment.upsert).not.toHaveBeenCalled();
+      expect(mockedUpsertPaymentIntentTransaction).not.toHaveBeenCalled();
+      expect(vi.mocked(cancelPaymentIntentIfCancellableWithResult)).toHaveBeenCalledWith("pi_new");
+    });
+
+    it("refuses with 410 and cancels the new intent when the booking stopped being payable during the mint", async () => {
+      mockedFindUnique.mockResolvedValue(baseLink() as never);
+      const payable = baseBooking({ guests: [{ id: "guest-1" }] });
+      vi.mocked(prisma.booking.findUnique)
+        // The revalidation transaction's lock-key read and post-lock re-read.
+        .mockResolvedValueOnce(payable as never)
+        .mockResolvedValueOnce(payable as never)
+        // The attach's re-read: cancelled while Stripe was minting.
+        .mockResolvedValueOnce({ status: BookingStatus.CANCELLED } as never);
+      vi.mocked(prisma.payment.findUnique).mockResolvedValue(null as never);
+      mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+      mockedCreatePaymentIntent.mockResolvedValue({
+        id: "pi_new",
+        client_secret: "secret_new",
+        amount: 12000,
+      } as never);
+
+      await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+        status: 410,
+      });
+      expect(mockedUpsertPaymentIntentTransaction).not.toHaveBeenCalled();
+      expect(vi.mocked(cancelPaymentIntentIfCancellableWithResult)).toHaveBeenCalledWith("pi_new");
+    });
+
+    it("attaches a card intent under lock(1), on the locked transaction's handle", async () => {
+      mockedFindUnique.mockResolvedValue(baseLink() as never);
+      vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+        baseBooking({ guests: [{ id: "guest-1" }] }) as never
+      );
+      vi.mocked(prisma.payment.findUnique).mockResolvedValue({ source: "STRIPE" } as never);
+      mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+      mockedCreatePaymentIntent.mockResolvedValue({
+        id: "pi_new",
+        client_secret: "secret_new",
+        amount: 12000,
+      } as never);
+      vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+      const txHandles: unknown[] = [];
+      mockedTransaction.mockImplementation(
+        async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+          txHandles.push(prisma);
+          return fn(prisma);
+        }
+      );
+
+      await createPaymentIntentForPaymentLink(RAW_TOKEN);
+
+      // The attach is its own transaction, after the lodge-lock revalidation.
+      expect(txHandles).toHaveLength(2);
+      const lockCall = vi
+        .mocked(prisma.$executeRaw)
+        .mock.calls.findIndex(([sql]) =>
+          (sql as unknown as string[]).join("?").includes("pg_advisory_xact_lock(1)")
+        );
+      expect(lockCall).toBeGreaterThanOrEqual(0);
+      expect(
+        vi.mocked(prisma.$executeRaw).mock.invocationCallOrder[lockCall]
+      ).toBeLessThan(vi.mocked(prisma.payment.findUnique).mock.invocationCallOrder[0]);
+      expect(mockedUpsertPaymentIntentTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          paymentId: "pay-1",
+          paymentIntentId: "pi_new",
+          store: prisma,
+        })
+      );
+      expect(vi.mocked(cancelPaymentIntentIfCancellableWithResult)).not.toHaveBeenCalled();
+    });
+  });
+
+  it("throws when the booking has no client secret available", async () => {
+    mockedFindUnique.mockResolvedValue(baseLink() as never);
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }] }) as never
+    );
+    mockedFindOrCreateCustomer.mockResolvedValue({ id: "cus_123" } as never);
+    mockedCreatePaymentIntent.mockResolvedValue({
+      id: "pi_new",
+      client_secret: null, currency: "nzd",
+      amount: 12000,
+    } as never);
+    vi.mocked(prisma.payment.upsert).mockResolvedValue({ id: "pay-1" } as never);
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({ status: 500 });
+  });
+
+  it("refuses with 410 when the link was revoked between resolution and the under-lock re-read (#1967 FIX-6)", async () => {
+    // The cron's auto-charge claim revokes links under the lodge lock just
+    // before charging a saved card; a /pay request that resolved the link a
+    // moment earlier must see the revocation in its own locked re-read and
+    // never mint a competing PaymentIntent.
+    mockedFindUnique.mockImplementation((async ({
+      where,
+    }: {
+      where: { tokenHash?: string; id?: string };
+    }) =>
+      where.tokenHash
+        ? baseLink() // initial token resolution: still active
+        : { revokedAt: new Date() }) as never); // under-lock re-read: revoked
+    vi.mocked(prisma.booking.findUnique).mockResolvedValue(
+      baseBooking({ guests: [{ id: "guest-1" }] }) as never
+    );
+
+    await expect(createPaymentIntentForPaymentLink(RAW_TOKEN)).rejects.toMatchObject({
+      status: 410,
+    });
+    expect(mockedFindOrCreateCustomer).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+});
+
+describe("issueSplitGuestPaymentLink (#1967)", () => {
+  const mockedBookingFindUnique = vi.mocked(prisma.booking.findUnique);
+  const mockedPaymentLinkFindFirst = vi.mocked(prisma.paymentLink.findFirst);
+  const mockedPaymentLinkCreate = vi.mocked(prisma.paymentLink.create);
+
+  function splitChild(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "child-1",
+      memberId: "member-1",
+      status: BookingStatus.PENDING,
+      checkIn: new Date("2026-08-01T00:00:00.000Z"),
+      checkOut: new Date("2026-08-03T00:00:00.000Z"),
+      finalPriceCents: 12000,
+      deletedAt: null,
+      parentBookingId: "parent-1",
+      hasNonMembers: true,
+      lodgeId: "lodge-1",
+      member: {
+        id: "member-1",
+        email: "tara@example.com",
+        firstName: "Tara",
+        lastName: "Tester",
+      },
+      guests: [{ id: "g1" }, { id: "g2" }],
+      // No saved card anywhere (FIX-5) and not a #796 group joiner (FIX-2).
+      payment: null,
+      parentBooking: { id: "parent-1", payment: null },
+      groupBookingJoin: null,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prisma.emailLog.findFirst).mockResolvedValue(null);
+    vi.mocked(prisma.emailLog.create).mockResolvedValue({ id: "emaillog-1" } as never);
+    // The helper mints under the shared booking advisory lock: invoke the
+    // transaction callback with a tx exposing only what it touches.
+    mockedTransaction.mockImplementation(async (arg: unknown) => {
+      if (typeof arg === "function") {
+        return (arg as (tx: unknown) => unknown)({
+          booking: { findUnique: mockedBookingFindUnique },
+          paymentLink: {
+            findFirst: mockedPaymentLinkFindFirst,
+            create: mockedPaymentLinkCreate,
+            updateMany: mockedUpdateMany,
+          },
+        });
+      }
+      return arg;
+    });
+    mockedUpdateMany.mockResolvedValue({ count: 0 } as never);
+  });
+
+  it("returns not_payable for a non-child booking without minting or emailing", async () => {
+    mockedBookingFindUnique.mockResolvedValue(
+      splitChild({ parentBookingId: null }) as never
+    );
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "not_payable" });
+    expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+  });
+
+  it("returns not_payable for a #796 group joiner, which must never enter the split-guest flow (#1967 FIX-2)", async () => {
+    mockedBookingFindUnique.mockResolvedValue(
+      splitChild({ groupBookingJoin: { id: "join-1" } }) as never
+    );
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "not_payable" });
+    expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["is not PENDING", { status: BookingStatus.CONFIRMED }],
+    ["carries no non-members", { hasNonMembers: false }],
+  ])(
+    "returns not_payable when the child %s, through the shared split-guest child rule (INV-SSOT)",
+    async (_label, overrides) => {
+      mockedBookingFindUnique.mockResolvedValue(splitChild(overrides) as never);
+
+      const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+      expect(result).toEqual({ outcome: "not_payable" });
+      expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+      expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+    }
+  );
+
+  it("returns not_payable when the parent payment carries a saved card — the cron will auto-charge (#1967 FIX-5)", async () => {
+    mockedBookingFindUnique.mockResolvedValue(
+      splitChild({
+        parentBooking: {
+          id: "parent-1",
+          payment: {
+            id: "pay-parent",
+            stripeCustomerId: "cus_parent",
+            stripePaymentMethodId: "pm_parent",
+            // #3269: a saved card is one a SetupIntent saved.
+            stripeSetupIntentId: "seti_parent",
+          },
+        },
+      }) as never
+    );
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "not_payable" });
+    expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+  });
+
+  it("returns not_payable when the child's own payment carries a saved card (#1967 FIX-5)", async () => {
+    mockedBookingFindUnique.mockResolvedValue(
+      splitChild({
+        payment: {
+          id: "pay-child",
+          stripeCustomerId: "cus_child",
+          stripePaymentMethodId: "pm_child",
+          stripeSetupIntentId: "seti_child",
+        },
+      }) as never
+    );
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "not_payable" });
+    expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+  });
+
+  it("#4357: a $0 child still owing a recorded change fee gets its link; a $0 child owing nothing does not", async () => {
+    const owingFee = splitChild({
+      finalPriceCents: 0,
+      payment: { id: "pay-child", changeFeeCents: 2500, stripeCustomerId: null, stripePaymentMethodId: null, stripeSetupIntentId: null },
+    });
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(owingFee as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-1" } as never);
+
+    expect(await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST)).toMatchObject({ outcome: "sent" });
+
+    mockedBookingFindUnique.mockResolvedValueOnce(splitChild({ finalPriceCents: 0 }) as never);
+    expect(await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST)).toEqual({ outcome: "not_payable" });
+  });
+
+  it("mints the link when the parent's card came from a one-off checkout (no SetupIntent): the cron will not charge it, so the link is the only settlement path (#3269)", async () => {
+    // Pre-#3269 this read as "has a saved card" and refused the link, while the
+    // cron's charge on the same card was refused by Stripe — nothing settled.
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(
+        splitChild({
+          parentBooking: {
+            id: "parent-1",
+            payment: {
+              id: "pay-parent",
+              stripeCustomerId: "cus_parent",
+              stripePaymentMethodId: "pm_parent",
+              stripeSetupIntentId: null,
+            },
+          },
+        }) as never
+      )
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-1" } as never);
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toMatchObject({
+      outcome: "sent",
+      emailLogId: "log-2",
+      recipientMemberId: "member-1",
+      sentTo: "tara@example.com",
+    });
+    expect(mockedPaymentLinkCreate).toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).toHaveBeenCalled();
+  });
+
+  it("returns not_payable when the under-lock re-read finds the booking has left PENDING (#1967)", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never) // outer load
+      .mockResolvedValueOnce({ status: BookingStatus.CANCELLED } as never); // under-lock re-read
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "not_payable" });
+    expect(mockedPaymentLinkFindFirst).not.toHaveBeenCalled();
+    expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+  });
+
+  // #2258 review finding: discovering the withhold only at SEND time meant the
+  // link was minted, the send withheld, and the link revoked — every single run.
+  it("mints nothing at all when the booking has No emails on, and records the withhold once", async () => {
+    mockedBookingFindUnique.mockResolvedValue(
+      splitChild({ noEmails: true }) as never
+    );
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "withheld" });
+    // The whole point: no mint, so no revoke, so no churn.
+    expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+    expect(mockedPaymentLinkFindFirst).not.toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+    // Recorded idempotently, so repeat attempts do not flood the withheld list.
+    expect(vi.mocked(prisma.emailLog.findFirst)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          bookingId: "child-1",
+          templateName: "split-guest-payment-link",
+        }),
+      })
+    );
+  });
+
+  it("writes no second withheld row when one already exists", async () => {
+    mockedBookingFindUnique.mockResolvedValue(
+      splitChild({ noEmails: true }) as never
+    );
+    vi.mocked(prisma.emailLog.findFirst).mockResolvedValue({
+      id: "log-existing",
+    } as never);
+
+    await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(vi.mocked(prisma.emailLog.create)).not.toHaveBeenCalled();
+  });
+
+  it("mints a link and emails the member's guest portion on the first request", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never) // outer load
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never); // under-lock re-read
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-1" } as never);
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toMatchObject({ outcome: "sent" });
+    expect(mockedPaymentLinkCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ bookingId: "child-1" }),
+      })
+    );
+    expect(sendSplitGuestPaymentLinkEmail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        email: "tara@example.com",
+        priceCents: 12000,
+        amountDueCents: 12000,
+        guestCount: 2,
+        bookingId: "child-1",
+      }), CLUB_FORMAT_TEST
+    );
+  });
+
+  it("quotes the amount owed, not the bare price, in the guest-portion email (#4058)", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(
+        splitChild({
+          finalPriceCents: 30000,
+          payment: { id: "pay-1", source: "STRIPE", status: PaymentStatus.PENDING, changeFeeCents: 2500 },
+        }) as never,
+      )
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-1" } as never);
+
+    await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(sendSplitGuestPaymentLinkEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ priceCents: 30000, amountDueCents: 32500 }),
+      CLUB_FORMAT_TEST,
+    );
+  });
+
+  it("short-circuits to just_sent when an active link was minted moments ago (double-click guard)", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue({
+      id: "pl-existing",
+      createdAt: new Date(Date.now() - 10_000), // 10s old — inside cooldown
+    } as never);
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "just_sent" });
+    expect(mockedPaymentLinkCreate).not.toHaveBeenCalled();
+    expect(mockedUpdateMany).not.toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).not.toHaveBeenCalled();
+  });
+
+  it("revokes and re-mints past the cooldown: a true re-send replaces the unrecoverable token (#1967 FIX-3b)", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue({
+      id: "pl-existing",
+      createdAt: new Date(Date.now() - 10 * 60_000), // 10 min old
+    } as never);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-fresh" } as never);
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toMatchObject({ outcome: "sent" });
+    // Revocation and mint are one atomic step under the lodge lock:
+    // exactly-one-active-link is preserved.
+    expect(mockedUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          bookingId: "child-1",
+          revokedAt: null,
+          usedAt: null,
+        }),
+        data: expect.objectContaining({ revokedAt: expect.any(Date) }),
+      })
+    );
+    expect(mockedPaymentLinkCreate).toHaveBeenCalled();
+    expect(sendSplitGuestPaymentLinkEmail).toHaveBeenCalled();
+  });
+
+  it("revokes the just-minted link when the email is suppressed, so nothing unreachable stays active (#1967 FIX-3)", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-fresh" } as never);
+    vi.mocked(sendSplitGuestPaymentLinkEmail).mockResolvedValueOnce({
+      status: "suppressed",
+      emailLogId: null,
+      emailSuppressionId: "sup-1",
+      reason: "BOUNCE",
+    } as never);
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    expect(result).toEqual({ outcome: "suppressed" });
+    // Post-commit revocation targets exactly the minted row by id.
+    expect(mockedUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: "pl-fresh",
+          revokedAt: null,
+          usedAt: null,
+        }),
+      })
+    );
+  });
+
+  /*
+    #3035 review: AN ENVIRONMENT WITHHOLD IS NOT AN UNDELIVERABLE ADDRESS.
+
+    Every non-sent outcome used to fall into `suppressed`, and the route turns
+    that into a 502 reading "your email address is undeliverable" — shown to a
+    MEMBER. On the epic's headline case (a live club upgraded without the
+    declaration) the member's mailbox is perfectly fine and the club has simply
+    not told the software what the installation is. The same file already states
+    that rule for the unreadable-switch case: telling somebody their address is
+    undeliverable when it is not is misinformation, and it points an officer at
+    the wrong diagnosis.
+  */
+  it("reports an undeclared installation as a TRANSIENT failure, not an undeliverable address", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-fresh" } as never);
+    vi.mocked(sendSplitGuestPaymentLinkEmail).mockResolvedValueOnce({
+      status: "withheld_for_environment",
+      emailLogId: "log-1",
+      reason: "environment_unknown",
+    } as never);
+
+    const result = await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST);
+
+    // 503 "try again shortly" rather than 502 "your address is undeliverable".
+    expect(result).toEqual({ outcome: "transient_failure" });
+    // The unreachable link is still revoked, exactly as for every other
+    // non-send: nothing minted may stay active.
+    expect(mockedUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "pl-fresh", revokedAt: null }),
+      })
+    );
+  });
+
+  it("reports a live site wrongly declaring a capture mailbox as transient too", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-fresh" } as never);
+    vi.mocked(sendSplitGuestPaymentLinkEmail).mockResolvedValueOnce({
+      status: "withheld_for_environment",
+      emailLogId: "log-1",
+      reason: "capture_transport_in_production",
+    } as never);
+
+    expect(await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST)).toEqual({
+      outcome: "transient_failure",
+    });
+  });
+
+  it("reports a confirmed COPY as withheld, which is the deliberate bucket", async () => {
+    /*
+      Not transient: a copy is a copy until somebody re-declares it, so "try again
+      shortly" would be false. `withheld` is the non-transient, no-cause-disclosed
+      bucket the per-booking "No emails" switch already uses.
+    */
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-fresh" } as never);
+    vi.mocked(sendSplitGuestPaymentLinkEmail).mockResolvedValueOnce({
+      status: "withheld_for_environment",
+      emailLogId: "log-1",
+      reason: "environment_non_production",
+    } as never);
+
+    expect(await issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST)).toEqual({
+      outcome: "withheld",
+    });
+  });
+
+  it("revokes the just-minted link and rethrows when the email send throws (#1967 FIX-3)", async () => {
+    mockedBookingFindUnique
+      .mockResolvedValueOnce(splitChild() as never)
+      .mockResolvedValueOnce({ status: BookingStatus.PENDING } as never);
+    mockedPaymentLinkFindFirst.mockResolvedValue(null);
+    mockedPaymentLinkCreate.mockResolvedValue({ id: "pl-fresh" } as never);
+    vi.mocked(sendSplitGuestPaymentLinkEmail).mockRejectedValueOnce(
+      new Error("SES unavailable")
+    );
+
+    await expect(issueSplitGuestPaymentLink("child-1", CLUB_FORMAT_TEST)).rejects.toThrow(
+      "SES unavailable"
+    );
+    expect(mockedUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "pl-fresh" }),
+      })
+    );
+  });
+});
+
+describe("mintSplitGuestPaymentLinkIfAbsent (#1967) — real helper against a stateful store", () => {
+  type StoredLink = {
+    id: string;
+    bookingId: string;
+    tokenHash: string;
+    expiresAt: Date;
+    usedAt: Date | null;
+    revokedAt: Date | null;
+  };
+
+  // A minimal in-memory PaymentLink table honouring exactly the query shapes
+  // the helper issues, so consecutive calls exercise the REAL cross-run
+  // idempotency sentinel rather than a mocked return value.
+  function makeStatefulTx(seed: StoredLink[] = []) {
+    const links: StoredLink[] = [...seed];
+    let nextId = seed.length + 1;
+    const tx = {
+      paymentLink: {
+        findFirst: async ({
+          where,
+        }: {
+          where: { bookingId: string; expiresAt: { gt: Date } };
+        }) =>
+          links.find(
+            (l) =>
+              l.bookingId === where.bookingId &&
+              l.revokedAt === null &&
+              l.usedAt === null &&
+              l.expiresAt.getTime() > where.expiresAt.gt.getTime()
+          ) ?? null,
+        updateMany: async ({
+          where,
+          data,
+        }: {
+          where: { bookingId: string };
+          data: { revokedAt: Date };
+        }) => {
+          let count = 0;
+          for (const l of links) {
+            if (
+              l.bookingId === where.bookingId &&
+              l.revokedAt === null &&
+              l.usedAt === null
+            ) {
+              l.revokedAt = data.revokedAt;
+              count += 1;
+            }
+          }
+          return { count };
+        },
+        create: async ({
+          data,
+        }: {
+          data: { bookingId: string; tokenHash: string; expiresAt: Date };
+        }) => {
+          const row: StoredLink = {
+            id: `pl-${nextId++}`,
+            usedAt: null,
+            revokedAt: null,
+            ...data,
+          };
+          links.push(row);
+          return row;
+        },
+      },
+    };
+    return { tx: tx as never, links };
+  }
+
+  const FUTURE_CHECK_IN = new Date("2026-08-01T00:00:00.000Z");
+  /**
+   * The zone the caller supplies. These tests are about the idempotency
+   * sentinel rather than the boundary, so they pass the zone this deployment's
+   * `APP_TIME_ZONE` already resolves to and their expected instants do not
+   * move. The boundary itself — that it is the club's PERSISTED zone and not
+   * the environment's — is
+   * `payment-link-expiry-club-zone.test.ts`, which is where a divergent zone
+   * belongs; asserting it here as well would only re-pin Auckland.
+   */
+  const CLUB_ZONE = requireClubTimeZone("Pacific/Auckland");
+
+  it("mints on the first run and returns null on every later run while the link stays active (real cross-run idempotency)", async () => {
+    const { tx, links } = makeStatefulTx();
+
+    const first = await mintSplitGuestPaymentLinkIfAbsent(
+      tx,
+      { id: "child-1", checkIn: FUTURE_CHECK_IN },
+      CLUB_ZONE
+    );
+    const second = await mintSplitGuestPaymentLinkIfAbsent(
+      tx,
+      { id: "child-1", checkIn: FUTURE_CHECK_IN },
+      CLUB_ZONE
+    );
+    const third = await mintSplitGuestPaymentLinkIfAbsent(
+      tx,
+      { id: "child-1", checkIn: FUTURE_CHECK_IN },
+      CLUB_ZONE
+    );
+
+    expect(first).toEqual({
+      token: expect.any(String),
+      paymentLinkId: "pl-1",
+      // The stored instant, returned so the caller's email cannot derive a
+      // different one.
+      expiresAt: links[0].expiresAt,
+    });
+    expect(second).toBeNull();
+    expect(third).toBeNull();
+    // Exactly one live link exists.
+    expect(links.filter((l) => l.revokedAt === null)).toHaveLength(1);
+  });
+
+  it("treats an expired unused link as NOT active: revokes it and mints a fresh one (#1967 FIX-3c)", async () => {
+    // e.g. the booking's dates were pushed out after the first link lapsed.
+    const { tx, links } = makeStatefulTx([
+      {
+        id: "pl-stale",
+        bookingId: "child-1",
+        tokenHash: "stale-hash",
+        expiresAt: new Date("2026-01-01T00:00:00.000Z"), // long past
+        usedAt: null,
+        revokedAt: null,
+      },
+    ]);
+
+    const minted = await mintSplitGuestPaymentLinkIfAbsent(
+      tx,
+      { id: "child-1", checkIn: FUTURE_CHECK_IN },
+      CLUB_ZONE
+    );
+
+    expect(minted).toEqual({
+      token: expect.any(String),
+      paymentLinkId: expect.any(String),
+      expiresAt: expect.any(Date),
+    });
+    // The stale link was revoked in the same locked step, so at most one
+    // usable token exists.
+    expect(links.find((l) => l.id === "pl-stale")?.revokedAt).toBeInstanceOf(
+      Date
+    );
+    expect(links.filter((l) => l.revokedAt === null)).toHaveLength(1);
+  });
+
+  it("never mints a link that would be born expired (check-in day already over)", async () => {
+    const { tx, links } = makeStatefulTx();
+
+    const minted = await mintSplitGuestPaymentLinkIfAbsent(
+      tx,
+      { id: "child-1", checkIn: new Date("2020-01-01T00:00:00.000Z") },
+      CLUB_ZONE
+    );
+
+    expect(minted).toBeNull();
+    expect(links).toHaveLength(0);
+  });
+});
+
+describe("revokePaymentLinkById (#1967)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("revokes exactly the given link, only while unused and unrevoked", async () => {
+    mockedUpdateMany.mockResolvedValue({ count: 1 } as never);
+
+    const count = await revokePaymentLinkById("pl-1");
+
+    expect(count).toBe(1);
+    expect(mockedUpdateMany).toHaveBeenCalledWith({
+      where: { id: "pl-1", revokedAt: null, usedAt: null },
+      data: { revokedAt: expect.any(Date) },
+    });
+  });
+});

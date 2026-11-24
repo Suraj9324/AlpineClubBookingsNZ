@@ -1,0 +1,404 @@
+import {
+  formatClubDayMonth,
+  requireCalendarDate,
+  type ClubDateFormat,
+} from "@/lib/club-time";
+import {
+  getFinanceBookingMetrics,
+  type FinanceBookingMetricsResult,
+} from "@/lib/finance-booking-metrics";
+import type { FinanceDashboardSelection } from "@/lib/finance-dashboard-ranges";
+import {
+  formatDollarsDisplay,
+  formatFinanceNumber as formatNumber,
+  formatFinancePercent as formatPercent,
+  formatFinanceSignedNumber as formatSignedNumber,
+  formatSignedDollarsDisplay,
+} from "@/lib/finance-format";
+import {
+  cardRows,
+  type FinanceDashboardKpiCard,
+  type FinanceDashboardStatusPanel,
+  type FinanceDashboardTrend,
+  type FinanceDashboardViewModel,
+} from "@/lib/finance-dashboard-page/model";
+import { appendBookingMoneyReconciliationDashboardState } from "@/lib/finance-dashboard-page/money-reconciliation";
+import { SERIES_COLORS } from "@/lib/finance-dashboard-page/series-colors";
+import type { ClubFormat } from "@/lib/club-format";
+import { formatNetCollectedLedgerGapWarning } from "@/lib/payment-net-collected";
+import {
+  CREDITS_OWED_LABEL,
+  REFUNDS_AND_CREDITS_OWED_NOTE,
+  REFUNDS_OWED_LABEL,
+} from "@/lib/refunds-and-credits-owed-shared";
+import { formatCents } from "@/lib/utils";
+
+// Compact day+month export label ("14 Jun"), deliberately year-less: it labels
+// rows already scoped to one range, and widening it to the shared medium form
+// would change an exported report column. That bag is the kernel's `dayMonth`
+// shape (F3, #3079), so the local formatter this file kept is gone.
+//
+// CT-4 (#2870): THIS ALSO CORRECTS THE DAY. Every value reaching it is a
+// `yyyy-MM-dd` metric key minted by `buildIsoDateRange`, i.e. a CALENDAR DATE,
+// which takes no zone — and the local formatter was still pinned to
+// `APP_TIME_ZONE`. That projection cancelled only because New Zealand is east of
+// Greenwich; for a club west of it every trend point on the finance dashboard,
+// and every exported row label, named the PREVIOUS day (INV-DATE-019).
+
+function formatShortDate(dateOnly: string, format: ClubDateFormat) {
+  return formatClubDayMonth(requireCalendarDate(dateOnly), format);
+}
+
+/** The Net Collected card's footnote: where the figure comes from. */
+const NET_COLLECTED_SOURCE_NOTE =
+  "Worked out from this app's own payment, account credit and refund records, not from Xero revenue.";
+
+export async function buildBookingsDashboard(
+  selection: FinanceDashboardSelection,
+  lodgeId: string | null,
+  format: ClubFormat,
+): Promise<FinanceDashboardViewModel> {
+  const warnings: string[] = [];
+  const query = {
+    realized: {
+      from: selection.primary.from,
+      to: selection.primary.to,
+      cutoffDate: selection.primary.to,
+    },
+    ...(selection.forwardWindow.from && selection.forwardWindow.to
+      ? {
+          forward: {
+            from: selection.forwardWindow.from,
+            to: selection.forwardWindow.to,
+            asOfDate: selection.primary.to,
+          },
+        }
+      : {}),
+    lodgeId,
+  };
+  const [metrics, comparison] = await Promise.all([
+    // #3372: this window shows Refunds owed and Credits owed; the comparison
+    // does not, so the page reads them once.
+    getFinanceBookingMetrics({ ...query, includeRefundsAndCreditsOwed: true }),
+    selection.comparison
+      ? getFinanceBookingMetrics({
+          realized: {
+            from: selection.comparison.from,
+            to: selection.comparison.to,
+            cutoffDate: selection.comparison.to,
+          },
+          lodgeId,
+        })
+      : Promise.resolve(null),
+  ]);
+  const realized = metrics.realized;
+  const compareRealized = comparison?.realized ?? null;
+
+  if (!realized) {
+    warnings.push(
+      "Realized booking metrics were unavailable for the selected range.",
+    );
+  }
+
+  // #2408. Net Collected starts from the captured figure on the payment
+  // rows, which contains a collected price increase because the payment ledger
+  // put it there. A payment that says its increase was collected without a
+  // ledger row to prove it is the one shape where that is not true, so the card
+  // below would understate the cash. Say so where the treasurer reads the
+  // number, and say by how much, rather than publishing a figure that is
+  // quietly short. #3637: the one wording Reports and Payments use, over the
+  // same payments the figure counts. Its amount is in exact cents, as there,
+  // not the page's whole dollars: a gap under a dollar must not read "$0".
+  const ledgerGapBookings = metrics.paymentSummary.additionalLedgerGapBookings;
+  const ledgerGapWarning = formatNetCollectedLedgerGapWarning(
+    metrics.paymentSummary,
+    { one: "booking in this range", many: "bookings in this range" },
+    (cents) => formatCents(cents, format),
+    (count) => formatNumber(count, format),
+  );
+  if (ledgerGapWarning) warnings.push(ledgerGapWarning);
+  const moneyReconciliationPanel =
+    appendBookingMoneyReconciliationDashboardState({
+      warnings,
+      primary: metrics.moneyReconciliation,
+      comparison: comparison?.moneyReconciliation ?? null,
+      affectedMetrics:
+        "Booked revenue, forward revenue, and comparison figures",
+      formatNumber: (value) => formatNumber(value, format),
+    });
+
+  const realizedTotals = realized?.totals;
+  const compareTotals = compareRealized?.totals;
+  const cards: FinanceDashboardKpiCard[] = [
+    {
+      title: "Realized guest nights",
+      value: formatNumber(realizedTotals?.guestNights ?? 0, format),
+      description: "Guest nights stayed in the selected period.",
+      footnote: compareTotals
+        ? `${formatSignedNumber((realizedTotals?.guestNights ?? 0) - compareTotals.guestNights, format)} vs comparison.`
+        : undefined,
+    },
+    {
+      title: "Occupancy",
+      value: formatPercent(realizedTotals?.occupancy.occupancyRate ?? 0, format),
+      description: "Occupied bed nights divided by available bed nights.",
+      footnote: compareTotals
+        ? `${formatPercent(compareTotals.occupancy.occupancyRate, format)} in comparison.`
+        : undefined,
+    },
+    {
+      title: "Booked revenue",
+      value: formatDollarsDisplay(realizedTotals?.bookedRevenueCents ?? 0, format),
+      description:
+        "Booking-system revenue allocated across realized stay nights.",
+      footnote: compareTotals
+        ? `${formatSignedDollarsDisplay((realizedTotals?.bookedRevenueCents ?? 0) - compareTotals.bookedRevenueCents, format)} vs comparison.`
+        : undefined,
+    },
+    {
+      title: "Net Collected",
+      value: formatDollarsDisplay(metrics.paymentSummary.netCollectedCents, format),
+      // #2408: one figure, counted once. The captured amount on a payment row
+      // already includes any later price increase that was collected, so this
+      // is the whole of the cash and not a part of it. #3637: over the one Net
+      // Collected booking scope (every booking in the range whatever its
+      // status, deleted ones left out), so it answers as the dashboard,
+      // Payments and Reports do.
+      description:
+        "Captured payments less refunds and credits, and less money still owed back (refunds owed by hand, card refunds not yet paid, late card charges awaiting a decision), for bookings in the range, including any collected price increase. Cancelled bookings count only what was kept of what was paid; deleted bookings are left out.",
+      // #3372 (3 Oct 2026): kept account credit and hand-backs owed come from
+      // this app's credit and refund-task rows too, so not "payment-derived".
+      footnote:
+        ledgerGapBookings > 0
+          ? `May understate by ${formatCents(metrics.paymentSummary.additionalLedgerGapCents, format)} - see the warning above. ${NET_COLLECTED_SOURCE_NOTE}`
+          : NET_COLLECTED_SOURCE_NOTE,
+    },
+    // #3372 (owner, 7 Oct 2026): beside Net Collected, what is still owed back.
+    {
+      title: REFUNDS_OWED_LABEL,
+      value: formatDollarsDisplay(metrics.paymentSummary.refundsOwedCents ?? 0, format),
+      // #3372 review (F5): each comes off Net Collected only for its own
+      // booking, which may sit outside this range or be deleted.
+      description:
+        "Refunds promised back and not yet paid: by hand, by card while Stripe has not yet paid them, and late card charges awaiting the treasurer's decision. Each is taken off Net Collected for its own booking, so only those in this range come off the figure beside it.",
+      footnote: REFUNDS_AND_CREDITS_OWED_NOTE,
+    },
+    {
+      title: CREDITS_OWED_LABEL,
+      value: formatDollarsDisplay(metrics.paymentSummary.creditsOwedCents ?? 0, format),
+      description:
+        "Account credit issued to members and not yet used on a booking.",
+      footnote: REFUNDS_AND_CREDITS_OWED_NOTE,
+    },
+    {
+      title: "Forward demand",
+      value: formatNumber(
+        metrics.forward?.totals.totalPipeline.guestNights ?? 0,
+        format,
+      ),
+      description:
+        "Committed plus at-risk future guest nights in the forward window.",
+      footnote: selection.forwardWindow.from
+        ? selection.forwardWindow.label
+        : "Forward window unavailable.",
+    },
+    {
+      // #2350: the payment summary has always counted these; nothing rendered
+      // them, so an upward booking change whose extra was never collected was
+      // invisible on every finance surface.
+      title: "Outstanding additional payments",
+      value: formatDollarsDisplay(
+        metrics.paymentSummary.outstandingAdditionalCents,
+        format,
+      ),
+      description:
+        "Extra owed after an upward booking change and not yet collected, for bookings in the selected range.",
+      // Window-scoped, unlike the admin dashboard card and sidebar badge (which
+      // count every owing booking, whenever it stays) and the reports summary
+      // (which counts the report's own date range). Say so, or the three
+      // numbers look like a contradiction rather than three questions.
+      footnote: `${formatNumber(metrics.paymentSummary.outstandingAdditionalBookings, format)} booking${metrics.paymentSummary.outstandingAdditionalBookings === 1 ? "" : "s"} awaiting or failed payment in this range.`,
+    },
+  ];
+
+  const trends: FinanceDashboardTrend[] = [];
+  if (realized) {
+    trends.push({
+      title: "Occupancy and guest-night trend",
+      description:
+        "Daily realized occupancy and guest nights for the selected range.",
+      variant: "line",
+      xKey: "label",
+      data: realized.byDate.map((entry) => ({
+        label: formatShortDate(entry.date, format),
+        occupancy: entry.occupancyRate,
+        guestNights: entry.guestNights,
+      })),
+      series: [
+        {
+          key: "occupancy",
+          name: "Occupancy",
+          color: SERIES_COLORS.revenue,
+          valueType: "percent",
+        },
+        {
+          key: "guestNights",
+          name: "Guest nights",
+          color: SERIES_COLORS.bookings,
+          valueType: "count",
+        },
+      ],
+    });
+  }
+  if (metrics.forward) {
+    trends.push({
+      title: "Forward committed and at-risk demand",
+      description:
+        "Future pipeline split between paid committed stays and at-risk bookings.",
+      variant: "area",
+      xKey: "label",
+      data: metrics.forward.byDate.map((entry) => ({
+        label: formatShortDate(entry.date, format),
+        committed: entry.committed.guestNights,
+        atRisk: entry.atRisk.guestNights,
+      })),
+      series: [
+        {
+          key: "committed",
+          name: "Committed",
+          color: SERIES_COLORS.positive,
+          valueType: "count",
+          stackId: "pipeline",
+        },
+        {
+          key: "atRisk",
+          name: "At risk",
+          color: SERIES_COLORS.costs,
+          valueType: "count",
+          stackId: "pipeline",
+        },
+      ],
+    });
+  }
+
+  const statusPanels = [
+    moneyReconciliationPanel,
+    ...buildBookingStatusPanels(metrics, format),
+  ];
+  return {
+    cards,
+    trends,
+    mix: null,
+    statusPanels,
+    costFilters: null,
+    sourceNotes: [
+      {
+        label: "Booking metrics",
+        description:
+          "Guest nights, occupancy, and booked revenue come from local booking and guest-night rows.",
+      },
+      {
+        label: "Net Collected",
+        description:
+          "Net Collected comes from local payment, account credit and refund-task rows and remains separate from Xero revenue recognition.",
+      },
+    ],
+    exportSections: [
+      { title: "KPI cards", rows: cardRows(cards) },
+      {
+        title: "Forward status",
+        rows: statusPanels.flatMap((panel) =>
+          panel.items.map((item) => ({
+            Panel: panel.title,
+            Label: item.label,
+            Value: item.value,
+            Detail: item.detail ?? "",
+          })),
+        ),
+      },
+    ],
+    warnings,
+  };
+}
+
+function buildBookingStatusPanels(
+  metrics: FinanceBookingMetricsResult,
+  format: ClubFormat,
+): FinanceDashboardStatusPanel[] {
+  const panels: FinanceDashboardStatusPanel[] = [];
+  if (metrics.realized) {
+    panels.push({
+      title: "Realized status mix",
+      description: "Booking statuses contributing to realized guest nights.",
+      items: Object.entries(metrics.realized.statusBreakdown).map(
+        ([status, summary]) => ({
+          label: status,
+          value: formatNumber(summary.guestNights, format),
+          detail: `${formatNumber(summary.bookingCount, format)} bookings, ${formatDollarsDisplay(summary.bookedRevenueCents, format)}`,
+        }),
+      ),
+    });
+  }
+  // #2350: the additional-payment status split, alongside the existing
+  // realized/forward panels. Rendered only when something is actually
+  // outstanding — an all-clear panel of zeroes is noise on a busy dashboard.
+  const additionalBreakdown =
+    metrics.paymentSummary.additionalPaymentStatusBreakdown;
+  if (metrics.paymentSummary.outstandingAdditionalBookings > 0) {
+    panels.push({
+      title: "Outstanding additional payments",
+      description:
+        "Bookings whose price went up after payment, with the extra still uncollected.",
+      badgeLabel: "Owing",
+      badgeTone: "secondary",
+      items: [
+        {
+          label: "Awaiting payment",
+          value: formatNumber(additionalBreakdown.PENDING, format),
+          detail: "Charge not yet completed by the member.",
+        },
+        {
+          label: "Payment failed",
+          value: formatNumber(additionalBreakdown.FAILED, format),
+          detail: "The last attempt to charge the card did not succeed.",
+        },
+        {
+          label: "Total outstanding",
+          value: formatDollarsDisplay(
+            metrics.paymentSummary.outstandingAdditionalCents,
+            format,
+          ),
+          detail: `Across ${formatNumber(metrics.paymentSummary.outstandingAdditionalBookings, format)} booking${metrics.paymentSummary.outstandingAdditionalBookings === 1 ? "" : "s"}.`,
+        },
+      ],
+    });
+  }
+  if (metrics.forward) {
+    panels.push({
+      title: "Forward pipeline split",
+      description:
+        "Committed demand is paid; at-risk demand still needs settlement or review.",
+      badgeLabel: "Forward",
+      badgeTone: "secondary",
+      items: [
+        {
+          label: "Committed",
+          value: formatNumber(metrics.forward.totals.committed.guestNights, format),
+          detail: formatDollarsDisplay(
+            metrics.forward.totals.committed.bookedRevenueCents,
+            format,
+          ),
+        },
+        {
+          label: "At risk",
+          value: formatNumber(metrics.forward.totals.atRisk.guestNights, format),
+          detail: formatDollarsDisplay(
+            metrics.forward.totals.atRisk.bookedRevenueCents,
+            format,
+          ),
+        },
+      ],
+    });
+  }
+  return panels;
+}

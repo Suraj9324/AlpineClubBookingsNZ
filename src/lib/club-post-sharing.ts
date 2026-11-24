@@ -1,0 +1,671 @@
+import "server-only";
+
+import type { Prisma } from "@prisma/client";
+
+import {
+  OUTSTANDING_WITHDRAWAL_WHERE,
+  recordedShareAwaitsWithdrawal,
+  strayCopyId,
+} from "@/lib/club-post-share-problem";
+import logger from "@/lib/logger";
+import { deletePostImage, readPostImage } from "@/lib/post-image-storage";
+import { prisma } from "@/lib/prisma";
+import {
+  ServerNzApiError,
+  ServerNzVersionMismatchError,
+  shareClubPost,
+  withdrawClubPost,
+} from "@/lib/servernz-api";
+import { SERVERNZ_TRANSACTION_OPTIONS, lockServerNzSettings } from "@/lib/servernz-settings";
+import { isServerSyncPaused } from "@/lib/servernz-version-check";
+
+/**
+ * Sending a board post to the central server (epic #2992).
+ *
+ * SHARING NEVER BLOCKS POSTING. A member writes to their own club's board and
+ * that write succeeds or fails on its own terms; ticking "share with all
+ * clubs" records an INTENTION (`shareRequestedAt`) which this module then tries
+ * to satisfy. If the central server is down, mid-deploy or slow, the post is
+ * still on this club's board and the attempt is retried later — the alternative
+ * is losing a member's post to somebody else's outage.
+ *
+ * `sharedAt` therefore means "the server took it", never "we tried".
+ */
+
+/**
+ * Most attempts before a post stops being retried automatically (#3091
+ * review 5). At the cap the request is CLEARED with the reason recorded on
+ * `shareError`, so a permanently failing share ends as an explained failure
+ * on the member's post rather than an eternal retry.
+ */
+export const MAX_SHARE_ATTEMPTS = 8;
+
+/**
+ * Posts per sweep pass. Separate from the attempt cap above — the two were
+ * one constant once, which made the cap a page size that capped nothing.
+ */
+export const SHARE_SWEEP_PAGE_SIZE = 8;
+
+export type ShareOutcome =
+  | { status: "shared"; serverPostId: string }
+  | { status: "failed"; error: string; retryable: boolean }
+  /** `claimed` (#4590 review): another caller holds this share; nothing was sent. */
+  | { status: "skipped"; reason: "already-shared" | "not-requested" | "gone" | "claimed" }
+  /**
+   * The central server is on a different API version (#49): nothing was sent,
+   * the request stays pending and NO attempt is counted, so a pause that lasts
+   * longer than the cap's worth of cron cycles cannot retire the share.
+   */
+  | { status: "paused" };
+
+/**
+ * Decide whether a failure is worth trying again.
+ *
+ * A 4xx other than 429 is the server saying the REQUEST is wrong — a body too
+ * long, a scope the token lacks, a payload it will not accept. Retrying that
+ * unchanged just produces the same refusal on a schedule, so it stops and says
+ * why. Everything else (network, timeout, 5xx, rate limit) is the server or
+ * the path being temporarily unavailable, which is exactly what retrying is
+ * for.
+ */
+function isRetryable(error: unknown): boolean {
+  // Sending again would only put a second copy on the server (#4588 review).
+  if (error instanceof ShareStampConflictError || error instanceof ShareStampMismatchError) return false;
+  if (error instanceof ServerNzApiError) {
+    if (error.status === 429) return true;
+    return error.status < 400 || error.status >= 500;
+  }
+  return true;
+}
+
+/** The server's id for a share is held by a mirrored post that is not our copy (#4588 review). */
+class ShareStampConflictError extends Error {
+  constructor(serverPostId: string) {
+    super(`The central server's id for this post (${serverPostId}) is already held here by another club's post, so the share was not recorded.`);
+    this.name = "ShareStampConflictError";
+  }
+}
+
+/** Our post already holds a DIFFERENT server id; the new one is never written over it (#4590 review). */
+class ShareStampMismatchError extends Error {
+  constructor(held: string, abandoned: string) {
+    super(`This post is already recorded as ${held} on the central server; its newer copy there (${abandoned}) was not recorded.`);
+    this.name = "ShareStampMismatchError";
+  }
+}
+
+/** Our post was deleted while its stamp was retried: there is no row to record the id on (#4590 review). */
+class ShareStampPostGoneError extends Error {
+  constructor() {
+    super("The post was deleted before its share could be recorded");
+    this.name = "ShareStampPostGoneError";
+  }
+}
+
+/**
+ * Why a stamp matched no row: our post is gone, or holds another id (never
+ * overwritten). Read on the same client as the write that matched nothing.
+ */
+async function stampMissed(
+  db: Pick<typeof prisma, "clubPost">,
+  postId: string,
+  serverPostId: string,
+): Promise<void> {
+  const row = await db.clubPost.findUnique({ where: { id: postId }, select: { serverPostId: true } });
+  if (!row) throw new ShareStampPostGoneError();
+  if (row.serverPostId !== serverPostId) throw new ShareStampMismatchError(row.serverPostId ?? "unknown", serverPostId);
+}
+
+/**
+ * Record the server's id on our post, under the lock the mirror writes under
+ * (#4588).
+ *
+ * The mirror can pull our post back before this stamp commits: it does not yet
+ * know the id is ours, so it creates a MIRROR row holding it, and the stamp
+ * then failed on the unique `serverPostId`, leaving our post reading as never
+ * shared (and a retry would share it twice). This install cannot recognise its
+ * own club by code: it does not store the code the server knows it by. So the
+ * stamp takes the settings row first, the lock every mirror write holds (its
+ * page fence), which means no mirror create of this id is in flight. If the
+ * mirror got there first, its copy of our own post (proven by our words and
+ * author name) is deleted, our post and that copy locked in id order before
+ * either changes, and the stamp lands; a row that is not our copy is never
+ * touched.
+ * From then on the mirror's locked re-read finds our post and skips it. Order:
+ * settings row -> ClubPost rows (id order) -> ClubPostImage by cascade, as in
+ * docs/CONCURRENCY_AND_LOCKING.md -> "Message-board posts and their images".
+ */
+async function stampShare(postId: string, serverPostId: string): Promise<void> {
+  const copyFiles = await prisma.$transaction(async (tx) => {
+    await lockServerNzSettings(tx);
+    const copy = await tx.clubPost.findUnique({ where: { serverPostId }, select: { id: true, originClubCode: true } });
+    let files: string[] = [];
+    if (copy && copy.originClubCode !== null) {
+      await tx.$executeRaw`SELECT 1 FROM "ClubPost" WHERE "id" IN (${postId}, ${copy.id}) ORDER BY "id" FOR UPDATE`;
+      // ONLY A PROVEN COPY OF OUR POST (#4588 review). Under both locks, the
+      // mirror row must carry our words and our author name exactly as the
+      // mirror stores what we sent; anything else (an id another club's post
+      // holds here, say after an address move) is never deleted, and the
+      // stamp fails without retrying, since a retry would share it twice.
+      const ours = await tx.clubPost.findUnique({ where: { id: postId }, select: { content: true, authorName: true } });
+      const mirrored = await tx.clubPost.findUnique({ where: { id: copy.id }, select: { content: true, authorName: true } });
+      if (!ours || !mirrored || mirrored.content !== ours.content.slice(0, 4000) || mirrored.authorName !== ours.authorName) {
+        logger.error({ postId, serverPostId, mirrorPostId: copy.id }, "A shared post's server id is held by a mirrored post that is not our copy; neither was changed");
+        throw new ShareStampConflictError(serverPostId);
+      }
+      const images = await tx.clubPostImage.findMany({ where: { postId: copy.id }, select: { storageKey: true } });
+      await tx.clubPost.deleteMany({ where: { id: copy.id } });
+      files = images.map((image) => image.storageKey);
+      logger.warn({ postId, serverPostId }, "The mirror copied our own post back before its share was recorded; the copy was removed");
+    }
+    // Only while our post holds no id, or this very one (#4590 review): a
+    // different id already recorded is never written over.
+    const stamped = await tx.clubPost.updateMany({
+      where: { id: postId, OR: [{ serverPostId: null }, { serverPostId }] },
+      data: { serverPostId, sharedAt: new Date(), shareError: null, shareSentAt: null },
+    });
+    if (stamped.count === 0) await stampMissed(tx, postId, serverPostId);
+    return files;
+  }, SERVERNZ_TRANSACTION_OPTIONS);
+  // Rows first, files second. After the commit, so a file that cannot be
+  // removed is logged, never reported as a failed stamp (#4590).
+  for (const key of copyFiles) {
+    await deletePostImage(key).catch((error: unknown) => {
+      logger.warn({ postId, storageKey: key, err: error }, "Could not delete a removed mirror copy's image file");
+    });
+  }
+}
+
+/**
+ * The stamp without the settings lock (#4590): our post takes the id only
+ * while it holds none. Correct without the lock because the unique
+ * `serverPostId` arbitrates: if the mirror's copy holds the id, this write is
+ * refused and the locked stamp runs again; once it lands, every mirror write
+ * re-reads under the post lock and finds our own post. A write that matched
+ * nothing succeeded only if our post already holds this very id.
+ */
+async function stampShareUnlocked(postId: string, serverPostId: string): Promise<void> {
+  const { count } = await prisma.clubPost.updateMany({
+    where: { id: postId, serverPostId: null },
+    data: { serverPostId, sharedAt: new Date(), shareError: null, shareSentAt: null },
+  });
+  if (count === 1) return;
+  await stampMissed(prisma, postId, serverPostId);
+}
+
+/**
+ * Try to share one post.
+ *
+ * Idempotent on `serverPostId`: a post that already carries one is not sent
+ * again. And AT MOST ONCE (#4590 review): the request is claimed off the row
+ * before the send, so a retry after a crash, a failed stamp or a second caller
+ * cannot produce a duplicate on every other club's board.
+ */
+export async function shareOnePost(postId: string): Promise<ShareOutcome> {
+  const post = await prisma.clubPost.findUnique({
+    where: { id: postId },
+    select: {
+      id: true,
+      authorMemberId: true,
+      authorName: true,
+      content: true,
+      bodyHtml: true,
+      shareRequestedAt: true,
+      shareAttempts: true,
+      sharedAt: true,
+      serverPostId: true,
+      removedAt: true,
+      images: {
+        orderBy: { position: "asc" },
+        select: { publicId: true, mimeType: true, storageKey: true },
+      },
+    },
+  });
+
+  if (!post || post.removedAt) return { status: "skipped", reason: "gone" };
+  if (post.sharedAt || post.serverPostId) {
+    return { status: "skipped", reason: "already-shared" };
+  }
+  if (!post.shareRequestedAt) {
+    return { status: "skipped", reason: "not-requested" };
+  }
+
+  // Paused BEFORE the images are read and before any attempt is counted. The
+  // gate in resolveConnection would refuse the send anyway; asking first is
+  // what keeps the attempt counter and the error column untouched.
+  if (await isServerSyncPaused()) return { status: "paused" };
+
+  // Read in the SAME ORDER the body's image URLs will be rewritten against.
+  // The server maps `image_ids[n]` onto the nth attached file, so a different
+  // order here silently attaches every picture to the wrong place.
+  const images: {
+    publicId: string;
+    mimeType: string;
+    bytes: Uint8Array;
+  }[] = [];
+  for (const image of post.images) {
+    const bytes = await readPostImage(image.storageKey);
+    if (!bytes) {
+      // A row whose file is missing. Skipped rather than failed: the post's
+      // words are still worth sharing, and a permanently missing file would
+      // otherwise block this post forever.
+      logger.warn(
+        { postId: post.id, publicId: image.publicId },
+        "Club post image row has no file on disk; sharing without it",
+      );
+      continue;
+    }
+    images.push({
+      publicId: image.publicId,
+      mimeType: image.mimeType,
+      bytes: new Uint8Array(bytes),
+    });
+  }
+
+  // THE CLAIM, BEFORE THE SEND (#4590 review, #4592). Taking the request off
+  // the row first makes the remote send at most once: a second caller (the
+  // post route's inline share racing the cron sweep) matches nothing and sends
+  // nothing, and a stamp that fails after the server accepted the share, the
+  // database being down, or the process being killed mid-send leave no
+  // request for a later sweep to send again. The request goes back only when
+  // the server did NOT take the share and the failure is worth retrying
+  // (`recordShareFailure`); if even that write fails, the share is lost, never
+  // duplicated. The trade-off is deliberate: a lost share can be posted again,
+  // a duplicate on every club's board cannot be withdrawn from here.
+  //
+  // `shareSentAt` goes on in the same write (#5246) and every write that
+  // records the result takes it off. If none of them can land, the marker
+  // stays and the admin screen reports the outcome as unknown; it never puts
+  // the request back.
+  const requestedAt = post.shareRequestedAt;
+  const claimed = await prisma.clubPost.updateMany({
+    where: { id: post.id, sharedAt: null, serverPostId: null, removedAt: null, shareRequestedAt: requestedAt },
+    data: { shareRequestedAt: null, shareSentAt: new Date() },
+  });
+  if (claimed.count === 0) return { status: "skipped", reason: "claimed" };
+
+  let serverPostId: string;
+  try {
+    const result = await shareClubPost({
+      // The central server cannot verify author identity — it trusts this
+      // club's API key — so these are club-attested. They come from the row,
+      // which took them from the session at compose time.
+      authorUserId: post.authorMemberId ?? `deleted:${post.id}`,
+      authorName: post.authorName,
+      content: post.content,
+      bodyHtml: post.bodyHtml,
+      images,
+    });
+    serverPostId = result.id;
+  } catch (error) {
+    // Not accepted: the request may go back on the row.
+    return recordShareFailure(post, error, { requestedAt });
+  }
+  return recordAcceptedShare(post, serverPostId);
+}
+
+/** A share that did not reach the server, or was refused: counted, and retried or given up (#3091 review 5). */
+async function recordShareFailure(
+  post: { id: string; shareAttempts: number },
+  error: unknown,
+  {
+    requestedAt,
+    unrecordedServerPostId,
+  }: {
+    /**
+     * The request the claim took, passed ONLY when the server did not accept
+     * the share: a retryable failure or a pause puts it back. Never passed
+     * after acceptance, so an accepted share is never requested again.
+     */
+    requestedAt?: Date;
+    /**
+     * The id of a copy the server ACCEPTED that is not recorded as this
+     * post's share (#5246), kept so the admin can have it withdrawn.
+     */
+    unrecordedServerPostId?: string;
+  } = {},
+): Promise<ShareOutcome> {
+  // The gate can still refuse between the pre-check and the send (a version
+  // recorded by another container, or the inline self-heal on a never-asked
+  // row). A pause is not an attempt: the counter and the row stay as they
+  // are, and the next pass asks again.
+  if (error instanceof ServerNzVersionMismatchError) {
+    logger.info(
+      { postId: post.id, expected: error.expected, serverVersion: error.serverVersion },
+      "Sharing a club post is paused: the central server API version differs",
+    );
+    if (requestedAt) {
+      await prisma.clubPost.updateMany({
+        where: { id: post.id, shareRequestedAt: null, sharedAt: null, serverPostId: null },
+        data: { shareRequestedAt: requestedAt, shareSentAt: null },
+      });
+    }
+    return { status: "paused" };
+  }
+  const attempts = post.shareAttempts + 1;
+  // Retryable by ERROR KIND and still under the cap. A refusal that will
+  // never succeed stops at once; a transient failure stops at the cap
+  // (#3091 review 5) — either way the request is cleared and the reason is
+  // on the row, so the member is told plainly rather than left watching a
+  // post that never goes anywhere.
+  const retryable = isRetryable(error) && attempts < MAX_SHARE_ATTEMPTS;
+  const message =
+    error instanceof Error ? error.message : "The central server refused it.";
+  const recorded = (
+    isRetryable(error) && !retryable
+      ? `Gave up after ${MAX_SHARE_ATTEMPTS} attempts: ${message}`
+      : message
+  ).slice(0, 300);
+
+  await prisma.clubPost.update({
+    where: { id: post.id },
+    data: {
+      shareError: recorded,
+      shareAttempts: attempts,
+      shareSentAt: null,
+      ...(unrecordedServerPostId ? { unrecordedServerPostId } : {}),
+      // Back on the row only for a share the server did not take (#4590 review).
+      ...(retryable && requestedAt ? { shareRequestedAt: requestedAt } : { shareRequestedAt: null }),
+    },
+  });
+
+  logger.warn(
+    { postId: post.id, retryable, attempts, err: error },
+    "Sharing a club post to the central server failed",
+  );
+  return { status: "failed", error: message, retryable };
+}
+
+/**
+ * Record a share the central server ACCEPTED (#4590). The post is on the
+ * server under `serverPostId` from here, and its request was taken off the
+ * row by the claim before the send, so nothing sends it again.
+ *
+ * The id already returned is retried, in three steps: the locked stamp
+ * ({@link stampShare}); then a guarded write of the id alone, without the
+ * settings lock (enough when that lock was the trouble, and refused by the
+ * unique `serverPostId` if the mirror already copied the post back); then the
+ * locked stamp once more, which removes such a copy. EVERY EXIT NAMES THE
+ * SERVER ID (#4590 review): a conflict or a different id already held is a
+ * final failure, and all three stamps failing is too; each stores the id in
+ * `unrecordedServerPostId` and the reason in `shareError` (#5246), which the
+ * admin's message-board screen lists under "Sharing problems" with a
+ * "Withdraw the shared copy" action. A post deleted meanwhile has no row to
+ * hold the id; a recording write that fails too leaves `shareSentAt` set,
+ * which the screen reports as an unknown outcome. Both leave the id in the
+ * error log, and docs/guides/message-board.md says how to have that copy
+ * taken down.
+ */
+async function recordAcceptedShare(
+  post: { id: string; shareAttempts: number },
+  serverPostId: string,
+): Promise<ShareOutcome> {
+  let lastError: unknown;
+  for (const stamp of [stampShare, stampShareUnlocked, stampShare]) {
+    try {
+      await stamp(post.id, serverPostId);
+      return { status: "shared", serverPostId };
+    } catch (error) {
+      // Final, and never sent again: not our copy to delete (#4588 review), or
+      // our post already holds another id (#4590 review). The request is not
+      // passed, so it stays off the row.
+      if (error instanceof ShareStampConflictError || error instanceof ShareStampMismatchError) {
+        logger.error({ postId: post.id, serverPostId, err: error }, "A share the central server accepted was not recorded here");
+        return recordShareFailure(post, error, { unrecordedServerPostId: serverPostId });
+      }
+      if (error instanceof ShareStampPostGoneError) {
+        logger.error({ postId: post.id, serverPostId }, "A shared post was deleted before its share was recorded; its copy on the central server has no local record");
+        return { status: "failed", error: error.message, retryable: false };
+      }
+      lastError = error;
+    }
+  }
+  const message = `Shared to the central server as ${serverPostId}, but recording that here failed; it will not be sent again.`.slice(0, 300);
+  try {
+    // Never on a post that already holds this very id (#5246 review): a stamp
+    // can commit with its answer lost, and the id would then read as a stray
+    // copy of the post's own share, which "Withdraw the shared copy" would
+    // take down. Written out as an OR because `not` alone skips a null.
+    const recorded = await prisma.clubPost.updateMany({
+      where: { id: post.id, OR: [{ serverPostId: null }, { serverPostId: { not: serverPostId } }] },
+      data: {
+        shareAttempts: post.shareAttempts + 1,
+        shareError: message,
+        unrecordedServerPostId: serverPostId,
+        shareSentAt: null,
+      },
+    });
+    if (recorded.count === 0) {
+      const row = await prisma.clubPost.findUnique({ where: { id: post.id }, select: { serverPostId: true } });
+      if (row?.serverPostId === serverPostId) return { status: "shared", serverPostId };
+    }
+  } catch (error) {
+    // Nothing more can be recorded; the log is the record, and the claim's
+    // `shareSentAt` stays to say so on screen. The request was already taken
+    // off the row by the claim, so it is still never re-sent.
+    logger.error({ postId: post.id, serverPostId, err: error }, "Could not record a share the central server accepted");
+  }
+  logger.error({ postId: post.id, serverPostId, err: lastError }, "A share the central server accepted could not be recorded here; it will not be sent again");
+  return { status: "failed", error: message, retryable: false };
+}
+
+export interface ShareSweepResult {
+  attempted: number;
+  shared: number;
+  failed: number;
+  /** Shares left pending, untouched, because the server version differs (#49). */
+  paused: number;
+  /** The takedown half (#3091 review 1): withdrawals retried this pass. */
+  withdrawalsAttempted: number;
+  withdrawalsConfirmed: number;
+  withdrawalsFailed: number;
+}
+
+/** Withdrawals retried per pass — bounded for the same reason the shares are. */
+export const WITHDRAWAL_SWEEP_PAGE_SIZE = 8;
+
+/** The fields {@link withdrawOutstandingCopies} decides from. */
+export const OUTSTANDING_COPY_SELECT = {
+  id: true,
+  serverPostId: true,
+  unrecordedServerPostId: true,
+  removedAt: true,
+  withdrawnAt: true,
+  originClubCode: true,
+} satisfies Prisma.ClubPostSelect;
+
+type OutstandingCopyPost = Prisma.ClubPostGetPayload<{ select: typeof OUTSTANDING_COPY_SELECT }>;
+
+/**
+ * Withdraw every copy of this club's post the central server may still show
+ * (#3091 review 1, #5246), and record each confirmation.
+ *
+ * Two copies can be outstanding. The UNRECORDED one ({@link strayCopyId}, a
+ * copy the server accepted that is not the post's recorded share) is
+ * withdrawn whenever it is held, live post or removed: it is a stray. The
+ * RECORDED one (`serverPostId`) is withdrawn only once the post is removed and
+ * the takedown is not yet confirmed: a live post's own share is never taken
+ * down from here. `withdrawClubPost` treats a 404 as success, so a copy the
+ * server already dropped confirms cleanly.
+ *
+ * Each confirmation is a guarded write on the post row alone, never touching
+ * the share request, so nothing here can send the post again. Every copy is
+ * tried; the row keeps what is still outstanding. Nothing is thrown: the
+ * result carries the server ids confirmed down AND the first failure, so a
+ * half-successful withdrawal still reaches its caller's audit row (#5246
+ * review). A version pause comes back as the `ServerNzVersionMismatchError`
+ * itself.
+ */
+export interface OutstandingCopyWithdrawal {
+  /** Server ids the central server confirmed down (a 404 counts). */
+  confirmedServerPostIds: string[];
+  /** The first failure, or null when every outstanding copy came down. */
+  error: unknown;
+}
+
+export async function withdrawOutstandingCopies(post: OutstandingCopyPost): Promise<OutstandingCopyWithdrawal> {
+  const confirmedServerPostIds: string[] = [];
+  if (post.originClubCode !== null) return { confirmedServerPostIds, error: null };
+  let firstError: unknown = null;
+
+  const stray = strayCopyId(post);
+  if (stray) {
+    try {
+      await withdrawClubPost(stray);
+      // The reason went with the copy: `shareError` names it.
+      await prisma.clubPost.updateMany({
+        where: { id: post.id, unrecordedServerPostId: stray },
+        data: { unrecordedServerPostId: null, shareError: null },
+      });
+      confirmedServerPostIds.push(stray);
+    } catch (error) {
+      firstError = error;
+    }
+  } else if (post.unrecordedServerPostId) {
+    // The post's own recorded share, never a stray (#5246 review): the marker
+    // is cleared and nothing is withdrawn. Caught like the writes above, so a
+    // failed clear is reported to the caller and never thrown past it.
+    try {
+      await prisma.clubPost.updateMany({
+        where: { id: post.id, unrecordedServerPostId: post.unrecordedServerPostId },
+        data: { unrecordedServerPostId: null },
+      });
+    } catch (error) {
+      firstError = error;
+    }
+  }
+
+  // The pause answers for both copies: the second is not asked.
+  const paused = firstError instanceof ServerNzVersionMismatchError;
+  if (!paused && recordedShareAwaitsWithdrawal(post)) {
+    try {
+      await withdrawClubPost(post.serverPostId);
+      // CONFIRMED down everywhere (#3091 review 1). Without this stamp the
+      // row reads as withdrawal-pending forever and the sweep re-withdraws a
+      // copy that is already gone (harmless, the server 404s, but noisy).
+      // Guarded so two withdrawals at once (the sweep and an admin, or two
+      // admins) keep the first confirmation's time; the second's DELETE got
+      // a 404, which is success, and writes nothing.
+      await prisma.clubPost.updateMany({
+        where: { id: post.id, serverPostId: post.serverPostId, withdrawnAt: null },
+        data: { withdrawnAt: new Date() },
+      });
+      confirmedServerPostIds.push(post.serverPostId);
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+
+  return { confirmedServerPostIds, error: firstError };
+}
+
+/**
+ * Retry every takedown the central server has not yet confirmed (#3091
+ * review 1, #5246). `removeClubPost` withdraws inline; when that call fails
+ * (server unreachable, mid-deploy, a 5xx) the post is removed locally but its
+ * copy is still on every other club's board, and NOTHING else would ever try
+ * again. This sweep is the retry, over exactly the rows
+ * {@link OUTSTANDING_WITHDRAWAL_WHERE} names.
+ */
+export async function retryPendingWithdrawals(): Promise<{
+  attempted: number;
+  confirmed: number;
+  failed: number;
+}> {
+  // Same pre-check as a share (#49): a paused server is asked nothing, and the
+  // rows stay exactly as they are for the pass after the versions match again.
+  if (await isServerSyncPaused()) return { attempted: 0, confirmed: 0, failed: 0 };
+
+  const pending = await prisma.clubPost.findMany({
+    where: OUTSTANDING_WITHDRAWAL_WHERE,
+    orderBy: { removedAt: "asc" },
+    take: WITHDRAWAL_SWEEP_PAGE_SIZE,
+    select: OUTSTANDING_COPY_SELECT,
+  });
+
+  const result = { attempted: pending.length, confirmed: 0, failed: 0 };
+  for (const post of pending) {
+    const { error } = await withdrawOutstandingCopies(post);
+    if (error === null) {
+      result.confirmed += 1;
+    } else {
+      // The server's own 409 for version (recorded by the API client): the
+      // rest of the page would only be refused the same way. Not a failure -
+      // the rows stay for the pass after the versions match.
+      if (error instanceof ServerNzVersionMismatchError) {
+        logger.info(
+          { postId: post.id, expected: error.expected, serverVersion: error.serverVersion },
+          "Withdrawal sweep paused: the central server API version differs",
+        );
+        break;
+      }
+      result.failed += 1;
+      logger.warn(
+        {
+          postId: post.id,
+          serverPostId: post.serverPostId,
+          unrecordedServerPostId: post.unrecordedServerPostId,
+          err: error,
+        },
+        "Retrying a club post withdrawal failed; the network copy may still be visible",
+      );
+    }
+  }
+  return result;
+}
+
+/**
+ * Retry every post whose share is still outstanding.
+ *
+ * Bounded per pass so one unreachable server cannot turn the shared cron cycle
+ * into a long series of timeouts — the rest of that cycle has work to do.
+ */
+export async function retryPendingShares(
+  now: Date = new Date(),
+): Promise<ShareSweepResult> {
+  const pending = await prisma.clubPost.findMany({
+    where: {
+      shareRequestedAt: { not: null, lte: now },
+      sharedAt: null,
+      removedAt: null,
+    },
+    // Fewest attempts FIRST (#3091 review 5): a page of stuck posts selected
+    // oldest-first would be re-selected every pass and starve every newer
+    // share behind it. Ordering by attempts rotates the stuck ones to the
+    // back until the cap retires them; age breaks ties.
+    orderBy: [{ shareAttempts: "asc" }, { shareRequestedAt: "asc" }],
+    take: SHARE_SWEEP_PAGE_SIZE,
+    select: { id: true },
+  });
+
+  const result: ShareSweepResult = {
+    attempted: pending.length,
+    shared: 0,
+    failed: 0,
+    paused: 0,
+    withdrawalsAttempted: 0,
+    withdrawalsConfirmed: 0,
+    withdrawalsFailed: 0,
+  };
+
+  for (const post of pending) {
+    const outcome = await shareOnePost(post.id);
+    if (outcome.status === "shared") result.shared += 1;
+    else if (outcome.status === "failed") result.failed += 1;
+    else if (outcome.status === "paused") {
+      // One pause answers for the whole page: the version is the server's,
+      // not the post's, so the rest of the page would only be re-asked.
+      result.paused = pending.length - result.shared - result.failed;
+      break;
+    }
+  }
+
+  // The takedown half rides the same cycle: a removal must come down
+  // everywhere with the same persistence a share goes up with.
+  const withdrawals = await retryPendingWithdrawals();
+  result.withdrawalsAttempted = withdrawals.attempted;
+  result.withdrawalsConfirmed = withdrawals.confirmed;
+  result.withdrawalsFailed = withdrawals.failed;
+
+  return result;
+}

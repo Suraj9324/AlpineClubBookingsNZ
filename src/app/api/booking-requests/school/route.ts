@@ -1,0 +1,144 @@
+import { NextRequest, NextResponse } from "next/server";
+import { SchoolCateringPreference } from "@prisma/client";
+import { z } from "zod";
+import {
+  assertRequestedLodgeActive,
+  BookingRequestError,
+} from "@/lib/booking-request";
+import {
+  assertSchoolGuestsWithinLodgeCapacity,
+  createSchoolBookingRequest,
+  schoolTeacherSchema,
+} from "@/lib/school-booking-request";
+import { schoolChildCountsSchema } from "@/lib/admin-bookings-schemas/requests";
+import { generateSchoolGuests } from "@/lib/school-booking-constants";
+import { applyRateLimit, rateLimiters } from "@/lib/rate-limit";
+import { parsedDateOnlySchema } from "@/lib/date-only-schema";
+import { clubTodayDateOnlyInstant } from "@/lib/club-time/server";
+import { nameField } from "@/lib/zod-helpers";
+import logger from "@/lib/logger";
+import { parseJsonRequestBody } from "@/lib/api-json";
+
+const noCrlf = (value: string) => !/[\r\n]/.test(value);
+
+const schoolBookingRequestSchema = z.object({
+  schoolName: z
+    .string()
+    .min(1, "School name is required")
+    .max(200)
+    .refine(noCrlf, "School name cannot contain line breaks"),
+  contactFirstName: nameField(),
+  contactLastName: nameField(),
+  contactEmail: z.string().email("Invalid email address").max(200),
+  contactPhone: z
+    .string()
+    .max(30)
+    .refine(noCrlf, "Phone number cannot contain line breaks")
+    .optional()
+    .nullable(),
+  checkIn: parsedDateOnlySchema,
+  checkOut: parsedDateOnlySchema,
+  // Lodge the stay is requested at; omitted means the club's default lodge.
+  lodgeId: z.string().min(1).optional(),
+  cateringPreference: z
+    .enum(["CATERED", "NON_CATERED", "QUOTE_BOTH"])
+    .default("QUOTE_BOTH"),
+  teachers: z.array(schoolTeacherSchema).min(1, "At least one teacher is required").max(50),
+  childCounts: schoolChildCountsSchema,
+  // Whole-lodge exclusivity request (issue #121). School front-door only — the
+  // general booking-request path deliberately does not accept this.
+  exclusivityRequested: z.boolean().optional().default(false),
+  message: z
+    .string()
+    .max(1000)
+    .refine(noCrlf, "Message cannot contain line breaks")
+    .optional()
+    .nullable(),
+});
+
+export async function POST(request: NextRequest) {
+  const rateLimited = await applyRateLimit(rateLimiters.bookingRequest, request);
+  if (rateLimited) return rateLimited;
+
+  const jsonBody = await parseJsonRequestBody(request, {
+    error: "Invalid JSON payload",
+  });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = schoolBookingRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid input", details: parsed.error.flatten().fieldErrors },
+      { status: 422 }
+    );
+  }
+
+  const { checkIn, checkOut, teachers, childCounts } = parsed.data;
+
+  if (checkOut <= checkIn) {
+    return NextResponse.json({ error: "Check-out must be after check-in" }, { status: 400 });
+  }
+
+  // CT-4 (#2870): the club's day, from the persisted ClubTimeSettings zone and
+  // not the container's TZ (INV-CONFIG-002, INV-DATE-019), encoded at UTC
+  // midnight so it shares a frame with the submitted date-only values.
+  const today = await clubTodayDateOnlyInstant();
+  if (checkIn < today) {
+    return NextResponse.json({ error: "Cannot request a booking in the past" }, { status: 400 });
+  }
+
+  const guests = generateSchoolGuests({ teachers, childCounts });
+  if (guests.length === 0) {
+    return NextResponse.json(
+      { error: "Add at least one teacher and one child" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    // A provided lodgeId must name an ACTIVE lodge (400 otherwise); omitted
+    // means the club's default lodge, stored as null.
+    const lodgeId = await assertRequestedLodgeActive(parsed.data.lodgeId);
+
+    // #3412: the ONE implementation of the school capacity rule, shared with
+    // `createSchoolBookingRequest` below and with the officer's guest-override
+    // resolver. It throws a `BookingRequestError`, which this route's catch
+    // already turns into `{ error }` at the status given — 400 here, because
+    // this public door answers 400 for every rejected submission, where the two
+    // admin doors answer 422.
+    await assertSchoolGuestsWithinLodgeCapacity({
+      guestCount: guests.length,
+      lodgeId,
+      status: 400,
+    });
+
+    await createSchoolBookingRequest({
+      schoolName: parsed.data.schoolName,
+      contactFirstName: parsed.data.contactFirstName,
+      contactLastName: parsed.data.contactLastName,
+      contactEmail: parsed.data.contactEmail,
+      contactPhone: parsed.data.contactPhone,
+      checkIn,
+      checkOut,
+      cateringPreference: parsed.data.cateringPreference as SchoolCateringPreference,
+      teachers,
+      childCounts,
+      exclusivityRequested: parsed.data.exclusivityRequested,
+      message: parsed.data.message,
+      lodgeId,
+    });
+
+    return NextResponse.json({ success: true }, { status: 201 });
+  } catch (err) {
+    if (err instanceof BookingRequestError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+
+    logger.error({ err }, "Unexpected error creating school booking request");
+    return NextResponse.json(
+      { error: "Unable to submit school booking request right now" },
+      { status: 500 }
+    );
+  }
+}

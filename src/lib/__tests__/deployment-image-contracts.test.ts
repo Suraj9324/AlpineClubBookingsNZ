@@ -1,0 +1,1143 @@
+import { readdirSync, readFileSync } from "fs";
+import path from "path";
+import { describe, expect, it } from "vitest";
+
+import { parseWorkflowYaml } from "../../../scripts/ci/check-workflow-suite-checkout-depth.mjs";
+
+import { readAllowBuilds } from "../../../scripts/ci/check-allow-builds.mjs";
+
+/**
+ * Every tracked file under `dir` whose extension is in `exts`, repository-
+ * relative, recursively.
+ *
+ * Written because the census below used to loop over a HARDCODED PAIR of
+ * workflow files while `gitleaks-image.sh` claimed it covered `scripts/` too.
+ * Probed during review: a third workflow running
+ * `ghcr.io/gitleaks/gitleaks:v8.0.0 --exit-code=1` passed 22 of 22. A census
+ * that names its inputs cannot notice a new one, which for a drift guard is
+ * the only thing it is for.
+ */
+function filesUnder(dir: string, exts: readonly string[]): string[] {
+  const root = path.resolve(process.cwd(), dir);
+  const out: string[] = [];
+  const walk = (absolute: string, relative: string) => {
+    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+      const nextRelative = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules") continue;
+        walk(path.join(absolute, entry.name), nextRelative);
+      } else if (exts.some((ext) => entry.name.endsWith(ext))) {
+        out.push(nextRelative);
+      }
+    }
+  };
+  walk(root, dir);
+  return out.sort();
+}
+
+function readRepoFile(relativePath: string) {
+  // Test helper: reads a fixed repo file under process.cwd(); relativePath is test-controlled, not user input.
+  return readFileSync(path.resolve(process.cwd(), relativePath), "utf8");
+}
+
+/**
+ * Strip whole-line `#` comments so an assertion reads the DIRECTIVES.
+ *
+ * Recurring defect in this file: a comment explaining at length why a directive
+ * must never be removed satisfies the guard that was supposed to notice the
+ * directive going missing. Three of the assertions below were found green
+ * against a deleted directive for exactly that reason.
+ */
+function directivesOnly(text: string) {
+  return text
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+}
+
+/** The one file allowed to name the gitleaks container. */
+const GITLEAKS_PIN_HOME = "scripts/ci/gitleaks-image.sh";
+
+describe("deployment image contracts", () => {
+  it("lets production Compose use prebuilt app and migration images", () => {
+    const compose = readRepoFile("docker-compose.yml");
+
+    expect(compose).toContain(
+      "image: ${APP_IMAGE:-${COMPOSE_PROJECT_NAME:-tacbookings}-app:local}",
+    );
+    expect(compose).toContain(
+      "image: ${MIGRATE_IMAGE:-${COMPOSE_PROJECT_NAME:-tacbookings}-migrate:local}",
+    );
+    expect(compose).toContain("target: builder");
+  });
+
+  it("hands NODE_BUILD_OPTIONS to every image build in Compose, not only the app's (#3824)", () => {
+    const lines = directivesOnly(readRepoFile("docker-compose.yml")).split("\n");
+    // Every `build:` block, by indentation: the key line plus every deeper line.
+    // A census rather than a named pair, so a third builder-stage service cannot
+    // quietly miss the setting the way `migrate` did. The short form
+    // (`build: .`) is matched too: it yields an empty block and fails, because it
+    // cannot carry build args at all.
+    const buildBlocks: string[] = [];
+    lines.forEach((line, index) => {
+      const opener = /^(\s*)build:(\s|$)/.exec(line);
+      if (!opener) return;
+      const indent = opener[1].length;
+      const body: string[] = [];
+      for (const next of lines.slice(index + 1)) {
+        if (next.trim() !== "" && next.search(/\S/) <= indent) break;
+        body.push(next);
+      }
+      buildBlocks.push(body.join("\n"));
+    });
+
+    // The x-app-service anchor and the migrate service, at least.
+    expect(buildBlocks.length).toBeGreaterThanOrEqual(2);
+    for (const block of buildBlocks) {
+      expect(block).toContain("NODE_OPTIONS: ${NODE_BUILD_OPTIONS:-}");
+    }
+  });
+
+  it("publishes app and migration images to GHCR after CI passes", () => {
+    const workflow = readRepoFile(".github/workflows/ci.yml");
+
+    expect(workflow).toContain("publish-ghcr-images:");
+    expect(workflow).toContain("packages: write");
+    expect(workflow).toContain(
+      "APP_IMAGE: ${{ vars.GHCR_APP_IMAGE_REPOSITORY || format('ghcr.io/{0}/alpineclubbookingsnz-app', github.repository_owner) }}:${{ github.sha }}",
+    );
+    expect(workflow).toContain(
+      "MIGRATE_IMAGE: ${{ vars.GHCR_MIGRATE_IMAGE_REPOSITORY || format('ghcr.io/{0}/alpineclubbookingsnz-migrate', github.repository_owner) }}:${{ github.sha }}",
+    );
+    // #4455: pinned to a commit SHA, with the version as its comment.
+    expect(workflow).toMatch(/uses: docker\/build-push-action@[0-9a-f]{40} # v7\n/);
+    expect(workflow).toContain("target: builder");
+  });
+
+  it("ties every CI PostgreSQL service to the compose image", () => {
+    const compose = readRepoFile("docker-compose.yml");
+    const postgres = compose.match(/^  postgres:\n([\s\S]*?)(?=^  \S|^\S)/m)?.[1];
+    const image = postgres?.match(/^    image: (\S+)$/m)?.[1];
+    expect(image).toMatch(/^postgres:16-alpine@sha256:[a-f0-9]{64}$/);
+    const jobs = parseWorkflowYaml(readRepoFile(".github/workflows/ci.yml")).jobs;
+    const images = Object.values(jobs).flatMap((job) => {
+      const services = job.services as Record<string, { image: string }> | undefined;
+      return Object.values(services ?? {}).map((service) => service.image).filter((ref) => ref.startsWith("postgres:"));
+    });
+    expect(images.length).toBeGreaterThanOrEqual(4);
+    for (const reference of images) expect(reference).toBe(image);
+  });
+
+  it("pins scanner actions and images away from default branch refs", () => {
+    const workflow = readRepoFile(".github/workflows/ci.yml");
+
+    expect(workflow).toMatch(/^\s*SEMGREP_IMAGE: semgrep\/semgrep:1\.161\.0@sha256:[a-f0-9]{64}$/m);
+    // The gitleaks pin moved OUT of this workflow in #2852, because the
+    // scheduled sweep needs the same binary and a second copy of a version
+    // string is how #2686's 8.24.3-versus-8.28.0 split happened. The
+    // assertion follows it; the census below proves that file is its only
+    // home, which is the half a `toContain` here could never do.
+    // Tag AND digest. A tag is a pointer its publisher can move, so the one
+    // file whose entire job is to be immutable does not rely on one.
+    expect(readRepoFile("scripts/ci/gitleaks-image.sh")).toContain(
+      "GITLEAKS_IMAGE=ghcr.io/gitleaks/gitleaks:v8.28.0@sha256:" +
+        "cdbb7c955abce02001a9f6c9f602fb195b7fadc1e812065883f695d1eeaba854",
+    );
+    expect(workflow).toMatch(/uses: aquasecurity\/trivy-action@[0-9a-f]{40} # v0\.36\.0\n/);
+    for (const file of filesUnder(".github/workflows", [".yml", ".yaml"])) {
+      expect(
+        readRepoFile(file),
+        `${file} pins an action to a moving branch ref`,
+      ).not.toMatch(/uses:\s+\S+@(master|main)\b/);
+    }
+  });
+
+  it("mounts scanner source checkouts read-only", () => {
+    const workflow = readRepoFile(".github/workflows/ci.yml");
+
+    expect(workflow).toContain('-v "$PWD:/src:ro"');
+    expect(workflow).toContain('-v "$RUNNER_TEMP/semgrep-output:/out"');
+    // gitleaks mounts from the shared script now (#2852). `:ro` is the load-
+    // bearing half: a scanner has no business writing to the tree it reads,
+    // and the report path is a separate mount for exactly that reason.
+    const scanScript = readRepoFile("scripts/ci/gitleaks-scan.sh");
+    expect(scanScript).toContain('host_repo="$(host_path "${REPO_ROOT}")"');
+    expect(scanScript).toContain('-v "${host_repo}:/repo:ro"');
+    // A mount source Docker Desktop cannot resolve is CREATED as an empty
+    // directory rather than refused, so `dir /repo` scans nothing and exits 0.
+    // `git` mode has the zero-commit check; `dir` mode has nothing, so the
+    // preflight is host-side and covers both.
+    // `${host_repo}`, the path actually mounted — `${REPO_ROOT}` is this
+    // checkout by construction and cannot fail for the reason that matters.
+    expect(scanScript).toContain('if [ ! -f "${host_repo}/.gitleaks.toml" ]; then');
+    expect(scanScript).toContain("[A-Za-z]:/*)");
+    expect(workflow).toContain("${{ runner.temp }}/semgrep-output/semgrep-results.sarif");
+  });
+
+  // #2686. Each of the three gates below is a REQUIRED protected-branch check,
+  // and each has a specific way of going quiet without going red — which is the
+  // worst failure available to a security gate, because the checks list still
+  // reads green. The assertions pin the exact shape that makes each one real.
+  describe("required security gates (#2686)", () => {
+    it("runs the repository's own Semgrep rules in the blocking gate, without dropping the registry packs", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+
+      // The custom rules must be IN the blocking scan. Matched as the
+      // backslash-continued argument line, because `--config .semgrep/rules`
+      // also appears in the fixture-test step above it — so the plain substring
+      // stayed green when the flag was deleted from the scan itself, which is
+      // the only place that makes the rules blocking. Mutation-testing found it.
+      expect(workflow).toMatch(/^ +--config \.semgrep\/rules \\$/m);
+      // ...and the four registry packs must still be there beside them. Wiring
+      // custom rules in by REPLACING the packs is the silent-coverage-loss the
+      // issue's review focus names.
+      expect(workflow).toContain("--config p/nextjs");
+      expect(workflow).toContain("--config p/typescript");
+      expect(workflow).toContain("--config p/javascript");
+      expect(workflow).toContain("--config p/react");
+      // #2842's coverage gate is a STEP, and a step is the one thing in this
+      // job nothing pinned. A later reshape that drops it leaves every check
+      // green, the required context passing, and the whole of that issue's
+      // gate gone — the same silent removal the `--config .semgrep/rules`
+      // assertion above exists to prevent for a flag.
+      //
+      // The step's PRESENCE is the unpinned half and the half that matters:
+      // dropping the `--json-output` flag it consumes is already fail-loud,
+      // because the gate exits non-zero on the report it cannot find. Pinned
+      // as the run line rather than the step name, so renaming the step for
+      // readability does not fail while deleting the gate does.
+      expect(workflow).toMatch(
+        /^ +node scripts\/ci\/check-semgrep-coverage\.mjs \\$/m,
+      );
+      expect(workflow).toContain("--json-output /out/semgrep-results.json");
+      // The fixtures must run. A custom rule that has stopped matching anything
+      // scans clean, which is indistinguishable from a rule that found nothing.
+      expect(workflow).toContain(
+        "semgrep --test --config .semgrep/rules .semgrep/tests",
+      );
+      // The fixtures are deliberate violations, so the scan must not read them.
+      expect(workflow).toContain("--exclude .semgrep/tests");
+      // `--error` is what turns a finding into a non-zero exit.
+      expect(workflow).toContain("--error");
+    });
+
+    // #2841. GitHub's SARIF ingest does not act on `suppressions`, so every
+    // justified `nosemgrep` comment used to mint a code-scanning alert that could
+    // never be closed — and a dangerous new raw-SQL call would have arrived in
+    // that list looking identical to the known-safe ones. The filter that fixes
+    // it has two ways of going wrong quietly, and this pins both: publishing the
+    // raw file again (the alerts come back) and filtering the AUDIT artifact or
+    // the blocking scan (which would hide real findings).
+    it("publishes filtered alerts while keeping the blocking scan and the artifact unfiltered", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+
+      // The code-scanning upload consumes the FILTERED file.
+      expect(workflow).toMatch(
+        /sarif_file: \$\{\{ runner\.temp \}\}\/semgrep-output\/semgrep-results\.published\.sarif/,
+      );
+      // The build artifact keeps the RAW file — it is the audit record the
+      // triage was measured from.
+      expect(workflow).toMatch(
+        /name: semgrep-sarif-\$\{\{ github\.run_id \}\}\n\s+path: \$\{\{ runner\.temp \}\}\/semgrep-output\/semgrep-results\.sarif\n/,
+      );
+      // The filter runs on the raw output and writes a separate file, so the
+      // scan's own exit code was decided before it ever ran.
+      expect(workflow).toContain(
+        "node scripts/ci/filter-suppressed-sarif.mjs \\",
+      );
+      expect(workflow.indexOf("--sarif-output /out/semgrep-results.sarif")).
+        toBeLessThan(workflow.indexOf("filter-suppressed-sarif.mjs"));
+      // ...and `semgrep scan` must never be pointed at the published copy, which
+      // would make the filter part of the gate rather than part of the report.
+      expect(workflow).not.toContain(
+        "--sarif-output /out/semgrep-results.published.sarif",
+      );
+      // Conditions stay at STEP level: a job-level `if:` on a required check
+      // reports "skipped", which GitHub counts as SATISFYING branch protection.
+      const staticAnalysis = workflow.slice(
+        workflow.indexOf("  static-analysis:"),
+        workflow.indexOf("  secret-scan:"),
+      );
+      expect(staticAnalysis).not.toMatch(/^ {4}if:/m);
+    });
+
+    it("keeps the gitleaks gate on one pinned container, covering the PR range, main's history and the tree", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+
+      const scan = readRepoFile("scripts/ci/gitleaks-scan.sh");
+
+      expect(workflow).toContain("name: Secret scan (gitleaks)");
+      // One container for all three scopes, and since #2852 the same one the
+      // scheduled sweep runs. The gate names the SCOPES; the script owns the
+      // image and the flags.
+      expect(scan).toContain('. "${SCRIPT_DIR}/gitleaks-image.sh"');
+      // THREE scopes, and each covers a hole the other two leave.
+      //
+      // The PR range is the precise signal, and it carries the merge flag too
+      // because a PR that merges `main` into itself to resolve a conflict would
+      // otherwise have that resolution scanned by nothing.
+      expect(workflow).toContain(
+        'GITLEAKS_LOG_OPTS="--diff-merges=first-parent ${PR_BASE_SHA}..${PR_HEAD_SHA}"',
+      );
+      // The history scan is scoped to a RESOLVED ref, never `--all`.
+      // `actions/checkout` with `fetch-depth: 0` materialises every branch as
+      // `refs/remotes/origin/*`, so `git log --all` made this required check
+      // hostage to a leak on anyone's unrelated branch — red on every open PR,
+      // and unfixable from your own branch.
+      expect(workflow).toContain(
+        'GITLEAKS_LOG_OPTS="--diff-merges=first-parent ${HISTORY_SCAN_SCOPE}"',
+      );
+      // Asserted against the DIRECTIVES: the job's comment quotes `--all` at
+      // length while explaining why it is gone, and a banned flag named in order
+      // to forbid it must not read as using it.
+      const directives = workflow
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("#"))
+        .join("\n");
+      expect(directives).not.toContain("--log-opts=--all");
+      // ...and the scope must be resolved with a hard failure when the ref is
+      // missing. A required secret gate that quietly scans an empty range is
+      // the whole defect class #2686 exists to close.
+      expect(workflow).toContain("HISTORY_SCAN_SCOPE=$scope");
+      expect(workflow).toMatch(/if \[ -z "\$scope" \]; then\n\s+echo "::error::/);
+      // The tree scan is topology-independent: whatever is in the checked-out
+      // files right now is covered however it got there, including a pull
+      // request's merge PREVIEW, which is not any commit either patch scan
+      // walks. Anchored to the `dir` mode the gate asks the script for.
+      expect(workflow).toContain("bash scripts/ci/gitleaks-scan.sh dir");
+      expect(scan).toContain("scan=(dir /repo)");
+      // Non-zero exit on a finding, and no secret echoed into a public log.
+      //
+      // `--exit-code=2`, not 1, and that is #2852's acceptance criterion
+      // rather than a preference: gitleaks exits 1 BOTH when it finds a leak
+      // and when it fails to run, so on 1 alone a required gate cannot say
+      // which happened. Measured against v8.28.0 while writing this --
+      // clean 0, findings 2, fatal error 1, bad flag 126, unresolvable image
+      // 125. Both outcomes still fail the caller, so nothing about what
+      // blocks a merge changed. The discrimination is fail-closed in both
+      // directions.
+      //
+      // And exit 0 is NOT sufficient on its own. Measured on v8.28.0: when
+      // the git source itself fails — an unresolvable range, or
+      // `detected dubious ownership` — gitleaks logs the git error, reports
+      // `0 commits scanned … no leaks found`, and exits 0, because from its
+      // point of view it completed. `--exit-code` never applies. That lands
+      // on the REQUIRED gate, whose pull-request scope resolves
+      // `${PR_BASE_SHA}..${PR_HEAD_SHA}` and is unresolvable whenever the
+      // base commit is missing from the checkout. Zero commits is never a
+      // legitimate result for any caller here, so the script refuses it.
+      expect(scan).toContain("[1-9][0-9]* commits scanned");
+      expect(scan).toContain("walked ZERO commits");
+      // ...and the message must not blame the range's SHAPE, because a
+      // legitimately empty valid range prints the same line. Either way
+      // nothing was scanned, which is the part that matters.
+      expect(scan).toContain("the range is empty or git rejected it");
+      // THE OTHER HALF. A git error part way through the walk stops the
+      // commit stream; gitleaks reports the commits it already had and exits
+      // 0 — `1500 commits scanned … no leaks found` for a `--all` sweep that
+      // hit a bad object at twenty percent. That passes the zero-commit
+      // check and reads as a clean sweep of the whole repository.
+      // The `[git] ` TAG is the marker, not the prefix after it. In v8.28.0
+      // `listenForStdErr` emits five allowlisted benign messages as untagged
+      // `WRN`, and routes every other stderr line through
+      // `Error().Msgf("[git] %s", …)` while setting `errEncountered`, which
+      // aborts the walk. A narrower `(fatal|error):` match therefore let
+      // `[git] warning: unable to access '/root/.gitconfig'` and git's
+      // `hint:` lines through — each of which truncates the scan.
+      // Against the DIRECTIVES on both sides. A positive assertion that reads
+      // raw text is satisfied by a COMMENT quoting the pattern, so commenting
+      // the guard out left this census green — measured, and the sixth
+      // instance of this file's recurring defect.
+      expect(directivesOnly(scan)).toContain("\\[git\\] |stderr is not empty");
+      expect(directivesOnly(scan)).toContain(
+        "the scan is TRUNCATED even though gitleaks exited 0",
+      );
+      // The narrowed pattern must not come back. On a required secret gate
+      // it trades a false red for a false GREEN, which is the wrong way
+      // round. Against the DIRECTIVES, because the block's own comment
+      // quotes the narrowed pattern while explaining why it went — the
+      // recurring defect in this file, now five times over.
+      expect(directivesOnly(scan)).not.toContain("(fatal|error):");
+      // No check may anchor on the level token: with colour on, zerolog
+      // emits `\x1b[31mERR\x1b[0m` and an `ERR `-anchored regex matches
+      // nothing. The greps read message body only.
+      expect(scan).not.toMatch(/grep -Eq '(\^\|)?ERR /);
+      expect(scan).toContain('-e NO_COLOR=1');
+      expect(scan).toContain("LEAK_EXIT=2");
+      // #4766: a failed run must print where the finding is, and it must not
+      // print what it is. `--verbose` prints each finding; `--redact` is what
+      // makes the value read REDACTED in that output. They sit in one
+      // array and are never separated; a run with neither flag printed only
+      // `leaks found: N` while the error text claimed more.
+      expect(directivesOnly(scan)).toContain(
+        'args=(--exit-code="${LEAK_EXIT}" --redact --verbose)',
+      );
+      // The error line states what the log really holds: rule, file, line and,
+      // for a history scan, the commit. The old text said the file, commit and
+      // rule were NOT redacted "above" when nothing was printed above.
+      expect(scan).toContain(
+        "Each finding's rule id, file, line and (for a history scan) commit are printed above",
+      );
+      expect(scan).not.toContain("the file, commit and rule id are not");
+      // `GITLEAKS_SCAN_ROOT` is the self-test's seam. A workflow that set it
+      // would point the required gate at some other directory.
+      for (const file of [
+        ".github/workflows/ci.yml",
+        ".github/workflows/gitleaks-scheduled.yml",
+      ]) {
+        expect(readRepoFile(file)).not.toContain("GITLEAKS_SCAN_ROOT");
+      }
+      // The clean path is the LAST branch, reached only after the findings
+      // exit, the non-zero exit and the zero-commit check have each declined
+      // it. Anchored on that ordering because an early `exit 0` is precisely
+      // the regression that would restore the false green.
+      expect(
+        scan.indexOf('echo "gitleaks found nothing in ${LABEL}."'),
+      ).toBeGreaterThan(scan.indexOf("walked ZERO commits"));
+      expect(scan).toContain("SCANNER FAILURE, not a clean scan");
+      // The action is no longer USED: it installed a DIFFERENT gitleaks (8.24.3
+      // by default) than the pinned container, so the two jobs disagreed about
+      // which tool was enforcing the gate. Matched on `uses:` rather than on the
+      // bare name, because the job's own comment explains why it went.
+      expect(workflow).not.toMatch(/uses:\s*gitleaks\/gitleaks-action/);
+      // The SHAs reach the script through `env:`, not through `${{ }}` spliced
+      // into the shell program.
+      expect(workflow).toContain("PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}");
+      expect(workflow).toContain("PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}");
+    });
+
+    it("proves the secret scanner can still fail before trusting it to pass", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+      const selftest = readRepoFile("scripts/ci/gitleaks-selftest.sh");
+
+      // Every silent-failure mode #2686 found — an empty rule set, a shape
+      // allowlist that swallowed a whole default rule, a scan that never looked
+      // at merge commits — turned this gate GREEN. So the gate runs a failure
+      // injection first, and the injection runs BEFORE the real scans.
+      expect(workflow).toContain("run: bash scripts/ci/gitleaks-selftest.sh");
+      expect(workflow.indexOf("gitleaks-selftest.sh")).toBeLessThan(
+        workflow.indexOf("HISTORY_SCAN_SCOPE=$scope"),
+      );
+      // The three things the injection must actually assert. Named rather than
+      // counted, so deleting one is a named failure.
+      expect(selftest).toContain("acb-connection-string-password");
+      expect(selftest).toContain("--diff-merges=first-parent main");
+      expect(selftest).toContain("git merge --no-commit side");
+      // #4766: ...and it runs the gate's OWN script over a planted finding and
+      // reads the LOG, asserting the file, rule id and commit are named and the
+      // planted value is not. Named so deleting either direction is a failure.
+      expect(selftest).toContain('GITLEAKS_SCAN_ROOT="${WORK}/merge"');
+      expect(selftest).toContain('bash "${SCRIPT_DIR}/gitleaks-scan.sh" git');
+      expect(selftest).toContain("the log names the file that holds the finding");
+      expect(selftest).toContain("the log names the rule id");
+      expect(selftest).toContain("the log names the commit");
+      expect(selftest).toContain("the planted secret value appears in the gate's log");
+      // ...and it must be able to fail. `exit 1` on a non-zero failure count is
+      // the only line that makes any of the above load-bearing.
+      expect(selftest).toMatch(/if \[ "\$failures" -ne 0 \]; then/);
+      // No literal a rule matches may live in the script itself, or the tree
+      // scan two steps later reports the self-test as a leak. The samples are
+      // assembled from a prefix plus fresh randomness, which is why the live
+      // Stripe prefix is split across a `printf` argument.
+      expect(selftest).not.toMatch(/sk_live_[A-Za-z0-9]{10,}/);
+      expect(selftest).not.toMatch(/ghp_[A-Za-z0-9]{20,}/);
+    });
+
+    it("never puts the required secret-scan job behind a job-level event condition", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+      const job = workflow.slice(
+        workflow.indexOf("  secret-scan:"),
+        workflow.indexOf("  verify:"),
+      );
+
+      expect(job.length).toBeGreaterThan(0);
+      // WHY, correctly. An earlier version of this comment said a skipped job
+      // produces no status and leaves the branch unmergeable. That is false, and
+      // this repository refutes it: on push 66448740c, `dependency-review` and
+      // `gitleaks-pr-diff` both skipped via a JOB-level `if:` and both reported
+      // a status. Only a WORKFLOW-level `on:` filter produces no status.
+      //
+      // The real hazard is the inverse, and worse: GitHub counts a `skipped`
+      // required check as SATISFYING branch protection. A job-level `if:` on a
+      // required security gate therefore makes it vacuously green — the gate
+      // says "skipped" and the merge button turns on. So every condition in this
+      // job stays at STEP level, where a skip leaves the job a real pass or a
+      // real failure.
+      expect(job).not.toMatch(/^ {4}if:/m);
+      expect(job).toMatch(/^ {8}if: github\.event_name == 'pull_request'$/m);
+    });
+
+    /*
+      #2852 added a SECOND thing that scans this repository for secrets, and a
+      second scanner is a liability unless it is provably the same scanner. The
+      four assertions below are the whole reason the pin and the invocation were
+      moved into `scripts/ci/`: they are what stops the sweep quietly becoming a
+      different tool over a different rule set, which is precisely the state
+      #2686 found the two jobs it deleted in.
+    */
+    it("runs the scheduled sweep on the same pinned scanner as the required gate", () => {
+      const sweep = readRepoFile(".github/workflows/gitleaks-scheduled.yml");
+      const gate = readRepoFile(".github/workflows/ci.yml");
+
+      // Both go through the one script, so a version bump is one edit and
+      // cannot land on only one of them.
+      expect(sweep).toContain("bash scripts/ci/gitleaks-scan.sh git");
+      expect(sweep).toContain("bash scripts/ci/gitleaks-scan.sh dir");
+      expect(gate).toContain("bash scripts/ci/gitleaks-scan.sh git");
+      expect(gate).toContain("bash scripts/ci/gitleaks-scan.sh dir");
+      // And NOTHING may reach for a container of its own. This used to loop
+      // over the two workflow files by name, which is the shape of guard that
+      // cannot see the file it most needs to: a third workflow with its own
+      // `ghcr.io/gitleaks/gitleaks:v8.0.0` passed the named version 22 of 22.
+      // So the search is a WALK, and the allowlist is one file.
+      const searched = [
+        ...filesUnder(".github/workflows", [".yml", ".yaml"]),
+        ...filesUnder(".github/actions", [".yml", ".yaml"]),
+        ...filesUnder("scripts", [".sh", ".mjs", ".ts", ".js"]),
+        "SECURITY.md",
+        "docs/MAINTENANCE.md",
+        "docs/SECURITY-ATTACK-SURFACE.md",
+      ];
+      // Not vacuous: a walk that found nothing would pass silently, which is
+      // the failure mode of every census that selects its own inputs.
+      expect(searched.length).toBeGreaterThan(30);
+      expect(searched).toContain(GITLEAKS_PIN_HOME);
+      expect(searched).toContain(".github/workflows/gitleaks-scheduled.yml");
+      const offenders = searched
+        .filter((file) => file !== GITLEAKS_PIN_HOME)
+        .filter((file) => {
+          const text = readRepoFile(file);
+          // Comments stripped for YAML and shell, because both discuss the
+          // image at length and a comment explaining the rule must not
+          // satisfy it. NOT stripped for Markdown: a document that restates
+          // the version IS the second home, prose or not.
+          const body = /\.(ya?ml|sh)$/.test(file) ? directivesOnly(text) : text;
+          return body.includes("ghcr.io/gitleaks/gitleaks");
+        });
+      expect(
+        offenders,
+        `these name a gitleaks container of their own; the pin lives in ${GITLEAKS_PIN_HOME}`,
+      ).toEqual([]);
+      // The sweep proves the scanner can still fail before trusting its green,
+      // exactly as the gate does. A weekly job nobody watches needs this more
+      // than the gate does, not less.
+      expect(sweep).toContain("run: bash scripts/ci/gitleaks-selftest.sh");
+      // ...and the self-test runs the pinned binary rather than a default of
+      // its own, or it proves nothing about the gate it guards.
+      expect(readRepoFile("scripts/ci/gitleaks-selftest.sh")).toContain(
+        '. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gitleaks-image.sh"',
+      );
+    });
+
+    it("keeps `--all` in the sweep and out of the required gate", () => {
+      const sweep = readRepoFile(".github/workflows/gitleaks-scheduled.yml");
+
+      // The division of responsibility, pinned in both directions because each
+      // half is a real defect. `--all` in the gate makes a required check
+      // hostage to a leak on anybody's abandoned branch, red on every open pull
+      // request and unfixable by its author (#2686). `--all` missing from the
+      // sweep leaves the sweep scanning what the gate already scanned, which is
+      // the "full repository scan" that #2686 measured doing nothing.
+      expect(sweep).toContain(
+        "GITLEAKS_LOG_OPTS: --diff-merges=first-parent --all",
+      );
+      expect(directivesOnly(readRepoFile(".github/workflows/ci.yml"))).not.toContain(
+        "--all",
+      );
+      // Every branch's history is only reachable from a full clone. Against
+      // the DIRECTIVES, because this workflow's own header quotes
+      // `fetch-depth: 0` while explaining why the gate cannot use `--all` --
+      // found by mutation-testing, which is the fourth time in this file a
+      // comment about a directive has satisfied the guard on that directive.
+      expect(directivesOnly(sweep)).toContain("fetch-depth: 0");
+    });
+
+    it("keeps the scheduled sweep incapable of becoming a merge gate by accident", () => {
+      const sweep = readRepoFile(".github/workflows/gitleaks-scheduled.yml");
+      const triggers = sweep.slice(sweep.indexOf("\non:"), sweep.indexOf("\npermissions:"));
+
+      // #2852 explicitly does not add a branch-protection requirement, and the
+      // mechanism that keeps it that way is the trigger list: a workflow with no
+      // `pull_request` and no `push` trigger reports no status context on a pull
+      // request at all, so there is nothing for branch protection to require and
+      // nothing to sit "Expected — waiting for status" on an open PR. Making it
+      // required later is the three-step sequence in `AGENTS.md`.
+      expect(triggers).toContain("schedule:");
+      expect(triggers).toContain("workflow_dispatch:");
+      expect(triggers).not.toContain("pull_request");
+      expect(triggers).not.toContain("push:");
+      // A cancelled security scan reports neither clean nor dirty, and the next
+      // one is a week away.
+      expect(sweep).toContain("cancel-in-progress: false");
+      // Read-only, and no `security-events: write`: the sweep publishes its
+      // findings as a run summary and an artifact, so it never needs a token
+      // that can write to the repository.
+      expect(directivesOnly(sweep)).not.toContain(": write");
+    });
+
+    it("reports sweep findings with context and without the secret", () => {
+      const sweep = readRepoFile(".github/workflows/gitleaks-scheduled.yml");
+      const scan = readRepoFile("scripts/ci/gitleaks-scan.sh");
+
+      // Actionable a week later means the rule, the file, the line and the
+      // commit — and `--redact` means the matched value in that report is the
+      // literal string REDACTED, so summarising it republishes nothing.
+      // Verified against v8.28.0: the JSON report's `Match` and `Secret` fields
+      // both come back as "REDACTED" while `File`, `StartLine`, `Commit` and
+      // `RuleID` are intact.
+      expect(scan).toContain("--report-format=json");
+      expect(scan).toContain("--redact");
+      expect(sweep).toContain(
+        '\\(.RuleID) | `\\(.File | sub("^/repo/"; ""))` | \\(.StartLine) | \\(.Commit[0:12])',
+      );
+      // Only these four fields are ever rendered. `Match` and `Secret` are
+      // REDACTED in the report and must not be republished even so.
+      expect(sweep).not.toContain(".Secret");
+      expect(sweep).not.toContain(".Match");
+      // Both scans run even when the first one fails, so one sweep gives one
+      // complete answer rather than a partial one that has to be re-run.
+      expect(sweep).toMatch(/- name: Sweep the checked-out tree\n\s+id: tree\n\s+if: always\(\)/);
+      // A missing report is NOT "no findings", and neither is a well-formed
+      // report of `[]` from a scan that failed at the git source — which is
+      // exactly what gitleaks writes in that case. So the summary reads the
+      // step's OUTCOME, and prints "No findings." only when it succeeded.
+      expect(sweep).toContain("HISTORY_OUTCOME: ${{ steps.history.outcome }}");
+      expect(sweep).toContain("TREE_OUTCOME: ${{ steps.tree.outcome }}");
+      expect(sweep).toContain('[ "$outcome" != "success" ]');
+      expect(sweep).toContain("The scan did not complete (step outcome:");
+      // ...and a missing `jq` must fail rather than render every scope as
+      // clean, which is this job's own failure mode arriving through a tool.
+      expect(sweep).toContain("jq is not on PATH");
+    });
+
+    it("names the Trivy gate for what it blocks and keeps it off the verify critical path", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+      const job = workflow.slice(
+        workflow.indexOf("  docker-image-security:"),
+        workflow.indexOf("  publish-ghcr-images:"),
+      );
+
+      expect(job).toContain("name: Image security gate (Trivy CRITICAL)");
+      // CRITICAL blocks...
+      expect(job).toContain(
+        "name: Trivy CRITICAL gate (REQUIRED — a finding here blocks the merge)",
+      );
+      // ...HIGH does not, and must keep its escape hatch or it would start
+      // blocking merges under a policy nobody agreed to.
+      expect(job).toContain(
+        "name: Trivy HIGH report (ADVISORY — never blocks the merge)",
+      );
+      // Anchored: the step's own comment quotes `continue-on-error: true` while
+      // explaining why it must stay, so the plain substring survived deleting
+      // the directive. Third instance of that defect in this block, all three
+      // found by mutation-testing rather than by reading.
+      expect(job).toMatch(/^ +continue-on-error: true$/m);
+      // `needs: verify` here would put a REQUIRED image scan behind a ~17-minute
+      // job, making it the new critical path for every merge — and, because
+      // GitHub counts a skipped required check as satisfied, a failed `verify`
+      // would have reported this gate as skipped, i.e. as PASSING.
+      //
+      // The pattern accepts both YAML spellings. The first version matched only
+      // the block-sequence form, so `needs: verify` and `needs: [verify]` — the
+      // same dependency, one line shorter — both walked straight past it.
+      expect(job).not.toMatch(/needs:\s*(\n\s*-\s*)?\[?\s*verify/);
+    });
+
+    it("keeps the gitleaks config extending the default rule set", () => {
+      const config = readRepoFile(".gitleaks.toml");
+
+      // Without this, the config REPLACES the built-in rules with the empty set
+      // this file declares, and every gitleaks job in CI passes unconditionally.
+      // That is exactly what shipped before #2686.
+      //
+      // Anchored to the start of a line on purpose. `toContain("[extend]")`
+      // passes on the COMMENT above the directive, which explains at length why
+      // the directive must never be removed — so deleting the directive left
+      // this test green when it was first written. Mutation-testing it is what
+      // found that; the file's own prose was satisfying the guard.
+      expect(config).toMatch(/^\[extend\]$/m);
+      expect(config).toMatch(/^useDefault\s*=\s*true$/m);
+      // Allowlists stay content-scoped: a global allowlist carrying `paths`
+      // suppresses EVERYTHING under those paths in gitleaks 8.28.0, whatever
+      // else the entry says.
+      expect(config).not.toMatch(/^\s*paths\s*=/m);
+      // ...and they stay pinned to EXACT LITERALS, never to a shape. A global
+      // allowlist applies to every rule, not the one its description names, so a
+      // shape class silences rules nobody thought about: measured, the UUID
+      // shape dropped `heroku-api-key` and a UUID `CRON_SECRET`, and
+      // `^(?:pk|sk)_test_[A-Za-z0-9_]+$` forgave every Stripe test-mode key that
+      // will ever exist here. Both regexes are forbidden by name.
+      //
+      // Asserted against the DIRECTIVES, with `#` comment lines stripped: the
+      // file explains at length why each banned shape is banned, and quoting a
+      // shape in order to forbid it must not read as using it. That is the same
+      // prose-satisfies-the-guard defect as the `[extend]` case above, inverted.
+      const directives = config
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("#"))
+        .join("\n");
+      expect(directives).not.toContain("(?:pk|sk)_test_[A-Za-z0-9_]+");
+      expect(directives).not.toContain("[0-9a-f]{8}-[0-9a-f]{4}");
+      // `targetRules` is never the answer either: in 8.28.0 it silently voids
+      // the allowlist entirely, which turns a narrowing into a widening.
+      expect(directives).not.toContain("targetRules");
+      // The one rule this repository owns. gitleaks' defaults have no rule for a
+      // connection-string password, which on a PUBLIC repository holding member
+      // and payment data is the most damaging plausible leak — the URL carries
+      // the host as well as the credential.
+      expect(config).toMatch(/^id = "acb-connection-string-password"$/m);
+      expect(config).toMatch(/^entropy = /m);
+    });
+
+    it("keeps the .gitleaksignore free of fingerprints that suppress nothing", () => {
+      const ignore = readRepoFile(".gitleaksignore");
+      const entries = ignore
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line !== "" && !line.startsWith("#"));
+
+      // The file shipped nine fingerprints described as "RE-VERIFIED against
+      // gitleaks v8.28.0", and not one of them suppressed anything: replacing
+      // the file with an empty one changed no scan result. An ignore file full
+      // of dead entries is worse than an empty one, because it reads as
+      // coverage.
+      //
+      // A fingerprint is also not durable here. The history scan passes
+      // `--diff-merges=first-parent`, so a line is re-reported at every merge
+      // that carried it forward — each with its own `commit:file:rule:line`
+      // fingerprint — and pinning by fingerprint would need a new entry after
+      // every merge, forever, on a REQUIRED check. Real suppressions are
+      // exact-literal allowlists in `.gitleaks.toml` instead.
+      //
+      // This is not "the file must stay empty". It is: every entry must be
+      // shaped like a fingerprint, so a fingerprint added for the one case that
+      // still warrants one (a rotated credential whose value must not be
+      // written down) passes, and a stale or malformed line does not.
+      for (const entry of entries) {
+        expect(entry, `${entry} is not a gitleaks fingerprint`).toMatch(
+          /^[0-9a-f]{40}:[^:]+:[^:]+:\d+$/,
+        );
+      }
+    });
+
+    // #2946. The audit used to be a STEP near the front of `verify`. Actions
+    // skips every later step in a job once one fails, so when a high-severity
+    // advisory landed in a transitive dependency on 17 August (#2945) it took
+    // lint, the file-size ratchet, `prisma generate`, typecheck, knip, `pnpm test`
+    // and the build down with it — on every branch, silently, while the other
+    // required checks stayed green. The check list read "one dependency thing is
+    // red"; the suite had not run. #2947 restored it and the first real run
+    // immediately failed on a defect (#2944) that had accumulated behind it.
+    it("audits dependencies in a job of its own, so an advisory cannot silence verify (#2946)", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+      const job = workflow.slice(
+        workflow.indexOf("  dependency-audit:"),
+        workflow.indexOf("  static-analysis:"),
+      );
+
+      expect(job.length).toBeGreaterThan(0);
+      // The context name is what branch protection stores. Renaming it silently
+      // un-requires the gate until someone re-reads the protection API.
+      expect(job).toMatch(/^ {4}name: Dependency audit$/m);
+      // Still BLOCKING (owner decision, 19 Aug 2026): a new advisory is a
+      // supply-chain decision a human makes, not a report.
+      //
+      // #3254 replaced the bare `npm audit --audit-level=high` with a wrapper
+      // that distinguishes "found a vulnerability" from "could not reach the
+      // advisory service", retries the second and then fails anyway. The
+      // threshold is unchanged and lives in the script; what is anchored here is
+      // that the job runs the wrapper rather than the raw command, because
+      // reverting to the raw command silently restores the misleading red.
+      // Anchored to the run line — the job's comment quotes both.
+      expect(job).toMatch(/^ +run: node scripts\/ci\/audit-dependencies\.mjs$/m);
+      expect(job).not.toContain("continue-on-error");
+
+      // The other hazard #3254 raises — a job-level `if:` or `needs:` making
+      // this gate vacuously green, because GitHub counts a SKIPPED required
+      // check as satisfying branch protection — is deliberately not re-asserted
+      // here. The repo-wide case below ("puts no job-level `if:` or `needs:` on
+      // any required-check job") already covers every required job including
+      // this one, and a second copy would be a rule with two homes.
+
+      // ...and `verify` must no longer run it. Asserted against the DIRECTIVES,
+      // because verify now carries a comment naming the departed step and saying
+      // where it went, which a plain substring check would match.
+      const verify = directivesOnly(
+        workflow.slice(
+          workflow.indexOf("  verify:"),
+          workflow.indexOf("  migration-drift:"),
+        ),
+      );
+      expect(verify.length).toBeGreaterThan(0);
+      expect(verify).not.toContain("npm audit");
+      expect(verify).not.toContain("pnpm audit");
+      // The gates that were skipped must all still be reached by `verify`, and
+      // none of them may have acquired a condition of its own on the way out.
+      // #3431 moves the suite itself to independent shard jobs, and #4425 does
+      // the same for lint, typecheck and build; each keeps its fail-closed
+      // bridge as a step in this required job, which names every one of them
+      // (and, since #4907, the real-PostgreSQL job too).
+      for (const step of [
+        "run: node scripts/ci/run-budget-gate.mjs",
+        "run: pnpm run db:generate",
+        "run: pnpm exec knip",
+        'run: node scripts/ci/require-test-shards.mjs --max-queue-minutes 60 --max-run-minutes 45 --job Typecheck --job Lint --job "Production build" --job "Real-PostgreSQL suites (all)"',
+      ]) {
+        expect(verify, `verify no longer runs \`${step}\``).toContain(step);
+      }
+      for (const [jobId, step] of [
+        ["typecheck", "run: pnpm run typecheck"],
+        ["lint", "run: pnpm run lint"],
+        ["build", "run: pnpm run build"],
+      ]) {
+        const start = workflow.indexOf(`\n  ${jobId}:\n`);
+        expect(start, `the ${jobId} job is missing`).toBeGreaterThan(-1);
+        const rest = workflow.slice(start + 1).search(/\n {2}[a-z][a-z0-9-]*:\n/);
+        const job = directivesOnly(workflow.slice(start, start + 1 + rest));
+        expect(job, `the ${jobId} job no longer runs \`${step}\``).toContain(step);
+        expect(verify, `verify runs \`${step}\` as well as its own job`).not.toContain(step);
+      }
+    });
+
+    // #3843: the advisory `dependency-review` job judges the same report the
+    // same way as the required job, through the one canonical wrapper. Run bare,
+    // `pnpm audit` would disagree with the required gate over a MITIGATED record.
+    it("routes the advisory dependency-review audit through the same wrapper (#3843)", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+      const job = directivesOnly(
+        workflow.slice(
+          workflow.indexOf("  dependency-review:"),
+          workflow.indexOf("  dependency-audit:"),
+        ),
+      );
+      expect(job.length).toBeGreaterThan(0);
+      expect(job).toMatch(/^ +run: node scripts\/ci\/audit-dependencies\.mjs$/m);
+      expect(job).not.toContain("pnpm audit");
+      expect(job).not.toContain("continue-on-error");
+    });
+
+    // The generalisation of the two job-level assertions above, applied to every
+    // required check at once (#2946). A skipped job REPORTS a status and GitHub
+    // counts a skipped required check as SATISFYING branch protection, so a
+    // job-level `if:` — or a `needs:` on a job that then fails — turns a gate
+    // vacuously green and switches the merge button on. Conditions belong on
+    // steps. The two exemptions are named, not inferred.
+    it("puts no job-level `if:` or `needs:` on any required-check job (#2946)", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+
+      // Deliberately NOT required, each for a reason that is itself the point:
+      // `dependency-review` is advisory and pull-request-only (its job-level
+      // `if:` is exactly why it can never be required), and
+      // `publish-ghcr-images` is a release step rather than a gate.
+      const notRequired = new Set(["dependency-review", "publish-ghcr-images"]);
+
+      // From `jobs:` onward only — `on:` also carries two-space keys
+      // (`pull_request:`, `push:`) that are not jobs.
+      const jobsBlock = workflow.slice(workflow.indexOf("\njobs:\n"));
+      expect(jobsBlock.length).toBeGreaterThan(0);
+
+      const jobs = [...jobsBlock.matchAll(/^ {2}([a-z0-9-]+):$/gm)];
+      expect(jobs.length).toBeGreaterThan(5);
+
+      for (const [index, match] of jobs.entries()) {
+        const id = match[1];
+        if (notRequired.has(id)) continue;
+
+        const start = match.index ?? 0;
+        const end = jobs[index + 1]?.index ?? jobsBlock.length;
+        const body = directivesOnly(jobsBlock.slice(start, end));
+
+        expect(body, `job \`${id}\` has a job-level \`if:\``).not.toMatch(
+          /^ {4}if:/m,
+        );
+        expect(body, `job \`${id}\` has a job-level \`needs:\``).not.toMatch(
+          /^ {4}needs:/m,
+        );
+      }
+    });
+
+    it("releases only behind the renamed secret-scan gate", () => {
+      const workflow = readRepoFile(".github/workflows/ci.yml");
+      const publish = workflow.slice(workflow.indexOf("  publish-ghcr-images:"));
+
+      expect(publish).toContain("- secret-scan");
+      expect(publish).not.toContain("- gitleaks-full-repo");
+    });
+
+    it("releases only behind verify, which waits for the real-PostgreSQL suites (#4907)", () => {
+      // Since #4907 a red, cancelled or timed-out `realdb-all` run fails
+      // `verify`, and through it stops the release image. The verify half is
+      // pinned with verify's other steps above; this pins the release half,
+      // read from the parsed `needs:` so either YAML spelling counts.
+      const jobs = parseWorkflowYaml(readRepoFile(".github/workflows/ci.yml")).jobs;
+      const needs = jobs["publish-ghcr-images"]?.needs as string | string[] | undefined;
+
+      expect([needs ?? []].flat()).toContain("verify");
+    });
+  });
+
+  it("deploys the resolved commit SHA image references from the production script", () => {
+    const deployScript = readRepoFile("scripts/run-production-blue-green-deploy.sh");
+
+    // The repositories are resolved in `resolve_image_refs`
+    // from the shell, then the source repository's .env, then these upstream
+    // defaults — so the defaults are named once, as constants, and the shell
+    // value is read into an empty-when-unset variable.
+    expect(deployScript).toContain(
+      'GHCR_APP_IMAGE_REPOSITORY="${GHCR_APP_IMAGE_REPOSITORY:-}"',
+    );
+    expect(deployScript).toContain(
+      'GHCR_MIGRATE_IMAGE_REPOSITORY="${GHCR_MIGRATE_IMAGE_REPOSITORY:-}"',
+    );
+    expect(deployScript).toContain(
+      'UPSTREAM_GHCR_APP_IMAGE_REPOSITORY="ghcr.io/thatskiff33/alpineclubbookingsnz-app"',
+    );
+    expect(deployScript).toContain(
+      'UPSTREAM_GHCR_MIGRATE_IMAGE_REPOSITORY="ghcr.io/thatskiff33/alpineclubbookingsnz-migrate"',
+    );
+    expect(deployScript).toContain(
+      'APP_IMAGE="${GHCR_APP_IMAGE_REPOSITORY}:${RESOLVED_REF}"',
+    );
+    expect(deployScript).toContain(
+      'MIGRATE_IMAGE="${GHCR_MIGRATE_IMAGE_REPOSITORY}:${RESOLVED_REF}"',
+    );
+    expect(deployScript).toContain('APP_IMAGE="$APP_IMAGE"');
+    expect(deployScript).toContain('MIGRATE_IMAGE="$MIGRATE_IMAGE"');
+    expect(deployScript).toContain("--internal-blue-green-deploy");
+  });
+
+  it("pulls supplied app and migration images instead of building locally", () => {
+    const deploy = readRepoFile("scripts/run-production-blue-green-deploy.sh");
+
+    expect(deploy).toContain('APP_IMAGE="${APP_IMAGE:-}"');
+    expect(deploy).toContain('MIGRATE_IMAGE="${MIGRATE_IMAGE:-}"');
+    expect(deploy).toContain("validate_image_reference_contract");
+    expect(deploy).toContain(
+      'docker compose pull "$CRON_SERVICE" "$TARGET_SERVICE" "$MIGRATE_SERVICE"',
+    );
+    expect(deploy).toContain(
+      'docker compose build --pull "$CRON_SERVICE" "$TARGET_SERVICE" "$MIGRATE_SERVICE"',
+    );
+  });
+
+  it("copies standalone static assets without nesting static/static", () => {
+    const dockerfile = readRepoFile("Dockerfile");
+
+    expect(dockerfile).toContain(
+      "COPY --from=builder /app/.next/standalone ./",
+    );
+    expect(dockerfile).toContain(
+      "COPY --from=builder /app/.next/static/ ./.next/static/",
+    );
+    expect(dockerfile).not.toMatch(
+      /^COPY --from=builder \/app\/\.next\/static \.\/\.next\/static$/m,
+    );
+  });
+});
+
+/**
+ * #3673: this repository installs with pnpm, in the strict layout, and
+ * `npm install`/`npm ci` out of habit must fail loudly instead of quietly writing
+ * a second lockfile.
+ * Every guard below is one a tidy-up could remove without anything else going
+ * red, which is why each is pinned here rather than trusted.
+ */
+describe("package manager contract (#3673)", () => {
+  const WORKFLOWS = filesUnder(".github/workflows", [".yml", ".yaml"]);
+
+  it("pins pnpm once, in `packageManager`, and makes npm's install refuse", () => {
+    const pkg = JSON.parse(readRepoFile("package.json")) as {
+      packageManager?: string;
+      engines?: Record<string, string>;
+      overrides?: unknown;
+      allowScripts?: unknown;
+    };
+    expect(pkg.packageManager).toMatch(/^pnpm@\d+\.\d+\.\d+$/);
+    // `engines.pnpm` is a floor (the major this configuration needs), not a
+    // second copy of the pin: bumping `packageManager` inside the major is a
+    // one-field edit.
+    expect(pkg.engines?.pnpm).toMatch(/^>=\d+$/);
+    const floor = Number(pkg.engines?.pnpm?.slice(2));
+    expect(Number(pkg.packageManager?.slice("pnpm@".length).split(".")[0])).toBeGreaterThanOrEqual(floor);
+    // Not a semver range, so npm can never satisfy it; with `engine-strict`
+    // below it is the backstop that stops `npm install`/`npm ci` before they
+    // write a package-lock.json or a node_modules tree (today npm usually fails
+    // even earlier, on the `catalog:` specifiers or the missing npm lockfile).
+    expect(pkg.engines?.npm).toBe("please-use-pnpm");
+    expect(readRepoFile(".npmrc")).toMatch(/^engine-strict=true$/m);
+    // npm-only fields pnpm ignores: their settings live in pnpm-workspace.yaml.
+    expect(pkg.overrides).toBeUndefined();
+    expect(pkg.allowScripts).toBeUndefined();
+  });
+
+  it("keeps the strict layout, the overrides and the build allowlist in pnpm-workspace.yaml", () => {
+    const workspace = readRepoFile("pnpm-workspace.yaml");
+    expect(workspace).toMatch(/^nodeLinker: isolated$/m);
+    expect(workspace).toMatch(/^overrides:$/m);
+    expect(workspace).toMatch(/^ {2}next-auth>nodemailer: "catalog:"$/m);
+    expect(workspace).toMatch(/^ {2}"@auth\/core>nodemailer": "catalog:"$/m);
+    expect(workspace).toMatch(/^allowBuilds:$/m);
+  });
+
+  /*
+    #3673 review: these settings decide which third-party code runs at install
+    time and what the audit may overlook, so they are pinned EXACTLY. A key added
+    under `allowBuilds:` would run a new install script; `strictDepBuilds: false`
+    would let an unlisted one run with only a warning; `dangerouslyAllowAllBuilds`
+    would run all of them; `auditConfig` (its `ignoreGhsas` list) was shown to
+    turn `pnpm audit` green over a real advisory; `registry` would move where
+    packages AND advisories come from; `minimumReleaseAge: 0` would drop pnpm's
+    one-day hold on fresh releases.
+  */
+  it("pins which install scripts run, and forbids the settings that would widen that or blind the audit", () => {
+    const workspace = readRepoFile("pnpm-workspace.yaml");
+    const lines = workspace.split(/\r?\n/);
+    expect(lines).toContain("allowBuilds:");
+    // Which packages, and allowed or denied, is the contract. The exact version
+    // lives only in pnpm-workspace.yaml, so a reviewed bump is a one-line edit
+    // there (CONTRIBUTING.md, "Package manager: pnpm"). Every allowed entry must
+    // carry an exact version: a bare name would approve every future version.
+    // The entries are read by the pre-install gate's own reader (#4364), which
+    // also checks each version against pnpm-lock.yaml.
+    const parsed = readAllowBuilds(workspace);
+    expect(parsed.map(({ name, allowed }) => `${name}=${allowed}`)).toEqual([
+      "@prisma/engines=true",
+      "core-js=false",
+      "esbuild=true",
+      "prisma=true",
+      "unrs-resolver=true",
+    ]);
+    for (const entry of parsed.filter((e) => e.allowed)) {
+      expect(entry.versions, `${entry.name} must be pinned to an exact version`).not.toEqual([]);
+      for (const version of entry.versions) {
+        expect(version, `${entry.name} must be pinned to an exact version`).toMatch(/^\d+\.\d+\.\d+$/);
+      }
+    }
+
+    const topLevelKeys = lines
+      .map((line) => /^([A-Za-z][\w-]*):/.exec(line)?.[1])
+      .filter((key): key is string => key !== undefined);
+    for (const forbidden of [
+      "dangerouslyAllowAllBuilds",
+      "strictDepBuilds",
+      "auditConfig",
+      "registry",
+      "registries",
+      "onlyBuiltDependencies",
+      "neverBuiltDependencies",
+    ]) {
+      expect(topLevelKeys, `pnpm-workspace.yaml must not set \`${forbidden}\``).not.toContain(forbidden);
+    }
+    // #4455: a release-age hold may only be STRICTER than pnpm's one-day
+    // default, and any exemption names one exact version, like allowBuilds.
+    const releaseAge = /^minimumReleaseAge: (\d+)$/m.exec(workspace);
+    if (topLevelKeys.includes("minimumReleaseAge")) {
+      expect(releaseAge, "minimumReleaseAge must be a whole number of minutes").not.toBeNull();
+      expect(Number(releaseAge?.[1])).toBeGreaterThanOrEqual(1440);
+    }
+    const excluded = /^minimumReleaseAgeExclude:\n((?: {2}- .+\n)*)/m.exec(workspace)?.[1] ?? "";
+    for (const entry of excluded.split("\n").filter(Boolean)) {
+      expect(entry, "a release-age exemption names one exact version").toMatch(/^ {2}- (@?[\w.-]+(?:\/[\w.-]+)?)@\d+\.\d+\.\d+$/);
+    }
+    // Nested spellings too, e.g. an ignore list under some other key.
+    expect(workspace).not.toMatch(/ignoreGhsas|ignoreCves/);
+
+    // A run never installs by itself (AGENTS.md: an install needs authorisation),
+    // and the virtual store stays inside each worktree.
+    expect(workspace).toMatch(/^verifyDepsBeforeRun: error$/m);
+    expect(workspace).toMatch(/^enableGlobalVirtualStore: false$/m);
+  });
+
+  it("has one lockfile, and refuses an npm one in CI and in git", () => {
+    const root = readdirSync(process.cwd());
+    expect(root).toContain("pnpm-lock.yaml");
+    expect(root).not.toContain("package-lock.json");
+    expect(root).not.toContain("npm-shrinkwrap.json");
+    expect(readRepoFile(".gitignore")).toMatch(/^\/package-lock\.json$/m);
+
+    const workflow = readRepoFile(".github/workflows/ci.yml");
+    const verify = directivesOnly(
+      workflow.slice(workflow.indexOf("  verify:"), workflow.indexOf("  migration-drift:")),
+    );
+    const refuse = verify.indexOf("- name: Refuse an npm lockfile");
+    const install = verify.indexOf("- name: Install dependencies");
+    expect(refuse).toBeGreaterThan(-1);
+    expect(install).toBeGreaterThan(refuse);
+    const refuseStep = verify.slice(refuse, verify.indexOf("- name:", refuse + 1));
+    expect(refuseStep).toContain("package-lock.json");
+    expect(refuseStep).toContain("npm-shrinkwrap.json");
+    expect(refuseStep).toMatch(/exit "\$found"/);
+  });
+
+  it("installs with pnpm from the lockfile in every workflow, never with npm", () => {
+    for (const file of WORKFLOWS) {
+      const directives = directivesOnly(readRepoFile(file));
+      expect(directives, `${file} still caches npm`).not.toMatch(/^\s*cache: npm\s*$/m);
+      expect(directives, `${file} still runs npm ci`).not.toMatch(/\bnpm (ci|install)\b/);
+      expect(directives, `${file} still runs npx`).not.toMatch(/(?<![\w-])npx /);
+      expect(directives, `${file} still runs npm audit`).not.toMatch(/(?<!p)npm audit/);
+
+      // `cache: pnpm` needs pnpm on PATH, so every job that caches the store
+      // must set pnpm up BEFORE setup-node — the other order fails the job.
+      const jobs = directives.split(/^ {2}(?=[\w-]+:\s*$)/m);
+      for (const job of jobs) {
+        const cache = job.search(/^\s*cache: pnpm\s*$/m);
+        if (cache === -1) continue;
+        const pnpmSetup = job.indexOf("uses: pnpm/action-setup@");
+        const nodeSetup = job.indexOf("uses: actions/setup-node@");
+        expect(pnpmSetup, `${file}: a job caches pnpm without setting pnpm up`).toBeGreaterThan(-1);
+        expect(pnpmSetup, `${file}: pnpm must be set up before setup-node`).toBeLessThan(nodeSetup);
+      }
+      for (const install of directives.match(/^\s*run: pnpm install\b[^\n]*/gm) ?? []) {
+        expect(install, `${file}: CI installs must be frozen`).toContain("--frozen-lockfile");
+      }
+    }
+  });
+
+  it("builds the image with the pinned pnpm and the frozen lockfile", () => {
+    const dockerfile = directivesOnly(readRepoFile("Dockerfile"));
+    // The version is read from package.json, never written here a second time.
+    expect(dockerfile).toContain(
+      `npm install -g "$(node -p "require('/tmp/package-manager/package.json').packageManager")"`,
+    );
+    expect(dockerfile).not.toMatch(/pnpm@\d/);
+    expect(dockerfile).toMatch(/^COPY package\.json pnpm-lock\.yaml pnpm-workspace\.yaml \.\/$/m);
+    expect(dockerfile).toContain("pnpm install --frozen-lockfile");
+    // #3843: the lockfile records each `patchedDependencies` patch's hash, so
+    // the reviewed patches must reach the deps stage before its frozen install.
+    const deps = dockerfile.slice(
+      dockerfile.indexOf("FROM base AS deps"),
+      dockerfile.indexOf("FROM base AS builder"),
+    );
+    expect(deps).toMatch(/^COPY patches \.\/patches\/$/m);
+    expect(deps.indexOf("COPY patches")).toBeLessThan(deps.indexOf("pnpm install --frozen-lockfile"));
+    // Git does not track an empty directory, so once the last patch is retired
+    // `COPY patches` would fail on a missing source. The tracked placeholder
+    // keeps the directory, and the image build, whole with no patch in it.
+    expect(readdirSync(path.join(process.cwd(), "patches"))).toContain(".gitkeep");
+    // pnpm checks patch DATES before every `pnpm run`, so the builder must take
+    // patches/ from the deps layer (older than its install), AFTER `COPY . .`,
+    // or a cached deps layer fails the build with "Patches were modified".
+    const builder = dockerfile.slice(
+      dockerfile.indexOf("FROM base AS builder"),
+      dockerfile.indexOf("FROM node:24.17-alpine AS runner"),
+    );
+    expect(builder).toMatch(/^COPY --from=deps \/app\/patches \.\/patches\/$/m);
+    expect(builder.indexOf("COPY . .")).toBeLessThan(builder.indexOf("COPY --from=deps /app/patches"));
+    const firstPnpm = builder.search(/^RUN pnpm\b/m);
+    expect(firstPnpm).toBeGreaterThan(-1);
+    expect(builder.indexOf("COPY --from=deps /app/patches")).toBeLessThan(firstPnpm);
+    // #4028: node_modules and patches/ are separate cached layers, so a partial
+    // cache hit can pair a fresh patch with an older install; the builder pins
+    // the patch dates to the epoch, after restoring them and before any `pnpm run`.
+    const pinDates = builder.search(/^RUN find patches -type f -exec touch -d @0 \{\} \+$/m);
+    expect(pinDates).toBeGreaterThan(builder.indexOf("COPY --from=deps /app/patches"));
+    expect(pinDates).toBeLessThan(firstPnpm);
+    expect(dockerfile).not.toMatch(/\bnpm ci\b|package-lock\.json/);
+    // npm is used once, to install pnpm, and then removed in the SAME layer, so
+    // the builder and migrate images carry pnpm and no npm/npx.
+    const base = dockerfile.slice(0, dockerfile.indexOf("FROM base AS deps"));
+    expect(base).toContain("/usr/local/lib/node_modules/npm");
+    expect(base).toContain("/usr/local/bin/npx");
+  });
+});

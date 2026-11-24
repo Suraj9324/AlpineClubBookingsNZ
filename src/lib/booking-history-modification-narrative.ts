@@ -1,0 +1,243 @@
+import { formatCents } from "@/lib/utils";
+import {
+  parseModificationLines,
+  renderModificationLineWithAmount,
+} from "@/lib/booking-modification-lines";
+import type { RateMembershipLabelResolver } from "@/lib/rate-membership-label";
+import type {
+  BookingMoneyBuildUpHistoryMetadata,
+  BookingMoneyCompatibilityClassification,
+} from "@/lib/booking-money-build-up";
+import type { ClubFormat } from "@/lib/club-format";
+
+/**
+ * HOW A STORED `BookingModification` ROW IS DESCRIBED IN WORDS.
+ *
+ * Split out of `booking-history.ts` (#3232 fix round), which is the timeline
+ * BUILDER: it decides which events appear, in what order, for which reader, and
+ * with which money beside them. Turning one stored row into a sentence is a
+ * different job with a different reason to change — new modification types, new
+ * wording, new keys written by an edit — and it is the half that grows every time
+ * the modification service learns to record something new.
+ *
+ * IT OWNS THE ROW SHAPE, rather than importing it back from the builder, because
+ * the shape is exactly the fields these functions read. The builder imports the
+ * type from here (`INV-SSOT-001`); a second declaration on either side is two
+ * things that can disagree about what a modification row contains.
+ *
+ * Pure and I/O-free, like the builder it serves.
+ */
+
+export interface BookingHistoryModification {
+  id: string;
+  modificationType: string;
+  previousData: unknown;
+  newData: unknown;
+  priceDiffCents: number;
+  changeFeeCents: number;
+  /** #3530: the stored itemisation, or null / absent on a row that has none. */
+  priceLines?: unknown;
+  createdAt: Date;
+}
+
+export const MODIFICATION_LABELS: Record<string, string> = {
+  DATE_CHANGE: "Dates Changed",
+  GUEST_ADD: "Guests Added",
+  GUEST_REMOVE: "Guest Removed",
+  EXTEND_STAY: "Stay Extended",
+  BATCH_MODIFY: "Booking Modified",
+  // #2266: an edit that changed ONLY the stored credit election (#2265).
+  CREDIT_ELECTION: "Credit Choice Updated",
+  // #3219: not an edit at all - the booking's own price brought back into
+  // agreement with its nights when a parked edit's financial review was closed.
+  // It is in the booking's history rather than only in the audit log because a
+  // re-base can reduce what a later cancellation refunds, and "why did I only
+  // get $120 back?" has to be answerable from the booking.
+  PRICE_REBASE: "Price Recalculated",
+  // #3827 (D-3813-4): a guest accepted their place, so the codes the booking
+  // already carried were applied again over their nights.
+  PROMO_REPRICE: "Promo Codes Re-applied",
+};
+
+function isRemovedGuest(
+  value: unknown
+): value is { firstName?: string; lastName?: string } {
+  return Boolean(value) && typeof value === "object";
+}
+
+/**
+ * A plain-English sentence an edit stored on its own modification record for the
+ * member to read later, or null when that edit had nothing to say.
+ *
+ * Two keys use it: `promoCoverageNote`, the promotion-cap split a reprice
+ * explained at the time (#2390), and `promoChangeNotAppliedNote`, the
+ * promo-code change an edit saved without (#3179). One reader rather than two,
+ * because both are the same thing — the exact words the member was shown,
+ * replayed verbatim (`INV-SSOT`).
+ *
+ * Read defensively: `newData` is free-form JSON, and every modification written
+ * before either key existed simply does not have it.
+ */
+export function memberFacingNoteOf(
+  modification: BookingHistoryModification,
+  key: "promoCoverageNote" | "promoChangeNotAppliedNote"
+): string | null {
+  const next =
+    modification.newData && typeof modification.newData === "object"
+      ? (modification.newData as Record<string, unknown>)
+      : {};
+  const note = next[key];
+  return typeof note === "string" && note.trim().length > 0 ? note : null;
+}
+
+const MONEY_BUILD_UP_FALLBACK_LABELS: Record<
+  BookingMoneyCompatibilityClassification,
+  string
+> = {
+  STORED_SIDE_DEFECT: "the stored evidence is incomplete or inconsistent",
+  DERIVATION_DEFECT: "the current calculation needs investigation",
+  LEGITIMATE_DIVERGENCE: "the two methods legitimately describe different states",
+};
+
+/**
+ * The member/officer-visible explanation of Stage 3's source verdict. The
+ * writer stores the canonical metadata in `newData`; this reader translates it
+ * without exposing internal enum names. Historical rows simply have no note.
+ */
+export function moneyBuildUpNoteOf(
+  modification: BookingHistoryModification,
+  format: ClubFormat,
+): string | null {
+  const next =
+    modification.newData && typeof modification.newData === "object"
+      ? (modification.newData as Partial<BookingMoneyBuildUpHistoryMetadata>)
+      : {};
+  const source = next.moneyBuildUpSource;
+  const derivedCents = next.moneyBuildUpDerivedCents;
+  if (source === "STORED" && Number.isInteger(next.moneyBuildUpStoredCents)) {
+    return `Price source: stored booking build-up (${formatCents(next.moneyBuildUpStoredCents!, format)}), confirmed against the current calculation.`;
+  }
+  if (
+    source === "DERIVED_COMPATIBILITY_FALLBACK" &&
+    Number.isInteger(derivedCents)
+  ) {
+    const stored = Number.isInteger(next.moneyBuildUpStoredCents)
+      ? `; the stored build-up was ${formatCents(next.moneyBuildUpStoredCents!, format)}`
+      : "";
+    const classification = next.moneyBuildUpFallbackClassification
+      ? MONEY_BUILD_UP_FALLBACK_LABELS[next.moneyBuildUpFallbackClassification]
+      : null;
+    const reason = classification ? ` because ${classification}` : "";
+    return `Price source: current calculation (${formatCents(derivedCents!, format)}) retained${stored}${reason}.`;
+  }
+  if (source === "BASE_EVIDENCE_UNKNOWN") {
+    return "Price source: stored sold-price evidence was not exact enough to use; the source is recorded as unknown.";
+  }
+  return null;
+}
+
+export function describeModification(modification: BookingHistoryModification, format: ClubFormat): string | null {
+  const previous =
+    modification.previousData && typeof modification.previousData === "object"
+      ? (modification.previousData as Record<string, unknown>)
+      : {};
+  const next =
+    modification.newData && typeof modification.newData === "object"
+      ? (modification.newData as Record<string, unknown>)
+      : {};
+
+  switch (modification.modificationType) {
+    case "DATE_CHANGE":
+      return `${String(previous.checkIn)} to ${String(next.checkIn)} and ${String(previous.checkOut)} to ${String(next.checkOut)}`;
+    case "GUEST_ADD":
+      return `${String(previous.guestCount)} to ${String(next.guestCount)} guests.`;
+    case "GUEST_REMOVE": {
+      const removedGuest = previous.removedGuest;
+      const name = isRemovedGuest(removedGuest)
+        ? [removedGuest.firstName, removedGuest.lastName]
+            .filter(Boolean)
+            .join(" ")
+        : "guest";
+      return `Removed ${name}; ${String(previous.guestCount)} to ${String(next.guestCount)} guests.`;
+    }
+    case "BATCH_MODIFY": {
+      const parts: string[] = [];
+      if (previous.checkIn !== next.checkIn || previous.checkOut !== next.checkOut) {
+        parts.push(
+          `${String(previous.checkIn)}-${String(previous.checkOut)} to ${String(next.checkIn)}-${String(next.checkOut)}`
+        );
+      }
+      if (previous.guestCount !== next.guestCount) {
+        parts.push(`${String(previous.guestCount)} to ${String(next.guestCount)} guests`);
+      }
+      return parts.length > 0 ? `${parts.join(" and ")}.` : "Booking details were updated.";
+    }
+    // #2266: a credit-election-only edit. The new/previous election cents ride
+    // the modification data (see booking-batch-modification-service).
+    case "CREDIT_ELECTION": {
+      const electionCents = next.creditElectionCents;
+      return typeof electionCents === "number" && electionCents > 0
+        ? `${formatCents(electionCents, format)} of account credit will be applied at payment.`
+        : "The saved account-credit choice was removed.";
+    }
+    // #3219: the review settle re-based the booking from its strands. The
+    // sentence says what moved and, when it matters, that the club's invoice no
+    // longer agrees - which is the one thing a treasurer settling this booking
+    // by bank transfer has to know before they mark it PAID.
+    case "PRICE_REBASE": {
+      const parts: string[] = [];
+      if (
+        typeof previous.finalPriceCents === "number" &&
+        typeof next.finalPriceCents === "number"
+      ) {
+        parts.push(
+          `${formatCents(previous.finalPriceCents, format)} to ${formatCents(next.finalPriceCents, format)}, recalculated from what this booking's nights sold for.`,
+        );
+      } else {
+        parts.push(
+          "Recalculated from what this booking's nights sold for.",
+        );
+      }
+      if (next.xeroInvoiceDiverged === true) {
+        parts.push(
+          "The club's invoice for this booking was not changed to match, so check it before recording a payment against this figure.",
+        );
+      }
+      if (next.promoRemoved === true) {
+        parts.push("The promotion no longer applies and was removed.");
+      }
+      return parts.join(" ");
+    }
+    case "PROMO_REPRICE": {
+      const moved =
+        typeof previous.finalPriceCents === "number" &&
+        typeof next.finalPriceCents === "number"
+          ? ` The price went from ${formatCents(previous.finalPriceCents, format)} to ${formatCents(next.finalPriceCents, format)}.`
+          : "";
+      return `A guest accepted their place, so the booking's promo codes were applied again.${moved}`;
+    }
+    default:
+      return "Booking details were updated.";
+  }
+}
+
+/**
+ * #3530: what the edit's delta is MADE OF, line by line, in dollars - the same
+ * lines the edit's audit row carries and (stage 2b) the Xero document renders,
+ * so an officer reading the booking sees what the treasurer sees. Null for a
+ * row that stores no itemisation (parked, inexact evidence, or written before
+ * the column existed), in which case the sentence above stands alone exactly
+ * as it always did.
+ */
+export function describeModificationLines(
+  modification: Pick<BookingHistoryModification, "priceLines">,
+  /** #2543's member word follows the rate snapshot; null falls back to `isMember`. */
+  rateLabels: RateMembershipLabelResolver | null,
+  format: ClubFormat,
+): string | null {
+  const lines = parseModificationLines(modification.priceLines);
+  if (!lines) return null;
+  return `Made up of: ${lines
+    .map((line) => renderModificationLineWithAmount(line, format, rateLabels))
+    .join("; ")}.`;
+}

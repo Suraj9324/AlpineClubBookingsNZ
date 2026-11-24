@@ -1,0 +1,2987 @@
+#!/usr/bin/env node
+/**
+ * Documentation index integrity: every doc is reachable, every cited invariant
+ * id exists (issue #2691).
+ *
+ * ## Why this exists
+ *
+ * #2691 split a 7,135-line `docs/DOMAIN_INVARIANTS.md` into per-domain files
+ * under `docs/invariants/`, each rule carrying a permanent `INV-<PREFIX>-<NNN>`
+ * id, and replaced the nine-document "Read First" list in `AGENTS.md` with a
+ * small always-read core plus a routing table. Both halves of that only work
+ * while these properties hold, and none of them is self-maintaining:
+ *
+ *  - **A prefix's numbers are dense.** They run from `001` to that prefix's
+ *    highest with no holes, which is the whole reason "take the next number" is
+ *    mechanical rather than a matter of looking carefully. See
+ *    {@link auditNumberSequences}.
+ *  - **Merged ids are append-only.** Density alone cannot see the highest id
+ *    being deleted, or a whole prefix disappearing. The current definitions are
+ *    therefore also compared with the base revision. See
+ *    {@link auditPermanentInvariantIds}.
+ *  - **Every cited id resolves.** An id is cited from places this repository
+ *    cannot rewrite — merged commits, closed issues, lint strings shipped in a
+ *    release, test names in a fork. A citation that resolves to nothing is the
+ *    exact failure #2691 exists to prevent: a rule written down correctly that
+ *    still does not hold, because the pointer to it went stale.
+ *  - **Every doc is reachable from an index.** The issue's own watchpoint names
+ *    the routing table as the part most likely to rot. A doc nothing links to is
+ *    a doc nobody finds, which is how `docs/DOMAIN_INVARIANTS.md` became
+ *    unreachable-at-the-moment-of-need in the first place.
+ *  - **The routing table points at things that exist.** Every prefix it names is
+ *    a declared prefix, every declared prefix has a row, and every document it
+ *    links to is a real file.
+ *  - **Nobody cites a line number into the invariants.** A `:NN` suffix is stale
+ *    the next time somebody edits above it; the whole point of the id scheme is
+ *    that it is not.
+ *  - **No tracked text file is mojibake or carries a byte-order mark.** One
+ *    invariant file was committed double-encoded and every other gate stayed
+ *    green. See {@link auditEncoding}.
+ *  - **No tracked text file carries a byte that is not valid UTF-8.** The
+ *    decode replaces one with U+FFFD before every other check here sees it,
+ *    so it needs the raw buffer. See {@link findInvalidUtf8Bytes}.
+ *
+ *   pnpm run docs:indexcheck                       # check, non-zero on any problem
+ *   node scripts/ci/check-doc-index-integrity.mjs  # same
+ *
+ * ## The `INV-` namespace was already occupied
+ *
+ * This repository writes `INV-…` strings in quantity as **Xero invoice numbers**
+ * in test fixtures, and four of them match the invariant citation shape exactly
+ * (`INV-IB-001`, `INV-SETTLE-001`, `INV-SETTLE-002`, `INV-SUP-001`). They are
+ * carried in {@link RESERVED_INVOICE_PREFIXES} below.
+ *
+ * An **unrecognised** prefix is a hard failure rather than something the
+ * reserved list waves through. That is deliberate and it is the whole reason the
+ * `INV-` namespace was safe to adopt: the likelier mistake is a typo'd prefix —
+ * `INV-CPA-…` written for `INV-CAP-021` — and a blanket whitelist would make
+ * exactly that mistake invisible. Every failure mode here is a noisy error; none
+ * of them is a silent mis-resolution.
+ *
+ * ## Scanning rules
+ *
+ * Definitions, ordinary citations and malformed shapes skip Markdown literal
+ * regions, so a document may show placeholders and fixture ids without treating
+ * them as definitions. One bounded CommonMark block pass classifies fenced and
+ * indented code, raw HTML, paragraphs, and ATX/Setext headings while retaining
+ * blockquote/list containers. A second, narrower pass does inspect the literal
+ * view: a
+ * well-formed id under a prefix the repository really declares must resolve
+ * there too. That catches an invented live-prefix example while leaving
+ * `INV-<PREFIX>-<NNN>` placeholders, reserved invoice numbers and custom fixture
+ * prefixes alone.
+ * Inline backticks are **not** skipped — most real citations in prose are
+ * written `` `INV-CAP-021` `` and skipping them would make the check blind to
+ * the common case.
+ *
+ * Anchor-style citations (`…#inv-cap-021`) are deliberately not handled here.
+ * `pnpm run docs:linkcheck` already validates fragments against real headings, and
+ * duplicating it would give two places to disagree.
+ */
+import { scanMarkdownBlocks, scannableLines, markdownProseLines, literalAuditLines } from "../lib/markdown-blocks.mjs";
+export { SETEXT_HEADING_UNDERLINE_PATTERN, scanMarkdownFenceLines, scannableLines, fencedLines, literalAuditLines } from "../lib/markdown-blocks.mjs";
+import { inlineLinkTargets, refDefTargets } from "../lib/markdown-links.mjs";
+import { userGuideScreenshotNames } from "../lib/user-guide-screenshots.mjs";
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { isMainModule } from "../lib/is-main-module.mjs";
+
+/** The index every invariant file and every id must be reachable from. */
+export const INVARIANT_INDEX = "docs/DOMAIN_INVARIANTS.md";
+
+/** Where invariant definitions live. Nothing outside it may define an id. */
+export const INVARIANT_DIR = "docs/invariants/";
+
+/** The scheme's illustrative fences must never look like live invariant ids. */
+export const INVARIANT_SCHEME = "docs/invariants/SCHEME.md";
+
+/**
+ * A DEFINITION is a heading whose entire text is the id. A citation is never a
+ * whole heading line, so the two patterns cannot be confused in either
+ * direction. Levels 2–4 because an id heading sits exactly one level below its
+ * nearest structural heading, and a file with no subsections has one level less.
+ */
+export const DEFINITION_PATTERN = /^#{2,4} (INV-[A-Z][A-Z0-9]*-\d{3})\s*$/;
+
+/** A numeric invariant-shaped token, used to recognise Setext headings too. */
+export const INVARIANT_SHAPED_TOKEN_PATTERN =
+  /\bINV-[A-Z][A-Z0-9]*-\d+/i;
+
+/** A CITATION is the id anywhere in a line of any tracked text file. */
+export const CITATION_PATTERN = /\bINV-[A-Z][A-Z0-9]*-\d{3}\b/g;
+
+/**
+ * An index ROW is the id alone in the first cell of a table row. Matching the
+ * row rather than any mention is what lets the index's own prose use a real id
+ * as an illustration without counting as a second catalogue entry.
+ */
+export const INDEX_ROW_PATTERN = /^ {0,3}\|\s*`(INV-[A-Z][A-Z0-9]*-\d{3})`\s*\|/;
+
+/**
+ * Prefixes that belong to Xero invoice-number fixtures, not to invariants, and
+ * are therefore permanently unavailable as invariant prefixes.
+ *
+ * The first three collide with the citation shape today. The rest are near
+ * misses in the same fixture family (`INV-SUB-2026-001`, `INV-XERO-9`, …) that
+ * would collide the day someone wrote one with three trailing digits; reserving
+ * them now costs nothing and stops a future invariant prefix from being chosen
+ * where a fixture could plausibly land on it.
+ */
+export const RESERVED_INVOICE_PREFIXES = new Set([
+  "IB",
+  "SETTLE",
+  "SUP",
+  "SUB",
+  "XERO",
+  "FAM",
+  "LEGACY",
+  "PM",
+  "JOR",
+  "REB",
+]);
+
+/**
+ * Files that quote MALFORMED ids on purpose, in prose rather than in a fence,
+ * and are therefore exempt from the shape guard only — never from citation
+ * resolution.
+ *
+ * Exactly one: `SCHEME.md` is the id scheme itself. It argues for three digits
+ * by showing the two-digit form the issue body illustrated, and justifies the
+ * shape guard by showing the two near-misses it catches. Those sentences are
+ * about the malformed forms, so fencing them would be a worse document.
+ *
+ * If the file is ever renamed, this entry has to be renamed with it or the
+ * exemption silently stops applying and `SCHEME.md` starts failing. Nothing
+ * enforces that; the failure is at least loud and names the file.
+ */
+export const SHAPE_GUARD_EXEMPT_FILES = new Set(["docs/invariants/SCHEME.md"]);
+
+/**
+ * Files exempt from the CITATION scan and from the line-number citation scan.
+ *
+ * Exactly one, and it is this check's own test: its fixtures have to contain
+ * unresolvable ids, unrecognised prefixes and line-number citations, because
+ * that is what they assert the checker rejects. Nothing else may be added here —
+ * an exemption is the one way to make a citation invisible, which is the failure
+ * this file exists to prevent.
+ *
+ * This file itself is deliberately NOT exempt. Its prose describes the forbidden
+ * forms without writing them, which is the same discipline it asks of everybody
+ * else.
+ */
+export const CITATION_EXEMPT_FILES = new Set([
+  "scripts/ci/check-doc-index-integrity.test.mjs",
+]);
+
+/**
+ * The repository's front doors, for the reachability walk.
+ *
+ * `docs/README.md` is the documentation hub named by the house rule ("every doc
+ * must be reachable from a hub"); the other three are the entry points a reader
+ * or an agent actually starts from, and each links into `docs/` directly.
+ */
+export const REACHABILITY_ROOTS = [
+  "README.md",
+  "AGENTS.md",
+  "CONTRIBUTING.md",
+  "docs/README.md",
+];
+
+/**
+ * Markdown under `docs/` that is deliberately not linked from anywhere.
+ *
+ * Empty, and it should stay that way: an unreachable doc is the problem, not a
+ * category of doc. Link the file from its nearest hub instead of listing it
+ * here.
+ */
+export const UNREACHABLE_ALLOWLIST = new Set([]);
+
+/**
+ * The domain `##` headings `docs/DOMAIN_INVARIANTS.md` keeps VERBATIM.
+ *
+ * `SCHEME.md` §4.1 and §6.1 promise that the index retains the ten domain
+ * headings of the pre-split document byte-identical, so an anchor written
+ * before the split still resolves. Until #2720 nothing checked that, and the
+ * prose beside it also claimed "many inbound anchors" target them — a number
+ * this repository cannot support. Measured on 17 Aug 2026: **zero** tracked
+ * files link to an anchor inside the index; every reference is to the bare
+ * path. So every anchor the promise is about lives outside this repository —
+ * in a fork, a merged commit, a closed issue, a shipped release — and is
+ * therefore unmeasurable here and permanently unfixable once it breaks.
+ *
+ * That is the argument for pinning the property instead of editing the number:
+ * an anchor nobody can enumerate is exactly the anchor that must never move.
+ * A heading renamed here fails loudly, at the moment of the edit, in the one
+ * place that can still do something about it.
+ *
+ * This is an ALLOWLIST OF SURVIVORS, not a census. The index may grow new
+ * sections freely — `Product Configuration` is one, added by #2720 — and a new
+ * section carries no pre-split anchors, so nothing about it is promised. What is
+ * forbidden is renaming, re-casing or removing one of the ten.
+ */
+export const STABLE_INDEX_HEADINGS = [
+  "Public authoritative content",
+  "Money",
+  "Booking Dates And Capacity",
+  "Payment And Settlement",
+  "Member-Guest Consent",
+  "Booking Modifications",
+  "Analytics And Privacy",
+  "Membership Lifecycle",
+  "Integrations",
+  "Operations",
+];
+
+/** A top-level section heading in the index, with its exact text. */
+const INDEX_SECTION_HEADING_PATTERN = /^ {0,3}##\s+(.+?)\s*#*\s*$/;
+
+/**
+ * Where the routing table lives, and how its section is found.
+ *
+ * Anchored on the heading rather than on a line range so the audit survives
+ * every edit above it. If the heading is renamed the audit fails loudly rather
+ * than quietly checking nothing, which is the failure mode that matters: a
+ * routing audit that silently stops running is worse than none, for the same
+ * reason the table itself says a stale table is worse than no table.
+ */
+export const ROUTING_TABLE_FILE = "AGENTS.md";
+export const ROUTING_TABLE_HEADING = /^###\s+Routing table\s*$/;
+
+/**
+ * A routed PREFIX is a bare family name in backticks: `` `INV-CAP` ``.
+ *
+ * Deliberately does not match a full id (`` `INV-CAP-021` ``): the table routes
+ * families, and a row that named a single rule would be a row that goes stale
+ * the moment a second rule joins the family.
+ */
+export const ROUTING_PREFIX_PATTERN = /`INV-([A-Z][A-Z0-9]*)`/g;
+
+/**
+ * A line-number citation INTO the invariants: the index or any domain file,
+ * with or without a leading path, followed by a `:120` or `:35-40` suffix.
+ *
+ * Scoped to the invariants because that is the habit the id scheme replaced.
+ * Line references into other documents are not great either, but they were not
+ * what #2691 was about and a repository-wide ban would be a much larger change
+ * than this check should make on its own.
+ *
+ * There is no allowlist and no grandfather register. Both were considered and
+ * both were rejected: this repository resolves residuals inside the PR rather
+ * than deferring them, and a per-file register has the specific vice that a file
+ * somebody has since CLEANED stays on the list, silently unprotected. The five
+ * pre-existing citations under `src/lib/` were fixed instead — they now cite
+ * INV-CAP-017 (the admin-mediated double-book guard) and INV-PAY-017 (a booking
+ * invoice is raised at the full price and locally-applied credit is never
+ * allocated against it).
+ */
+export const INVARIANT_LINE_CITATION_PATTERN =
+  /\b((?:[A-Za-z0-9_.-]+\/)*(?:DOMAIN_INVARIANTS\.md|invariants\/[A-Za-z0-9_-]+\.md)):(\d+(?:-\d+)?)/g;
+
+/**
+ * The leading character of a cp1252-through-UTF-8 mojibake pair.
+ *
+ * These are what cp1252 renders for the UTF-8 lead bytes C2-C6, CE-D1 and
+ * E1-E7 — the ranges that carry Latin-1 accents, the General Punctuation block
+ * (em dash, curly quotes, ellipsis) and Greek/Cyrillic.
+ *
+ * Built from code points rather than written out, so that this file stays pure
+ * ASCII and cannot trip its own check.
+ */
+const MOJIBAKE_LEAD = String.fromCharCode(
+  0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xce, 0xcf, 0xd0, 0xd1,
+  0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,
+);
+
+/**
+ * The trailing character of a mojibake pair: what cp1252 renders for a UTF-8
+ * CONTINUATION byte (0x80-0xBF). Bytes 0xA0-0xBF map to themselves; the rest map
+ * into the punctuation cp1252 defines in that range.
+ *
+ * Requiring a lead AND a trail is what keeps this quiet on real text: te reo
+ * macrons, a French name or a stray accented letter are single characters and
+ * never form one of these pairs.
+ */
+const MOJIBAKE_TRAIL =
+  // 0x80-0xBF as a character-class range, then the cp1252 punctuation those
+  // bytes render as when the byte itself is not a printable Latin-1 letter.
+  `${String.fromCharCode(0x80)}-${String.fromCharCode(0xbf)}` +
+  String.fromCharCode(
+    0x20ac, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030,
+    0x0160, 0x2039, 0x0152, 0x017d, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+    0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x017e, 0x0178,
+  );
+
+/** A cp1252-through-UTF-8 mojibake pair, anywhere in a line. */
+export const MOJIBAKE_PATTERN = new RegExp(
+  `[${MOJIBAKE_LEAD}][${MOJIBAKE_TRAIL}]`,
+  "g",
+);
+
+/** What an em dash looks like after one bad round-trip, for the message. */
+const MOJIBAKE_EXAMPLE = String.fromCharCode(0xe2, 0x20ac, 0x201d);
+
+/** The Unicode byte-order mark, as `fs.readFileSync(path, "utf8")` leaves it. */
+export const BYTE_ORDER_MARK = String.fromCharCode(0xfeff);
+
+/**
+ * Every C0 control character except the three that structure a text file, plus
+ * DEL.
+ *
+ * TAB (0x09), LF (0x0A) and CR (0x0D) are excluded because they ARE the text
+ * format. Everything else in 0x00-0x1F, and 0x7F, is an editing accident: see
+ * {@link auditControlCharacters}.
+ *
+ * Built from code points, like the mojibake classes above, so that this file
+ * stays pure ASCII and cannot trip its own check.
+ */
+export const CONTROL_CHARACTER_PATTERN = new RegExp(
+  "[" +
+    `${String.fromCharCode(0x00)}-${String.fromCharCode(0x08)}` +
+    String.fromCharCode(0x0b, 0x0c) +
+    `${String.fromCharCode(0x0e)}-${String.fromCharCode(0x1f)}` +
+    String.fromCharCode(0x7f) +
+    "]",
+  "g",
+);
+
+/**
+ * The escape sequence each commonly-mistaken byte spells, for the message.
+ *
+ * These are the ones an editing tool interprets: a heredoc, a `sed` script or a
+ * Python string that was meant to carry the two characters and wrote the one
+ * byte instead. Naming the escape in the failure is the difference between "a
+ * control character is here" and "you meant a word boundary".
+ */
+const BACKSLASH = String.fromCharCode(92);
+const ESCAPE_SPELLING = new Map([
+  [0x00, `${BACKSLASH}0`],
+  [0x07, `${BACKSLASH}a`],
+  [0x08, `${BACKSLASH}b`],
+  [0x0b, `${BACKSLASH}v`],
+  [0x0c, `${BACKSLASH}f`],
+  [0x1b, `${BACKSLASH}e`],
+]);
+
+/** `0x08`, for a message. Two hex digits, so 0x0B never reads as 0xB. */
+function hexByte(codePoint) {
+  return `0x${codePoint.toString(16).padStart(2, "0")}`;
+}
+
+
+// Upper bound on the inline-tag stripping loop in stripInlineHtmlTags. Each pass
+// must strip at least one `<...>` to continue, so a heading cannot need more
+// passes than it has characters; this only caps pathological input.
+const MAX_INLINE_HTML_STRIP_PASSES = 100;
+
+/** Every physical line in a non-Markdown source file, with its original number. */
+function sourceLines(text) {
+  return text.split(/\r?\n/).map((line, index) => ({ number: index + 1, text: line }));
+}
+
+/** Markdown hides examples structurally; every other scanned format is linewise source. */
+function ordinaryAuditLines(rel, text) {
+  return rel.endsWith(".md") ? scannableLines(text) : sourceLines(text);
+}
+
+/** The prefix half of an id: `INV-CAP-021` -> `CAP`. */
+export function prefixOf(id) {
+  return id.split("-")[1];
+}
+
+/** The number half of an id, as a number: `INV-CAP-021` -> `21`. */
+export function numberOf(id) {
+  return Number(id.slice(id.lastIndexOf("-") + 1));
+}
+
+/**
+ * A sorted ascending list of numbers as zero-padded runs: `033-041, 050`.
+ *
+ * Runs rather than a bare list because a mis-numbered id usually skips a block
+ * of numbers at once, and "missing 033-041" is a sentence a reader acts on where
+ * nine comma-separated numbers is a wall.
+ */
+function formatNumberRuns(numbers) {
+  const pad = (n) => String(n).padStart(3, "0");
+  const runs = [];
+  for (const n of numbers) {
+    const last = runs.at(-1);
+    if (last && n === last[1] + 1) last[1] = n;
+    else runs.push([n, n]);
+  }
+  return runs.map(([from, to]) => (from === to ? pad(from) : `${pad(from)}-${pad(to)}`)).join(", ");
+}
+
+/** Relative Markdown links a file makes, resolved to repo-relative paths. */
+export function markdownLinkTargets(fromPath, text) {
+  const dir = path.posix.dirname(fromPath);
+  const targets = [];
+  for (const { text: scannable } of markdownProseLines(text)) {
+    const raw = [];
+    for (const { target } of [...inlineLinkTargets(scannable), ...refDefTargets(scannable)]) raw.push(target);
+
+    for (let target of raw) {
+      if (target.startsWith("//") || /^[a-z][a-z0-9+.-]*:/i.test(target)) continue;
+      target = target.replace(/^</, "").replace(/>$/, "").split("#")[0].split("?")[0];
+      if (!target) continue;
+      try {
+        target = decodeURIComponent(target);
+      } catch {
+        /* malformed encoding: leave as written, it simply will not resolve */
+      }
+      if (!target.toLowerCase().endsWith(".md")) continue;
+      targets.push(path.posix.normalize(path.posix.join(dir, target)));
+    }
+  }
+  return targets;
+}
+
+/**
+ * Definitions, keyed by id, each with every place it was defined.
+ *
+ * Only files under {@link INVARIANT_DIR} may define an id.
+ */
+export function collectDefinitions(files) {
+  const definitions = new Map();
+  for (const [rel, text] of files) {
+    if (!rel.startsWith(INVARIANT_DIR) || !rel.endsWith(".md")) continue;
+    for (const { number, text: line } of scannableLines(text)) {
+      const match = line.match(DEFINITION_PATTERN);
+      if (match) {
+        if (!definitions.has(match[1])) definitions.set(match[1], []);
+        definitions.get(match[1]).push(`${rel}:${number}`);
+      }
+    }
+  }
+  return definitions;
+}
+
+/**
+ * A conservative GFM inline-link shape used only by the invariant-heading
+ * sentinel. It retains the rendered label and removes a destination that is
+ * syntactically bounded on this line. The destination accepts an angle form or
+ * a whitespace-free form with one balanced-parentheses level, plus an optional
+ * quoted/parenthesised title. Images are deliberately excluded: alt text is not
+ * a visibly contiguous heading token.
+ */
+const HEADING_INLINE_LINK_PATTERN =
+  /(?<!!)\[([^\]\r\n]+)\]\(\s*(?:<[^<>\r\n]*>|(?:\\[^\r\n]|[^\\()\s\r\n]|\([^()\r\n]*\))+)(?:[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^()\r\n]*\)))?[ \t]*\)/g;
+
+/**
+ * Full/collapsed reference-link labels, followed by shortcut-link labels.
+ * Resolving a shortcut requires definitions elsewhere in the document, so the
+ * sentinel conservatively unwraps bracketed labels whenever doing so reveals
+ * an invariant-shaped heading. Literal brackets around a would-be invariant ID
+ * are decoration too and cannot be a canonical definition.
+ */
+const HEADING_REFERENCE_LINK_PATTERN = /(?<!!)\[([^\]\r\n]+)\][ \t]*\[[^\]\r\n]*\]/g;
+const HEADING_SHORTCUT_LINK_PATTERN = /(?<!!)\[([^\]\r\n]+)\]/g;
+
+/** Decode bounded numeric character references without importing an HTML parser. */
+function decodeNumericCharacterReferences(text) {
+  return text.replace(
+    /&#(?:([0-9]{1,7})|[xX]([0-9A-Fa-f]{1,6}));/g,
+    (reference, decimal, hexadecimal) => {
+      const codePoint = Number.parseInt(decimal ?? hexadecimal, decimal ? 10 : 16);
+      if (
+        !Number.isInteger(codePoint) ||
+        codePoint === 0 ||
+        codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff)
+      ) {
+        return reference;
+      }
+      return String.fromCodePoint(codePoint);
+    },
+  );
+}
+
+/**
+ * Approximate the visible heading text only as far as the invariant sentinel
+ * needs. This is intentionally not a Markdown renderer: it unwraps bounded
+ * inline links, decodes numeric references, and removes inline decoration
+ * delimiters/tags that can split an otherwise canonical-looking token.
+ */
+function headingInvariantShapeText(line) {
+  return foldInvariantLookalikes(
+    stripInlineHtmlTags(
+      decodeNumericCharacterReferences(
+        line
+          .replace(HEADING_INLINE_LINK_PATTERN, "$1")
+          .replace(HEADING_REFERENCE_LINK_PATTERN, "$1")
+          .replace(HEADING_SHORTCUT_LINK_PATTERN, "$1"),
+      ).replace(/[*_~`]/g, ""),
+    ),
+  );
+}
+
+/**
+ * Fold the characters that *look* like an invariant id but are not one.
+ *
+ * Every other defence in this function works on ASCII `INV-[A-Z]-\d`, so a
+ * single lookalike codepoint used to walk through all of them at once: the
+ * heading, `collectDefinitions`, `CITATION_PATTERN` and `INDEX_ROW_PATTERN`
+ * would all miss a heading whose hyphen is U+2011 rather than hyphen-minus,
+ * while GitHub rendered it as an ordinary, correct-looking id. A reviewer saw a
+ * normal new invariant that had skipped nine numbers, and CI was green — the
+ * exact outcome this check exists to make impossible.
+ *
+ * No literal id is written in this comment on purpose. This file is scanned for
+ * citations like any other, so an illustrative id here would either have to
+ * resolve or be excused — and an invented one under a live prefix is precisely
+ * the grep bait #2889 exists to remove. Describe the shape; do not spell it.
+ *
+ * Two steps, because they catch different things. NFKC settles the
+ * compatibility forms (full-width letters and digits). The dash class then
+ * folds the hyphen lookalikes NFKC deliberately leaves alone, since U+2011 and
+ * U+2013 are distinct characters rather than compatibility variants of `-`.
+ *
+ * Letter homoglyphs from other scripts — Cyrillic `А` for `A` — are not
+ * foldable this way and are handled instead by the ASCII-only rule in
+ * `auditDefinitionHeadingShapes`: an invariant heading is pure ASCII by
+ * construction, so anything else in it is worth failing on.
+ */
+function foldInvariantLookalikes(text) {
+  return text
+    .normalize("NFKC")
+    .replace(/[­‐-―−﹘﹣－]/g, "-");
+}
+
+/**
+ * Remove inline HTML tags, repeatedly, until the text stops changing.
+ *
+ * A single pass is not enough: removing the inner tag from `<scr<span>ipt>`
+ * splices its neighbours into a *new* tag, so one pass leaves behind markup a
+ * reader never sees. That matters here because this text is what decides
+ * whether a heading carries an invariant token — residue can split an
+ * otherwise canonical id and make a real definition invisible to the
+ * catalogue, which is the failure this whole check exists to prevent.
+ * (CodeQL js/incomplete-multi-character-sanitization flagged the single pass.)
+ *
+ * The loop is bounded: each pass must shorten the string to continue, so it
+ * terminates in at most one iteration per character even on adversarial input.
+ */
+function stripInlineHtmlTags(text) {
+  let current = text;
+  for (let pass = 0; pass < MAX_INLINE_HTML_STRIP_PASSES; pass += 1) {
+    const next = current.replace(/<\/?[A-Za-z][^>]*>/g, "");
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * Fail headings under the invariant directory that contain a numeric invariant
+ * token but are not canonical definitions. Without this, a lower-cased,
+ * backticked or decorated heading can be mistaken for a citation (or ignored
+ * entirely) while the rule it appears to define stays invisible to catalogue
+ * and sequence checks.
+ */
+/**
+ * Report a non-ASCII character sitting inside something that reads as an
+ * invariant id, or `null` when the heading is clean.
+ *
+ * `foldInvariantLookalikes` handles the dash and compatibility families, but it
+ * cannot help with letter homoglyphs: Cyrillic `А` (U+0410) is a different
+ * letter from `A` and folding it would be wrong everywhere else. The workable
+ * rule is the structural one. An invariant id is ASCII by construction, so a
+ * word-run that contains `INV` and also contains a non-ASCII character is
+ * either a lookalike or a typo, and both deserve to fail rather than to be
+ * silently skipped by every scan in this file.
+ *
+ * Scoped to word-runs containing `INV` so ordinary prose in a heading — an em
+ * dash, a macron, a te reo Māori word — is untouched.
+ */
+function nonAsciiInsideInvariantWord(line) {
+  for (const run of line.split(/[^\p{L}\p{N}\p{Pd}_&#;]+/u)) {
+    if (!/[^\x20-\x7e]/.test(run)) continue;
+    const folded = run.normalize("NFKC");
+    // Either the run says INV in any script that folds to it, or it has the
+    // whole three-letters-prefix-number shape with a non-ASCII letter standing
+    // in for one of the ASCII ones (Cyrillic І for I, for example).
+    if (!/INV/i.test(folded) && !/\p{Lu}{3}-\p{Lu}+-\d/u.test(folded)) continue;
+    const offender = [...run].find((ch) => !/[\x20-\x7e]/.test(ch));
+    const codePoint = offender.codePointAt(0).toString(16).toUpperCase();
+    return {
+      description: `U+${codePoint.padStart(4, "0")} (${JSON.stringify(offender)})`,
+    };
+  }
+  return null;
+}
+
+export function auditDefinitionHeadingShapes(files) {
+  const problems = [];
+  for (const [rel, text] of files) {
+    if (!rel.startsWith(INVARIANT_DIR) || !rel.endsWith(".md")) continue;
+    for (const heading of scanMarkdownBlocks(text).headings) {
+      const { number, text: line } = heading;
+      const lookalike = nonAsciiInsideInvariantWord(line);
+      if (lookalike) {
+        problems.push(
+          `${rel}:${number} writes ${lookalike.description} inside what reads as an ` +
+            "invariant id. An invariant id is pure ASCII, so this heading is invisible to " +
+            "every audit here — the definition scan, the citation scan and the index-row " +
+            "scan all miss it — while GitHub renders it as an ordinary id. That is how a " +
+            "wrong number reaches a reviewer looking correct and merges permanently. " +
+            "Retype the id with ASCII letters, digits and hyphen-minus. A smart-punctuation " +
+            "editor, or a paste from a document or chat transcript, is the usual cause.",
+        );
+        continue;
+      }
+      if (
+        INVARIANT_SHAPED_TOKEN_PATTERN.test(headingInvariantShapeText(line)) &&
+        (heading.kind !== "atx" ||
+          heading.containerDepth > 0 ||
+          !DEFINITION_PATTERN.test(line))
+      ) {
+        problems.push(
+          `${rel}:${number} looks like an invariant definition heading but is not in ` +
+            "the canonical top-level `##`-to-`#### INV-<PREFIX>-<NNN>` shape with an uppercase " +
+            "prefix, exactly three digits, no identifier suffix and no decoration. Only " +
+            "that canonical heading defines a rule, even when an embedded existing ID " +
+            "resolves as a citation. Make this heading canonical, or give a narrative " +
+            "heading ordinary topic text and put the invariant citation in its body.",
+        );
+      }
+    }
+  }
+  return problems;
+}
+
+/** Every citation in every scanned file, with where it was written. */
+export function collectCitations(files) {
+  const citations = [];
+  for (const [rel, text] of files) {
+    if (CITATION_EXEMPT_FILES.has(rel)) continue;
+    for (const { number, text: line } of ordinaryAuditLines(rel, text)) {
+      for (const match of line.matchAll(CITATION_PATTERN)) {
+        citations.push({ id: match[0], at: `${rel}:${number}` });
+      }
+    }
+  }
+  return citations;
+}
+
+/**
+ * Invariant citation assertions: no duplicate definition, every citation under
+ * a declared prefix resolves (including the narrow fenced pass), every
+ * unrecognised ordinary prefix is either reserved or a failure, and every
+ * near-miss under a declared prefix has exactly three digits.
+ */
+export function auditInvariantIds(files) {
+  const problems = [];
+  const definitions = collectDefinitions(files);
+
+  for (const [id, places] of definitions) {
+    if (places.length > 1) {
+      problems.push(
+        `${id} is defined ${places.length} times (${places.join(", ")}). An id names ` +
+          "exactly one rule and is never reused. Two lanes that independently took " +
+          "the next free number is the usual cause: whichever lands second renumbers " +
+          "its own definition — free, because nothing has cited it yet — and updates " +
+          `its row in ${INVARIANT_INDEX}.`,
+      );
+    }
+  }
+
+  const declaredPrefixes = new Set([...definitions.keys()].map(prefixOf));
+  const unresolved = new Map();
+  const unrecognised = new Map();
+
+  for (const { id, at } of collectCitations(files)) {
+    const prefix = prefixOf(id);
+    if (declaredPrefixes.has(prefix)) {
+      if (!definitions.has(id)) {
+        if (!unresolved.has(id)) unresolved.set(id, []);
+        unresolved.get(id).push(at);
+      }
+    } else if (!RESERVED_INVOICE_PREFIXES.has(prefix)) {
+      if (!unrecognised.has(prefix)) unrecognised.set(prefix, []);
+      unrecognised.get(prefix).push(`${id} at ${at}`);
+    }
+  }
+
+  for (const [id, places] of unresolved) {
+    problems.push(
+      `${id} is cited at ${places.join(", ")} but no file under ${INVARIANT_DIR} ` +
+        "defines it. Either the id is mistyped, or the rule it named was deleted — " +
+        "which the scheme forbids: a superseded rule keeps its heading and gains a " +
+        "`Superseded by` line, a retired one keeps its heading and gains a reason, so " +
+        "an old citation always lands on an explanation rather than on nothing.",
+    );
+  }
+
+  // Literal source may carry placeholders, invoice-number fixtures, custom
+  // prefixes and real citations. A numeric token under a declared prefix must
+  // resolve and use the canonical width. SCHEME's illustrative literal blocks
+  // are stricter: they use placeholders/custom prefixes exclusively, because a
+  // live-looking example is the grep trap this issue exists to remove.
+  const unresolvedFenced = new Map();
+  const malformedFenced = [];
+  const schemeLiteralLiveIds = [];
+
+  // Built only from declared prefixes, so placeholders, reserved invoice
+  // numbers and custom fixture prefixes never enter this audit.
+  const livePrefixNumericPattern =
+    declaredPrefixes.size > 0
+      ? new RegExp(
+          `\\bINV-(?:${[...declaredPrefixes].sort().join("|")})-[0-9]+\\b(?!\\.[0-9]|-[A-Za-z0-9_])`,
+          // A dotted numeric continuation is owned by the identifier audit
+          // below; do not also truncate it to a plausible unresolved ID.
+          "g",
+        )
+      : null;
+
+  if (livePrefixNumericPattern) {
+    for (const [rel, text] of files) {
+      if (CITATION_EXEMPT_FILES.has(rel) || !rel.endsWith(".md")) continue;
+      for (const { number, text: line } of literalAuditLines(text)) {
+        for (const match of line.matchAll(livePrefixNumericPattern)) {
+          const id = match[0];
+          const digits = id.slice(id.lastIndexOf("-") + 1);
+          if (digits.length !== 3) {
+            malformedFenced.push({
+              id,
+              digits: digits.length,
+              at: `${rel}:${number}`,
+            });
+          } else if (!definitions.has(id)) {
+            if (!unresolvedFenced.has(id)) unresolvedFenced.set(id, []);
+            unresolvedFenced.get(id).push(`${rel}:${number}`);
+          } else if (rel === INVARIANT_SCHEME) {
+            schemeLiteralLiveIds.push({ at: `${rel}:${number}`, id });
+          }
+        }
+      }
+    }
+  }
+
+  for (const { id, digits, at } of malformedFenced) {
+    problems.push(
+      `${id} at ${at} uses ${digits} digit(s) inside a Markdown literal block or fence opener. Invariant ` +
+        "numbers under a live prefix are exactly three, zero-padded, even in examples. " +
+        "Use a placeholder such as `INV-<PREFIX>-<NNN>` when the example must not " +
+        "claim a real invariant id.",
+    );
+  }
+
+  for (const [id, places] of unresolvedFenced) {
+    problems.push(
+      `${id} appears inside a Markdown literal block or fence opener at ${places.join(", ")} but no ` +
+        `file under ${INVARIANT_DIR} defines it. A fence may use ` +
+        "`INV-<PREFIX>-<NNN>`, a reserved invoice number, a custom fixture prefix, " +
+        "or a real citation that resolves; it may not invent a number under a live " +
+        "invariant prefix, because that reads as a real maximum to repository searches.",
+    );
+  }
+
+  for (const { at, id } of schemeLiteralLiveIds) {
+    problems.push(
+      `${id} at ${at} is a live invariant id inside an illustrative literal block in ` +
+        `${INVARIANT_SCHEME}. That file teaches allocation and is the source of the ` +
+        "#2889 grep trap, so its examples use `INV-<PREFIX>-<NNN>` placeholders or a " +
+        "custom non-live prefix instead of anything a live-id grep can mistake for " +
+        "the current maximum.",
+    );
+  }
+
+  for (const [prefix, places] of unrecognised) {
+    problems.push(
+      `INV-${prefix}-… is not a declared invariant prefix and is not on the reserved ` +
+        `Xero invoice-number list (${places.join(", ")}). If it is a typo for a real ` +
+        `prefix, fix it. If it is a new invariant area, define its ids under ` +
+        `${INVARIANT_DIR} and list them in ${INVARIANT_INDEX}. If it is genuinely an ` +
+        "invoice number, add its prefix to RESERVED_INVOICE_PREFIXES in this script " +
+        "with a note saying so.",
+    );
+  }
+
+  // Shape guard, built from the prefixes the definitions actually declared: a
+  // near-miss under a REAL prefix slips past the strict citation pattern and
+  // resolves to nothing while being reported as nothing. Scoped to declared
+  // prefixes rather than to `INV-` generally, because a generic shape guard
+  // flags every Xero invoice fixture in the test suite.
+  if (livePrefixNumericPattern) {
+    for (const [rel, text] of files) {
+      if (SHAPE_GUARD_EXEMPT_FILES.has(rel) || CITATION_EXEMPT_FILES.has(rel)) continue;
+      for (const { number, text: line } of ordinaryAuditLines(rel, text)) {
+        for (const match of line.matchAll(livePrefixNumericPattern)) {
+          const digits = match[0].slice(match[0].lastIndexOf("-") + 1);
+          if (digits.length !== 3) {
+            problems.push(
+              `${match[0]} at ${rel}:${number} uses ${digits.length} digit(s). Invariant ` +
+                "numbers are exactly three, zero-padded, so a citation cannot be " +
+                "ambiguous between `-21` and `-021`. Write it the way the definition " +
+                "heading does.",
+            );
+          }
+        }
+      }
+    }
+  }
+
+  const prefixAlternation = [...declaredPrefixes].sort().join("|");
+  const livePrefixIdentifierContinuationPattern =
+    prefixAlternation.length > 0
+      ? new RegExp(
+          `\\bINV-(?:${prefixAlternation})-([0-9]+)((?:[A-Za-z_]|-[A-Za-z0-9_]|\\.(?=[0-9]))[A-Za-z0-9_.-]*)(?=$|[^A-Za-z0-9_.-])`,
+          "g",
+        )
+      : null;
+
+  if (livePrefixIdentifierContinuationPattern) {
+    for (const [rel, text] of files) {
+      if (CITATION_EXEMPT_FILES.has(rel)) continue;
+      const markdown = rel.endsWith(".md") ? scanMarkdownBlocks(text) : null;
+      const headingLines = new Set(
+        markdown?.headings.flatMap((heading) => heading.lineNumbers) ?? [],
+      );
+      const ordinaryLines = SHAPE_GUARD_EXEMPT_FILES.has(rel)
+        ? []
+        : ordinaryAuditLines(rel, text).filter(({ number }) => !headingLines.has(number));
+      const identifierAuditLines = markdown
+        ? [...ordinaryLines, ...markdown.literalAudit].sort(
+            (left, right) => left.number - right.number,
+          )
+        : ordinaryLines;
+      for (const { number, text: line } of identifierAuditLines) {
+        for (const match of line.matchAll(livePrefixIdentifierContinuationPattern)) {
+          problems.push(
+            `${match[0]} at ${rel}:${number} extends an invariant id with the identifier ` +
+              `continuation ${match[2]}. Invariant ids end after exactly three digits; ` +
+              "use punctuation or whitespace after the id, and put any explanatory " +
+              "word outside the identifier.",
+          );
+        }
+      }
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * Every file under {@link INVARIANT_DIR} is linked from the index.
+ *
+ * Stricter than general reachability on purpose — reaching an invariant file
+ * through some other document is not good enough, because the index is what a
+ * reader is told to open first and it is authoritative for id -> file.
+ */
+export function auditInvariantFilesLinkedFromIndex(files) {
+  const indexText = files.get(INVARIANT_INDEX);
+  if (indexText === undefined) {
+    return [
+      `${INVARIANT_INDEX} is missing. It is the root of the invariants tree: every ` +
+        "domain file is linked from it and every id is catalogued in it.",
+    ];
+  }
+
+  const linked = new Set(markdownLinkTargets(INVARIANT_INDEX, indexText));
+  const problems = [];
+  for (const rel of [...files.keys()].sort()) {
+    if (!rel.startsWith(INVARIANT_DIR) || !rel.endsWith(".md")) continue;
+    if (!linked.has(rel)) {
+      problems.push(
+        `${rel} is not linked from ${INVARIANT_INDEX}. Every invariant file is reached ` +
+          "through the index, so a file it does not name is a file nobody opens — and " +
+          "its rules are exactly as unreachable as they were before the split.",
+      );
+    }
+  }
+  return problems;
+}
+
+/**
+ * Every defined id has exactly one catalogue row in the index, and
+ * every catalogue row names a defined id.
+ *
+ * This is what stops the index rotting, which is the part the issue's own
+ * watchpoint predicts will rot first.
+ */
+export function auditIndexRows(files) {
+  const indexText = files.get(INVARIANT_INDEX);
+  if (indexText === undefined) return []; // already reported above
+
+  const rows = new Map();
+  for (const { number, text: line } of scannableLines(indexText)) {
+    const match = line.match(INDEX_ROW_PATTERN);
+    if (match) {
+      if (!rows.has(match[1])) rows.set(match[1], []);
+      rows.get(match[1]).push(`${INVARIANT_INDEX}:${number}`);
+    }
+  }
+
+  const definitions = collectDefinitions(files);
+  const problems = [];
+
+  for (const [id, places] of [...definitions].sort()) {
+    const listed = rows.get(id);
+    if (!listed) {
+      problems.push(
+        `${id} is defined at ${places[0]} but has no row in ${INVARIANT_INDEX}. The ` +
+          "index is the only part anyone reads in full, so a rule missing from it can " +
+          "only be found by someone who already knew it was there. Add a row, in file " +
+          "order, with a description of twelve words or fewer.",
+      );
+    } else if (listed.length > 1) {
+      problems.push(
+        `${id} has ${listed.length} rows in ${INVARIANT_INDEX} (${listed.join(", ")}). ` +
+          "One id, one row: two rows drift apart and a reader believes whichever they " +
+          "found first.",
+      );
+    }
+  }
+
+  for (const [id, places] of [...rows].sort()) {
+    if (!definitions.has(id)) {
+      problems.push(
+        `${INVARIANT_INDEX} lists ${id} (${places.join(", ")}) but nothing under ` +
+          `${INVARIANT_DIR} defines it. Either the definition was lost in a move, or ` +
+          "the row is a leftover from a rule that was renamed.",
+      );
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * ## Word budgets (#2789)
+ *
+ * One home per decision: a standing rule lives in its invariant, and the
+ * measurements, alternatives and history behind it live in the deciding issue.
+ * The owner's stated reason (11 Aug 2026) is that a decision that changed
+ * nothing once had to be recorded in seven files because earlier work had
+ * restated the same facts seven times. Two budgets make the rule mechanical:
+ *
+ *  - an index row's description is at most {@link INDEX_ROW_WORD_CAP} words —
+ *    the cap `SCHEME.md` §5.2 states, which keeps each grep hit a complete,
+ *    scannable line; it has no exceptions and no ratchet;
+ *  - an invariant entry is at most {@link INVARIANT_ENTRY_WORD_BUDGET} words
+ *    unless {@link WORD_BUDGET_REGISTER} carries an approved exception for it
+ *    (its own fixed ceiling, the deciding issue and the reason it cannot be
+ *    split) or a migration-ratchet record (the exact count it had when it was
+ *    last measured, which may only go down).
+ *
+ * A **word** is a run of letters, digits, combining marks, connector
+ * punctuation, apostrophes and hyphens containing at least one letter or digit
+ * ({@link WORD_SEPARATOR_PATTERN}); a lone pipe, dash, em dash or arrow is
+ * Markdown structure, a path is as many words as it has segments, and no
+ * invisible character can join two words ({@link auditInvisibleCharacters}).
+ * An **entry** runs from a canonical definition heading to the next canonical
+ * definition, or to the next heading ABOVE the definition's own level that
+ * carries no invariant-shaped token — the file's section headings. Everything
+ * in between counts, including fenced code and same-level or deeper
+ * sub-headings: the budget is about how much a reader has to hold, not about
+ * which syntax it arrived in. A heading that *looks* like a definition but is
+ * not canonical — a lookalike codepoint, a homoglyph, a Setext underline, a
+ * heading inside a list — never ends an entry, so it cannot be used to split an
+ * oversize one into two compliant halves; the shape audit above fails the
+ * heading itself in the same run.
+ *
+ * Every failure names the id, the measured count and the limit that applied,
+ * because a person reading it has to know which of the three knobs to turn.
+ */
+
+/** The cap on an index row's description, in words. `SCHEME.md` §5.2. */
+export const INDEX_ROW_WORD_CAP = 12;
+
+/** The default budget for one invariant entry, in words. `SCHEME.md` §8. */
+export const INVARIANT_ENTRY_WORD_BUDGET = 300;
+
+/**
+ * The register of approved exceptions and migration-ratchet records. Absent is
+ * legal and means "no exceptions, no debt" — which is the intended end state
+ * once the ratchet has shrunk to nothing and the file is deleted.
+ */
+export const WORD_BUDGET_REGISTER = "docs/invariants/WORD_BUDGETS.md";
+
+/** The register's two table sections, matched on their exact `##` text. */
+export const WORD_BUDGET_EXCEPTIONS_HEADING = "Approved exceptions";
+export const WORD_BUDGET_RATCHET_HEADING = "Migration ratchet";
+
+/**
+ * A table row is split on its pipes and each cell validated on its own, never
+ * matched by one regex over the whole line: the first cut used
+ * `(\S.*?)\s*\|\s*$` for the reason cell and was quadratic in the run of
+ * spaces before the closing pipe (24 ms at 8k spaces, 99 ms at 16k). A cell
+ * containing a literal pipe is therefore not representable, which is stated
+ * rather than worked around.
+ */
+const TABLE_ROW_PATTERN = /^ {0,3}\|(.*)\|\s*$/;
+const ID_CELL_PATTERN = /^`(INV-[A-Z][A-Z0-9]*-\d{3})`$/;
+/** A whole number with no leading zero: `04615` is a typo, not a count. */
+const WHOLE_NUMBER_PATTERN = /^[1-9]\d*$/;
+const ISSUE_CELL_PATTERN = /^#\d+$/;
+/** No approved ceiling is plausibly above this; a larger one is a typo. */
+export const WORD_BUDGET_EXCEPTION_CEILING_MAX = 5000;
+
+/** The cells of a table row, trimmed, or `null` when the line is not a row. */
+function splitTableCells(line) {
+  const row = line.match(TABLE_ROW_PATTERN);
+  if (!row) return null;
+  return row[1].split("|").map((cell) => cell.trim());
+}
+
+/**
+ * What separates words. Anything that is not a letter, a number, a combining
+ * mark, connector punctuation, an apostrophe or a hyphen ends a token — so the
+ * format characters (U+200B ZERO WIDTH SPACE, U+2060 WORD JOINER, U+00AD SOFT
+ * HYPHEN, U+180E) and U+2800 BRAILLE PATTERN BLANK, which `\\s` does not match
+ * and GitHub renders as a space or as nothing, cannot glue words into one
+ * token. A path such as `src/lib/date-only.ts` therefore counts as four
+ * words and `#2789` as one; the budgets are measured that way and the ratchet
+ * records were re-measured when this rule landed (#2789).
+ */
+export const WORD_SEPARATOR_PATTERN = /[^\p{L}\p{N}\p{M}\p{Pc}'\u2019-]+/u;
+
+/** Count the words in a piece of text, per the definition above. */
+export function countWords(text) {
+  let count = 0;
+  for (const token of text.split(WORD_SEPARATOR_PATTERN)) {
+    if (/[\p{L}\p{N}]/u.test(token)) count += 1;
+  }
+  return count;
+}
+
+/**
+ * The description cell of an index row: everything after the id cell, with the
+ * closing pipe removed. One home, because the audit and the `--words` inventory
+ * must count the same text or the inventory is a rubber stamp (INV-SSOT-004).
+ */
+export function indexRowDescription(line, match = line.match(INDEX_ROW_PATTERN)) {
+  return line.slice(match[0].length).replace(/\|\s*$/, "");
+}
+
+/** The `#` depth of an ATX heading line; a Setext heading is level 1 or 2. */
+function headingLevel(heading) {
+  if (heading.kind !== "atx") return 2;
+  return heading.text.match(/^ {0,3}(#{1,6})/)[1].length;
+}
+
+/**
+ * Measure every invariant entry: id -> { at, words }.
+ *
+ * Definitions are the canonical headings {@link collectDefinitions} takes; the
+ * span rule is the one in the section comment above. A duplicate definition is
+ * reported by {@link auditInvariantIds}, so the first occurrence is measured
+ * here and the second is left to that audit.
+ */
+/**
+ * A heading that reads as an invariant id — canonical or not — so that no
+ * lookalike, decorated, Setext or homoglyph heading can end an entry early.
+ */
+function readsAsInvariantHeading(heading) {
+  return (
+    INVARIANT_SHAPED_TOKEN_PATTERN.test(headingInvariantShapeText(heading.text)) ||
+    nonAsciiInsideInvariantWord(heading.text) !== null
+  );
+}
+
+/**
+ * Measure every invariant entry: id -> { at, words }.
+ *
+ * Definitions are the canonical headings {@link collectDefinitions} takes. An
+ * entry ends ONLY at the next canonical definition, or at a heading that sits
+ * ABOVE the definition's own level and does not read as an invariant id — the
+ * file's section headings (`##` in a file whose definitions are `###`, the
+ * title in a file whose definitions are `##`) — or at a SAME-level heading
+ * that introduces a nested group, i.e. it is immediately followed by a deeper
+ * definition
+ * (a `##` section between `##` definitions whose own rules are `###`). Any
+ * other heading at the same level or deeper — `### Background`, `### Worked
+ * example`, a Setext underline, a closed `### Background ###` — stays INSIDE
+ * the entry and its prose counts, because
+ * splitting an oversize entry with a narrative heading is exactly the move
+ * compaction pressure invites, and prose that belongs to no entry is prose the
+ * budget never sees. A duplicate definition is reported by
+ * {@link auditInvariantIds}, so the first occurrence is measured here.
+ */
+export function measureInvariantEntryWords(files) {
+  const entries = new Map();
+  const ordered = [...files].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  for (const [rel, text] of ordered) {
+    if (!rel.startsWith(INVARIANT_DIR) || !rel.endsWith(".md")) continue;
+    const lines = text.split(/\r?\n/);
+    const headings = scanMarkdownBlocks(text).headings.map((heading) => ({
+      ...heading,
+      isDefinition:
+        heading.kind === "atx" &&
+        heading.containerDepth === 0 &&
+        DEFINITION_PATTERN.test(heading.text),
+      level: headingLevel(heading),
+      readsAsInvariant: readsAsInvariantHeading(heading),
+      startLine: heading.lineNumbers[0],
+    }));
+
+    for (const [index, heading] of headings.entries()) {
+      if (!heading.isDefinition) continue;
+      const id = heading.text.match(DEFINITION_PATTERN)[1];
+      let end = lines.length + 1;
+      const later = headings.slice(index + 1);
+      for (const [offset, next] of later.entries()) {
+        if (next.isDefinition) {
+          end = next.startLine;
+          break;
+        }
+        if (next.readsAsInvariant) continue;
+        // A heading above the entry's level is a section heading. A heading AT
+        // the entry's level is one too when it introduces a nested group — it
+        // is IMMEDIATELY followed by a definition at a deeper level (a `##`
+        // section between `##` definitions whose rules are `###`). Looking any
+        // further ahead would let a same-level narrative heading anywhere
+        // before the file's nested block end the entry it sits in. Otherwise
+        // it is narrative and stays inside the entry.
+        const following = later[offset + 1];
+        const introducesNestedGroup =
+          next.level === heading.level &&
+          following !== undefined &&
+          following.isDefinition &&
+          following.level > next.level;
+        if (next.level < heading.level || introducesNestedGroup) {
+          end = next.startLine;
+          break;
+        }
+      }
+      let words = 0;
+      for (let number = heading.startLine + 1; number < end; number += 1) {
+        words += countWords(lines[number - 1]);
+      }
+      if (!entries.has(id)) entries.set(id, { at: `${rel}:${heading.startLine}`, words });
+    }
+  }
+  return entries;
+}
+
+/**
+ * Parse {@link WORD_BUDGET_REGISTER}: `{ exceptions, ratchet, problems }`.
+ *
+ * Strict on purpose. A row in either table that starts with something shaped
+ * like an id but does not match the exact row form is a failure rather than a
+ * row that is quietly not a record — that is the same discipline the heading
+ * shape audit applies, and for the same reason: a record that parses as
+ * nothing is a limit that is silently not enforced.
+ */
+export function parseWordBudgetRegister(files) {
+  const exceptions = new Map();
+  const ratchet = new Map();
+  const problems = [];
+  const text = files.get(WORD_BUDGET_REGISTER);
+  if (text === undefined) return { exceptions, ratchet, problems };
+
+  const duplicate = (at, id) =>
+    `${at} records ${id} a second time. One id has one limit: either one approved ` +
+    "exception or one ratchet record, never both and never twice.";
+
+  let section = null;
+  for (const { number, text: line } of scannableLines(text)) {
+    const heading = line.match(INDEX_SECTION_HEADING_PATTERN);
+    if (heading) {
+      section = heading[1];
+      continue;
+    }
+    const cells = splitTableCells(line);
+    if (!cells) continue;
+    const firstCell = cells[0];
+    const idShaped =
+      INVARIANT_SHAPED_TOKEN_PATTERN.test(headingInvariantShapeText(firstCell)) ||
+      nonAsciiInsideInvariantWord(firstCell) !== null;
+    if (!idShaped) continue;
+    const at = `${WORD_BUDGET_REGISTER}:${number}`;
+    const id = firstCell.match(ID_CELL_PATTERN)?.[1] ?? null;
+
+    if (section === WORD_BUDGET_EXCEPTIONS_HEADING) {
+      const [, ceiling, issue, reason] = cells;
+      const wellFormed =
+        id !== null &&
+        cells.length === 4 &&
+        WHOLE_NUMBER_PATTERN.test(ceiling) &&
+        Number(ceiling) <= WORD_BUDGET_EXCEPTION_CEILING_MAX &&
+        ISSUE_CELL_PATTERN.test(issue) &&
+        /[\p{L}\p{N}]/u.test(reason);
+      if (!wellFormed) {
+        problems.push(
+          `${at} is in the "${section}" table but is not a well-formed exception row. ` +
+            "The exact form is | `INV-<PREFIX>-<NNN>` | <ceiling> | #<issue> | <reason> |, " +
+            "with an ASCII id, a whole-number ceiling with no leading zero and at most " +
+            `${WORD_BUDGET_EXCEPTION_CEILING_MAX}, the deciding issue as #<number> and a ` +
+            "reason that says something (not empty, not a dash); the reason may not " +
+            "contain a `|`, even inside backticks, because cells are split on pipes. A " +
+            "row that parses as nothing is a limit that is silently not enforced, so it " +
+            "fails instead.",
+        );
+        continue;
+      }
+      if (exceptions.has(id) || ratchet.has(id)) {
+        problems.push(duplicate(at, id));
+        continue;
+      }
+      exceptions.set(id, { at, ceiling: Number(ceiling), issue, reason });
+    } else if (section === WORD_BUDGET_RATCHET_HEADING) {
+      const [, words] = cells;
+      const wellFormed = id !== null && cells.length === 2 && WHOLE_NUMBER_PATTERN.test(words);
+      if (!wellFormed) {
+        problems.push(
+          `${at} is in the "${section}" table but is not a well-formed ratchet row. ` +
+            "The exact form is | `INV-<PREFIX>-<NNN>` | <words> |, with an ASCII id " +
+            "and the whole-number word count (no leading zero) the entry had when it " +
+            "was last measured. A row that parses as nothing is a limit that is " +
+            "silently not enforced, so it fails instead.",
+        );
+        continue;
+      }
+      if (exceptions.has(id) || ratchet.has(id)) {
+        problems.push(duplicate(at, id));
+        continue;
+      }
+      ratchet.set(id, { at, words: Number(words) });
+    } else {
+      problems.push(
+        `${at} is an id-shaped table row outside both budget tables ` +
+          `("${WORD_BUDGET_EXCEPTIONS_HEADING}" and "${WORD_BUDGET_RATCHET_HEADING}"). ` +
+          "Only those two tables are read, so a record anywhere else in the file is a " +
+          "record nothing enforces. Move it under the right heading, or take it out.",
+      );
+    }
+  }
+  return { exceptions, ratchet, problems };
+}
+
+/**
+ * Index rows within {@link INDEX_ROW_WORD_CAP} words; every entry within its
+ * applicable limit; the register exact — no stale, duplicate, unknown or
+ * malformed record, no exception that the default budget already covers.
+ */
+export function auditWordBudgets(files) {
+  const problems = [];
+
+  const indexText = files.get(INVARIANT_INDEX);
+  if (indexText !== undefined) {
+    for (const { number, text: line } of scannableLines(indexText)) {
+      const match = line.match(INDEX_ROW_PATTERN);
+      if (!match) continue;
+      const words = countWords(indexRowDescription(line, match));
+      if (words > INDEX_ROW_WORD_CAP) {
+        problems.push(
+          `${INVARIANT_INDEX}:${number} — the description for ${match[1]} is ${words} ` +
+            `words; the cap is ${INDEX_ROW_WORD_CAP} (SCHEME.md §5.2), with no exceptions ` +
+            "and no ratchet. An agent finds a rule by grepping the index, and the cap keeps " +
+            "each row a complete, scannable line. Say what " +
+            "the rule covers, not what it says; the entry itself holds the rule.",
+        );
+      }
+    }
+  }
+
+  const register = parseWordBudgetRegister(files);
+  problems.push(...register.problems);
+  const entries = measureInvariantEntryWords(files);
+
+  for (const [id, { at, words }] of [...entries].sort()) {
+    const exception = register.exceptions.get(id);
+    const record = register.ratchet.get(id);
+    if (exception) {
+      if (exception.ceiling <= INVARIANT_ENTRY_WORD_BUDGET) {
+        problems.push(
+          `${exception.at} approves a ceiling of ${exception.ceiling} words for ${id}, which ` +
+            `is not above the default budget of ${INVARIANT_ENTRY_WORD_BUDGET}. An exception ` +
+            "that the default already covers is a record with no effect; delete it.",
+        );
+      } else if (words > exception.ceiling) {
+        problems.push(
+          `${id} at ${at} is ${words} words; its approved-exception ceiling is ` +
+            `${exception.ceiling} (${exception.at}, ${exception.issue}). The ceiling is the ` +
+            "limit the owner approved, not a floor to grow from. Compact the entry back " +
+            "under it, or take a fresh approval for a new ceiling on the deciding issue.",
+        );
+      } else if (words <= INVARIANT_ENTRY_WORD_BUDGET) {
+        problems.push(
+          `${exception.at} approves an exception for ${id}, but the entry at ${at} is ` +
+            `${words} words and the default budget is ${INVARIANT_ENTRY_WORD_BUDGET}. The ` +
+            "entry no longer needs the exception; delete the row so the register stays " +
+            "an exact inventory of what is really excepted.",
+        );
+      }
+      continue;
+    }
+    if (record) {
+      if (words <= INVARIANT_ENTRY_WORD_BUDGET) {
+        problems.push(
+          `${record.at} carries a ratchet record for ${id}, but the entry at ${at} is ` +
+            `${words} words and the default budget is ${INVARIANT_ENTRY_WORD_BUDGET}. It ` +
+            "is compliant now — delete the row. The ratchet only ever shrinks, and a " +
+            "record for a compliant entry is a ceiling it could grow back up to.",
+        );
+      } else if (words > record.words) {
+        problems.push(
+          `${id} at ${at} is ${words} words; its ratchet record is ${record.words} ` +
+            `(${record.at}). An oversize entry may only shrink toward the ` +
+            `${INVARIANT_ENTRY_WORD_BUDGET}-word budget, never grow. Take the addition ` +
+            "out, or compact the entry by at least as much as it adds and lower the record.",
+        );
+      } else if (words < record.words) {
+        problems.push(
+          `${id} at ${at} is ${words} words; its ratchet record is ${record.words} ` +
+            `(${record.at}). Good — it shrank. Record ${words} so it cannot grow back, ` +
+            "because the record is the ceiling and the ratchet is monotonic.",
+        );
+      }
+      continue;
+    }
+    if (words > INVARIANT_ENTRY_WORD_BUDGET) {
+      problems.push(
+        `${id} at ${at} is ${words} words; the budget is ${INVARIANT_ENTRY_WORD_BUDGET} ` +
+          `and ${WORD_BUDGET_REGISTER} carries neither an approved exception nor a ` +
+          "ratchet record for it. Keep the rule, the pin and the link; move the " +
+          "measurements, alternatives and history to the deciding issue and link it. " +
+          "Never broaden, narrow or reword the rule to fit — if it genuinely cannot be " +
+          "compacted or split, that is an approved exception with its own ceiling, " +
+          "taken on the deciding issue, not a silent overrun.",
+      );
+    }
+  }
+
+  for (const [id, { at }] of [...register.exceptions, ...register.ratchet].sort()) {
+    if (!entries.has(id)) {
+      problems.push(
+        `${at} records ${id}, but nothing under ${INVARIANT_DIR} defines it. A record ` +
+          "for an id that does not exist is either a typo — in which case the real " +
+          "entry is unguarded — or a leftover from a retired rule.",
+      );
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * The agent guides, each held to a word ceiling in {@link WORD_BUDGET_REGISTER}
+ * (#4462). Every top-level `docs/agents/*.md` page is read, so a new guide has
+ * to be given a row before it can merge.
+ */
+export const AGENT_DOC_PATTERN = /^docs\/agents\/[^/]+\.md$/;
+export const AGENT_DOC_BUDGET_HEADING = "Agent docs";
+
+/**
+ * How far a ceiling may sit above its page when a change SETS it: a row this
+ * change adds or alters against the base must be at or within this many words
+ * above its page, so a ceiling is never written as room to grow into. A row
+ * the change leaves alone fails only when its page goes over it. A floor on
+ * unchanged rows would let two green pull requests that each shrink one page
+ * redden `main` between them, so drift there is reported, not failed.
+ */
+export const AGENT_DOC_BUDGET_SLACK = 50;
+
+const AGENT_DOC_CELL_PATTERN = /^`(docs\/agents\/[^/`]+\.md)`$/;
+
+/**
+ * Parse the {@link AGENT_DOC_BUDGET_HEADING} table:
+ * `{ ceilings: Map<path, { at, ceiling }>, problems }`.
+ */
+export function parseAgentDocBudgets(files) {
+  const ceilings = new Map();
+  const problems = [];
+  const text = files.get(WORD_BUDGET_REGISTER);
+  if (text === undefined) return { ceilings, problems };
+  let section = null;
+  for (const { number, text: line } of scannableLines(text)) {
+    const heading = line.match(INDEX_SECTION_HEADING_PATTERN);
+    if (heading) {
+      section = heading[1];
+      continue;
+    }
+    if (section !== AGENT_DOC_BUDGET_HEADING) continue;
+    const cells = splitTableCells(line);
+    if (!cells || cells[0] === "File" || /^:?-+:?$/.test(cells[0])) continue;
+    const at = `${WORD_BUDGET_REGISTER}:${number}`;
+    const file = cells[0].match(AGENT_DOC_CELL_PATTERN)?.[1];
+    if (!file || cells.length !== 2 || !WHOLE_NUMBER_PATTERN.test(cells[1])) {
+      problems.push(
+        `${at} is in the "${AGENT_DOC_BUDGET_HEADING}" table but is not a well-formed row. ` +
+          "The exact form is | `docs/agents/<Name>.md` | <ceiling> |, with a whole-number " +
+          "ceiling. A row that parses as nothing is a limit that is silently not enforced.",
+      );
+      continue;
+    }
+    if (ceilings.has(file)) {
+      problems.push(`${at} records ${file} a second time. One page has one ceiling.`);
+      continue;
+    }
+    ceilings.set(file, { at, ceiling: Number(cells[1]) });
+  }
+  return { ceilings, problems };
+}
+
+/**
+ * The agent guides whose ceiling sits more than {@link AGENT_DOC_BUDGET_SLACK}
+ * words above their page: `[{ rel, words, ceiling, at }]`, for the information
+ * lines the CLI prints and the `--words` inventory.
+ */
+export function agentDocBudgetDrift(files) {
+  const { ceilings } = parseAgentDocBudgets(files);
+  const drift = [];
+  for (const [rel, { at, ceiling }] of ceilings) {
+    const text = files.get(rel);
+    if (text === undefined) continue;
+    const words = countWords(text);
+    if (ceiling - words > AGENT_DOC_BUDGET_SLACK) drift.push({ rel, words, ceiling, at });
+  }
+  return drift;
+}
+
+/**
+ * Every agent guide within its ceiling, every row well formed and live, and
+ * every ceiling this change sets close to its page. `baselineFiles` is the
+ * base the checker already resolves for invariant ids; without one, no row
+ * counts as set by this change. For a pull request that base is the branch
+ * point (#5156), which is also the right one here: a ceiling the base branch
+ * changed after the branch point is not one this change set, and measuring
+ * against the base's later tip would hold the branch to it.
+ */
+export function auditAgentDocWordBudgets(files, baselineFiles = null) {
+  const { ceilings, problems } = parseAgentDocBudgets(files);
+  const baseCeilings = baselineFiles ? parseAgentDocBudgets(baselineFiles).ceilings : null;
+  const pages = [...files.keys()].filter((rel) => AGENT_DOC_PATTERN.test(rel)).sort();
+  for (const rel of pages) {
+    const words = countWords(files.get(rel));
+    const record = ceilings.get(rel);
+    const setHere = baseCeilings !== null && baseCeilings.get(rel)?.ceiling !== record?.ceiling;
+    if (!record) {
+      problems.push(
+        `${rel} is ${words} words and has no row in the "${AGENT_DOC_BUDGET_HEADING}" table of ` +
+          `${WORD_BUDGET_REGISTER}. Add one with a ceiling at or just above ${words}.`,
+      );
+    } else if (words > record.ceiling) {
+      problems.push(
+        `${rel} is ${words} words; its ceiling is ${record.ceiling} (${record.at}). Agent guidance ` +
+          "is read under context pressure, so it may not grow by default: compact it, move detail " +
+          "to the doc that owns it, or turn a mechanical rule into a hook (#4462). Raising the " +
+          "ceiling is a deliberate change a reviewer sees.",
+      );
+    } else if (setHere && record.ceiling - words > AGENT_DOC_BUDGET_SLACK) {
+      problems.push(
+        `${record.at} sets the ceiling for ${rel} to ${record.ceiling}, more than ` +
+          `${AGENT_DOC_BUDGET_SLACK} words above its ${words} words. A ceiling this change writes ` +
+          `goes at or just above the page, so it is not room to grow into.`,
+      );
+    }
+  }
+  for (const [rel, { at }] of ceilings) {
+    if (!files.has(rel)) {
+      problems.push(`${at} records ${rel}, which is not a tracked file. Delete the row.`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * Inside a catalogue table of the index — a table whose header's first cell is
+ * `ID` — every body row's first cell is a backticked id. A row with an empty
+ * first cell renders as a continuation of the description above it and is
+ * counted by nothing, which is a way past the 12-word cap that this closes.
+ */
+export function auditIndexCatalogueRows(files) {
+  const indexText = files.get(INVARIANT_INDEX);
+  if (indexText === undefined) return [];
+  const problems = [];
+  let inCatalogue = false;
+  let sawSeparator = false;
+  for (const { number, text: line } of scannableLines(indexText)) {
+    const cells = splitTableCells(line);
+    if (!cells) {
+      inCatalogue = false;
+      continue;
+    }
+    if (!inCatalogue) {
+      if (cells[0] === "ID") {
+        inCatalogue = true;
+        sawSeparator = false;
+      }
+      continue;
+    }
+    if (!sawSeparator) {
+      sawSeparator = true;
+      if (/^:?-+:?$/.test(cells[0])) continue;
+    }
+    if (!INDEX_ROW_PATTERN.test(line)) {
+      problems.push(
+        `${INVARIANT_INDEX}:${number} is a row of a catalogue table whose first cell is ` +
+          "not a backticked invariant id. Every row of an ID table is one id and its " +
+          "description; a row that starts with anything else — an empty cell, prose, a " +
+          "second description — renders as a continuation of the row above and is " +
+          "counted by nothing.",
+      );
+    }
+  }
+  return problems;
+}
+
+/**
+ * Every heading named in {@link STABLE_INDEX_HEADINGS} is still a `##` heading
+ * of the index, spelled exactly the same way.
+ *
+ * Opt-in rather than unconditional, the same shape as
+ * {@link auditPermanentInvariantIds}: the expectation is a fact about THIS
+ * repository's index, and hard-wiring it into the pure audit would force every
+ * in-memory fixture to carry ten production heading names it has no other use
+ * for. `main` supplies the list; a test asserts that wiring, and a planted
+ * rename was run through the real CLI to prove the message fires.
+ */
+export function auditStableIndexHeadings(files, stableHeadings) {
+  if (!Array.isArray(stableHeadings) || stableHeadings.length === 0) {
+    return [
+      "auditStableIndexHeadings was given no headings to pin. An empty list " +
+        "makes this audit vacuous, which is worse than not having it: it " +
+        "reports a pass it has not earned. Restore STABLE_INDEX_HEADINGS.",
+    ];
+  }
+
+  const indexText = files.get(INVARIANT_INDEX);
+  if (indexText === undefined) return []; // reported by the linked-files audit
+
+  const present = new Set();
+  for (const { text: line } of scannableLines(indexText)) {
+    const match = line.match(INDEX_SECTION_HEADING_PATTERN);
+    if (match) present.add(match[1]);
+  }
+
+  const problems = [];
+  for (const heading of stableHeadings) {
+    if (present.has(heading)) continue;
+    problems.push(
+      `${INVARIANT_INDEX} no longer has the "## ${heading}" heading. It is one ` +
+        "of the ten pre-split domain headings the index keeps verbatim so that " +
+        "anchors written before the split still resolve. Those anchors live " +
+        "OUTSIDE this repository — in a fork, a merged commit, a closed issue, " +
+        "a shipped release — so nothing here can find them and nothing can fix " +
+        "them once they break. Restore the heading exactly, including its " +
+        "capitalisation and hyphenation; if the section's content genuinely " +
+        "moved, keep the heading and put a pointer under it. Adding NEW " +
+        "sections is free and needs no change here.",
+    );
+  }
+  return problems;
+}
+
+/**
+ * The rows of the `AGENTS.md` routing table, as `{ number, text }`.
+ *
+ * Separator rows are dropped; the header row is kept and simply contributes
+ * nothing, because it names no prefix and links to nothing.
+ */
+export function routingTableRows(agentsText) {
+  const rows = [];
+  let inTable = false;
+  for (const line of scannableLines(agentsText)) {
+    if (ROUTING_TABLE_HEADING.test(line.text)) {
+      inTable = true;
+      continue;
+    }
+    if (!inTable) continue;
+    if (/^#{1,6}\s/.test(line.text)) break;
+    if (!line.text.trimStart().startsWith("|")) continue;
+    if (/^\s*\|[\s|:-]*\|?\s*$/.test(line.text)) continue; // `| --- | --- |`
+    rows.push(line);
+  }
+  return rows;
+}
+
+/**
+ * The routing table resolves.
+ *
+ * Three directions, all of them cheap and none of them needing an exemption:
+ *
+ *  1. every `` `INV-XXX` `` the table routes is a prefix something under
+ *     {@link INVARIANT_DIR} actually declares;
+ *  2. every declared prefix has at least one row, so a new invariant family
+ *     cannot be added without becoming findable;
+ *  3. every document the table links to exists.
+ *
+ * What this deliberately does NOT check is the converse of (3) — that every
+ * document under `docs/` has a row. There are roughly two hundred of them and
+ * most are correctly reached through a feature hub rather than through
+ * `AGENTS.md`, so that rule would be almost entirely exemptions. General
+ * reachability ({@link auditDocReachability}) is the guard that covers those.
+ */
+export function auditRoutingTable(files) {
+  const agentsText = files.get(ROUTING_TABLE_FILE);
+  if (agentsText === undefined) {
+    return [
+      `${ROUTING_TABLE_FILE} is missing. It carries the routing table, which is how ` +
+        "an agent finds the documents that bind the change it is about to make.",
+    ];
+  }
+
+  const rows = routingTableRows(agentsText);
+  if (rows.length === 0) {
+    return [
+      `No routing table found in ${ROUTING_TABLE_FILE}. This audit anchors on the ` +
+        "heading `### Routing table`; if the section was renamed, update " +
+        "ROUTING_TABLE_HEADING in this script so the table keeps being checked " +
+        "rather than silently stopping.",
+    ];
+  }
+
+  const problems = [];
+  const routedPrefixes = new Set();
+
+  for (const { number, text: row } of rows) {
+    for (const match of row.matchAll(ROUTING_PREFIX_PATTERN)) {
+      routedPrefixes.add(match[1]);
+    }
+    for (const target of markdownLinkTargets(ROUTING_TABLE_FILE, row)) {
+      if (!files.has(target)) {
+        problems.push(
+          `The routing table row at ${ROUTING_TABLE_FILE}:${number} links to ${target}, ` +
+            "which is not a tracked file. A row that points at nothing is worse than a " +
+            "missing row: it reads as an answer. Fix the path, or drop the row if the " +
+            "document was retired.",
+        );
+      }
+    }
+  }
+
+  const declaredPrefixes = new Set(
+    [...collectDefinitions(files).keys()].map(prefixOf),
+  );
+
+  for (const prefix of [...routedPrefixes].sort()) {
+    if (!declaredPrefixes.has(prefix)) {
+      problems.push(
+        `The routing table routes INV-${prefix} but nothing under ${INVARIANT_DIR} ` +
+          "declares that prefix. Either the prefix is mistyped, or its file was renamed " +
+          "without the table following.",
+      );
+    }
+  }
+
+  for (const prefix of [...declaredPrefixes].sort()) {
+    if (!routedPrefixes.has(prefix)) {
+      problems.push(
+        `INV-${prefix} is declared under ${INVARIANT_DIR} but no routing table row in ` +
+          `${ROUTING_TABLE_FILE} names it. An agent who does not already know the family ` +
+          "exists will never be sent to it. Add a row saying, in plain English, what kind " +
+          "of change the family binds.",
+      );
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * Nobody cites a line number into the invariants. No exceptions.
+ *
+ * A line reference into a domain file is stale the next time somebody edits
+ * above it, and it fails silently — the reader lands on unrelated text and
+ * believes it. The permanent ids exist precisely so that citation never has to
+ * be written, so the rule is unconditional: no allowlist, no grandfather
+ * register, nothing to keep in step with the tree. The only file that may write
+ * the forbidden form is this check's own test, via
+ * {@link CITATION_EXEMPT_FILES}, because its fixtures are what assert the
+ * rejection.
+ */
+export function auditLineNumberCitations(files) {
+  const problems = [];
+
+  for (const rel of [...files.keys()].sort()) {
+    if (CITATION_EXEMPT_FILES.has(rel)) continue;
+    for (const { number, text: line } of ordinaryAuditLines(rel, files.get(rel))) {
+      for (const match of line.matchAll(INVARIANT_LINE_CITATION_PATTERN)) {
+        problems.push(
+          `${rel}:${number} cites ${match[1]}:${match[2]} — an invariants document by ` +
+            "LINE NUMBER. That pointer is stale the next time anybody edits above it, " +
+            "and it goes stale silently: the reader lands on unrelated text and believes " +
+            `it. Cite the permanent id instead (INV-CAP-021 style); ${INVARIANT_INDEX} ` +
+            "maps every id to the file it lives in.",
+        );
+      }
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * No tracked text file is double-encoded or carries a byte-order
+ * mark.
+ *
+ * `docs/invariants/member-guest-consent.md` was once committed with a UTF-8 BOM
+ * and 29 double-encoded em dashes, and NOTHING caught it: lint, typecheck,
+ * linkcheck, knip and every other assertion in this file stayed green, and the
+ * one census test over that document passed because its assertions happened not
+ * to contain an em dash. This repository has been bitten by the same family of
+ * problem before, when migration SQL went CRLF on Windows against an LF seed
+ * source (#2399).
+ *
+ * Fenced blocks are NOT skipped here: corruption inside a fence is still
+ * corruption, and a fence is exactly where a pasted transcript lands.
+ */
+export function auditEncoding(files) {
+  const problems = [];
+
+  for (const rel of [...files.keys()].sort()) {
+    const text = files.get(rel);
+    if (text.startsWith(BYTE_ORDER_MARK)) {
+      problems.push(
+        `${rel} starts with a UTF-8 byte-order mark (U+FEFF). Nothing in this repository ` +
+          "wants one: it breaks shebangs, leading front matter and exact-match assertions, " +
+          "and it is invisible in every editor. It usually arrives from a Windows tool " +
+          'that saved the file as "UTF-8 with BOM" — PowerShell\'s Out-File and Set-Content ' +
+          "on Windows PowerShell 5.1 both do it. Re-save as UTF-8 without a BOM.",
+      );
+    }
+
+    text.split(/\r?\n/).forEach((line, index) => {
+      const hits = [...line.matchAll(MOJIBAKE_PATTERN)];
+      if (hits.length === 0) return;
+      problems.push(
+        `${rel}:${index + 1} contains ${hits.length} double-encoded sequence(s) ` +
+          `(${[...new Set(hits.map((hit) => JSON.stringify(hit[0])))].join(", ")}). This is ` +
+          "mojibake: the file was UTF-8, some tool read it as Windows cp1252 and wrote it " +
+          `back out as UTF-8, so every non-ASCII character became two or three. An em dash ` +
+          `comes back as ${JSON.stringify(MOJIBAKE_EXAMPLE)}, a curly quote and a non-breaking ` +
+          "space have their own signatures. On Windows the usual culprit is a PowerShell " +
+          "redirect, Set-Content without -Encoding utf8, or an editor with a stale " +
+          "encoding setting. Restore the file from git and re-apply the edit with a " +
+          "UTF-8-clean tool rather than hand-repairing the characters.",
+      );
+    });
+  }
+
+  return problems;
+}
+
+/**
+ * No tracked text file contains a raw control character.
+ *
+ * ## Why this is worth a gate of its own
+ *
+ * An editing tool — a shell or Python heredoc, a `sed` script, anything that
+ * interprets escapes on the way in — turns the two characters `\b` into the one
+ * byte they name, 0x08. The damage is **completely invisible in every normal
+ * view**: an editor, `git diff`, a GitHub blob and `JSON.stringify` all render
+ * 0x08 back as `\b`, so the source reads as correct and a reviewer cannot see
+ * it. Only `cat -A`, or a grep over the raw bytes, shows what is really there.
+ *
+ * In a regex it is fatal. `/\bINTERVAL\b/i` becomes a pattern demanding a
+ * literal backspace either side of the word, and no source file contains one —
+ * so it matches nothing. When the assertion built on it is NEGATIVE, as
+ * `.not.toMatch()` is, the guard then passes unconditionally: it is not merely
+ * weakened, it can never fail again.
+ *
+ * ## What was actually measured (#3072)
+ *
+ * Censused over all 5,074 tracked files on the epic branch: **8 of the 4,959
+ * Git-classified text files carried a control byte**, 14 bytes in all. They
+ * split cleanly in two, and the split is the reason this check phrases its
+ * failure the way it does.
+ *
+ * **Five files, 9 bytes, were the accident** — an escape eaten on the way in:
+ *
+ * - two were NEGATIVE assertions that could never fail again. One banned
+ *   `INTERVAL` from every SQL statement in the booking/membership diagnostics
+ *   pack, so timestamp arithmetic on a lodge night was unguarded; the other
+ *   asserted that no member email address can reach the Xero containment
+ *   screen, so a privacy claim was passing unconditionally.
+ * - two more were the FIRST TWO of the eleven forbidden patterns in one
+ *   provenance guard's list. The other nine still matched, so the suite stayed
+ *   green and nothing named the two dead ones. (Counted, not recalled: the
+ *   inherited docblock said "patterns 11 and 12 of a list of twelve … the other
+ *   ten", and all three numbers were wrong.)
+ * - one was a normalisation step (`.replace(/\btype\b/g, " ")`) that stripped
+ *   nothing. It is equivalent on today's inputs because no scanned import
+ *   carries the token, which is exactly why it survived: a latent trap, armed
+ *   for whoever next writes `import { type Editor }`.
+ * - one was comment prose, where `D:\var\backups` had become unreadable.
+ *
+ * **Three files, 5 bytes, were deliberate data** and behaviourally correct: a
+ * PKZIP magic number in a fixture, a form feed fed to the HTML sanitiser, and a
+ * NUL separating the halves of a composite map key in application source. Each
+ * now spells the same value as an escape, which is why this check needs no
+ * exemption for them. A tenth site, the same NUL-separator shape in
+ * `src/lib/config-transfer/import-types.ts`, had already been normalised — see
+ * `.gitattributes`, which still carries the `diff` attribute that made it
+ * reviewable.
+ *
+ * Nothing else in the toolchain sees any of this: lint, typecheck, knip and the
+ * full test suite all stayed green, exactly as they did for the BOM and the
+ * double-encoding above.
+ *
+ * ## No allowlist, deliberately
+ *
+ * A control byte in a tracked text file has no legitimate use here, **including
+ * inside a comment** — a comment is where you look to understand the code under
+ * it. Where a control character is genuinely wanted as DATA, the escape
+ * sequence denotes exactly the same value (`"\0"` is byte 0x00, `"PK\x03\x04"`
+ * is the PKZIP magic), so writing it as an escape costs nothing, changes no
+ * behaviour, and keeps the file readable. That is what the three deliberate
+ * sites above now do.
+ *
+ * TAB, LF and CR are excluded because they are the text format itself.
+ *
+ * **The one case this stance has no answer for, stated because it is the real
+ * limit rather than the comfortable one.** "The escape denotes the identical
+ * value" holds only in a format that HAS escapes. A plain-text pin file has
+ * none: `*.txt`, `*.tsv` and `docs/BLUE_GREEN_MIGRATION_SAFETY.tsv` are
+ * class-pinned `text`, and a pin file that genuinely had to hold an ESC or DEL
+ * byte could not be written at all under this rule. The same is true of a
+ * vitest inline snapshot, which vitest rewrites from the runtime value rather
+ * than from what you typed (`help-corpus.test.ts` carries one). Neither case
+ * exists in the tree today, and neither has a fix that is better than an
+ * allowlist — so if one ever arrives, it is a decision about this rule, not a
+ * bug in this function.
+ *
+ * ## The one hole, and why {@link auditTextScanCoverage} exists
+ *
+ * This scan sees the file set `loadTrackedFiles` hands it, which is Git's own
+ * text classification. Measured against git 2.53: Git calls a file binary when
+ * it finds a **NUL in the first 8,000 bytes** — and only then. So 0x08, 0x0B,
+ * 0x0C and 0x7F are seen at any offset, and the whole accident class above is
+ * fully covered; a NUL is covered only past byte 8,000. The real NUL site sat
+ * at byte 12,529 and was seen, but that was luck, not coverage.
+ *
+ * A blind spot is worse than an allowlist, because an allowlist is at least
+ * written down. {@link auditTextScanCoverage} closes it without widening this
+ * scan into binary assets, and {@link findFilesHiddenFromTextScan} explains why
+ * it asks the question the way round that it does: a file that drops out of the
+ * text scan fails UNLESS `.gitattributes` declares it a binary asset, so a file
+ * class nobody has thought about fails closed rather than leaving the scan in
+ * silence.
+ */
+export function auditControlCharacters(files) {
+  const problems = [];
+
+  for (const rel of [...files.keys()].sort()) {
+    files.get(rel).split(/\r?\n/).forEach((line, index) => {
+      const hits = [...line.matchAll(CONTROL_CHARACTER_PATTERN)];
+      if (hits.length === 0) return;
+
+      // Column, not just line: the byte is invisible, so "look on line 1600" is
+      // not enough to find it by eye.
+      const found = hits.map((hit) => {
+        const codePoint = hit[0].charCodeAt(0);
+        const spelling = ESCAPE_SPELLING.get(codePoint);
+        const at = `column ${hit.index + 1}`;
+        return spelling
+          ? `${hexByte(codePoint)} at ${at}, the byte a ${spelling} escape names`
+          : `${hexByte(codePoint)} at ${at}`;
+      });
+
+      problems.push(
+        `${rel}:${index + 1} contains ${hits.length} raw control character(s): ` +
+          `${found.join("; ")}. Write the ESCAPE SEQUENCE instead of the byte it names. ` +
+          "This is almost always an editing tool that interpreted the escape on the way " +
+          "in — a shell or Python heredoc, a sed script — and it is invisible in every " +
+          "normal view: an editor, git diff, a GitHub blob and JSON.stringify all render " +
+          `the byte back as the characters that spell it, so the diff looks identical to ` +
+          "correct code. In a regex it is fatal, because a word-boundary escape becomes a " +
+          "demand for a literal control character that no source file contains, and the " +
+          "pattern then matches nothing — which silently makes a `.not.toMatch()` guard " +
+          "pass unconditionally (#3072). If the character is genuinely wanted as data, the " +
+          "escape denotes the identical value, so nothing is lost by spelling it out.",
+      );
+    });
+  }
+
+  return problems;
+}
+
+/**
+ * No file has an early NUL hiding it from the text scan, unless it is a
+ * declared binary asset.
+ *
+ * {@link auditControlCharacters} can only judge files it is given, and
+ * {@link loadTrackedFiles} gets them from `git grep -I`. Measured against git
+ * 2.53, that excludes a file with a NUL in its first 8,000 bytes — so a single
+ * early NUL would hide a source file, and every other check in this script with
+ * it.
+ *
+ * ## The question is asked the SAFE way round, and that took two attempts
+ *
+ * The first version of this check asked whether `.gitattributes` DECLARED the
+ * hidden file `text`, on the stated grounds that "every tracked text class here
+ * is pinned". **Measured at the time of writing, that was false for 43 of the
+ * 4,960 Git-classified text files, across 18 classes** — the 24 `.html`
+ * mockups, `knip.jsonc`, `Dockerfile`, `Caddyfile`, `deploy/caddy/*.caddy`,
+ * `scripts/lib/split-sql-statements.awk`, `.env.example`, two `.tsv` files,
+ * `.gitignore`, `.dockerignore`, `.nvmrc`, `.node-version`, `LICENSE` and the
+ * rest. Those pins exist to stop Windows materialising CRLF, and nobody ever
+ * promised they were exhaustive.
+ *
+ * So the check they backed was vacuous for exactly the files most exposed to
+ * the accident: a `.awk` script, a `Dockerfile` and a `Caddyfile` are what a
+ * shell heredoc or a `sed` one-liner edits. Proven end to end on `knip.jsonc`,
+ * which gates a required check: a NUL at byte 200 made `git grep -I` drop it,
+ * the declaration test filtered it out, and the run exited **0** printing
+ * "Scanned 4959 tracked file(s)" — one fewer than the truth — while the success
+ * line asserted the very property that had just been broken.
+ *
+ * A rule that fails open on a class nobody thought of is not a rule. So the
+ * predicate is inverted: a hidden file fails UNLESS `.gitattributes` declares
+ * it `-text` (which the standard `binary` macro sets). Adding a new text class
+ * now needs no action at all, and adding a new BINARY class fails loudly until
+ * somebody declares what it is — the direction an omission should point.
+ *
+ * ## Two things this is careful not to be
+ *
+ * **Not an allowlist for control bytes.** `*.png binary` says what a PNG IS; it
+ * does not exempt a text file from {@link auditControlCharacters}. A declared
+ * binary asset was never in the text scan to begin with.
+ *
+ * **Not a heuristic.** {@link findFilesHiddenFromTextScan} reads the file and
+ * confirms the NUL is really there before reporting it, so the message is true
+ * by construction rather than inferred from an absence.
+ */
+/**
+ * Format characters and the Braille blank are not words, not spaces and not
+ * visible: U+200B, U+2060, U+00AD, U+180E and friends (Unicode category Cf) and
+ * U+2800 BRAILLE PATTERN BLANK render as nothing or as a space on GitHub while
+ * gluing tokens together for any counter that splits on `\\s`. Three hundred
+ * words joined by U+2800 measured as ten (#2789 gate-bypass review). Every
+ * tracked Markdown file is therefore free of them, with no allowlist; a
+ * byte-order mark at offset 0 is {@link auditEncoding}'s and is not reported
+ * twice. U+200D ZERO WIDTH JOINER is Cf too, so a ZWJ emoji sequence (a family
+ * or a flag built from joined code points) is not permitted in tracked Markdown
+ * — none exists today, and a plain single-code-point emoji is unaffected.
+ */
+export const INVISIBLE_CHARACTER_PATTERN = /[\p{Cf}\u2800]/gu;
+
+export function auditInvisibleCharacters(files) {
+  const problems = [];
+  for (const rel of [...files.keys()].sort()) {
+    if (!rel.endsWith(".md")) continue;
+    const text = files.get(rel);
+    for (const [index, line] of text.split(/\r?\n/).entries()) {
+      for (const match of line.matchAll(INVISIBLE_CHARACTER_PATTERN)) {
+        if (index === 0 && match.index === 0 && match[0] === BYTE_ORDER_MARK) continue;
+        const codePoint = match[0].codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+        problems.push(
+          `${rel}:${index + 1}:${match.index + 1} carries U+${codePoint}, an invisible ` +
+            "format character (or the Braille blank). It renders as nothing or as a " +
+            "space, so a reader cannot see it, while it glues words together for any " +
+            "counter that splits on whitespace — which is how a 300-word passage was " +
+            "measured as ten. Delete it; if a soft break or a joiner was meant, use " +
+            "ordinary punctuation instead.",
+        );
+      }
+    }
+  }
+  return problems;
+}
+
+export function auditTextScanCoverage(hiddenFilesWithEarlyNul) {
+  return [...hiddenFilesWithEarlyNul]
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .map(
+      ({ path: rel, byteOffset }) =>
+        `${rel} carries a NUL byte (0x00) at byte ${byteOffset}, and Git is ` +
+        "therefore classifying this file as BINARY — a NUL early in a file is " +
+        "the one thing Git's binary detection keys on (measured window: the " +
+        "first 8,000 bytes, on git 2.53). So the file is invisible to every " +
+        "check in this script, INCLUDING the control-character check, which is " +
+        "why a NUL cannot be left to that check to find. `cat -A` and " +
+        "`git diff` will not show it; `node -e` over the raw buffer will. " +
+        "There are exactly two remedies. If this is " +
+        "TEXT, write the `\\0` escape instead of the byte — the escape denotes " +
+        "the identical value, which is what `src/lib/member-guest-find.ts` and " +
+        "`src/lib/config-transfer/import-types.ts` both do for a composite-key " +
+        "separator. If this is a BINARY ASSET, declare it as one in " +
+        "`.gitattributes` (`*.png binary`, and so on): that is a statement " +
+        "about what the file is, not an exemption, and it is what keeps this " +
+        "check failing closed on a file class nobody has pinned. Do NOT reach " +
+        "for a `diff` attribute — it does restore Git's textual " +
+        "classification, but that only moves the file into the scan where the " +
+        "control-character check then rejects it permanently, and there is no " +
+        "allowlist there by design (#3072).",
+    );
+}
+
+/**
+ * The byte offset of the first NUL in a file, or `null` if it holds none.
+ *
+ * Read in fixed chunks rather than whole, so an undeclared binary asset of any
+ * size costs bounded memory. Deliberately scans the ENTIRE file rather than
+ * Git's 8,000-byte detection window: the window is a measured property of one
+ * Git version, and hard-coding it here would put the fail-open behaviour back
+ * the moment a future Git widened it. The caller already knows Git hid this
+ * file; all this has to establish is that a NUL is what did it.
+ *
+ * `null` for a path that is not on disk. A tracked-but-deleted path in a dirty
+ * working tree is not this check's business — `git status` reports it, and
+ * {@link loadTrackedFiles} makes the same exclusion for the same reason.
+ */
+function firstNulByteOffset(absolutePath) {
+  let handle;
+  try {
+    handle = fs.openSync(absolutePath, "r");
+  } catch {
+    return null;
+  }
+
+  try {
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let consumed = 0;
+    for (;;) {
+      const read = fs.readSync(handle, chunk, 0, chunk.length, consumed);
+      if (read === 0) return null;
+      const index = chunk.subarray(0, read).indexOf(0);
+      if (index !== -1) return consumed + index;
+      consumed += read;
+    }
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+/**
+ * `{ trackedCount, hiddenWithEarlyNul }` — the tracked-file total, and the paths
+ * an early NUL hides from the text scan, excluding declared binary assets.
+ *
+ * The count comes back with the finding because the two belong together in the
+ * success line: printing "scanned N of M, and M-N are declared binary" is what
+ * makes a file silently leaving the scan visible in the log, which is precisely
+ * what "Scanned 4959" did not do when the number had just dropped from 4960.
+ *
+ * Impure, and kept out of {@link auditDocs} for the same reason
+ * {@link loadInvariantFilesAtRef} is: the rules stay testable without a
+ * repository, and the git calls happen once at the entry point.
+ *
+ * Two false positives the first version of this had, both fixed by reading the
+ * file instead of inferring from its absence. `git grep` also omits a file with
+ * NO LINE CONTENT — measured: 0 bytes is omitted and so is a lone newline,
+ * while `\r\n`, ` \n` and `\n\n\n` are all matched — so an empty `.md` stub or
+ * a deliberately-empty `"handles empty input"` fixture was reported as carrying
+ * an invisible NUL, and told to go hunting for a byte that was not there. (Live
+ * example at the time of writing: the two 0-byte `docs/images/**\/.gitkeep`
+ * files.) `git grep` also omits a tracked-but-deleted path and exits 0, so a
+ * dirty working tree reported a deleted file the same wrong way. Both now
+ * require the byte to actually be present.
+ */
+export function findFilesHiddenFromTextScan(repoRoot) {
+  const run = (args) => {
+    const result = spawnSync("git", args, {
+      cwd: repoRoot,
+      encoding: "utf8",
+      maxBuffer: 1 << 28,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (result.error) throw result.error;
+    // `git grep` exits 1 for "no match", which is not a failure here.
+    if (result.status !== 0 && result.status !== 1) {
+      throw new Error(
+        `git ${args[0]} failed (status ${result.status}): ${result.stderr.trim()}`,
+      );
+    }
+    return result.stdout.split("\0").filter(Boolean);
+  };
+
+  const tracked = run(["ls-files", "-z"]);
+  const scanned = new Set(run(["grep", "-Il", "-z", "-e", "", "--"]));
+  const hidden = tracked.filter((rel) => !scanned.has(rel));
+  if (hidden.length === 0) {
+    return { trackedCount: tracked.length, hiddenWithEarlyNul: [] };
+  }
+
+  // One bulk `check-attr`, so a repository of any size costs one process. The
+  // -z form emits flat path/attribute/value triples.
+  const attrs = spawnSync(
+    "git",
+    ["check-attr", "-z", "--stdin", "text"],
+    {
+      cwd: repoRoot,
+      input: `${hidden.join("\0")}\0`,
+      encoding: "utf8",
+      maxBuffer: 1 << 28,
+    },
+  );
+  if (attrs.error) throw attrs.error;
+  if (attrs.status !== 0) {
+    throw new Error(
+      `git check-attr failed (status ${attrs.status}): ${attrs.stderr.trim()}`,
+    );
+  }
+
+  // `-text`, which the standard `binary` macro sets, is the ONLY exemption —
+  // and it is the repository declaring what the file is, not this script
+  // excusing it. `unspecified` is deliberately NOT exempt: a file class nobody
+  // has thought about has to fail closed, which is the whole point.
+  const fields = attrs.stdout.split("\0");
+  const declaredBinary = new Set();
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    if (fields[i + 2] === "unset") declaredBinary.add(fields[i]);
+  }
+
+  const hiddenWithEarlyNul = [];
+  for (const rel of hidden) {
+    if (declaredBinary.has(rel)) continue;
+    const byteOffset = firstNulByteOffset(path.join(repoRoot, rel));
+    if (byteOffset !== null) hiddenWithEarlyNul.push({ path: rel, byteOffset });
+  }
+  return { trackedCount: tracked.length, hiddenWithEarlyNul };
+}
+
+/**
+ * Every Markdown file under `docs/` is reachable from a front door by following
+ * relative Markdown links.
+ *
+ * Scope is Markdown, because a doc is a page a reader reads: the assets beside
+ * them (`docs/images/**`, the lobby-display HTML mockups, the Codex profile
+ * TOMLs) are referenced from their own pages and are covered by
+ * `pnpm run docs:linkcheck` instead.
+ */
+export function auditDocReachability(files) {
+  const markdown = new Set(
+    [...files.keys()].filter((rel) => rel.toLowerCase().endsWith(".md")),
+  );
+
+  const seen = new Set();
+  const queue = [];
+  for (const root of REACHABILITY_ROOTS) {
+    if (markdown.has(root) && !seen.has(root)) {
+      seen.add(root);
+      queue.push(root);
+    }
+  }
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (const target of markdownLinkTargets(current, files.get(current))) {
+      if (markdown.has(target) && !seen.has(target)) {
+        seen.add(target);
+        queue.push(target);
+      }
+    }
+  }
+
+  const problems = [];
+  for (const rel of [...markdown].sort()) {
+    if (!rel.startsWith("docs/")) continue;
+    if (seen.has(rel) || UNREACHABLE_ALLOWLIST.has(rel)) continue;
+    problems.push(
+      `${rel} is not reachable from any of ${REACHABILITY_ROOTS.join(", ")} by ` +
+        "following relative Markdown links. Link it from its nearest hub — the feature " +
+        "README beside it, or docs/README.md — so somebody can find it without already " +
+        "knowing the path.",
+    );
+  }
+  return problems;
+}
+
+/**
+ * Every prefix's numbers run from `001` to its highest with no
+ * gaps (issue #2889).
+ *
+ * ## Why contiguity is the property, and why it is enough
+ *
+ * `SCHEME.md` §1.3 allocates a new invariant `max + 1`. Nothing used to check
+ * the arithmetic, and a wrong number is irreversible: §1.4 makes an id permanent
+ * the moment it merges, so a skipped block of numbers is a hole this repository
+ * keeps forever.
+ *
+ * Density is what makes `max + 1` *forced* rather than merely instructed. Every
+ * number below the maximum is taken, and no id may be defined twice (the
+ * duplicate-definition audit), so the only number a new invariant can have is
+ * one more than the highest.
+ * Any other choice is either a duplicate — caught there — or a hole, caught
+ * here. Between the two, the allocation rule is mechanical.
+ *
+ * It also catches an interior deletion. Deleting the highest id or every id in
+ * a prefix leaves no hole; {@link auditPermanentInvariantIds} closes those two
+ * revision-shaped gaps instead.
+ *
+ * ## Why there is no allowlist
+ *
+ * `main` needed none when this was turned on, so nothing had to be closed or
+ * excused first. The live totals are printed by the check rather than repeated
+ * here, where concurrent invariant additions would make them stale.
+ *
+ * Nor is there a legitimate gap to allow. An id is never deleted — a superseded
+ * rule keeps its heading and gains a status line, a retired one keeps its
+ * heading and gains a reason — so a hole has exactly two causes, a wrong number
+ * and a forbidden deletion, and both are things to fix rather than to register.
+ * A register would only ever be the mechanism by which a wrong number becomes
+ * permanent, which is the failure this assertion exists to prevent.
+ *
+ * If a prefix ever genuinely wants a reserved range, the answer is a new prefix.
+ * Reserving numbers inside an existing one gives away the density that makes
+ * `max + 1` forced, and buys nothing an id's location-independence (§1.4) does
+ * not already give for free.
+ */
+export function auditNumberSequences(files) {
+  const byPrefix = new Map();
+  for (const [id, places] of collectDefinitions(files)) {
+    const prefix = prefixOf(id);
+    if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
+    byPrefix.get(prefix).push({ id, number: numberOf(id), at: places[0] });
+  }
+
+  const problems = [];
+  for (const prefix of [...byPrefix.keys()].sort()) {
+    const ids = byPrefix.get(prefix).sort((a, b) => a.number - b.number);
+    const lowest = ids[0];
+    const highest = ids.at(-1);
+
+    if (lowest.number !== 1) {
+      problems.push(
+        `INV-${prefix} starts at ${lowest.id} (${lowest.at}), not 001. A prefix numbers ` +
+          "from 001 — the first rule of a new family is 001, not whatever number was next " +
+          "in the file it was copied from. Renumber it down, which is free until the id " +
+          `merges (${INVARIANT_DIR}SCHEME.md §1.3), and fix its row in ${INVARIANT_INDEX}.`,
+      );
+    }
+
+    const taken = new Set(ids.map((entry) => entry.number));
+    const missing = [];
+    for (let n = lowest.number + 1; n < highest.number; n += 1) {
+      if (!taken.has(n)) missing.push(n);
+    }
+
+    if (missing.length > 0) {
+      problems.push(
+        `INV-${prefix} is missing ${formatNumberRuns(missing)}. It defines ${ids.length} ` +
+          `id(s) but its highest is ${highest.id} (${highest.at}), so the numbering has a ` +
+          "hole. A prefix's numbers are dense from 001, and that is what makes the next " +
+          "number mechanical: every number below the maximum is taken and no id may be " +
+          "defined twice, so max + 1 is the only number a new invariant can have. Two " +
+          "causes, both worth a look. Either a new id took the wrong number, in which case " +
+          `renumber it to INV-${prefix}-${formatNumberRuns([missing[0]])} and fix its row ` +
+          `in ${INVARIANT_INDEX} — free until it merges, never afterwards. The usual reason ` +
+          "is reading the maximum off a repo-wide grep, which returns illustrative ids from " +
+          "prose, from fenced examples and from this check's own test fixtures alongside the " +
+          `real definitions; read it off the prefix's tables in ${INVARIANT_INDEX} instead. ` +
+          "Or a rule was deleted, which the scheme forbids: a superseded or retired rule " +
+          "keeps its heading so an old citation still lands on an explanation. Restore it.",
+      );
+    }
+  }
+
+  return problems;
+}
+
+/**
+ * Merged invariant ids are append-only: every definition present in the base
+ * revision must still be defined in the current tree.
+ *
+ * The density audit cannot prove this on its own. Removing the highest number
+ * leaves the remaining sequence dense, and removing every id in a prefix makes
+ * the prefix disappear from the census altogether. Comparing revisions closes
+ * both holes without trying to infer history from the current snapshot.
+ */
+export function auditPermanentInvariantIds(
+  files,
+  baselineFiles,
+  baselineLabel = "the base revision",
+) {
+  const current = collectDefinitions(files);
+  const baseline = collectDefinitions(baselineFiles);
+  const missingByPrefix = new Map();
+
+  for (const [id, places] of baseline) {
+    if (current.has(id)) continue;
+    const prefix = prefixOf(id);
+    if (!missingByPrefix.has(prefix)) missingByPrefix.set(prefix, []);
+    missingByPrefix.get(prefix).push({ id, number: numberOf(id), at: places[0] });
+  }
+
+  const currentPrefixes = new Set([...current.keys()].map(prefixOf));
+  const problems = [];
+  for (const prefix of [...missingByPrefix.keys()].sort()) {
+    const missing = missingByPrefix.get(prefix).sort((a, b) => a.number - b.number);
+    const ids = missing.map((entry) => entry.id).join(", ");
+    const places = missing.map((entry) => entry.at).join(", ");
+    if (!currentPrefixes.has(prefix)) {
+      problems.push(
+        `The entire INV-${prefix} prefix disappeared relative to ${baselineLabel}: ` +
+          `${ids} were defined at ${places}. Merged invariant ids are permanent and ` +
+          "append-only. Restore every heading; a superseded rule keeps its heading and " +
+          "gains a `Superseded by` line, and a retired rule keeps its heading and gains " +
+          "a reason.",
+      );
+      continue;
+    }
+
+    problems.push(
+      `${ids} disappeared relative to ${baselineLabel} (previously ${places}). Merged ` +
+        "invariant ids are permanent and append-only. Density cannot detect removal of " +
+        "the highest number in a prefix, so the base revision is the authority here. " +
+        "Restore each heading and supersede or retire the rule in place instead of " +
+        "deleting it.",
+    );
+  }
+
+  return problems;
+}
+
+/** Screen coverage and reading budget for the navigable UX map (#4469). */
+export function auditUxFlowMap(files) {
+  const mapPath = "docs/UX_FLOW_MAP.md";
+  const source = files.get(mapPath);
+  if (source === undefined) return [];
+  const problems = [];
+  const visibleText = (text) => scannableLines(text).map((line) => line.text).join("\n");
+  const budgetRow = visibleText(files.get(WORD_BUDGET_REGISTER) ?? "")
+    .match(/\| `docs\/UX_FLOW_MAP\.md` \| ([1-9][0-9]*) \|/);
+  if (!budgetRow) {
+    problems.push(`${WORD_BUDGET_REGISTER}: missing screen-map word ceiling.`);
+  } else if (countWords(source) > Number(budgetRow[1])) {
+    problems.push(`${mapPath}: ${countWords(source)} words exceeds its ${budgetRow[1]}-word ceiling.`);
+  }
+  // A route in a list or an unrelated paragraph is not a screen section.
+  const screens = new Set([...visibleText(source).matchAll(
+    /^### [^\n]+\n(?:(?!^###? ).)*?^Screen: `\/admin\/([^`]+)`\./gms,
+  )].map((match) => match[1]));
+  for (const match of visibleText(files.get("docs/COVERAGE_MATRIX.md") ?? "")
+    .matchAll(/^\| `([^`]+)` \|/gm)) {
+    if (!screens.has(match[1])) {
+      problems.push(`${mapPath}: /admin/${match[1]} needs a screen section (COVERAGE_MATRIX.md).`);
+    }
+  }
+  for (const [file, content] of files) {
+    if (!/^docs\/user-guide\/[^/]+\.md$/.test(file)) continue;
+    if (userGuideScreenshotNames(content).length === 0) {
+      problems.push(`${file}: embed a named user-guide screenshot with descriptive alt text.`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * The whole check, over an in-memory map of repo-relative path -> file text.
+ *
+ * Pure, so the rules are testable without a repository. Returns a list of
+ * plain-English problems; an empty list is a pass.
+ */
+export function auditDocs(
+  files,
+  {
+    baselineFiles = null,
+    baselineLabel = "the base revision",
+    stableIndexHeadings = null,
+    hiddenFilesWithEarlyNul = [],
+    invalidUtf8Files = [],
+  } = {},
+) {
+  return [
+    ...auditDefinitionHeadingShapes(files),
+    ...auditInvariantIds(files),
+    ...auditInvariantFilesLinkedFromIndex(files),
+    ...auditIndexRows(files),
+    ...auditIndexCatalogueRows(files),
+    ...auditWordBudgets(files),
+    ...auditUxFlowMap(files),
+    ...auditAgentDocWordBudgets(files, baselineFiles),
+    ...auditRoutingTable(files),
+    ...auditLineNumberCitations(files),
+    ...auditDocReachability(files),
+    ...auditEncoding(files),
+    ...auditControlCharacters(files),
+    ...auditInvisibleCharacters(files),
+    ...auditInvalidUtf8Bytes(invalidUtf8Files),
+    ...auditTextScanCoverage(hiddenFilesWithEarlyNul),
+    ...auditNumberSequences(files),
+    ...(baselineFiles
+      ? auditPermanentInvariantIds(files, baselineFiles, baselineLabel)
+      : []),
+    ...(stableIndexHeadings
+      ? auditStableIndexHeadings(files, stableIndexHeadings)
+      : []),
+  ];
+}
+
+/**
+ * Read every nonempty tracked text file, keyed by repo-relative path.
+ *
+ * Git owns both halves of that classification: its index supplies the tracked
+ * tree, and `grep -I` applies Git's binary/text rules instead of a file-extension
+ * allowlist that inevitably omits a new source or configuration form. Empty
+ * files are absent because grep has no line to return; they cannot contain an
+ * invariant token, a byte-order mark, mojibake, a link or a definition.
+ */
+/**
+ * The tracked text files this script looks at, as `[relative, absolute]` pairs.
+ *
+ * Git decides what "text" means here, through `git grep -I`; this is the one
+ * home for that decision, so {@link loadTrackedFiles} and
+ * {@link findInvalidUtf8Bytes} cannot come to look at different file sets. A
+ * file Git classifies as binary is invisible to both, which is the gap
+ * {@link auditTextScanCoverage} covers.
+ */
+function listTrackedTextFiles(repoRoot) {
+  const listed = spawnSync("git", ["grep", "-Il", "-z", "-e", "", "--"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    maxBuffer: 1 << 28,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (listed.error) throw listed.error;
+  if (listed.status !== 0 && listed.status !== 1) {
+    throw new Error(
+      `git grep could not classify tracked text files (status ${listed.status}): ` +
+        listed.stderr.trim(),
+    );
+  }
+
+  const pairs = [];
+  for (const entry of listed.stdout.split("\0").filter(Boolean)) {
+    const rel = entry.replace(/\\/g, "/");
+    const absolute = path.join(repoRoot, rel);
+    // A tracked-but-deleted path in a dirty working tree is not this check's
+    // business; git status reports it and reading it would throw here.
+    if (!fs.existsSync(absolute)) continue;
+    pairs.push([rel, absolute]);
+  }
+  return pairs;
+}
+
+export function loadTrackedFiles(repoRoot) {
+  const files = new Map();
+  for (const [rel, absolute] of listTrackedTextFiles(repoRoot)) {
+    files.set(rel, fs.readFileSync(absolute, "utf8"));
+  }
+  return files;
+}
+
+
+/**
+ * Every tracked text file whose bytes are not valid UTF-8.
+ *
+ * ## Why {@link auditEncoding} cannot do this
+ *
+ * That check reads what {@link loadTrackedFiles} already decoded, and the decode
+ * is where the evidence is destroyed: `fs.readFileSync(path, "utf8")` replaces
+ * an invalid byte with U+FFFD rather than refusing it. U+FFFD is not a control
+ * character and not a double-encoded sequence, so the byte-order-mark, mojibake
+ * and control-character checks all pass a file no UTF-8 reader can render, and
+ * the black diamond ships. Measured on #3445, where a lone `0x97` — the cp1252
+ * em dash, pasted from a Windows tool — sat in a source comment through a green
+ * `docs:indexcheck`; both review lenses found it only by decoding the changed
+ * files themselves.
+ *
+ * So this reads the BYTES, and it is the one check in this script that must.
+ *
+ * ## How the detection is exact
+ *
+ * A decode followed by a re-encode round-trips byte for byte if and only if the
+ * original was valid UTF-8, so `Buffer.equals` answers the question outright —
+ * no hand-rolled validator, and no guessing from the presence of U+FFFD, which
+ * a file may legitimately contain as a character in its own right. Only once a
+ * file is known to be damaged does the first U+FFFD locate it, and the offset is
+ * the length in bytes of everything decoded before it. That offset is the part
+ * worth reporting: an invalid byte is invisible in every editor, and without it
+ * the only way to find one is to decode the file by hand.
+ */
+export function findInvalidUtf8Bytes(repoRoot) {
+  const findings = [];
+  for (const [rel, absolute] of listTrackedTextFiles(repoRoot)) {
+    const raw = fs.readFileSync(absolute);
+    const text = raw.toString("utf8");
+    if (Buffer.from(text, "utf8").equals(raw)) continue;
+    const damaged = text.indexOf("�");
+    const byteOffset = Buffer.byteLength(text.slice(0, damaged), "utf8");
+    findings.push({ path: rel, byteOffset, byte: raw[byteOffset] });
+  }
+  return findings;
+}
+
+/**
+ * No tracked text file carries a byte that is not valid UTF-8.
+ *
+ * Kept apart from {@link auditEncoding} because its evidence is the raw buffer
+ * rather than the decoded text; {@link findInvalidUtf8Bytes} explains why that
+ * distinction is forced rather than chosen.
+ */
+export function auditInvalidUtf8Bytes(invalidUtf8Files) {
+  return [...invalidUtf8Files]
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .map(({ path: rel, byteOffset, byte }) => {
+      const hex = byte === undefined ? "??" : `0x${byte.toString(16).padStart(2, "0")}`;
+      return (
+        `${rel} is not valid UTF-8: byte ${byteOffset} is ${hex}, which no UTF-8 ` +
+        "reader can decode, so it renders as a black diamond in GitHub's diff and " +
+        "in every editor. The usual cause is a character pasted from a Windows tool " +
+        `that writes cp1252 — ${hex} is an em dash there, and a curly quote and an ` +
+        "ellipsis have their own single bytes. Nothing in this repository wants one: " +
+        "write the real UTF-8 character, or plain ASCII. The other encoding checks " +
+        "here cannot see this, because they read the file after the decode has " +
+        "already replaced the byte (#3445, #3525), which is why it has its own check " +
+        "and why that check reads bytes."
+      );
+    });
+}
+
+/** Resolve a git ref to a commit, returning null when it does not exist. */
+function tryResolveCommit(repoRoot, ref) {
+  try {
+    return execFileSync("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An all-zero object id. GitHub sends this as a push event's `before` when the
+ * ref did not exist beforehand, and git never resolves it to a commit. The
+ * 64-zero form is the same thing in a sha256 repository. Mirrors `isNullSha` in
+ * `scripts/lib/file-size-base.ts`, which the file-size ratchet uses for the
+ * identical field.
+ */
+function isNullSha(sha) {
+  return /^0{40}$/.test(sha) || /^0{64}$/.test(sha);
+}
+
+/** Resolve a required baseline ref, failing instead of silently weakening scope. */
+function resolveRequiredCommit(repoRoot, ref, source) {
+  const resolved = tryResolveCommit(repoRoot, ref);
+  if (!resolved) {
+    throw new Error(`${source} ${ref} does not resolve to a commit`);
+  }
+  return resolved;
+}
+
+/** Find the immutable branch point for a local feature branch. */
+function tryMergeBase(repoRoot, left, right) {
+  try {
+    return execFileSync("git", ["merge-base", left, right], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Every merge base of two commits; empty when there is none or git fails. */
+function allMergeBases(repoRoot, left, right) {
+  try {
+    return execFileSync("git", ["merge-base", "--all", left, right], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The branch point of `head` against whichever spelling of main this checkout
+ * has, or null when it has neither. Shared by the epic-branch push path and the
+ * local feature-branch fallback, which want the same commit for the same
+ * reason: it is the last point at which the branch and main agreed, so it is
+ * the set of ids the branch is answerable for retaining.
+ */
+function mergeBaseAgainstMain(repoRoot, head) {
+  for (const candidate of ["origin/main", "main"]) {
+    if (!tryResolveCommit(repoRoot, candidate)) continue;
+    const mergeBase = tryMergeBase(repoRoot, head, candidate);
+    if (mergeBase) return mergeBase;
+  }
+  return null;
+}
+
+/**
+ * A pull request's invariant baseline: the merge base of `HEAD` and the event's
+ * exact `PR_BASE_SHA` (#5156).
+ *
+ * `PR_BASE_SHA` is the base branch's tip when the event fired, and it can be
+ * newer than anything the checked-out tree contains: a job may check out the PR
+ * head rather than the merge commit, and a re-run keeps its original commit while
+ * the base moves on. Measured against that tip, an id `main` gained after the
+ * branch point reads as one this branch removed. The merge base is the last
+ * commit the branch and its base shared, so it is exactly the set of ids the
+ * branch is answerable for retaining; both inputs are immutable commits, so it
+ * cannot drift. When `HEAD` is the merge commit, `PR_BASE_SHA` is one of its
+ * parents and the merge base IS `PR_BASE_SHA`, so that case is unchanged.
+ *
+ * A real deletion cannot hide behind this. An id the branch deleted was present
+ * at the branch point (or it was never the branch's to keep) and is absent from
+ * `HEAD`, so it is still reported. An id the base added later is checked when
+ * the branch's merge commit is, and on the push to `main`.
+ *
+ * Several merge bases fall back to `PR_BASE_SHA` itself (stricter, never weaker).
+ *
+ * No merge base fails closed: unrelated history or a checkout too shallow to
+ * reach the branch point gives no honest baseline, and `PR_BASE_SHA` would bring
+ * back the false "disappeared" this exists to remove.
+ */
+function pullRequestBranchPoint(repoRoot, head, prBase) {
+  const base = resolveRequiredCommit(repoRoot, prBase, "PR_BASE_SHA");
+  // More than one merge base (a branch stacked on a commit the base later
+  // merged, #5157 review): no single commit is "the" branch point, and picking
+  // one can choose a history that never held an id the branch then deleted. Use
+  // the base tip itself, the stricter pre-#5156 baseline: it can over-report on
+  // such a branch, never under-report.
+  if (allMergeBases(repoRoot, head, base).length > 1) return base;
+  const branchPoint = tryMergeBase(repoRoot, head, base);
+  if (!branchPoint) {
+    throw new Error(
+      `HEAD and PR_BASE_SHA ${prBase} share no merge base, so there is no branch point ` +
+        "to take the invariant baseline from. Either the histories are unrelated or the " +
+        "checkout is shallow: check out full history (actions/checkout with fetch-depth: 0)",
+    );
+  }
+  return branchPoint;
+}
+
+/**
+ * Pick the revision whose already-merged ids the current tree must retain.
+ *
+ * Pull requests compare with the merge base of `HEAD` and the immutable base SHA
+ * from their event (#5156; see {@link pullRequestBranchPoint}). Pushes to
+ * `main` and to an `epic/**` integration branch (#3002) compare with the
+ * immutable `PUSH_BASE_SHA` — on `main` the last judged main commit, which
+ * `ci.yml` resolves because a newer merge may have replaced the previous
+ * commit's queued run (#5356, INV-OPS-021), and on an epic branch the event's
+ * pre-push SHA — except the push that CREATES an epic branch, which
+ * carries no such SHA and compares with the branch point instead. Local feature
+ * branches compare with their merge-base against `origin/main` (or `main`).
+ * Every event/explicit ref fails closed when missing; `HEAD^1` is not a safe
+ * feature-branch fallback because it may be a feature commit made after a
+ * forbidden deletion.
+ */
+export function resolveInvariantBaselineRef(repoRoot, env = process.env) {
+  const explicit = env.DOC_INDEX_BASE_REF?.trim();
+  const head = tryResolveCommit(repoRoot, "HEAD");
+  if (!head) throw new Error("HEAD does not resolve to a commit");
+
+  const eventName = env.GITHUB_EVENT_NAME?.trim();
+  const prBase = env.PR_BASE_SHA?.trim();
+  const pushBase = env.PUSH_BASE_SHA?.trim();
+
+  // The webhook kind is the event identity. A pull-request `synchronize`
+  // payload also has a top-level `before` field, so the workflow's immutable
+  // PUSH_BASE_SHA mapping is populated even though that SHA is the previous PR
+  // head, not a push baseline. Never infer a second event from an unrelated
+  // payload field when GitHub has already named the event.
+  if (eventName === "pull_request") {
+    if (explicit) {
+      throw new Error(
+        "DOC_INDEX_BASE_REF cannot be set for a pull-request event; PR_BASE_SHA is " +
+          "authoritative and an inherited diagnostic override must not replace it",
+      );
+    }
+    if (!prBase) {
+      throw new Error(
+        "PR_BASE_SHA is required for a pull-request invariant baseline; a branch name " +
+          "can drift after the event and is not an exact substitute",
+      );
+    }
+    return pullRequestBranchPoint(repoRoot, head, prBase);
+  }
+
+  if (eventName === "push") {
+    const isMainRef =
+      env.GITHUB_REF === "refs/heads/main" || env.GITHUB_REF_NAME === "main";
+    // `epic/**` integration branches (#3002). An epic's children merge into one
+    // and the branch reaches `main` as a single merge, so `ci.yml` triggers on
+    // pushes to it as well — which makes this path reachable for the first time.
+    // WIDENED PRECISELY, and the refusal below is not a leftover: for any OTHER
+    // ref the invariant-retention baseline genuinely means nothing. A push to
+    // `feature/x` has no relationship to `PUSH_BASE_SHA` that this check can
+    // interpret, so it still fails closed rather than measuring against a
+    // baseline it cannot justify.
+    const isEpicRef =
+      env.GITHUB_REF?.trim().startsWith("refs/heads/epic/") === true ||
+      env.GITHUB_REF_NAME?.trim().startsWith("epic/") === true;
+    if (!isMainRef && !isEpicRef) {
+      throw new Error(
+        "Invariant push baselines are supported only for pushes to main or an " +
+          "epic/** integration branch; refusing to interpret PUSH_BASE_SHA for a " +
+          "different ref",
+      );
+    }
+    const pushLabel = isMainRef ? "main-push" : "epic-branch-push";
+    if (explicit) {
+      throw new Error(
+        `DOC_INDEX_BASE_REF cannot be set for a ${pushLabel} event; PUSH_BASE_SHA is ` +
+          "authoritative and an inherited diagnostic override must not replace it",
+      );
+    }
+    // A ref-CREATING push carries an all-zero `before`, and epic branches are
+    // created routinely now. `main` cannot be created by a push (branch
+    // protection blocks creating and deleting it), so an all-zero there is a
+    // fact about the event that this check must not paper over — it fails.
+    // On an epic branch it is ordinary, and the branch point against `main` is
+    // the honest baseline: it is where the branch and main last agreed, which
+    // is exactly the set of ids the branch is answerable for retaining. Failing
+    // instead would redden `verify` on every epic branch's first push, which is
+    // the same defect this widening exists to remove.
+    if (isEpicRef && (!pushBase || isNullSha(pushBase))) {
+      const branchPoint = mergeBaseAgainstMain(repoRoot, head);
+      if (!branchPoint) {
+        throw new Error(
+          "This push created the epic branch, so its event carries no 'before' " +
+            "commit, and neither origin/main nor main is present to take a branch " +
+            "point from. Fetch origin/main (actions/checkout with fetch-depth: 0)",
+        );
+      }
+      return branchPoint;
+    }
+    if (!pushBase) {
+      throw new Error(
+        `PUSH_BASE_SHA is required for a ${pushLabel} invariant baseline; HEAD^1 can ` +
+          "postdate a deletion when one push contains several commits",
+      );
+    }
+    if (isNullSha(pushBase)) {
+      throw new Error(
+        `PUSH_BASE_SHA is the all-zero object id, which is how a push event says the ` +
+          `ref did not exist before the push. ${env.GITHUB_REF_NAME ?? "This ref"} ` +
+          "cannot be created by a push, so this is not a baseline that can be trusted",
+      );
+    }
+    return resolveRequiredCommit(repoRoot, pushBase, "PUSH_BASE_SHA");
+  }
+
+  if (eventName) {
+    // Fail closed rather than guess — but note what that costs if the workflow's
+    // triggers change. This matches `.github/workflows/ci.yml`'s triggers exactly
+    // as they stand. Adding `merge_group` (which GitHub merge queues require) or
+    // `workflow_dispatch` there without also giving that event a baseline here
+    // would make `verify` — a required check — fail on every run with the message
+    // below. If you add a trigger, add its baseline in the same PR. Relevant
+    // because #2686 put branch protection on `main`.
+    //
+    // #3002 is the worked example of exactly that, and of the near miss: adding
+    // `push: branches: [epic/**]` to ci.yml did not add an EVENT, it widened an
+    // existing one, so it slipped past the sentence above and made the
+    // ref-specific refusal in the `push` branch reachable instead — same
+    // outcome, `verify` red on every epic-branch push. WIDENING A TRIGGER'S REF
+    // FILTER COUNTS. Give the new refs a baseline in the same PR, and keep
+    // refusing the ones that still have no meaningful one.
+    throw new Error(
+      `Unsupported GitHub event ${eventName}; refusing to infer an invariant ` +
+        "baseline from environment fields that belong to another event shape",
+    );
+  }
+
+  const isPullRequest =
+    Boolean(env.GITHUB_BASE_REF?.trim()) ||
+    Boolean(prBase);
+  const isMainPush =
+    Boolean(pushBase) ||
+    env.GITHUB_REF === "refs/heads/main" ||
+    env.GITHUB_REF_NAME === "main";
+
+  if (isPullRequest && isMainPush) {
+    throw new Error(
+      "Conflicting pull-request and push baseline identity; refusing to choose one",
+    );
+  }
+
+  if (isPullRequest) {
+    if (explicit) {
+      throw new Error(
+        "DOC_INDEX_BASE_REF cannot be set for a pull-request event; PR_BASE_SHA is " +
+          "authoritative and an inherited diagnostic override must not replace it",
+      );
+    }
+    if (!prBase) {
+      throw new Error(
+        "PR_BASE_SHA is required for a pull-request invariant baseline; a branch name " +
+          "can drift after the event and is not an exact substitute",
+      );
+    }
+    return pullRequestBranchPoint(repoRoot, head, prBase);
+  }
+
+  if (isMainPush) {
+    if (explicit) {
+      throw new Error(
+        "DOC_INDEX_BASE_REF cannot be set for a main-push event; PUSH_BASE_SHA is " +
+          "authoritative and an inherited diagnostic override must not replace it",
+      );
+    }
+    if (!pushBase) {
+      throw new Error(
+        "PUSH_BASE_SHA is required for a main-push invariant baseline; HEAD^1 can " +
+          "postdate a deletion when one push contains several commits",
+      );
+    }
+    return resolveRequiredCommit(repoRoot, pushBase, "PUSH_BASE_SHA");
+  }
+
+  if (explicit) {
+    return resolveRequiredCommit(repoRoot, explicit, "DOC_INDEX_BASE_REF");
+  }
+
+  const mergeBase = mergeBaseAgainstMain(repoRoot, head);
+  if (mergeBase) return mergeBase;
+
+  throw new Error(
+    "Cannot resolve an invariant-id baseline. Fetch origin/main or set " +
+      "DOC_INDEX_BASE_REF; HEAD^1 is deliberately not a feature-branch fallback.",
+  );
+}
+
+/** Read invariant Markdown exactly as stored at a git revision. */
+export function loadInvariantFilesAtRef(repoRoot, ref) {
+  const resolved = resolveRequiredCommit(repoRoot, ref, "Invariant baseline ref");
+  const listed = execFileSync(
+    "git",
+    ["ls-tree", "-r", "-z", "--name-only", resolved, "--", INVARIANT_DIR],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      maxBuffer: 1 << 24,
+    },
+  )
+    .split("\0")
+    .filter((entry) => entry.endsWith(".md"));
+
+  const files = new Map();
+  for (const rel of listed) {
+    files.set(
+      rel,
+      execFileSync("git", ["show", `${resolved}:${rel}`], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        maxBuffer: 1 << 24,
+      }),
+    );
+  }
+  return files;
+}
+
+/**
+ * `--words`: print the word-count inventory instead of auditing.
+ *
+ * The same measurement the audit applies, over the same tracked tree, so a
+ * lane compacting an entry or proposing a budget reads the figure CI will hold
+ * it to rather than one from a script of its own (INV-SSOT-004: two instruments
+ * that measure differently agree where both are blind). Every entry, longest
+ * first, then the distribution, then every index row over the cap.
+ */
+export function formatWordInventory(files) {
+  const entries = [...measureInvariantEntryWords(files)].sort(
+    ([, left], [, right]) => right.words - left.words,
+  );
+  const lines = entries.map(
+    ([id, { at, words }]) => `${String(words).padStart(5)}  ${id.padEnd(16)} ${at}`,
+  );
+  const total = entries.reduce((sum, [, { words }]) => sum + words, 0);
+  lines.push("", `${entries.length} entries, ${total} words in total`);
+  const bands = [
+    [0, 100],
+    [101, 200],
+    [201, INVARIANT_ENTRY_WORD_BUDGET],
+    [INVARIANT_ENTRY_WORD_BUDGET + 1, 350],
+    [351, 500],
+    [501, 800],
+    [801, 1500],
+    [1501, Number.POSITIVE_INFINITY],
+  ];
+  for (const [low, high] of bands) {
+    const count = entries.filter(([, { words }]) => words >= low && words <= high).length;
+    lines.push(`  ${low}-${Number.isFinite(high) ? high : "up"}: ${count}`);
+  }
+  const register = parseWordBudgetRegister(files);
+  lines.push(
+    `  over the ${INVARIANT_ENTRY_WORD_BUDGET}-word budget: ${entries.filter(([, { words }]) => words > INVARIANT_ENTRY_WORD_BUDGET).length} ` +
+      `(${register.exceptions.size} approved exception(s), ${register.ratchet.size} ratchet record(s))`,
+  );
+  const indexText = files.get(INVARIANT_INDEX) ?? "";
+  const overCap = [];
+  for (const { number, text: line } of scannableLines(indexText)) {
+    const match = line.match(INDEX_ROW_PATTERN);
+    if (!match) continue;
+    const words = countWords(indexRowDescription(line, match));
+    if (words > INDEX_ROW_WORD_CAP) {
+      overCap.push(
+        `${String(words).padStart(5)}  ${match[1].padEnd(16)} ${INVARIANT_INDEX}:${number}`,
+      );
+    }
+  }
+  lines.push("", `index rows over the ${INDEX_ROW_WORD_CAP}-word cap: ${overCap.length}`, ...overCap);
+  const { ceilings } = parseAgentDocBudgets(files);
+  const agentDocs = [...files.keys()].filter((rel) => AGENT_DOC_PATTERN.test(rel)).sort();
+  lines.push("", `agent docs (words / ceiling): ${agentDocs.length}`);
+  for (const rel of agentDocs) {
+    const ceiling = ceilings.get(rel)?.ceiling ?? "none";
+    const words = countWords(files.get(rel));
+    const drifted = typeof ceiling === "number" && ceiling - words > AGENT_DOC_BUDGET_SLACK;
+    lines.push(
+      `${String(words).padStart(5)} / ${String(ceiling).padStart(5)}  ${rel}` +
+        (drifted ? "  (shrank; the ceiling can be lowered)" : ""),
+    );
+  }
+  return lines.join("\n");
+}
+
+if (isMainModule(import.meta.url)) {
+  const repoRoot = path.resolve(path.join(import.meta.dirname, "..", ".."));
+  try {
+    const files = loadTrackedFiles(repoRoot);
+    if (process.argv.includes("--words")) {
+      console.log(formatWordInventory(files));
+      process.exit(0);
+    }
+    // ONE baseline for every comparison against a base (#5156): id retention
+    // (`auditPermanentInvariantIds`) and "a ceiling this change set"
+    // (`auditAgentDocWordBudgets`, whose register lives under docs/invariants/)
+    // both ask what this branch changed, so both read the same revision — for a
+    // pull request, its branch point. Every other rule reads the tree alone.
+    const baselineRef = resolveInvariantBaselineRef(repoRoot);
+    const baselineFiles = loadInvariantFilesAtRef(repoRoot, baselineRef);
+    const definitions = collectDefinitions(files);
+    const textScan = findFilesHiddenFromTextScan(repoRoot);
+    const trackedCount = textScan.trackedCount;
+    const problems = auditDocs(files, {
+      baselineFiles,
+      baselineLabel: baselineRef.slice(0, 12),
+      stableIndexHeadings: STABLE_INDEX_HEADINGS,
+      hiddenFilesWithEarlyNul: textScan.hiddenWithEarlyNul,
+      invalidUtf8Files: findInvalidUtf8Bytes(repoRoot),
+    });
+
+    if (problems.length > 0) {
+      console.error(
+        `Documentation index integrity failed (#2691) — ${problems.length} problem(s):\n`,
+      );
+      for (const problem of problems) console.error(`  - ${problem}\n`);
+      process.exitCode = 1;
+    } else {
+      const prefixes = new Set([...definitions.keys()].map(prefixOf));
+      const wordRegister = parseWordBudgetRegister(files);
+      const routedRows = routingTableRows(files.get(ROUTING_TABLE_FILE) ?? "").length;
+      console.log(
+        `Doc index check passed: ${definitions.size} invariant id(s) across ` +
+          `${prefixes.size} prefix(es), each numbering densely from 001 so the next id in ` +
+          "a prefix can only be max + 1, every citation resolves, every id is indexed, " +
+          `every id present at base ${baselineRef.slice(0, 12)} is still defined, ` +
+          `every index row is within ${INDEX_ROW_WORD_CAP} words and every entry within its ` +
+          `word budget (${INVARIANT_ENTRY_WORD_BUDGET} by default, ${wordRegister.exceptions.size} approved ` +
+          `exception(s), ${wordRegister.ratchet.size} ratchet record(s)), ` +
+          `every docs/agents page within its word ceiling (${parseAgentDocBudgets(files).ceilings.size} ` +
+          `ceiling(s)), every docs/ page is reachable, ${routedRows} routing row(s) resolve, all ` +
+          `${STABLE_INDEX_HEADINGS.length} pre-split index headings are intact, no line ` +
+          "number is cited into the invariants, no file is BOM'd or double-encoded, no " +
+          "file carries a raw control character or an invisible format character, every " +
+          "catalogue-table row is an id row, and nothing outside the declared binary " +
+          "assets has an early NUL hiding it from this scan. " +
+          `Scanned ${files.size} of ${trackedCount} tracked file(s) — the gap is Git's ` +
+          "binary classification, and the clause above is what accounts for it.",
+      );
+      for (const { rel, words, ceiling, at } of agentDocBudgetDrift(files)) {
+        console.log(
+          `Note: ${rel} is ${words} words, more than ${AGENT_DOC_BUDGET_SLACK} under its ceiling of ` +
+            `${ceiling} (${at}). Lowering the ceiling is welcome but not required.`,
+        );
+      }
+    }
+  } catch (error) {
+    console.error(`Documentation index integrity check failed: ${error.message}`);
+    process.exitCode = 1;
+  }
+}

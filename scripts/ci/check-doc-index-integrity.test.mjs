@@ -1,0 +1,4223 @@
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  AGENT_DOC_BUDGET_SLACK,
+  BYTE_ORDER_MARK,
+  agentDocBudgetDrift,
+  auditAgentDocWordBudgets,
+  auditControlCharacters,
+  auditDefinitionHeadingShapes,
+  auditDocReachability,
+  auditDocs,
+  auditUxFlowMap,
+  auditEncoding,
+  auditInvalidUtf8Bytes,
+  auditTextScanCoverage,
+  auditWordBudgets,
+  auditIndexCatalogueRows,
+  auditInvisibleCharacters,
+  markdownLinkTargets,
+  WORD_BUDGET_EXCEPTION_CEILING_MAX,
+  countWords,
+  formatWordInventory,
+  INDEX_ROW_WORD_CAP,
+  INVARIANT_ENTRY_WORD_BUDGET,
+  measureInvariantEntryWords,
+  parseWordBudgetRegister,
+  WORD_BUDGET_REGISTER,
+  auditIndexRows,
+  auditInvariantFilesLinkedFromIndex,
+  auditInvariantIds,
+  auditLineNumberCitations,
+  auditNumberSequences,
+  auditPermanentInvariantIds,
+  auditRoutingTable,
+  fencedLines,
+  INVARIANT_SCHEME,
+  literalAuditLines,
+  loadTrackedFiles,
+  loadInvariantFilesAtRef,
+  resolveInvariantBaselineRef,
+  routingTableRows,
+  auditStableIndexHeadings,
+  findFilesHiddenFromTextScan,
+  scanMarkdownFenceLines,
+  scannableLines,
+  STABLE_INDEX_HEADINGS,
+} from "./check-doc-index-integrity.mjs";
+
+/*
+  HEADROOM FOR A WHOLE-REPOSITORY SCAN, not cover for a slow test.
+
+  Thirteen cases here shell out to `git` or initialise a throwaway repository,
+  and the heaviest call `loadTrackedFiles(REPO_ROOT)`, which lists and reads
+  every tracked file — over 4,500 of them. That is the point: the real-repository
+  CLI cases are the strongest thing in this suite, and they are what caught the
+  `synchronize`-payload trap. They need the real tree, not a fixture.
+
+  Under vitest's 5-second default that work does not reliably finish on a busy
+  runner, and a *different* case loses each time. It failed exactly that way on
+  PR #2922, whose diff is documentation and cannot reach the subject of the test
+  that failed — 28.5s for the file against roughly 19s idle (#2923).
+
+  The mechanism was seen before this suite merged and mis-read as Windows load
+  sensitivity that "does not reproduce on CI's Linux runners". The first half was
+  right; the second half was an assumption. Nothing here is Windows-specific —
+  the runner only has to be busy.
+
+  Same treatment, and the same reasoning, as the whole-tree parser scan in
+  `src/lib/__tests__/jsx-text-escape-guard.test.ts`. If a case ever genuinely
+  needs a minute, that is a real regression worth looking at; this only stops the
+  clock deciding which assertion runs.
+*/
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
+
+const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
+const CHECKER_PATH = path.join(REPO_ROOT, "scripts", "ci", "check-doc-index-integrity.mjs");
+const TEMP_ROOTS = new Set();
+
+afterEach(() => {
+  for (const root of TEMP_ROOTS) rmSync(root, { force: true, recursive: true });
+  TEMP_ROOTS.clear();
+});
+
+function git(repoRoot, ...args) {
+  return execFileSync("git", args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function initGitRepo(initialBranch = "main") {
+  const repoRoot = mkdtempSync(path.join(tmpdir(), "doc-index-integrity-"));
+  TEMP_ROOTS.add(repoRoot);
+  git(repoRoot, "init", `--initial-branch=${initialBranch}`);
+  git(repoRoot, "config", "user.name", "Doc index tests");
+  git(repoRoot, "config", "user.email", "doc-index@example.invalid");
+  git(repoRoot, "config", "commit.gpgsign", "false");
+  git(repoRoot, "config", "core.autocrlf", "false");
+  return repoRoot;
+}
+
+function commitFiles(repoRoot, message, files) {
+  for (const [relative, text] of Object.entries(files)) {
+    const absolute = path.join(repoRoot, relative);
+    mkdirSync(path.dirname(absolute), { recursive: true });
+    writeFileSync(absolute, text, "utf8");
+  }
+  git(repoRoot, "add", ".");
+  git(repoRoot, "commit", "-m", message);
+  return git(repoRoot, "rev-parse", "HEAD");
+}
+
+/**
+ * Resolve a revision in THIS repository, failing with the reason rather than a
+ * raw git error.
+ *
+ * The CLI tests below build a real `pull_request` payload out of this
+ * repository's own commits, so they need history — `HEAD^1` and `origin/main`.
+ * `ci.yml` checks out with `fetch-depth: 0` and has it; a default
+ * `actions/checkout` is depth 1 and does not. That asymmetry once put `main`
+ * red on the clock canary while `verify` stayed green, and the symptom was
+ * `fatal: ambiguous argument 'HEAD^1'` four frames deep in a helper, which says
+ * nothing about the cause (#2907).
+ *
+ * Deliberately throws rather than skipping. A test that quietly disappears in
+ * one workflow is how this class of gap hides in the first place.
+ */
+function repoRevision(revision) {
+  try {
+    return git(REPO_ROOT, "rev-parse", revision);
+  } catch (cause) {
+    throw new Error(
+      `Could not resolve ${revision} in this repository. This test drives the ` +
+        "doc-index CLI against real commits, so it needs git history: a " +
+        "shallow clone has neither HEAD^1 nor origin/main. Every workflow that " +
+        "runs the unit suite must check out with `fetch-depth: 0` (ci.yml and " +
+        "clock-rollover-canary.yml both do). Locally, run `git fetch --unshallow`.",
+      { cause },
+    );
+  }
+}
+
+function checkerEnv(overrides = {}) {
+  return {
+    ...process.env,
+    DOC_INDEX_BASE_REF: "",
+    GITHUB_BASE_REF: "",
+    GITHUB_EVENT_NAME: "",
+    GITHUB_REF: "",
+    GITHUB_REF_NAME: "",
+    PR_BASE_SHA: "",
+    PUSH_BASE_SHA: "",
+    ...overrides,
+  };
+}
+
+/**
+ * Unit coverage for the pure half of the doc-index gate (#2691 phase 4).
+ *
+ * This file is the ONE entry in the checker's `CITATION_EXEMPT_FILES`, which
+ * covers both the invariant-id scan and the line-number citation scan. Its
+ * fixtures must contain unresolvable ids, unrecognised prefixes and line-number
+ * citations, because that is what they assert the checker rejects. Every fixture
+ * below is therefore a literal that would fail the real scan, which is the
+ * point. Nothing else is exempt — not even the checker itself.
+ *
+ * It is NOT exempt from the encoding audit, so the mojibake fixtures are built
+ * from code points rather than written out: this file stays ASCII and the check
+ * it is testing stays green over it.
+ *
+ * Exempt from the scan is not exempt from the habit, though. Where a fixture
+ * needs a well-formed id that resolves to NOTHING, it uses a real number under
+ * the fixture's own prefix — `002`, which this repository defines — so a grep
+ * for that prefix still lands on a real rule; the id is unresolved in the
+ * fixture repository below, which defines only `001`, and that is what the
+ * assertion is about. The fenced-width tests necessarily spell malformed
+ * two- and four-digit forms under a live prefix: they are isolated in this sole
+ * exempt fixture file and prove the production scanner rejects exactly those
+ * forms. Where a fixture needs a well-formed number far out of range, it uses a
+ * prefix this repository does not declare. No illustrative well-formed id
+ * invents a number under a live prefix, which is the trap #2889 closed and the
+ * rule `SCHEME.md` §1.4 states.
+ */
+
+/** An em dash after one UTF-8 -> cp1252 -> UTF-8 round-trip. */
+const MOJIBAKE_EM_DASH = String.fromCharCode(0xe2, 0x20ac, 0x201d);
+
+/** A non-breaking space after the same round-trip. */
+const MOJIBAKE_NBSP = String.fromCharCode(0xc2, 0xa0);
+
+/** A minimal repository that satisfies every rule, as a `Map` of path -> text. */
+function repo(overrides = {}) {
+  return new Map(
+    Object.entries({
+      "README.md": "# Repo\n\nSee [docs](docs/README.md).\n",
+      "AGENTS.md": [
+        "# Agent Guidelines",
+        "",
+        "### Routing table",
+        "",
+        "| About to change... | Invariants | Also read |",
+        "| --- | --- |  --- |",
+        "| Anything holding cents | `INV-MONEY` -> [`money.md`](docs/invariants/money.md) | [`hub`](docs/README.md) |",
+        "",
+        "### Something else",
+        "",
+        "| Not | A | Routing row |",
+        "",
+      ].join("\n"),
+      "docs/README.md": "# Docs\n\n- [Domain invariants](DOMAIN_INVARIANTS.md)\n",
+      "docs/DOMAIN_INVARIANTS.md": [
+        "# Domain Invariants",
+        "",
+        "File: [`money.md`](invariants/money.md).",
+        "",
+        "| ID | Covers |",
+        "| --- | --- |",
+        "| `INV-MONEY-001` | Store and calculate money as integer cents |",
+        "",
+      ].join("\n"),
+      "docs/invariants/money.md": [
+        "# Money",
+        "",
+        "Index: [`docs/DOMAIN_INVARIANTS.md`](../DOMAIN_INVARIANTS.md).",
+        "",
+        "## INV-MONEY-001",
+        "",
+        "- Store and calculate money as integer cents.",
+        "",
+      ].join("\n"),
+      ...overrides,
+    }),
+  );
+}
+
+/** A domain file defining every id given, in order, under one prefix. */
+function family(prefix, numbers) {
+  return [
+    `# ${prefix}`,
+    "",
+    ...numbers.flatMap((n) => [`## INV-${prefix}-${n}`, "", "- A rule.", ""]),
+  ].join("\n");
+}
+
+describe("markdownLinkTargets", () => {
+  // #5214: the link patterns come from scripts/lib/markdown-links.mjs, shared
+  // with check-doc-links.mjs and the changelog compiler, so a linked image
+  // yields both the image and the outer link here too.
+  it("sees both targets of an image wrapped in a link", () => {
+    expect(
+      markdownLinkTargets(
+        "docs/guide.md",
+        "[![Badge](badge.md)](other.md) and [ref]: ../README.md\n",
+      ),
+    ).toEqual(["docs/badge.md", "docs/other.md"]);
+    expect(markdownLinkTargets("docs/guide.md", "[ref]: ../README.md\n")).toEqual([
+      "README.md",
+    ]);
+  });
+});
+
+describe("scannableLines", () => {
+  it("drops fenced blocks so a document can show an example id", () => {
+    const lines = scannableLines("real\n```\nfenced\n```\nreal again\n");
+    expect(lines.map((l) => l.text)).toEqual(["real", "real again", ""]);
+  });
+
+  it("keeps inline backticks, because that is how citations are written", () => {
+    const lines = scannableLines("see `INV-MONEY-001` for the rule\n");
+    expect(lines[0].text).toContain("INV-MONEY-001");
+  });
+
+  it("classifies a tab-heavy pseudo-tag in linear time, not exponential", () => {
+    // The HTML-block tag pattern let an unquoted attribute value swallow TAB,
+    // which overlaps the whitespace separating the next attribute, so the outer
+    // repeat could re-split the same tabs exponentially many ways. Measured on
+    // the pre-fix pattern: 22 repetitions took 337ms and every further
+    // repetition doubled it, so a ~200-character line in any tracked Markdown
+    // file would have hung this gate rather than failed it. 400 repetitions
+    // would not have finished before the heat death of anything; if this ever
+    // regresses the test does not fail slowly, it stops finishing.
+    const pathological = `<a${"\t\t:=!".repeat(400)}\t\t:=!X\n`;
+
+    const started = process.hrtime.bigint();
+    scannableLines(pathological);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it("has a separate view of fenced lines for the narrow live-prefix audit", () => {
+    const lines = fencedLines("real\n```ts\nfenced\n```\nreal again\n");
+    expect(lines).toEqual([{ number: 3, text: "fenced" }]);
+  });
+
+  it("keeps a triple-backtick run inside a four-backtick fence", () => {
+    const source = [
+      "outside",
+      "````md",
+      "```",
+      "still fenced",
+      "`````",
+      "outside again",
+      "",
+    ].join("\n");
+
+    expect(scanMarkdownFenceLines(source)).toEqual({
+      fenced: [
+        { number: 3, text: "```" },
+        { number: 4, text: "still fenced" },
+      ],
+      scannable: [
+        { number: 1, text: "outside" },
+        { number: 6, text: "outside again" },
+        { number: 7, text: "" },
+      ],
+    });
+  });
+
+  it("treats the other marker and a short same-marker run as fenced content", () => {
+    const source = [
+      "~~~text",
+      "```",
+      "~~",
+      "inside",
+      "~~~~",
+      "outside",
+      "",
+    ].join("\n");
+
+    expect(fencedLines(source).map((line) => line.text)).toEqual([
+      "```",
+      "~~",
+      "inside",
+    ]);
+    expect(scannableLines(source).map((line) => line.text)).toEqual([
+      "outside",
+      "",
+    ]);
+  });
+
+  it("treats an over-indented opener as code but rejects an invalid inline opener", () => {
+    const source = "    ```\ncode\n```bad`info\ntext\n";
+
+    expect(fencedLines(source)).toEqual([{ number: 1, text: "    ```" }]);
+    expect(scannableLines(source).map((line) => line.text)).toEqual([
+      "code",
+      "```bad`info",
+      "text",
+      "",
+    ]);
+  });
+
+  it("does not let a fence marker inside raw pre HTML hide later headings", () => {
+    const source = [
+      "<pre>",
+      "```",
+      "literal text",
+      "</pre>",
+      "## INV-DEMO-001",
+      "",
+    ].join("\n");
+
+    expect(fencedLines(source).map((line) => line.text)).toEqual([
+      "<pre>",
+      "```",
+      "literal text",
+      "</pre>",
+    ]);
+    expect(scannableLines(source).map((line) => line.text)).toEqual([
+      "## INV-DEMO-001",
+      "",
+    ]);
+  });
+
+  it.each([
+    ["a standard block tag", ["<div>", "```", "</div>"]],
+    ["a complete custom tag", ['<fixture data-kind="docs">', "```", "</fixture>"]],
+  ])("ends raw HTML from %s at the following blank line", (_name, html) => {
+    const source = [...html, "", "## INV-DEMO-001", ""].join("\n");
+
+    expect(fencedLines(source).map((line) => line.text)).toEqual(html);
+    expect(scannableLines(source).map((line) => line.text)).toEqual([
+      "",
+      "## INV-DEMO-001",
+      "",
+    ]);
+  });
+
+  it("lets type-6 HTML interrupt a paragraph but keeps type-7 HTML in it", () => {
+    const typeSix = "paragraph\n<div>\ninside\n\nvisible\n";
+    const typeSeven = "paragraph\n<fixture>\nvisible\n";
+
+    expect(fencedLines(typeSix).map((line) => line.text)).toEqual(["<div>", "inside"]);
+    expect(scannableLines(typeSeven).map((line) => line.text)).toEqual([
+      "paragraph",
+      "<fixture>",
+      "visible",
+      "",
+    ]);
+  });
+
+  it("ends a type-1 HTML block only at the matching closing tag", () => {
+    const source = "<pre>\nliteral\n</script>\nstill literal\n</pre>\nvisible\n";
+
+    expect(fencedLines(source).map((line) => line.text)).toEqual([
+      "<pre>",
+      "literal",
+      "</script>",
+      "still literal",
+      "</pre>",
+    ]);
+    expect(scannableLines(source).map((line) => line.text)).toEqual(["visible", ""]);
+  });
+
+  it("includes backtick and tilde fence openers in the narrow literal audit", () => {
+    const source = "```lang INV-DEMO-002\nbody\n```\n~~~lang INV-DEMO-03\nbody\n~~~\n";
+
+    expect(literalAuditLines(source).map((line) => line.text)).toEqual([
+      "```lang INV-DEMO-002",
+      "body",
+      "~~~lang INV-DEMO-03",
+      "body",
+    ]);
+  });
+
+  it("does not let indented code interrupt an active paragraph", () => {
+    const source = "paragraph\n    paragraph continuation\n";
+
+    expect(fencedLines(source)).toEqual([]);
+    expect(scannableLines(source).map((line) => line.text)).toEqual([
+      "paragraph",
+      "    paragraph continuation",
+      "",
+    ]);
+  });
+
+  it.each([
+    ["blockquote", ["> ```text", "> INV-DEMO-999", "> ```"]],
+    ["list", ["- ```text", "  INV-DEMO-999", "  ```"]],
+  ])("recognises a fence owned by a %s container", (_name, lines) => {
+    const source = ["outside", ...lines, "outside again", ""].join("\n");
+
+    expect(fencedLines(source).map((line) => line.text)).toEqual([lines[1]]);
+    expect(scannableLines(source).map((line) => line.text)).toEqual([
+      "outside",
+      "outside again",
+      "",
+    ]);
+  });
+
+  it("reprocesses the first non-container line after an unclosed container fence", () => {
+    const source = [
+      "- ```text",
+      "  literal",
+      "## INV-MONEY-001",
+      "",
+    ].join("\n");
+
+    expect(scannableLines(source).map((line) => line.text)).toEqual([
+      "## INV-MONEY-001",
+      "",
+    ]);
+  });
+});
+
+describe("auditDefinitionHeadingShapes", () => {
+  it("fails an id-only invariant heading whose case is non-canonical", () => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md":
+          "# Money\n\n## INV-MONEY-001\n\n- A rule.\n\n## inv-money-002\n\n- Invisible.\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:7");
+    expect(problems[0]).toContain("definition heading");
+    expect(problems[0]).toContain("exactly three digits");
+  });
+
+  it.each([
+    ["a non-breaking hyphen", "## INV‑CAP-042", "U+2011"],
+    ["an en dash", "## INV–CAP-042", "U+2013"],
+    ["a Cyrillic A", "## INV-CАP-042", "U+0410"],
+    ["a full-width digit", "## INV-CAP-04２", "U+FF12"],
+  ])("fails %s hiding inside an invariant id", (_name, heading, codePoint) => {
+    // The worst bypass this checker had. Every other defence works on ASCII
+    // `INV-[A-Z]-\d`, so one lookalike codepoint walked past all of them at
+    // once — definition scan, citation scan and index-row scan alike — while
+    // GitHub rendered a perfectly ordinary `INV-CAP-042`. A reviewer saw a new
+    // invariant that had skipped nine numbers, and CI was green.
+    const problems = auditDefinitionHeadingShapes(
+      repo({ "docs/invariants/money.md": `# Money\n\n${heading}\n\n- A rule.\n` }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:3");
+    expect(problems[0]).toContain(codePoint);
+  });
+
+  it.each([
+    ["an em dash in ordinary prose", "## Capacity — the whole-lodge rule"],
+    ["a macron in ordinary prose", "## Whakatūpato about capacity"],
+    ["a clean canonical definition", "## INV-MONEY-001"],
+  ])("leaves %s alone", (_name, heading) => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({ "docs/invariants/money.md": `# Money\n\n${heading}\n\n- A rule.\n` }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("sees through nested inline tags that one strip pass would leave behind", () => {
+    // Stripping `<b>` out of `<s<b>pan>` splices its neighbours into a *new*
+    // tag, so a single pass leaves markup a reader never sees. Left in, the
+    // residue splits the id and the heading stops looking like a definition —
+    // the rule would be live in the document and invisible to the catalogue,
+    // which is precisely the failure this whole check exists to prevent.
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          "- A rule.",
+          "",
+          "## <s<b>pan>inv-money-002</s<b>pan>",
+          "",
+          "- Invisible.",
+          "",
+        ].join("\n"),
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:7");
+    expect(problems[0]).toContain("canonical");
+  });
+
+  it("fails a backticked id-only heading rather than silently ignoring it", () => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md":
+          "# Money\n\n## INV-MONEY-001\n\n- A rule.\n\n## `INV-MONEY-002`\n\n- Invisible.\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("canonical");
+  });
+
+  it("fails a decorated heading whose existing id would otherwise resolve as a citation", () => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          "- A rule.",
+          "",
+          "## INV-MONEY-001 — another rule",
+          "",
+          "- This is not a second canonical definition.",
+          "",
+        ].join("\n"),
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:7");
+    expect(problems[0]).toContain("definition heading");
+  });
+
+  it.each([
+    "## INV-**MONEY**-001",
+    "## INV-*MONEY*-001",
+    "## INV-__MONEY__-001",
+    "## INV-_MONEY_-001",
+    "## **INV**-MONEY-001",
+    "## INV-~~MONEY~~-001",
+    "## INV-`MONEY`-001",
+    "## INV-<em>MONEY</em>-001",
+  ])("fails an invariant token split by inline decoration: %s", (heading) => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          "- A rule.",
+          "",
+          heading,
+          "",
+          "- Invisible.",
+          "",
+        ].join("\n"),
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:7");
+    expect(problems[0]).toContain("no decoration");
+  });
+
+  it.each([
+    ["GFM inline link", "## INV-[MONEY](https://example.invalid)-002"],
+    ["GFM full reference link", "## INV-[MONEY][money]-002"],
+    ["GFM collapsed reference link", "## INV-[MONEY][]-002"],
+    ["GFM shortcut reference link", "## INV-[MONEY]-002"],
+    ["decimal character reference", "## INV-M&#79;NEY-002"],
+    ["hexadecimal character reference", "## INV-M&#x4f;NEY-002"],
+    [
+      "emphasised GFM link label",
+      "## INV-[**MONEY**](https://example.invalid/path_(one))-002",
+    ],
+  ])("fails an invariant token split by a %s", (_kind, heading) => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          "- A rule.",
+          "",
+          heading,
+          "",
+          "- Invisible.",
+          "",
+        ].join("\n"),
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:7");
+    expect(problems[0]).toContain("no decoration");
+  });
+
+  it("fails an invariant-shaped Setext heading rather than treating it as prose", () => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md":
+          "# Money\n\n## INV-MONEY-001\n\n- A rule.\n\nINV-MONEY-001 — another rule\n---\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:7");
+    expect(problems[0]).toContain("canonical");
+  });
+
+  it("accepts canonical definitions, narrative headings and illustrative fenced headings", () => {
+    const problems = auditDefinitionHeadingShapes(
+      repo({
+        "docs/invariants/money.md":
+          "# Money\n\n## INV-MONEY-001\n\n- A rule.\n\n## Money examples\n\n```md\n## inv-money-002\n```\n",
+      }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+});
+
+describe("auditDocs — the whole check", () => {
+  it("passes a repository that satisfies every rule", () => {
+    expect(auditDocs(repo())).toEqual([]);
+  });
+
+  it("fails a decorated heading even when its existing id resolves in the whole audit", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n## INV-MONEY-001 — another rule\n\n- Not a definition.\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/money.md:9");
+    expect(problems[0]).toContain("canonical");
+  });
+
+  it.each([
+    "## INV-**MONEY**-001",
+    "## INV-*MONEY*-001",
+    "## INV-__MONEY__-001",
+    "## INV-_MONEY_-001",
+  ])("fails an emphasis-split invariant heading in the whole audit: %s", (heading) => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n${heading}\n\n- Not a definition.\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it.each([
+    "## INV-[MONEY](https://example.invalid)-002",
+    "## INV-[MONEY][money]-002",
+    "## INV-[MONEY][]-002",
+    "## INV-[MONEY]-002",
+    "## INV-M&#79;NEY-002",
+    "## INV-M&#x4f;NEY-002",
+  ])("fails a link/entity-split invariant heading in the whole audit: %s", (heading) => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n${heading}\n\n- Not a definition.\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it.each(["INV-MONEY-001a", "INV-MONEY-001_extra"])(
+    "fails identifier-suffixed heading %s in the whole audit",
+    (malformed) => {
+      const files = repo();
+      files.set(
+        "docs/invariants/money.md",
+        `${files.get("docs/invariants/money.md")}\n## ${malformed}\n\n- Not a definition.\n`,
+      );
+
+      const problems = auditDocs(files);
+
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("docs/invariants/money.md:9");
+      expect(problems[0]).toContain("no identifier suffix");
+    },
+  );
+
+  it("does not let raw pre HTML hide a newly declared family", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n<pre>\n\`\`\`\n</pre>\n\n## INV-DEMO-001\n\n- A new family.\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems.some((problem) => problem.includes("INV-DEMO-001 is defined at"))).toBe(
+      true,
+    );
+    expect(problems.some((problem) => problem.includes("no routing table row in AGENTS.md"))).toBe(
+      true,
+    );
+  });
+
+  it("does not let type-7 HTML interrupt a paragraph and hide a malformed heading", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\nParagraph text\n<fixture data-kind="docs">\n## INV-MONEY-001 — another rule\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it("fails a multiline Setext heading whose first line contains an invariant id", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\nINV-MONEY-001 — another rule\ncontinued heading text\n---\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it.each([
+    ["blockquote", "> ## INV-MONEY-001"],
+    ["list", "- ## INV-MONEY-001"],
+    ["list continuation", "- Item\n  ## INV-MONEY-001"],
+  ])("fails a malformed invariant heading inside a %s", (_container, heading) => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n${heading}\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("canonical top-level");
+  });
+
+  it("treats four-space indented custom fixture ids as literal code", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n# Literal fixture\n\n    INV-FIXTURE-999\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it("keeps a decorated heading literal until the matching type-1 closing tag", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n<pre>\nliteral\n</script>\n## INV-MONEY-001 — illustrative\n</pre>\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it.each(["<fixture =bad>", "<fixture !>"])(
+    "does not let invalid type-7 tag %s hide a decorated invariant heading",
+    (invalidTag) => {
+      const files = repo();
+      files.set(
+        "docs/invariants/money.md",
+        `${files.get("docs/invariants/money.md")}\n${invalidTag}\n## INV-MONEY-001 — duplicate rule\n`,
+      );
+
+      const problems = auditDocs(files);
+
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("looks like an invariant definition heading");
+    },
+  );
+
+  it("does not let type-7 HTML interrupt a lazy blockquote paragraph continuation", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> paragraph\n<fixture>\n## INV-MONEY-001 — duplicate rule\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it("retains the original blockquote through a markerless lazy continuation", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> paragraph\nlazy continuation\n> <fixture>\n> ## INV-MONEY-001 — duplicate rule\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it("treats an unmarked dash thematic break as ending a blockquote paragraph", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> INV-MONEY-001\n---\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it("keeps a marked dash underline as a blockquote Setext heading", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> INV-MONEY-001\n> ---\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it("keeps a markerless equals underline as lazy blockquote paragraph text", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> INV-MONEY-001 narrative\n===\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it("recognises a marked equals underline as a blockquote Setext heading", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> INV-MONEY-001 narrative\n> ===\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+
+  it("resets container paragraph state at an asterisk thematic break", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> paragraph\n***\n<fixture>\n## INV-MONEY-001 — literal duplicate\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it.each(["- - -", "* * *"])(
+    "gives the spaced thematic break %s precedence over a list marker",
+    (thematicBreak) => {
+      const source = `${thematicBreak}\n      ## INV-MONEY-001 — literal example\n`;
+
+      expect(fencedLines(source)).toEqual([
+        { number: 2, text: "      ## INV-MONEY-001 — literal example" },
+        { number: 3, text: "" },
+      ]);
+      expect(scannableLines(source).map((line) => line.text)).toEqual([thematicBreak]);
+
+      const files = repo();
+      files.set(
+        "docs/invariants/money.md",
+        `${files.get("docs/invariants/money.md")}\n${source}`,
+      );
+      expect(auditDocs(files)).toEqual([]);
+    },
+  );
+
+  it.each([
+    [
+      "ordered marker digit width",
+      "9. cites INV-MONEY-001 in ordinary prose\n10. ## INV-MONEY-001 — duplicate rule",
+    ],
+    [
+      "ordered item padding width",
+      "1. cites INV-MONEY-001 in ordinary prose\n2.   ## INV-MONEY-001 — duplicate rule",
+    ],
+    [
+      "nested ordered marker digit width",
+      "1. outer item\n\n   9. cites INV-MONEY-001 in ordinary prose\n   10. ## INV-MONEY-001 — duplicate rule",
+    ],
+  ])("recognises a %s change as a list sibling in the whole audit", (_kind, fixture) => {
+    const files = repo({
+      "docs/invariants/money.md": [
+        "# Money",
+        "",
+        "## INV-MONEY-001",
+        "",
+        fixture,
+        "",
+      ].join("\n"),
+    });
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("canonical top-level");
+  });
+
+  it("does not treat a changed ordered-list delimiter as the active list's sibling", () => {
+    const files = repo({
+      "docs/invariants/money.md": [
+        "# Money",
+        "",
+        "## INV-MONEY-001",
+        "",
+        "9. cites INV-MONEY-001 in ordinary prose",
+        "10) ## INV-MONEY-001 — still paragraph text",
+        "",
+      ].join("\n"),
+    });
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it("does not treat an indented lazy blockquote paragraph continuation as code", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n> paragraph\n    INV-MONEY-002\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY-002 is cited at");
+  });
+
+  it.each([
+    [
+      "type-7 HTML",
+      "paragraph\n> <fixture>\n> ## INV-MONEY-001 — literal duplicate\n",
+    ],
+    ["indented code", "paragraph\n>     INV-DEMO-999\n"],
+  ])("lets a fresh blockquote interrupt a paragraph with %s", (_kind, fixture) => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n${fixture}`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it("recognises five spaces after a list marker as list-owned indented code", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n-     INV-DEMO-999\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it("expands tabs when recognising list-owned indented code", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n-\t\tINV-DEMO-999\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it.each([
+    ["list", "-\t  INV-DEMO-999"],
+    ["blockquote", ">\t  INV-DEMO-999"],
+    ["ordered list", "1.\t   INV-DEMO-999"],
+  ])(
+    "slices a partially consumed tab by expanded columns in a %s container",
+    (_container, source) => {
+      const files = repo();
+      files.set(
+        "docs/invariants/money.md",
+        `${files.get("docs/invariants/money.md")}\n${source}\n`,
+      );
+
+      expect(auditDocs(files)).toEqual([]);
+    },
+  );
+
+  it("keeps indented code inside an empty list item", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n-\n      INV-DEMO-999\n`,
+    );
+
+    expect(auditDocs(files)).toEqual([]);
+  });
+
+  it("retains a list container across a blank line before an indented heading", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\n- item\n\n    ## INV-MONEY-001 — duplicate rule\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("canonical top-level");
+  });
+
+  it.each([
+    ["bullet", "- cites INV-MONEY-001 in ordinary prose\n- ordinary heading\n  ---"],
+    ["ordered", "1. cites INV-MONEY-001 in ordinary prose\n2. ordinary heading\n   ---"],
+  ])(
+    "does not merge a same-width %s sibling Setext heading with the prior item's citation",
+    (_kind, fixture) => {
+      const files = repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          fixture,
+          "",
+        ].join("\n"),
+      });
+
+      expect(auditDocs(files)).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["bullet", "- first item\n-\n      INV-DEMO-999"],
+    ["ordered", "1. first item\n2.\n       INV-DEMO-999"],
+  ])(
+    "retains list-owned indented code after a fresh same-width %s sibling",
+    (_kind, fixture) => {
+      const files = repo();
+      files.set(
+        "docs/invariants/money.md",
+        `${files.get("docs/invariants/money.md")}\n${fixture}\n`,
+      );
+
+      expect(auditDocs(files)).toEqual([]);
+    },
+  );
+
+  it("allows a normal full stop immediately after a valid invariant citation", () => {
+    expect(
+      auditDocs(repo({ "src/lib/money.ts": "// See INV-MONEY-001. Then continue.\n" })),
+    ).toEqual([]);
+  });
+
+  it("does not let an ordered list starting above one interrupt a paragraph", () => {
+    const files = repo();
+    files.set(
+      "docs/invariants/money.md",
+      `${files.get("docs/invariants/money.md")}\nParagraph text\n2. <fixture>\n   ## INV-MONEY-001 — another rule\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("looks like an invariant definition heading");
+  });
+});
+
+describe("auditInvariantIds", () => {
+  it("fails a duplicate definition, naming both places", () => {
+    const problems = auditInvariantIds(
+      repo({
+        "docs/invariants/other.md": "# Other\n\n## INV-MONEY-001\n\n- A second one.\n",
+      }),
+    );
+
+    expect(problems.some((p) => p.includes("INV-MONEY-001") && p.includes("2 times"))).toBe(
+      true,
+    );
+  });
+
+  it("fails a citation under a declared prefix that resolves to nothing", () => {
+    const problems = auditInvariantIds(
+      repo({
+        "src/lib/money.ts": "// Enforces INV-MONEY-002.\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY-002");
+    expect(problems[0]).toContain("src/lib/money.ts:1");
+  });
+
+  it("fails an unrecognised prefix rather than ignoring it (the typo case)", () => {
+    // `MONYE` is the likelier mistake than a genuinely new area, and a blanket
+    // whitelist of unknown prefixes would make it invisible.
+    const problems = auditInvariantIds(
+      repo({ "src/lib/money.ts": "// See INV-MONYE-001.\n" }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONYE-");
+    expect(problems[0]).toContain("reserved");
+  });
+
+  it.each([
+    ["indented TypeScript", "src/lib/example.ts", "    // See INV-CPA-001.\n"],
+    ["indented TSX", "src/components/Example.tsx", "    {/* See INV-CPA-001. */}\n"],
+    ["indented YAML", ".semgrep/rules/example.yml", "    invariant: INV-CPA-001\n"],
+    ["indented JSON", "fixtures/example.json", '    "invariant": "INV-CPA-001"\n'],
+    [
+      "JSX-shaped source",
+      "src/components/Example.tsx",
+      "export const Example = () => (\n  <div>\n    INV-CPA-001\n  </div>\n);\n",
+    ],
+  ])("does not apply Markdown literal suppression to %s", (_name, rel, source) => {
+    const problems = auditInvariantIds(repo({ [rel]: source }));
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-CPA-");
+    expect(problems[0]).toContain("reserved");
+  });
+
+  it("accepts the Xero invoice-number fixtures that share the shape", () => {
+    const problems = auditInvariantIds(
+      repo({
+        "src/lib/__tests__/xero.test.ts":
+          'const invoices = ["INV-IB-001", "INV-SETTLE-001", "INV-SETTLE-002", "INV-SUP-001"];\n',
+      }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("ignores a custom-prefix fixture inside a fenced code block", () => {
+    const problems = auditInvariantIds(
+      repo({
+        "docs/example.md": "# Example\n\n```\nINV-NOPE-001\n```\n",
+      }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it.each([
+    ["blockquote", "> ```text\n> INV-DEMO-999\n> ```"],
+    ["list", "- ```text\n  INV-DEMO-999\n  ```"],
+  ])("ignores a custom-prefix fixture inside a %s fence", (_name, fixture) => {
+    const problems = auditInvariantIds(
+      repo({
+        "docs/example.md": `# Example\n\n${fixture}\n`,
+      }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("fails an unresolved id under a live prefix inside a fence", () => {
+    const problems = auditInvariantIds(
+      repo({
+        "docs/example.md": "# Example\n\n```\nINV-MONEY-002\n```\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY-002");
+    expect(problems[0]).toContain("Markdown literal block or fence opener");
+    expect(problems[0]).toContain("docs/example.md:4");
+  });
+
+  it.each([
+    ["INV-MONEY-002", "```", "no file under docs/invariants/ defines it"],
+    ["INV-MONEY-002", "~~~", "no file under docs/invariants/ defines it"],
+    ["INV-MONEY-42", "```", "2 digit(s)"],
+    ["INV-MONEY-0042", "~~~", "4 digit(s)"],
+  ])(
+    "audits declared-prefix id %s in a %s opener info string",
+    (id, marker, expected) => {
+      const problems = auditInvariantIds(
+        repo({
+          "docs/example.md": `# Example\n\n${marker}lang ${id}\nbody\n${marker}\n`,
+        }),
+      );
+
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain(id);
+      expect(problems[0]).toContain(expected);
+      expect(problems[0]).toContain("docs/example.md:3");
+    },
+  );
+
+  it.each([
+    ["INV-MONEY-42", 2],
+    ["INV-MONEY-0042", 4],
+  ])("fails fenced live-prefix numeric near-miss %s", (id, digitCount) => {
+    const problems = auditInvariantIds(
+      repo({ "docs/example.md": `# Example\n\n\`\`\`\n${id}\n\`\`\`\n` }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain(id);
+    expect(problems[0]).toContain(`${digitCount} digit(s)`);
+    expect(problems[0]).toContain("Markdown literal block or fence opener");
+    expect(problems[0]).toContain("docs/example.md:4");
+  });
+
+  it("allows placeholders, reserved invoices and custom prefixes in fences", () => {
+    const problems = auditInvariantIds(
+      repo({
+        "docs/example.md": [
+          "# Example",
+          "",
+          "```",
+          "INV-<PREFIX>-<NNN>",
+          "INV-XERO-999",
+          "INV-XERO-42",
+          "INV-DEMO-999",
+          "INV-DEMO-0042",
+          "```",
+          "",
+        ].join("\n"),
+      }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("rejects a live id in an illustrative SCHEME fence even when it resolves", () => {
+    const problems = auditInvariantIds(
+      repo({
+        [INVARIANT_SCHEME]: "# Scheme\n\n```text\nINV-MONEY-001\n```\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("live invariant id inside an illustrative literal block");
+    expect(problems[0]).toContain(`${INVARIANT_SCHEME}:4`);
+  });
+
+  it("keeps every real SCHEME literal free of live-prefix ids", () => {
+    const scheme = readFileSync(path.join(REPO_ROOT, INVARIANT_SCHEME), "utf8");
+    const index = readFileSync(
+      path.join(REPO_ROOT, "docs", "DOMAIN_INVARIANTS.md"),
+      "utf8",
+    );
+    const livePrefixes = [
+      ...new Set([...index.matchAll(/\bINV-([A-Z][A-Z0-9]*)-\d{3}\b/g)].map((match) => match[1])),
+    ].sort();
+    const liveId = new RegExp(`\\bINV-(?:${livePrefixes.join("|")})-\\d+\\b`);
+
+    expect(
+      literalAuditLines(scheme)
+        .filter((line) => liveId.test(line.text))
+        .map((line) => `${INVARIANT_SCHEME}:${line.number}`),
+    ).toEqual([]);
+  });
+
+  it.each([
+    "INV-MONEY-001a",
+    "INV-MONEY-001_extra",
+    "INV-MONEY-001-extra",
+    "INV-MONEY-001.1",
+  ])(
+    "rejects identifier continuation %s in ordinary source",
+    (malformed) => {
+      const problems = auditDocs(
+        repo({ "src/lib/money.ts": `// Malformed citation ${malformed}.\n` }),
+      );
+
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain(malformed);
+      expect(problems[0]).toContain("identifier continuation");
+    },
+  );
+
+  it.each([
+    ["backtick opener", "```lang INV-MONEY-001a\nbody\n```", "INV-MONEY-001a", 3],
+    ["tilde opener", "~~~lang INV-MONEY-001_extra\nbody\n~~~", "INV-MONEY-001_extra", 3],
+    ["hyphenated opener", "```lang INV-MONEY-001-extra\nbody\n```", "INV-MONEY-001-extra", 3],
+    ["dotted opener", "```lang INV-MONEY-001.1\nbody\n```", "INV-MONEY-001.1", 3],
+    ["fenced body", "```text\nINV-MONEY-001a\n```", "INV-MONEY-001a", 4],
+    ["dotted fenced body", "```text\nINV-MONEY-001.1\n```", "INV-MONEY-001.1", 4],
+    ["dotted raw-HTML body", "<pre>\nINV-MONEY-001.1\n</pre>", "INV-MONEY-001.1", 4],
+    ["dotted indented code", "    INV-MONEY-001.1", "INV-MONEY-001.1", 3],
+  ])(
+    "rejects identifier continuation in a %s",
+    (_location, fixture, malformed, lineNumber) => {
+      const problems = auditInvariantIds(
+        repo({ "docs/example.md": `# Example\n\n${fixture}\n` }),
+      );
+
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain(malformed);
+      expect(problems[0]).toContain("identifier continuation");
+      expect(problems[0]).toContain(`docs/example.md:${lineNumber}`);
+    },
+  );
+
+  it("catches a two-digit near-miss under a real prefix", () => {
+    // It slips past the strict citation pattern and would otherwise resolve to
+    // nothing while being reported as nothing.
+    const problems = auditInvariantIds(
+      repo({ "src/lib/money.ts": "// See INV-MONEY-01.\n" }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY-01");
+    expect(problems[0]).toContain("2 digit(s)");
+  });
+
+  it("does not apply the shape guard to a reserved invoice prefix", () => {
+    const problems = auditInvariantIds(
+      repo({ "src/lib/__tests__/xero.test.ts": 'const n = "INV-XERO-9";\n' }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("only takes definitions from docs/invariants", () => {
+    const problems = auditInvariantIds(
+      repo({ "docs/elsewhere.md": "# Elsewhere\n\n## INV-MONEY-002\n" }),
+    );
+
+    // The heading did not define anything, so the id in it is an unresolved
+    // citation — which is the loud outcome, not a silent second definition.
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("no file under docs/invariants/ defines it");
+  });
+});
+
+describe("tracked citation source extensions", () => {
+  it("loads every tracked text form by Git classification and excludes binary/untracked files", () => {
+    const repoRoot = initGitRepo();
+    const trackedText = {
+      "src/fixture.mts": "// See INV-MONEY-001.\n",
+      "src/fixture.cts": "// See INV-MONEY-001.\n",
+      "scripts/fixture.sh": "# See INV-MONEY-001.\n",
+      "config/fixture.toml": "rule = \"INV-MONEY-001\"\n",
+      "config/fixture.jsonc": "{ \"rule\": \"INV-MONEY-001\" }\n",
+      "fixtures/fixture.txt": "See INV-MONEY-001.\n",
+      "fixtures/fixture.html": "<p>See INV-MONEY-001.</p>\n",
+      Dockerfile: "# See INV-MONEY-001.\n",
+    };
+    commitFiles(repoRoot, "tracked text forms", {
+      ...Object.fromEntries(repo()),
+      ...trackedText,
+    });
+
+    const binaryPath = path.join(repoRoot, "fixtures", "fixture.bin");
+    writeFileSync(binaryPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff]));
+    git(repoRoot, "add", "fixtures/fixture.bin");
+    git(repoRoot, "commit", "-m", "tracked binary");
+    writeFileSync(
+      path.join(repoRoot, "fixtures", "untracked.txt"),
+      "See INV-MONEY-001.\n",
+      "utf8",
+    );
+
+    const files = loadTrackedFiles(repoRoot);
+
+    expect([...Object.keys(trackedText)].every((file) => files.has(file))).toBe(true);
+    expect(files.has("fixtures/fixture.bin")).toBe(false);
+    expect(files.has("fixtures/untracked.txt")).toBe(false);
+    expect(auditInvariantIds(files)).toEqual([]);
+  });
+
+  it("loads and audits the invariant citations in the migration safety TSV", () => {
+    const files = loadTrackedFiles(REPO_ROOT);
+    const safetyLedger = files.get("docs/BLUE_GREEN_MIGRATION_SAFETY.tsv");
+
+    expect(safetyLedger).toContain("INV-MOD-026");
+    expect(safetyLedger).toContain("INV-MOD-006");
+    expect(safetyLedger).toContain("INV-MOD-005");
+    expect(safetyLedger).toContain("INV-INT-017");
+    expect(auditInvariantIds(files)).toEqual([]);
+  });
+
+  it("fails a bad id planted in the tracked migration safety TSV", () => {
+    const files = loadTrackedFiles(REPO_ROOT);
+    const ledger = "docs/BLUE_GREEN_MIGRATION_SAFETY.tsv";
+    // One above the real INV-MOD maximum, not a far-out-of-range number: this
+    // fixture is greppable, and #2889 is the issue about a repo-wide grep
+    // returning an illustrative id and sending the next invariant to the wrong
+    // number. Misleading a grep by one — which density then catches — is the
+    // smallest lie this test can tell. See this file's fixture rule above.
+    //
+    // THEREFORE THIS NUMBER MOVES UP WHENEVER AN INV-MOD INVARIANT SHIPS, and
+    // whoever ships one has to move it. Being one above the maximum is the whole
+    // fixture: the moment the planted id becomes a real invariant it RESOLVES,
+    // the audit reports nothing, and this case fails with a bare "expected 1,
+    // got 0" that says nothing about why. The assertion below turns that into a
+    // readable failure, and it was earned — INV-MOD-027 shipped and this case
+    // went red on a branch whose author had no reason to look here. It went red
+    // a second time when #2789 split INV-MOD-027 and INV-MOD-028 into
+    // INV-MOD-029..054, which is the same lesson at scale: a split mints a
+    // whole range, so re-read this number after one.
+    // Moved up by the fourth `main`-into-epic sync: `main`'s #3219/#3257
+    // settle-time re-price rule arrived stacked inside INV-MOD-038 and was given
+    // its own id, INV-MOD-055, so the planted id had been taken. Stage 3 then
+    // allocated INV-MOD-056 for stored build-up selection. One above the
+    // maximum, and no further, exactly as the note above requires.
+    // Moved up again by #3497, which shipped INV-MOD-057: cancellable statuses
+    // have one home and the member-facing doors read a named subset of it.
+    // Moved up again by #3530 (2a), which shipped INV-MOD-058: an edit stores
+    // its delta as lines and every reader reads those rows.
+    // Moved up again by #3029, which shipped INV-MOD-059: a booking guest's
+    // dietary/allergy value is a snapshot seeded once and carried by identity.
+    // Moved up again by #4036, which shipped INV-MOD-060: an ordinary price
+    // ask's door and its recovery replay send one Stripe request.
+    // Moved up again by #4101, which shipped INV-MOD-061: an edit's card refund
+    // and its recovery replay send one Stripe request.
+    // Moved up again by #4924, which shipped INV-MOD-062: an edit settles only
+    // the figures its preview showed the member.
+    // Moved up again by fork triyder/AlpineClubBookingsNZ#133, which shipped INV-MOD-063: an officer's
+    // work-party correction on a started stay, and its Remove.
+    const planted = "INV-MOD-064";
+    // The precondition the fixture rests on. When this fails, `planted` has been
+    // taken by a real invariant: move it up one, and no further.
+    expect(files.get("docs/DOMAIN_INVARIANTS.md")).not.toContain(planted);
+    files.set(ledger, files.get(ledger).replace("INV-MOD-026", planted));
+
+    // Derived, not pinned: any row inserted above it by an unrelated PR would
+    // otherwise turn this into a red `verify` on a file this test does not own.
+    const expectedLine =
+      files.get(ledger).split("\n").findIndex((l) => l.includes(planted)) + 1;
+
+    const problems = auditInvariantIds(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain(planted);
+    expect(problems[0]).toContain(`${ledger}:${expectedLine}`);
+  });
+});
+
+describe("auditNumberSequences", () => {
+  it("passes the clean fixture repository", () => {
+    expect(auditNumberSequences(repo())).toEqual([]);
+  });
+
+  it("passes a prefix whose numbers run 001 upwards with no gaps", () => {
+    const problems = auditNumberSequences(
+      repo({ "docs/invariants/money.md": family("MONEY", ["001", "002", "003"]) }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("fails the #2889 case: a new id that skipped to the number a grep suggested", () => {
+    // The incident, to scale: a family ran 001-032 and a branch took 042,
+    // because the only place 041 appeared in the repository was a fenced example
+    // in SCHEME.md and the maximum was read off a repo-wide grep rather than off
+    // the index.
+    //
+    // The fixture uses a prefix this repository does not declare, deliberately.
+    // Writing the real one here would put an invented number under a live prefix
+    // back into the tree, where the next grep would find it and read it as the
+    // maximum — which is the whole mistake. SCHEME.md §1.4 states the rule.
+    const numbers = Array.from({ length: 32 }, (_, i) => String(i + 1).padStart(3, "0"));
+    const problems = auditNumberSequences(
+      repo({ "docs/invariants/demo.md": family("DEMO", [...numbers, "042"]) }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-DEMO is missing 033-041");
+    expect(problems[0]).toContain("its highest is INV-DEMO-042 (docs/invariants/demo.md:");
+    expect(problems[0]).toContain("renumber it to INV-DEMO-033");
+    // The diagnosis, not just the verdict: this is the mistake that made it.
+    expect(problems[0]).toContain("grep");
+  });
+
+  it("reports several gaps as compressed runs rather than a wall of numbers", () => {
+    const problems = auditNumberSequences(
+      repo({
+        "docs/invariants/money.md": family("MONEY", ["001", "005", "006", "009"]),
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("missing 002-004, 007-008");
+  });
+
+  it("fails a prefix that does not start at 001", () => {
+    const problems = auditNumberSequences(
+      repo({ "docs/invariants/money.md": family("MONEY", ["003", "004"]) }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY starts at INV-MONEY-003");
+    expect(problems[0]).toContain("not 001");
+  });
+
+  it("reports a bad start and an interior hole separately, so both get fixed", () => {
+    const problems = auditNumberSequences(
+      repo({ "docs/invariants/money.md": family("MONEY", ["002", "004"]) }),
+    );
+
+    expect(problems).toHaveLength(2);
+    expect(problems[0]).toContain("starts at INV-MONEY-002");
+    expect(problems[1]).toContain("missing 003");
+  });
+
+  it("checks each prefix on its own, not the numbers across all of them", () => {
+    // A prefix is a namespace: INV-CAP-001 existing says nothing about INV-MONEY.
+    const problems = auditNumberSequences(
+      repo({ "docs/invariants/beds.md": family("CAP", ["001", "002"]) }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("ignores an id in a fenced example, which is what a document shows one in", () => {
+    // Far out of range on purpose: were the fence scanned, the family would run
+    // 001 then 742 and this would report a 740-number hole. The prefix is one
+    // this repository does not declare, so the fixture cannot itself become the
+    // bait — which is the whole subject of #2889.
+    const problems = auditNumberSequences(
+      repo({
+        "docs/invariants/demo.md": `${family("DEMO", ["001"])}\n\`\`\`\n## INV-DEMO-742\n\`\`\`\n`,
+      }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("fails the whole check, not just this assertion in isolation", () => {
+    const files = repo({
+      "docs/invariants/money.md": family("MONEY", ["001", "004"]),
+    });
+    files.set(
+      "docs/DOMAIN_INVARIANTS.md",
+      `${files.get("docs/DOMAIN_INVARIANTS.md")}| \`INV-MONEY-004\` | A rule |\n`,
+    );
+
+    expect(auditDocs(files).some((p) => p.includes("INV-MONEY is missing 002-003"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("auditPermanentInvariantIds", () => {
+  it("fails deletion of the highest id even though the current sequence stays dense", () => {
+    const baseline = repo({
+      "docs/invariants/money.md": family("MONEY", ["001", "002", "003"]),
+    });
+    const current = repo({
+      "docs/invariants/money.md": family("MONEY", ["001", "002"]),
+    });
+
+    expect(auditNumberSequences(current)).toEqual([]);
+    const problems = auditPermanentInvariantIds(current, baseline, "base123");
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY-003 disappeared relative to base123");
+    expect(problems[0]).toContain("highest number");
+  });
+
+  it("fails deletion of a whole prefix, which a current-tree census cannot see", () => {
+    const baseline = repo({
+      "docs/invariants/beds.md": family("CAP", ["001", "002"]),
+    });
+    const current = repo();
+
+    const problems = auditPermanentInvariantIds(current, baseline, "base123");
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("entire INV-CAP prefix disappeared");
+    expect(problems[0]).toContain("INV-CAP-001, INV-CAP-002");
+  });
+
+  it("accepts a retained heading whose rule is retired in place", () => {
+    const baseline = repo({
+      "docs/invariants/money.md": family("MONEY", ["001", "002"]),
+    });
+    const current = repo({
+      "docs/invariants/money.md":
+        `${family("MONEY", ["001"])}\n## INV-MONEY-002\n\n**Retired: no longer applies.**\n`,
+    });
+
+    expect(auditPermanentInvariantIds(current, baseline)).toEqual([]);
+  });
+
+  it("is wired into the whole audit", () => {
+    const baseline = repo({
+      "docs/invariants/money.md": family("MONEY", ["001", "002"]),
+    });
+    const current = repo();
+
+    const problems = auditDocs(current, { baselineFiles: baseline, baselineLabel: "base123" });
+    expect(problems.some((problem) => problem.includes("INV-MONEY-002 disappeared"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("invariant baseline resolution and loading", () => {
+  it("uses the exact pull-request event base SHA instead of a moving main ref", () => {
+    const repoRoot = initGitRepo();
+    const base = commitFiles(repoRoot, "base", {
+      "docs/invariants/money.md": "# Money\n\n## INV-MONEY-001\n",
+    });
+    git(repoRoot, "checkout", "-b", "feature");
+    commitFiles(repoRoot, "feature", { "feature.txt": "feature\n" });
+    git(repoRoot, "checkout", "main");
+    const movedMain = commitFiles(repoRoot, "main moved", { "main.txt": "later\n" });
+    git(repoRoot, "checkout", "feature");
+
+    const resolved = resolveInvariantBaselineRef(
+      repoRoot,
+      checkerEnv({
+        GITHUB_BASE_REF: "main",
+        GITHUB_EVENT_NAME: "pull_request",
+        PR_BASE_SHA: base,
+      }),
+    );
+
+    expect(resolved).toBe(base);
+    expect(resolved).not.toBe(movedMain);
+  });
+
+  it("uses pull-request identity when synchronize also supplies webhook.before", () => {
+    const repoRoot = initGitRepo();
+    const base = commitFiles(repoRoot, "base", { "README.md": "base\n" });
+    const previousHead = commitFiles(repoRoot, "previous PR head", {
+      "feature.txt": "one\n",
+    });
+    commitFiles(repoRoot, "synchronized PR head", { "feature.txt": "two\n" });
+
+    expect(
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({
+          GITHUB_BASE_REF: "main",
+          GITHUB_EVENT_NAME: "pull_request",
+          PR_BASE_SHA: base,
+          PUSH_BASE_SHA: previousHead,
+        }),
+      ),
+    ).toBe(base);
+  });
+
+  it("fails closed when event identity is absent and both exact SHA fields are set", () => {
+    const repoRoot = initGitRepo();
+    const base = commitFiles(repoRoot, "base", { "README.md": "base\n" });
+
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({ PR_BASE_SHA: base, PUSH_BASE_SHA: base }),
+      ),
+    ).toThrow("Conflicting pull-request and push baseline identity");
+  });
+
+  it("fails closed when a pull-request event omits or names a missing base SHA", () => {
+    const repoRoot = initGitRepo();
+    commitFiles(repoRoot, "base", { "README.md": "# Repo\n" });
+
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({ GITHUB_BASE_REF: "main", GITHUB_EVENT_NAME: "pull_request" }),
+      ),
+    ).toThrow("PR_BASE_SHA is required");
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({
+          GITHUB_BASE_REF: "main",
+          GITHUB_EVENT_NAME: "pull_request",
+          PR_BASE_SHA: "refs/heads/not-fetched",
+        }),
+      ),
+    ).toThrow("PR_BASE_SHA refs/heads/not-fetched does not resolve to a commit");
+  });
+
+  describe("a pull request compares with its branch point, not the base's later tip (#5156)", () => {
+    const prEnv = (base) =>
+      checkerEnv({ GITHUB_BASE_REF: "main", GITHUB_EVENT_NAME: "pull_request", PR_BASE_SHA: base });
+    const tree = (repoRoot) => loadInvariantFilesAtRef(repoRoot, "HEAD");
+    const removed = (repoRoot, baseline) =>
+      auditPermanentInvariantIds(tree(repoRoot), loadInvariantFilesAtRef(repoRoot, baseline), baseline);
+
+    /** main defines MONEY-001; a branch is cut; main then gains MONEY-002. */
+    function behindBranch() {
+      const repoRoot = initGitRepo();
+      const branchPoint = commitFiles(repoRoot, "base", {
+        "docs/invariants/money.md": family("MONEY", ["001"]),
+      });
+      git(repoRoot, "checkout", "-b", "feature");
+      commitFiles(repoRoot, "feature", { "feature.txt": "feature\n" });
+      git(repoRoot, "checkout", "main");
+      const baseTip = commitFiles(repoRoot, "main gains an id", {
+        "docs/invariants/money.md": family("MONEY", ["001", "002"]),
+      });
+      git(repoRoot, "checkout", "feature");
+      return { repoRoot, branchPoint, baseTip };
+    }
+
+    it("passes a branch that is only behind a base which gained an id", () => {
+      const { repoRoot, branchPoint, baseTip } = behindBranch();
+      const resolved = resolveInvariantBaselineRef(repoRoot, prEnv(baseTip));
+      expect(resolved).toBe(branchPoint);
+      expect(removed(repoRoot, resolved)).toEqual([]);
+      // The defect this replaces: against the tip, MONEY-002 "disappeared".
+      expect(removed(repoRoot, baseTip).join("\n")).toContain("INV-MONEY-002 disappeared");
+    });
+
+    it("falls back to the base tip when the branch has more than one merge base, so a deletion cannot pick the kinder one", () => {
+      // feature is stacked on a side commit A1; main adds MONEY-002 (M1); feature
+      // merges M1; main merges A1 and moves on. feature and main's tip now share
+      // two merge bases, M1 (has 002) and A1 (never had it). feature deletes 002.
+      const repoRoot = initGitRepo();
+      commitFiles(repoRoot, "base", { "docs/invariants/money.md": family("MONEY", ["001"]) });
+      git(repoRoot, "checkout", "-b", "side");
+      commitFiles(repoRoot, "A1", { "side.txt": "side\n" });
+      git(repoRoot, "checkout", "-b", "feature");
+      git(repoRoot, "checkout", "main");
+      commitFiles(repoRoot, "M1 adds an id", { "docs/invariants/money.md": family("MONEY", ["001", "002"]) });
+      git(repoRoot, "checkout", "feature");
+      git(repoRoot, "merge", "--no-edit", "main");
+      git(repoRoot, "checkout", "main");
+      git(repoRoot, "merge", "--no-edit", "side");
+      const baseTip = commitFiles(repoRoot, "main moves on", { "main.txt": "main\n" });
+      git(repoRoot, "checkout", "feature");
+      commitFiles(repoRoot, "feature deletes the id", { "docs/invariants/money.md": family("MONEY", ["001"]) });
+
+      const resolved = resolveInvariantBaselineRef(repoRoot, prEnv(baseTip));
+      expect(resolved).toBe(baseTip);
+      expect(removed(repoRoot, resolved).join("\n")).toContain("INV-MONEY-002 disappeared");
+    });
+
+    it("still fails a branch that removes an id present at its branch point, naming it", () => {
+      const { repoRoot, baseTip } = behindBranch();
+      commitFiles(repoRoot, "delete an id", {
+        "docs/invariants/money.md": family("MONEY", ["002"]),
+      });
+      const resolved = resolveInvariantBaselineRef(repoRoot, prEnv(baseTip));
+      const problems = removed(repoRoot, resolved);
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("INV-MONEY-001 disappeared");
+    });
+
+    it("is unchanged when HEAD is the merge commit: the baseline is PR_BASE_SHA itself", () => {
+      const { repoRoot, baseTip } = behindBranch();
+      git(repoRoot, "checkout", "--detach", baseTip);
+      git(repoRoot, "merge", "--no-ff", "-m", "merge feature", "feature");
+      expect(resolveInvariantBaselineRef(repoRoot, prEnv(baseTip))).toBe(baseTip);
+      expect(removed(repoRoot, baseTip)).toEqual([]);
+      // Once the branch contains the base's new id, it is answerable for it.
+      commitFiles(repoRoot, "drop the base's new id", {
+        "docs/invariants/money.md": family("MONEY", ["001"]),
+      });
+      const resolved = resolveInvariantBaselineRef(repoRoot, prEnv(baseTip));
+      expect(resolved).toBe(baseTip);
+      expect(removed(repoRoot, resolved).join("\n")).toContain("INV-MONEY-002 disappeared");
+    });
+
+    it("fails closed when HEAD and PR_BASE_SHA share no merge base", () => {
+      const repoRoot = initGitRepo();
+      const base = commitFiles(repoRoot, "base", {
+        "docs/invariants/money.md": family("MONEY", ["001"]),
+      });
+      git(repoRoot, "checkout", "--orphan", "unrelated");
+      git(repoRoot, "rm", "-rqf", ".");
+      commitFiles(repoRoot, "unrelated root", { "README.md": "unrelated\n" });
+      expect(() => resolveInvariantBaselineRef(repoRoot, prEnv(base))).toThrow(
+        /share no merge base.*fetch-depth: 0/,
+      );
+      // The same with no event name, where PR_BASE_SHA alone identifies a PR.
+      expect(() =>
+        resolveInvariantBaselineRef(repoRoot, checkerEnv({ PR_BASE_SHA: base })),
+      ).toThrow("share no merge base");
+    });
+
+    it("uses the branch point when PR identity is inferred without an event name", () => {
+      const { repoRoot, branchPoint, baseTip } = behindBranch();
+      expect(
+        resolveInvariantBaselineRef(repoRoot, checkerEnv({ GITHUB_BASE_REF: "main", PR_BASE_SHA: baseTip })),
+      ).toBe(branchPoint);
+    });
+
+    it("still refuses DOC_INDEX_BASE_REF and a missing PR_BASE_SHA on a behind branch", () => {
+      const { repoRoot, baseTip } = behindBranch();
+      expect(() =>
+        resolveInvariantBaselineRef(repoRoot, { ...prEnv(baseTip), DOC_INDEX_BASE_REF: "HEAD" }),
+      ).toThrow("DOC_INDEX_BASE_REF cannot be set for a pull-request event");
+      expect(() => resolveInvariantBaselineRef(repoRoot, prEnv(""))).toThrow(
+        "PR_BASE_SHA is required",
+      );
+    });
+
+    it("does not count an agent-doc ceiling the base changed after the branch point as set here", () => {
+      // The ceiling audit reads the same baseline. The branch left A's loose row
+      // alone; main later tightened it. Against main's tip the branch would be
+      // blamed for a row it never wrote.
+      const prose = (n) => Array.from({ length: n }, (_, i) => `w${i + 1}`).join(" ");
+      const register = (ceiling) =>
+        ["# Word budgets", "", "## Agent docs", "", "| File | Ceiling |", "| --- | ---: |",
+          `| \`docs/agents/A.md\` | ${ceiling} |`, ""].join("\n");
+      const repoRoot = initGitRepo();
+      commitFiles(repoRoot, "base", {
+        [WORD_BUDGET_REGISTER]: register(101 + AGENT_DOC_BUDGET_SLACK),
+        "docs/agents/A.md": prose(100),
+      });
+      git(repoRoot, "checkout", "-b", "feature");
+      commitFiles(repoRoot, "feature", { "feature.txt": "feature\n" });
+      git(repoRoot, "checkout", "main");
+      const baseTip = commitFiles(repoRoot, "main tightens", { [WORD_BUDGET_REGISTER]: register(100) });
+      git(repoRoot, "checkout", "feature");
+      const head = new Map([...tree(repoRoot), ["docs/agents/A.md", prose(100)]]);
+      const resolved = resolveInvariantBaselineRef(repoRoot, prEnv(baseTip));
+      expect(auditAgentDocWordBudgets(head, loadInvariantFilesAtRef(repoRoot, resolved))).toEqual([]);
+      expect(auditAgentDocWordBudgets(head, loadInvariantFilesAtRef(repoRoot, baseTip))).toHaveLength(1);
+    });
+  });
+
+  it("fails an invalid explicit diagnostic baseline instead of falling back", () => {
+    const repoRoot = initGitRepo();
+    commitFiles(repoRoot, "base", { "README.md": "# Repo\n" });
+
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({ DOC_INDEX_BASE_REF: "refs/heads/not-fetched" }),
+      ),
+    ).toThrow("DOC_INDEX_BASE_REF refs/heads/not-fetched does not resolve to a commit");
+  });
+
+  it("fails closed rather than letting a diagnostic override replace an event base", () => {
+    const repoRoot = initGitRepo();
+    const base = commitFiles(repoRoot, "base", { "README.md": "base\n" });
+    commitFiles(repoRoot, "head", { "README.md": "head\n" });
+
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({
+          DOC_INDEX_BASE_REF: "HEAD",
+          GITHUB_BASE_REF: "main",
+          GITHUB_EVENT_NAME: "pull_request",
+          PR_BASE_SHA: base,
+        }),
+      ),
+    ).toThrow("DOC_INDEX_BASE_REF cannot be set for a pull-request event");
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({
+          DOC_INDEX_BASE_REF: "HEAD",
+          GITHUB_EVENT_NAME: "push",
+          GITHUB_REF: "refs/heads/main",
+          PUSH_BASE_SHA: base,
+        }),
+      ),
+    ).toThrow("DOC_INDEX_BASE_REF cannot be set for a main-push event");
+  });
+
+  it("fails when an exact event SHA is absent from a shallow checkout", () => {
+    const source = initGitRepo();
+    const base = commitFiles(source, "base", { "README.md": "base\n" });
+    commitFiles(source, "tip", { "README.md": "tip\n" });
+    const cloneParent = mkdtempSync(path.join(tmpdir(), "doc-index-shallow-"));
+    TEMP_ROOTS.add(cloneParent);
+    const shallow = path.join(cloneParent, "repo");
+    execFileSync(
+      "git",
+      ["clone", "--depth", "1", pathToFileURL(source).href, shallow],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    expect(() =>
+      resolveInvariantBaselineRef(
+        shallow,
+        checkerEnv({ GITHUB_EVENT_NAME: "pull_request", PR_BASE_SHA: base }),
+      ),
+    ).toThrow(`PR_BASE_SHA ${base} does not resolve to a commit`);
+  });
+
+  it("uses a local feature branch's merge-base, never its first parent", () => {
+    const repoRoot = initGitRepo();
+    const base = commitFiles(repoRoot, "base", { "README.md": "base\n" });
+    git(repoRoot, "checkout", "-b", "feature");
+    const featureParent = commitFiles(repoRoot, "feature one", {
+      "feature.txt": "one\n",
+    });
+    commitFiles(repoRoot, "feature two", { "feature.txt": "two\n" });
+    git(repoRoot, "checkout", "main");
+    commitFiles(repoRoot, "main moved", { "main.txt": "later\n" });
+    git(repoRoot, "checkout", "feature");
+
+    const resolved = resolveInvariantBaselineRef(repoRoot, checkerEnv());
+
+    expect(resolved).toBe(base);
+    expect(resolved).not.toBe(featureParent);
+  });
+
+  it("does not use HEAD^1 when no main ref exists on a feature branch", () => {
+    const repoRoot = initGitRepo("feature");
+    commitFiles(repoRoot, "one", { "README.md": "one\n" });
+    commitFiles(repoRoot, "two", { "README.md": "two\n" });
+
+    expect(() => resolveInvariantBaselineRef(repoRoot, checkerEnv())).toThrow(
+      "HEAD^1 is deliberately not a feature-branch fallback",
+    );
+  });
+
+  it("uses the exact main-push before SHA and fails when that event SHA is absent", () => {
+    const repoRoot = initGitRepo();
+    const before = commitFiles(repoRoot, "before", { "README.md": "before\n" });
+    commitFiles(repoRoot, "after", { "README.md": "after\n" });
+    const pushEnv = {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/heads/main",
+    };
+
+    expect(
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({ ...pushEnv, PUSH_BASE_SHA: before }),
+      ),
+    ).toBe(before);
+    expect(() =>
+      resolveInvariantBaselineRef(repoRoot, checkerEnv(pushEnv)),
+    ).toThrow("PUSH_BASE_SHA is required");
+  });
+
+  it("uses the exact before SHA for a push to an epic/** integration branch", () => {
+    // #3002 put `push: branches: [epic/**]` on ci.yml, which made this path
+    // reachable for the first time. Before the widening this threw, so `verify`
+    // — a required check — died about twenty seconds in on EVERY epic-branch
+    // push, every time.
+    const repoRoot = initGitRepo();
+    const before = commitFiles(repoRoot, "before", { "README.md": "before\n" });
+    git(repoRoot, "checkout", "-b", "epic/2988-club-time");
+    commitFiles(repoRoot, "a child merged", { "README.md": "after\n" });
+
+    expect(
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({
+          GITHUB_EVENT_NAME: "push",
+          GITHUB_REF: "refs/heads/epic/2988-club-time",
+          GITHUB_REF_NAME: "epic/2988-club-time",
+          PUSH_BASE_SHA: before,
+        }),
+      ),
+    ).toBe(before);
+  });
+
+  it("takes the branch point when the push CREATED the epic branch", () => {
+    // A ref-creating push carries an all-zero `before`, and epic branches are
+    // created routinely now. Resolving that as a commit fails, so the branch
+    // point against main is used instead — which is exactly the set of ids the
+    // branch is answerable for retaining. It must NOT be HEAD^1, which can
+    // postdate a deletion made earlier in the same push.
+    const repoRoot = initGitRepo();
+    const branchPoint = commitFiles(repoRoot, "main tip", { "README.md": "main\n" });
+    git(repoRoot, "checkout", "-b", "epic/2988-club-time");
+    const firstChild = commitFiles(repoRoot, "child one", { "child.txt": "one\n" });
+    commitFiles(repoRoot, "child two", { "child.txt": "two\n" });
+
+    const epicPush = {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/heads/epic/2988-club-time",
+      GITHUB_REF_NAME: "epic/2988-club-time",
+    };
+
+    const fromAllZero = resolveInvariantBaselineRef(
+      repoRoot,
+      checkerEnv({ ...epicPush, PUSH_BASE_SHA: "0".repeat(40) }),
+    );
+    expect(fromAllZero).toBe(branchPoint);
+    expect(fromAllZero).not.toBe(firstChild);
+    // Same answer when the workflow supplies no before at all.
+    expect(resolveInvariantBaselineRef(repoRoot, checkerEnv(epicPush))).toBe(branchPoint);
+  });
+
+  it("still refuses a push to a ref that is neither main nor epic/**", () => {
+    // The widening is precise, not an opening. A feature branch's push carries a
+    // `before` this check cannot interpret as an invariant-retention baseline,
+    // so it fails closed exactly as it did.
+    const repoRoot = initGitRepo();
+    const before = commitFiles(repoRoot, "before", { "README.md": "before\n" });
+    git(repoRoot, "checkout", "-b", "feature/x");
+    commitFiles(repoRoot, "work", { "README.md": "after\n" });
+
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({
+          GITHUB_EVENT_NAME: "push",
+          GITHUB_REF: "refs/heads/feature/x",
+          GITHUB_REF_NAME: "feature/x",
+          PUSH_BASE_SHA: before,
+        }),
+      ),
+    ).toThrow("supported only for pushes to main or an epic/** integration branch");
+  });
+
+  it("refuses an all-zero before on main, which a push cannot create", () => {
+    const repoRoot = initGitRepo();
+    commitFiles(repoRoot, "before", { "README.md": "before\n" });
+    commitFiles(repoRoot, "after", { "README.md": "after\n" });
+
+    expect(() =>
+      resolveInvariantBaselineRef(
+        repoRoot,
+        checkerEnv({
+          GITHUB_EVENT_NAME: "push",
+          GITHUB_REF: "refs/heads/main",
+          GITHUB_REF_NAME: "main",
+          PUSH_BASE_SHA: "0".repeat(40),
+        }),
+      ),
+    ).toThrow("PUSH_BASE_SHA is the all-zero object id");
+  });
+
+  it("loads invariant files from the resolved revision and rejects a missing ref", () => {
+    const repoRoot = initGitRepo();
+    const base = commitFiles(repoRoot, "base", {
+      "docs/invariants/money.md": "# Money\n\nbase text\n",
+    });
+    commitFiles(repoRoot, "head", {
+      "docs/invariants/money.md": "# Money\n\nhead text\n",
+    });
+
+    const loaded = loadInvariantFilesAtRef(repoRoot, base);
+
+    expect(loaded.get("docs/invariants/money.md")).toContain("base text");
+    expect(loaded.get("docs/invariants/money.md")).not.toContain("head text");
+    expect(() => loadInvariantFilesAtRef(repoRoot, "refs/heads/not-fetched")).toThrow(
+      "Invariant baseline ref refs/heads/not-fetched does not resolve to a commit",
+    );
+  });
+});
+
+/**
+ * How long a CLI spawn in this describe may take.
+ *
+ * These cases spawn the real checker over the REAL repository, so their runtime
+ * grows with the repository rather than with the test. That made the previous
+ * 15s an expiring limit rather than a limit: on the merge of #3491, #3546 and
+ * #3549 the checker crossed it and reddened `main` — measured at 15044ms for
+ * the case that failed, beside 13886ms for its sibling, which passed with a
+ * second to spare. Nothing was wrong with either test; there were simply more
+ * files to scan than when 15s was chosen.
+ *
+ * So the number is defined once, here, and set with real headroom over the
+ * slowest observed run rather than just above it. If this ever needs raising
+ * again, first ask whether the checker has got slower per file — a limit that
+ * has to be raised twice is telling you about the thing it is timing, not about
+ * itself.
+ */
+const CLI_SPAWN_TIMEOUT_MS = 45_000;
+
+describe("doc-index CLI baseline wiring", () => {
+  it(
+    "passes a real pull-request synchronize shape whose webhook.before is populated",
+    () => {
+      const eventRoot = mkdtempSync(path.join(tmpdir(), "doc-index-event-"));
+      TEMP_ROOTS.add(eventRoot);
+      const eventPath = path.join(eventRoot, "event.json");
+      const event = {
+        action: "synchronize",
+        after: repoRevision("HEAD"),
+        before: repoRevision("HEAD^1"),
+        number: 2891,
+        pull_request: {
+          base: { ref: "main", sha: repoRevision("origin/main") },
+          head: { sha: repoRevision("HEAD") },
+        },
+      };
+      writeFileSync(eventPath, `${JSON.stringify(event)}\n`, "utf8");
+      const synchronize = JSON.parse(readFileSync(eventPath, "utf8"));
+
+      const result = spawnSync(process.execPath, [CHECKER_PATH], {
+        cwd: REPO_ROOT,
+        encoding: "utf8",
+        env: checkerEnv({
+          GITHUB_BASE_REF: synchronize.pull_request.base.ref,
+          GITHUB_EVENT_NAME: "pull_request",
+          GITHUB_EVENT_PATH: eventPath,
+          PR_BASE_SHA: synchronize.pull_request.base.sha,
+          // This is exactly what the workflow's github.event.before mapping
+          // receives for a synchronize payload. It is a previous PR head, not
+          // evidence that this is also a push event.
+          PUSH_BASE_SHA: synchronize.before,
+        }),
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("every id present at base");
+    },
+    CLI_SPAWN_TIMEOUT_MS,
+  );
+
+  it("fails closed at the CLI when an event base SHA is missing", () => {
+    const result = spawnSync(process.execPath, [CHECKER_PATH], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: checkerEnv({
+        GITHUB_BASE_REF: "main",
+        GITHUB_EVENT_NAME: "pull_request",
+        PR_BASE_SHA: "refs/heads/not-fetched",
+      }),
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "PR_BASE_SHA refs/heads/not-fetched does not resolve to a commit",
+    );
+  });
+
+  it(
+    "passes through the CLI with a valid explicit exact baseline",
+    () => {
+      const result = spawnSync(process.execPath, [CHECKER_PATH], {
+        cwd: REPO_ROOT,
+        encoding: "utf8",
+        env: checkerEnv({ DOC_INDEX_BASE_REF: "HEAD" }),
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("every id present at base");
+    },
+    CLI_SPAWN_TIMEOUT_MS,
+  );
+
+  it("fails closed at the CLI when a process override collides with PR identity", () => {
+    const result = spawnSync(process.execPath, [CHECKER_PATH], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: checkerEnv({
+        DOC_INDEX_BASE_REF: "HEAD",
+        GITHUB_BASE_REF: "main",
+        GITHUB_EVENT_NAME: "pull_request",
+        PR_BASE_SHA: repoRevision("origin/main"),
+      }),
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "DOC_INDEX_BASE_REF cannot be set for a pull-request event",
+    );
+  });
+
+  it("wires the immutable base SHAs into the CI doc-index step (main push: the last judged main commit)", () => {
+    const workflow = readFileSync(path.join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    const start = workflow.indexOf(
+      "- name: Check doc index integrity (reachability + invariant ids)",
+    );
+    const end = workflow.indexOf("- name: Install dependencies", start);
+    const step = workflow.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(step.match(/^ {10}PR_BASE_SHA:.*$/gm)).toEqual([
+      "          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}",
+    ]);
+    expect(step.match(/^ {10}PUSH_BASE_SHA:.*$/gm)).toEqual([
+      "          PUSH_BASE_SHA: ${{ steps.main-push-base.outputs.sha || github.event.before }}",
+    ]);
+    expect(step.match(/^ {8}env:\s*$/gm)).toHaveLength(1);
+    expect(step.match(/^ {8}run:.*$/gm)).toEqual([
+      "        run: node scripts/ci/check-doc-index-integrity.mjs",
+    ]);
+    expect(workflow).not.toContain("DOC_INDEX_BASE_REF");
+  });
+});
+
+describe("auditInvariantFilesLinkedFromIndex", () => {
+  it("fails an invariant file the index does not name", () => {
+    const files = repo({
+      "docs/invariants/orphan.md": "# Orphan\n\n## INV-MONEY-002\n\n- A rule.\n",
+    });
+    // Keep the index catalogue honest so this test isolates the link rule.
+    files.set(
+      "docs/DOMAIN_INVARIANTS.md",
+      `${files.get("docs/DOMAIN_INVARIANTS.md")}| \`INV-MONEY-002\` | A rule |\n`,
+    );
+
+    const problems = auditInvariantFilesLinkedFromIndex(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/invariants/orphan.md");
+  });
+
+  it("fails loudly when the index itself is gone", () => {
+    const files = repo();
+    files.delete("docs/DOMAIN_INVARIANTS.md");
+
+    expect(auditInvariantFilesLinkedFromIndex(files)[0]).toContain("is missing");
+  });
+});
+
+describe("auditIndexRows", () => {
+  it.each(["", " ", "  ", "   "])(
+    "accepts a valid GFM index row with %s leading spaces",
+    (indent) => {
+      const files = repo();
+      files.set(
+        "docs/DOMAIN_INVARIANTS.md",
+        files
+          .get("docs/DOMAIN_INVARIANTS.md")
+          .replace("| `INV-MONEY-001`", `${indent}| \`INV-MONEY-001\``),
+      );
+
+      expect(auditIndexRows(files)).toEqual([]);
+    },
+  );
+
+  it("fails a defined id with no catalogue row", () => {
+    const files = repo({
+      "docs/invariants/money.md": [
+        "# Money",
+        "",
+        "## INV-MONEY-001",
+        "",
+        "- Cents.",
+        "",
+        "## INV-MONEY-002",
+        "",
+        "- Also cents.",
+        "",
+      ].join("\n"),
+    });
+
+    const problems = auditIndexRows(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY-002");
+    expect(problems[0]).toContain("no row");
+  });
+
+  it("fails a catalogue row whose definition does not exist", () => {
+    const files = repo();
+    files.set(
+      "docs/DOMAIN_INVARIANTS.md",
+      `${files.get("docs/DOMAIN_INVARIANTS.md")}| \`INV-MONEY-002\` | Vanished |\n`,
+    );
+
+    const problems = auditIndexRows(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-MONEY-002");
+    expect(problems[0]).toContain("nothing under docs/invariants/ defines it");
+  });
+
+  it("fails a duplicated catalogue row", () => {
+    const files = repo();
+    files.set(
+      "docs/DOMAIN_INVARIANTS.md",
+      `${files.get("docs/DOMAIN_INVARIANTS.md")}| \`INV-MONEY-001\` | Listed twice |\n`,
+    );
+
+    const problems = auditIndexRows(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("2 rows");
+  });
+
+  it("fails a three-space-indented duplicate row through the whole audit", () => {
+    const files = repo();
+    files.set(
+      "docs/DOMAIN_INVARIANTS.md",
+      `${files.get("docs/DOMAIN_INVARIANTS.md")}   | \`INV-MONEY-001\` | Listed twice |\n`,
+    );
+
+    const problems = auditDocs(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("2 rows");
+  });
+
+  it("does not count an id used as an illustration in the index's own prose", () => {
+    const files = repo();
+    files.set(
+      "docs/DOMAIN_INVARIANTS.md",
+      `${files.get("docs/DOMAIN_INVARIANTS.md")}\nCite ids, never line numbers: \`INV-MONEY-001\` stays valid.\n`,
+    );
+
+    expect(auditIndexRows(files)).toEqual([]);
+  });
+});
+
+describe("auditDocReachability", () => {
+  it("fails a docs page nothing links to", () => {
+    const problems = auditDocReachability(
+      repo({ "docs/lonely/notes.md": "# Notes\n" }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/lonely/notes.md");
+  });
+
+  it("accepts a page reached through a chain of hubs", () => {
+    const problems = auditDocReachability(
+      repo({
+        "docs/README.md":
+          "# Docs\n\n- [Domain invariants](DOMAIN_INVARIANTS.md)\n- [Lobby](lobby/README.md)\n",
+        "docs/lobby/README.md": "# Lobby\n\n- [ADR-1](decisions/ADR-001.md)\n",
+        "docs/lobby/decisions/ADR-001.md": "# ADR-001\n",
+      }),
+    );
+
+    expect(problems).toEqual([]);
+  });
+
+  it("ignores Markdown outside docs/", () => {
+    expect(auditDocReachability(repo({ "notes/scratch.md": "# Scratch\n" }))).toEqual([]);
+  });
+});
+
+describe("routingTableRows", () => {
+  it("takes the rows under the heading and stops at the next heading", () => {
+    const rows = routingTableRows(repo().get("AGENTS.md")).map((row) => row.text);
+
+    // Header row plus the one content row; the separator and the table under the
+    // NEXT heading are both left out.
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toContain("INV-MONEY");
+    expect(rows.join("\n")).not.toContain("Routing row");
+  });
+});
+
+describe("auditRoutingTable", () => {
+  it("passes a table whose prefixes and documents all resolve", () => {
+    expect(auditRoutingTable(repo())).toEqual([]);
+  });
+
+  it("fails a row that links to a document nobody tracks", () => {
+    const files = repo();
+    files.set(
+      "AGENTS.md",
+      files.get("AGENTS.md").replace("](docs/README.md)", "](docs/gone.md)"),
+    );
+
+    const problems = auditRoutingTable(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/gone.md");
+    expect(problems[0]).toContain("is not a tracked file");
+  });
+
+  it("fails a routed prefix that nothing declares (the typo case)", () => {
+    const files = repo();
+    files.set(
+      "AGENTS.md",
+      files.get("AGENTS.md").replace("`INV-MONEY`", "`INV-MONYE`"),
+    );
+
+    const problems = auditRoutingTable(files);
+
+    // Routed-but-undeclared, and declared-but-unrouted: both directions fire.
+    expect(problems).toHaveLength(2);
+    expect(problems[0]).toContain("routes INV-MONYE");
+    expect(problems[1]).toContain("INV-MONEY is declared");
+  });
+
+  it("fails a declared invariant family that no row sends anybody to", () => {
+    const files = repo({
+      "docs/invariants/beds.md": "# Beds\n\n## INV-CAP-001\n\n- A rule.\n",
+    });
+    files.set(
+      "docs/DOMAIN_INVARIANTS.md",
+      `${files.get("docs/DOMAIN_INVARIANTS.md")}| \`INV-CAP-001\` | A rule |\n`,
+    );
+
+    const problems = auditRoutingTable(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("INV-CAP is declared");
+    expect(problems[0]).toContain("no routing table row");
+  });
+
+  it("fails loudly if the heading it anchors on is renamed away", () => {
+    const files = repo();
+    files.set(
+      "AGENTS.md",
+      files.get("AGENTS.md").replace("### Routing table", "### Where to look"),
+    );
+
+    const problems = auditRoutingTable(files);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("No routing table found");
+  });
+});
+
+describe("auditStableIndexHeadings", () => {
+  /** An index carrying two pinned sections and one that is not pinned. */
+  function indexWith(headings) {
+    return repo({
+      "docs/DOMAIN_INVARIANTS.md": [
+        "# Domain Invariants",
+        "",
+        "File: [`money.md`](invariants/money.md).",
+        "",
+        ...headings.flatMap((heading) => [`## ${heading}`, "", "Text.", ""]),
+        "| ID | Covers |",
+        "| --- | --- |",
+        "| `INV-MONEY-001` | Store and calculate money as integer cents |",
+        "",
+      ].join("\n"),
+    });
+  }
+
+  it("passes when every pinned heading is present, verbatim", () => {
+    expect(
+      auditStableIndexHeadings(indexWith(["Money", "Operations"]), [
+        "Money",
+        "Operations",
+      ]),
+    ).toEqual([]);
+  });
+
+  it("lets the index add new sections that are not pinned", () => {
+    expect(
+      auditStableIndexHeadings(
+        indexWith(["Money", "Operations", "Product Configuration"]),
+        ["Money", "Operations"],
+      ),
+    ).toEqual([]);
+  });
+
+  it("fails a renamed heading, which is what silently breaks an outside anchor", () => {
+    const problems = auditStableIndexHeadings(
+      indexWith(["Money and cents", "Operations"]),
+      ["Money", "Operations"],
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('"## Money"');
+    expect(problems[0]).toContain("pre-split domain headings");
+  });
+
+  it("fails a heading whose only change is its capitalisation", () => {
+    // GitHub's anchor slugs are case-folded, so `#money` still resolves here —
+    // but `Member-Guest Consent` -> `Member-guest consent` does move the slug,
+    // and no rule distinguishes the two safely. Byte-identical is the promise.
+    const problems = auditStableIndexHeadings(indexWith(["money"]), ["Money"]);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('"## Money"');
+  });
+
+  it("refuses an empty pin list rather than reporting a pass it has not earned", () => {
+    const problems = auditStableIndexHeadings(indexWith(["Money"]), []);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("vacuous");
+  });
+
+  it("is opt-in through auditDocs, and fires when the option is supplied", () => {
+    // Both directions, because a conditional audit that main() forgets to wire
+    // is exactly as useless as no audit.
+    expect(auditDocs(indexWith(["Money and cents"]))).toEqual([]);
+    expect(
+      auditDocs(indexWith(["Money and cents"]), {
+        stableIndexHeadings: ["Money"],
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("pins ten headings that the real index really has", () => {
+    // The constant is only worth anything while it describes the tree. A
+    // heading dropped from the list AND from the index would otherwise agree
+    // with itself.
+    const files = loadTrackedFiles(REPO_ROOT);
+
+    expect(STABLE_INDEX_HEADINGS).toHaveLength(10);
+    expect(auditStableIndexHeadings(files, STABLE_INDEX_HEADINGS)).toEqual([]);
+  });
+
+  it("wires the pin into the CLI, not just into the exported audit", () => {
+    // The CLI is the only caller that runs in `verify`. Asserted against the
+    // source because `main()` resolves its own repo root and cannot be pointed
+    // at a fixture; a planted rename was run through the real CLI by hand and
+    // failed with the message above (#2720).
+    const checker = readFileSync(CHECKER_PATH, "utf8");
+
+    expect(checker).toContain("stableIndexHeadings: STABLE_INDEX_HEADINGS");
+  });
+});
+
+describe("auditLineNumberCitations", () => {
+  it("fails a line-number citation into the invariants index", () => {
+    const problems = auditLineNumberCitations(
+      repo({ "src/lib/money.ts": "// See docs/DOMAIN_INVARIANTS.md:120.\n" }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("src/lib/money.ts:1");
+    expect(problems[0]).toContain("docs/DOMAIN_INVARIANTS.md:120");
+    expect(problems[0]).toContain("LINE");
+  });
+
+  it("fails a line-RANGE citation into a domain file", () => {
+    const problems = auditLineNumberCitations(
+      repo({ "src/lib/money.ts": "// invariants/money.md:35-40 says so.\n" }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("invariants/money.md:35-40");
+  });
+
+  it("fails in the files that used to be grandfathered, like anywhere else", () => {
+    // These three carried the five pre-existing citations. They were fixed
+    // rather than registered, and the register was deleted, so a fresh citation
+    // here is now caught exactly like a fresh citation anywhere — this is the
+    // case an allowlist would have masked.
+    const problems = auditLineNumberCitations(
+      repo({
+        "src/lib/booking-request-quotes.ts": "// DOMAIN_INVARIANTS.md:35-40\n",
+        "src/lib/booking-request-shared.ts": "// DOMAIN_INVARIANTS.md:35-40\n",
+        "src/lib/ib-hold-clearing-audit.ts": "// DOMAIN_INVARIANTS.md:124-128\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(3);
+    expect(problems.map((p) => p.split(" ")[0])).toEqual([
+      "src/lib/booking-request-quotes.ts:1",
+      "src/lib/booking-request-shared.ts:1",
+      "src/lib/ib-hold-clearing-audit.ts:1",
+    ]);
+  });
+
+  it("fails every citation on a line, not just the first", () => {
+    const problems = auditLineNumberCitations(
+      repo({
+        "src/lib/money.ts":
+          "// DOMAIN_INVARIANTS.md:120 and invariants/money.md:900 disagree.\n",
+      }),
+    );
+
+    expect(problems).toHaveLength(2);
+    expect(problems[0]).toContain("DOMAIN_INVARIANTS.md:120");
+    expect(problems[1]).toContain("invariants/money.md:900");
+  });
+
+  it("points the reader at the id scheme rather than just refusing", () => {
+    const [problem] = auditLineNumberCitations(
+      repo({ "src/lib/money.ts": "// DOMAIN_INVARIANTS.md:120\n" }),
+    );
+
+    expect(problem).toContain("INV-CAP-021 style");
+    expect(problem).toContain("docs/DOMAIN_INVARIANTS.md");
+  });
+
+  it("ignores a fenced example", () => {
+    expect(
+      auditLineNumberCitations(
+        repo({ "docs/example.md": "# Example\n\n```\nDOMAIN_INVARIANTS.md:35-40\n```\n" }),
+      ),
+    ).toEqual([]);
+  });
+
+  it("ignores a line reference into a document that is not an invariants file", () => {
+    expect(
+      auditLineNumberCitations(
+        repo({ "src/lib/money.ts": "// See docs/ARCHITECTURE.md:120.\n" }),
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("auditEncoding", () => {
+  it("passes the clean fixture repository", () => {
+    expect(auditEncoding(repo())).toEqual([]);
+  });
+
+  it("fails a file that starts with a UTF-8 byte-order mark", () => {
+    const problems = auditEncoding(
+      repo({ "docs/example.md": `${BYTE_ORDER_MARK}# Example\n` }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/example.md");
+    expect(problems[0]).toContain("byte-order mark");
+    expect(problems[0]).toContain("UTF-8 without a BOM");
+  });
+
+  it("fails double-encoded text and explains where it comes from", () => {
+    const problems = auditEncoding(
+      repo({
+        "docs/example.md": `# Example\n\nOne rule ${MOJIBAKE_EM_DASH} and no more.\n`,
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/example.md:3");
+    expect(problems[0]).toContain("mojibake");
+    expect(problems[0]).toContain("cp1252");
+  });
+
+  it("catches the non-breaking-space signature too", () => {
+    const problems = auditEncoding(
+      repo({ "docs/example.md": `# Example\n\n$10${MOJIBAKE_NBSP}per night.\n` }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/example.md:3");
+  });
+
+  it("stays quiet on legitimate non-ASCII text", () => {
+    // Real prose in this repository: em dashes, curly quotes, te reo macrons and
+    // the odd accented name. None of them forms a lead+trail pair.
+    const prose = [
+      "# Example",
+      "",
+      "Tokoroa Alpine Club — the club's “house style” uses em dashes.",
+      "Māori place names carry macrons: Whakatāne, Tūrangi.",
+      "A café in Zürich costs £5 – or €6.",
+      "",
+    ].join("\n");
+
+    expect(auditEncoding(repo({ "docs/example.md": prose }))).toEqual([]);
+  });
+});
+
+// The findings this takes are produced by `findInvalidUtf8Bytes`, which reads
+// the raw buffer; these cases exercise the MESSAGE, and the scan itself is
+// covered by the repository-wide run in the integration test below. Byte values
+// are written as numbers, never as characters, so this file stays valid UTF-8
+// while describing text that is not — the same discipline the control-character
+// cases above follow.
+describe("auditInvalidUtf8Bytes", () => {
+  it("says nothing when every tracked file decoded cleanly", () => {
+    expect(auditInvalidUtf8Bytes([])).toEqual([]);
+  });
+
+  it("names the file, the byte offset and the byte, because none of them is visible", () => {
+    const problems = auditInvalidUtf8Bytes([
+      { path: "src/lib/example.ts", byteOffset: 412, byte: 0x97 },
+    ]);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("src/lib/example.ts");
+    expect(problems[0]).toContain("byte 412");
+    expect(problems[0]).toContain("0x97");
+    expect(problems[0]).toContain("cp1252");
+  });
+
+  it("explains why the other encoding checks cannot see it", () => {
+    const [problem] = auditInvalidUtf8Bytes([
+      { path: "docs/example.md", byteOffset: 0, byte: 0xff },
+    ]);
+
+    expect(problem).toContain("0xff");
+    expect(problem).toContain("after the decode");
+  });
+
+  it("reports one file per finding, in path order", () => {
+    const problems = auditInvalidUtf8Bytes([
+      { path: "src/z.ts", byteOffset: 1, byte: 0x91 },
+      { path: "src/a.ts", byteOffset: 2, byte: 0x92 },
+    ]);
+
+    expect(problems).toHaveLength(2);
+    expect(problems[0]).toContain("src/a.ts");
+    expect(problems[1]).toContain("src/z.ts");
+  });
+});
+
+// Every control byte below is CONSTRUCTED from its code point, never typed as a
+// literal. That is the rule this check enforces, and obeying it here is what
+// keeps this test file itself scannable: a literal 0x08 in a fixture would make
+// the suite fail its own subject when the real repository is scanned.
+const ctrl = (codePoint) => String.fromCharCode(codePoint);
+
+describe("auditControlCharacters", () => {
+  it("passes the clean fixture repository", () => {
+    expect(auditControlCharacters(repo())).toEqual([]);
+  });
+
+  it("names the file, the line, the column and the escape the author meant", () => {
+    // The real defect: `/\bINTERVAL\b/i` written with the byte 0x08 names.
+    const problems = auditControlCharacters(
+      repo({
+        "src/lib/example.test.ts": [
+          "const banned = [",
+          `  /${ctrl(0x08)}INTERVAL${ctrl(0x08)}/i,`,
+          "];",
+        ].join("\n"),
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("src/lib/example.test.ts:2");
+    expect(problems[0]).toContain("0x08");
+    // The escape, not just the code point: "a control character is here" sends
+    // the reader hunting a corrupt file, and this is a dead word boundary.
+    expect(problems[0]).toContain("a \\b escape names");
+    // Both hits on the line are counted and located.
+    expect(problems[0]).toContain("2 raw control character(s)");
+    // `  /` is columns 1-3, so the opening byte is 4 and `INTERVAL` runs 5-12.
+    expect(problems[0]).toContain("column 4");
+    expect(problems[0]).toContain("column 13");
+  });
+
+  it("spells out each byte an editing tool commonly eats", () => {
+    for (const [codePoint, escape] of [
+      [0x00, "\\0"],
+      [0x07, "\\a"],
+      [0x08, "\\b"],
+      [0x0b, "\\v"],
+      [0x0c, "\\f"],
+      [0x1b, "\\e"],
+    ]) {
+      const problems = auditControlCharacters(
+        repo({ "src/lib/example.ts": `const x = "${ctrl(codePoint)}";\n` }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain(`a ${escape} escape names`);
+    }
+  });
+
+  it("still reports a byte that spells no common escape", () => {
+    const problems = auditControlCharacters(
+      repo({ "src/lib/example.ts": `const x = "${ctrl(0x01)}";\n` }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("0x01");
+    // Two hex digits always, so 0x0B can never be read as 0xB.
+    expect(problems[0]).not.toContain("escape names");
+  });
+
+  it("reports DEL, which is outside the C0 range", () => {
+    const problems = auditControlCharacters(
+      repo({ "src/lib/example.ts": `const x = "${ctrl(0x7f)}";\n` }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("0x7f");
+  });
+
+  it("leaves TAB, LF and CR alone, because they are the text format", () => {
+    expect(
+      auditControlCharacters(
+        repo({
+          "src/lib/example.ts": `const x = 1;${ctrl(0x09)}// tab\r\n\tindented\n`,
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it("has no allowlist: a comment is scanned like any other line", () => {
+    // #3072 found `D:\var\backups` rendered unreadable inside a comment. A
+    // comment is where you look to understand the code under it.
+    const problems = auditControlCharacters(
+      repo({
+        "src/lib/example.test.ts": `// a path like D:${ctrl(0x0b)}ar${ctrl(0x08)}ackups\n`,
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("0x0b");
+    expect(problems[0]).toContain("0x08");
+  });
+
+  it("reports Markdown too, including inside a fenced example", () => {
+    // Unlike the invariant-id scan, a fence is not a hiding place here: a
+    // control byte in a code sample is the same editing accident.
+    const problems = auditControlCharacters(
+      repo({
+        "docs/example.md": [
+          "# Example",
+          "",
+          "```ts",
+          `const re = /${ctrl(0x08)}word${ctrl(0x08)}/;`,
+          "```",
+          "",
+        ].join("\n"),
+      }),
+    );
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/example.md:4");
+  });
+
+  it("reports every offending file, sorted, so a failure is a work list", () => {
+    const problems = auditControlCharacters(
+      repo({
+        "src/lib/zebra.ts": `const z = "${ctrl(0x08)}";\n`,
+        "src/lib/alpha.ts": `const a = "${ctrl(0x0c)}";\n`,
+      }),
+    );
+
+    expect(problems).toHaveLength(2);
+    expect(problems[0]).toContain("src/lib/alpha.ts");
+    expect(problems[1]).toContain("src/lib/zebra.ts");
+  });
+});
+
+describe("auditTextScanCoverage", () => {
+  it("passes when no file is hidden by an early NUL", () => {
+    expect(auditTextScanCoverage([])).toEqual([]);
+  });
+
+  it("names the file, the byte offset, and both remedies that work", () => {
+    // Measured against git 2.53: Git calls a file binary on a NUL in the first
+    // 8000 bytes and only then, so this is the one way the scan above can be
+    // blinded. Without this check the file silently leaves the file set and the
+    // whole run goes green having scanned one file fewer.
+    const problems = auditTextScanCoverage([
+      { path: "src/lib/hidden.ts", byteOffset: 200 },
+    ]);
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("src/lib/hidden.ts");
+    expect(problems[0]).toContain("0x00");
+    // The offset, not just "somewhere in the first 8000 bytes": the byte is
+    // invisible, so a reader needs to be told where to look.
+    expect(problems[0]).toContain("at byte 200");
+    expect(problems[0]).toContain("\\0");
+    expect(problems[0]).toContain("binary");
+  });
+
+  it("warns AGAINST the `diff` attribute, which cannot make the gate pass", () => {
+    // The remedy the first version prescribed. Both halves were measured:
+    // adding `diff` really does restore Git's textual classification, and the
+    // file then enters the scan where `auditControlCharacters` rejects it — with
+    // no allowlist, permanently. So for the one case the sentence addressed — a
+    // file that genuinely must carry the byte — the advice was unfollowable, and
+    // a message that sends its reader somewhere they cannot get out of is worse
+    // than one that says nothing.
+    const [problem] = auditTextScanCoverage([
+      { path: "src/lib/hidden.ts", byteOffset: 1 },
+    ]);
+
+    expect(problem).toContain("Do NOT reach for a `diff` attribute");
+  });
+
+  it("sorts by path, so the failure reads the same way twice", () => {
+    const problems = auditTextScanCoverage([
+      { path: "src/b.ts", byteOffset: 2 },
+      { path: "src/a.ts", byteOffset: 1 },
+    ]);
+
+    expect(problems).toHaveLength(2);
+    expect(problems[0]).toContain("src/a.ts");
+    expect(problems[1]).toContain("src/b.ts");
+  });
+});
+
+describe("findFilesHiddenFromTextScan", () => {
+  // These need a real repository: the whole question is what Git's own text
+  // classification does, and mocking that would test the mock.
+  const NUL = ctrl(0x00);
+
+  function repoWithHiddenFiles(extraAttributes = "") {
+    const repoRoot = initGitRepo();
+    commitFiles(repoRoot, "seed", {
+      ".gitattributes": `*.md text eol=lf\n*.ts text eol=lf\n${extraAttributes}`,
+      // A source file with an early NUL: hidden, and the accident this catches.
+      "src/hidden.ts": `${"x".repeat(200)}${NUL}\n// tail\n`,
+      // The same shape in a class nobody pinned. This is the case the first
+      // version of the check let through: measured, 43 of this repository's
+      // 4,960 text files sat in 18 such classes, `knip.jsonc` among them.
+      "unpinned.jsonc": `${"y".repeat(200)}${NUL}\n// tail\n`,
+      // Content-free files. `git grep` omits both, which the first version read
+      // as proof of an invisible NUL.
+      "docs/empty-stub.md": "",
+      "docs/newline-only.md": "\n",
+      // Present so the repository has something the scan can see.
+      "docs/README.md": "# Docs\n",
+    });
+    return repoRoot;
+  }
+
+  it("reports a hidden file whose class nobody pinned, not just a declared-text one", () => {
+    const { hiddenWithEarlyNul } = findFilesHiddenFromTextScan(
+      repoWithHiddenFiles(),
+    );
+
+    expect(hiddenWithEarlyNul.map((entry) => entry.path).sort()).toEqual([
+      "src/hidden.ts",
+      "unpinned.jsonc",
+    ]);
+    // The offset is read from the file, so the message cannot claim a byte that
+    // is not there.
+    for (const entry of hiddenWithEarlyNul) {
+      expect(entry.byteOffset).toBe(200);
+    }
+  });
+
+  it("exempts a declared binary asset, and ONLY a declared one", () => {
+    // `binary` is Git's standard macro for `-diff -merge -text`. Declaring the
+    // asset is a statement about what the file is; leaving a class undeclared
+    // now fails loudly instead of silently leaving the scan.
+    const repoRoot = repoWithHiddenFiles();
+    commitFiles(repoRoot, "assets", {
+      ".gitattributes":
+        `*.md text eol=lf\n*.ts text eol=lf\n*.png binary\n`,
+      "docs/images/logo.png": `PNG${NUL}payload\n`,
+      "docs/images/logo.webp": `WEBP${NUL}payload\n`,
+    });
+
+    const paths = findFilesHiddenFromTextScan(repoRoot).hiddenWithEarlyNul.map(
+      (entry) => entry.path,
+    );
+
+    expect(paths).not.toContain("docs/images/logo.png");
+    // The undeclared sibling format is the fail-closed direction: a new binary
+    // class reds the gate until somebody says what it is.
+    expect(paths).toContain("docs/images/logo.webp");
+  });
+
+  it("does not report a content-free file as carrying an invisible NUL", () => {
+    // `git grep -Il -e ""` omits a file with no line content — measured: 0 bytes
+    // and a lone newline are omitted, while `\r\n`, ` \n` and `\n\n\n` are all
+    // matched. An empty `.md` stub, or the natural fixture for "handles empty
+    // input", would otherwise turn the required `verify` job red and send the
+    // author hunting a byte that does not exist.
+    const paths = findFilesHiddenFromTextScan(
+      repoWithHiddenFiles(),
+    ).hiddenWithEarlyNul.map((entry) => entry.path);
+
+    expect(paths).not.toContain("docs/empty-stub.md");
+    expect(paths).not.toContain("docs/newline-only.md");
+  });
+
+  it("does not report a tracked-but-deleted path in a dirty working tree", () => {
+    // `git grep` omits it and exits 0. `loadTrackedFiles` excludes this case on
+    // purpose — "git status reports it and reading it would throw here" — and
+    // the first version of this check reintroduced it.
+    const repoRoot = repoWithHiddenFiles();
+    rmSync(path.join(repoRoot, "docs/README.md"));
+
+    const paths = findFilesHiddenFromTextScan(repoRoot).hiddenWithEarlyNul.map(
+      (entry) => entry.path,
+    );
+
+    expect(paths).not.toContain("docs/README.md");
+  });
+
+  it("returns the tracked total, so the success line can reconcile its own count", () => {
+    // "Scanned 4959" is what a file leaving the scan looked like: a number
+    // nobody could check. Printing "N of M" makes the same event visible.
+    const { trackedCount, hiddenWithEarlyNul } = findFilesHiddenFromTextScan(
+      repoWithHiddenFiles(),
+    );
+
+    expect(trackedCount).toBe(6);
+    expect(hiddenWithEarlyNul.length).toBeGreaterThan(0);
+  });
+
+  it("leaves a NUL past Git's window to the control-character check", () => {
+    // Pins the DIVISION OF LABOUR between the two checks, which is the thing a
+    // future edit could get wrong. It does not pin the whole-file read inside
+    // `firstNulByteOffset`: under git 2.53 a file hidden from the text scan
+    // always has its first NUL inside the 8,000-byte window, so no fixture can
+    // distinguish a whole-file read from a windowed one. The whole-file read is
+    // future-proofing against a Git that widens the window, argued rather than
+    // measured, and saying so is better than a test name implying otherwise.
+    const repoRoot = initGitRepo();
+    commitFiles(repoRoot, "seed", {
+      ".gitattributes": "*.ts text eol=lf\n",
+      "src/late.ts": `${"z".repeat(20_000)}${NUL}\n`,
+      "docs/README.md": "# Docs\n",
+    });
+
+    // Git sees this one as text — the NUL is past its window — so it is not
+    // hidden at all, and `auditControlCharacters` is what reports it.
+    expect(
+      findFilesHiddenFromTextScan(repoRoot).hiddenWithEarlyNul,
+    ).toEqual([]);
+    expect(
+      auditControlCharacters(loadTrackedFiles(repoRoot)).filter((problem) =>
+        problem.includes("src/late.ts"),
+      ),
+    ).toHaveLength(1);
+  });
+});
+
+describe("the control-character checks are wired into the whole check", () => {
+  // The regression this exists for: #3072's first attempt defined and EXPORTED
+  // `auditControlCharacters` but never added it to `auditDocs`, so
+  // `docs:indexcheck` passed a tree that still carried the bytes. An audit
+  // function nobody calls is indistinguishable from no check at all, and
+  // nothing else in this suite would have noticed.
+  it("auditDocs reports a raw control character", () => {
+    const problems = auditDocs(
+      repo({ "src/lib/example.ts": `const x = "${ctrl(0x08)}";\n` }),
+    );
+
+    expect(
+      problems.filter((problem) => problem.includes("raw control character")),
+    ).toHaveLength(1);
+  });
+
+  it("auditDocs reports a file hidden from the text scan", () => {
+    const problems = auditDocs(repo(), {
+      hiddenFilesWithEarlyNul: [
+        { path: "src/lib/hidden.ts", byteOffset: 200 },
+      ],
+    });
+
+    expect(
+      problems.filter((problem) => problem.includes("src/lib/hidden.ts")),
+    ).toHaveLength(1);
+  });
+
+  it("auditDocs stays clean when neither applies", () => {
+    expect(
+      auditDocs(repo()).filter(
+        (problem) =>
+          problem.includes("raw control character") ||
+          problem.includes("hiding it from this scan"),
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("word budgets (#2789)", () => {
+  /** `n` distinct words, one per token, so the count is exactly what it says. */
+  const prose = (n) => Array.from({ length: n }, (_, i) => `w${i + 1}`).join(" ");
+
+  /** The fixture repository with `money.md` replaced by one entry of `n` words. */
+  const repoWithEntry = (n, extra = {}) =>
+    repo({
+      "docs/invariants/money.md": ["# Money", "", "## INV-MONEY-001", "", prose(n), ""].join(
+        "\n",
+      ),
+      ...extra,
+    });
+
+  /** A register file with the given exception and ratchet rows. */
+  const register = ({ exceptions = [], ratchet = [] } = {}) =>
+    [
+      "# Word budgets",
+      "",
+      "## Approved exceptions",
+      "",
+      "| ID | Ceiling | Deciding issue | Reason |",
+      "| --- | ---: | --- | --- |",
+      ...exceptions,
+      "",
+      "## Migration ratchet",
+      "",
+      "| ID | Words |",
+      "| --- | ---: |",
+      ...ratchet,
+      "",
+    ].join("\n");
+
+  const budgetProblems = auditWordBudgets;
+
+  describe("countWords", () => {
+    it("counts whitespace-separated tokens that carry a letter or digit", () => {
+      expect(countWords("Store and calculate money as integer cents")).toBe(7);
+      expect(countWords("  two\twords\n")).toBe(2);
+      expect(countWords("")).toBe(0);
+    });
+
+    it("does not count Markdown structure or bare punctuation as words", () => {
+      // A pipe, a list dash, an em dash, an arrow and a lone asterisk are not
+      // words; `**bold**`, `` `code` `` and `#2789` are, and `v0.13` is two
+      // (the dot separates, so a path counts one word per segment).
+      expect(countWords("| - — -> * **bold** `code` #2789 v0.13")).toBe(5);
+    });
+
+    it("counts non-Latin letters, since the corpus carries te reo Maori", () => {
+      expect(countWords("Māori kupu")).toBe(2);
+    });
+  });
+
+  describe("index rows", () => {
+    it("passes the control repository, whose one row is seven words", () => {
+      expect(budgetProblems(repo())).toEqual([]);
+    });
+
+    it("accepts a description of exactly the cap", () => {
+      const files = repo();
+      files.set(
+        "docs/DOMAIN_INVARIANTS.md",
+        files
+          .get("docs/DOMAIN_INVARIANTS.md")
+          .replace("Store and calculate money as integer cents", prose(INDEX_ROW_WORD_CAP)),
+      );
+      expect(budgetProblems(files)).toEqual([]);
+    });
+
+    it("fails a description one word over the cap, naming id, count and cap", () => {
+      const files = repo();
+      files.set(
+        "docs/DOMAIN_INVARIANTS.md",
+        files
+          .get("docs/DOMAIN_INVARIANTS.md")
+          .replace(
+            "Store and calculate money as integer cents",
+            prose(INDEX_ROW_WORD_CAP + 1),
+          ),
+      );
+      const problems = budgetProblems(files);
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("docs/DOMAIN_INVARIANTS.md:7");
+      expect(problems[0]).toContain("INV-MONEY-001");
+      expect(problems[0]).toContain(`is ${INDEX_ROW_WORD_CAP + 1} words`);
+      expect(problems[0]).toContain(`the cap is ${INDEX_ROW_WORD_CAP}`);
+    });
+
+    it("does not let punctuation-only tokens push a row over, or words hide behind pipes", () => {
+      const files = repo();
+      // Twelve words plus an em dash and an arrow: still twelve.
+      files.set(
+        "docs/DOMAIN_INVARIANTS.md",
+        files
+          .get("docs/DOMAIN_INVARIANTS.md")
+          .replace(
+            "Store and calculate money as integer cents",
+            `${prose(6)} — ${prose(6)} ->`,
+          ),
+      );
+      expect(budgetProblems(files)).toEqual([]);
+    });
+
+    it("is reached through auditDocs, so the CLI enforces it", () => {
+      const files = repo();
+      files.set(
+        "docs/DOMAIN_INVARIANTS.md",
+        files
+          .get("docs/DOMAIN_INVARIANTS.md")
+          .replace("Store and calculate money as integer cents", prose(40)),
+      );
+      expect(auditDocs(files).filter((problem) => problem.includes("the cap is"))).toHaveLength(1);
+    });
+  });
+
+  describe("measureInvariantEntryWords", () => {
+    it("measures from the definition heading to the next definition", () => {
+      const files = repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "Front matter that belongs to no entry.",
+          "",
+          "## INV-MONEY-001",
+          "",
+          prose(10),
+          "",
+          "## INV-MONEY-002",
+          "",
+          prose(3),
+          "",
+        ].join("\n"),
+      });
+      const entries = measureInvariantEntryWords(files);
+      expect(entries.get("INV-MONEY-001")).toEqual({ at: "docs/invariants/money.md:5", words: 10 });
+      expect(entries.get("INV-MONEY-002")).toEqual({ at: "docs/invariants/money.md:9", words: 3 });
+    });
+
+    it("keeps same-level and deeper narrative headings inside the entry; only the section above ends it", () => {
+      const files = repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## Section one",
+          "",
+          "### INV-MONEY-001",
+          "",
+          prose(10),
+          "",
+          "#### Where it holds, and where it does not",
+          "",
+          prose(5),
+          "",
+          "### Narrative heading at the same level",
+          "",
+          prose(100),
+          "",
+          "## Section two",
+          "",
+          prose(100),
+          "",
+        ].join("\n"),
+      });
+      // 10 body + 8 (deeper heading) + 5 + 6 (same-level heading) + 100 beneath it;
+      // the 100 words under `## Section two` are structure and count nowhere.
+      expect(measureInvariantEntryWords(files).get("INV-MONEY-001").words).toBe(129);
+    });
+
+    it("counts fenced code and table rows: bulk is bulk", () => {
+      const files = repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          prose(4),
+          "",
+          "```ts",
+          "const a = 1;",
+          "```",
+          "",
+          "| Column | Other |",
+          "| --- | --- |",
+          "| cell | cell |",
+          "",
+        ].join("\n"),
+      });
+      // 4 + ts + `const a = 1;` (4 tokens, 3 with a letter or digit) + 2 header
+      // cells + 2 body cells. The fence markers and `| --- | --- |` count nothing.
+      expect(measureInvariantEntryWords(files).get("INV-MONEY-001").words).toBe(4 + 1 + 3 + 4);
+    });
+
+    it("does not let a definition-shaped heading inside a fence start or end an entry", () => {
+      const files = repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          prose(10),
+          "",
+          "```",
+          "## INV-MONEY-002",
+          "```",
+          "",
+          prose(10),
+          "",
+        ].join("\n"),
+      });
+      const entries = measureInvariantEntryWords(files);
+      expect(entries.has("INV-MONEY-002")).toBe(false);
+      // 10 + the fenced heading's two tokens (`##` carries no letter) + 10.
+      expect(entries.get("INV-MONEY-001").words).toBe(21);
+    });
+
+    it("does not let a lookalike heading split an oversize entry into two compliant halves", () => {
+      // U+2011 NON-BREAKING HYPHEN where the id wants hyphen-minus. GitHub renders
+      // it as an ordinary `### INV-MONEY-002`; a reviewer sees a second, compliant
+      // rule where there is really one oversize one.
+      const lookalike = "## INV‑MONEY‑002";
+      const files = repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          prose(200),
+          "",
+          lookalike,
+          "",
+          prose(200),
+          "",
+        ].join("\n"),
+      });
+      const entries = measureInvariantEntryWords(files);
+      expect([...entries.keys()]).toEqual(["INV-MONEY-001"]);
+      // 200 + 200 + the three tokens of the lookalike heading (its hyphens are
+      // U+2011, which is a separator, not part of a word).
+      expect(entries.get("INV-MONEY-001").words).toBe(403);
+
+      // Both defences fire in one run: the budget names the whole count, and the
+      // shape audit names the codepoint.
+      const problems = auditDocs(files);
+      expect(problems.some((problem) => problem.includes("is 403 words"))).toBe(true);
+      expect(problems.some((problem) => problem.includes("U+2011"))).toBe(true);
+    });
+
+    it("does not let a Setext, backticked, lower-cased or list-nested id heading end an entry", () => {
+      const files = repo({
+        "docs/invariants/money.md": [
+          "# Money",
+          "",
+          "## INV-MONEY-001",
+          "",
+          prose(100),
+          "",
+          "INV-MONEY-002",
+          "-------------",
+          "",
+          prose(100),
+          "",
+          "## `INV-MONEY-003`",
+          "",
+          prose(100),
+          "",
+          "## inv-money-004",
+          "",
+          prose(100),
+          "",
+          "- ## INV-MONEY-005",
+          "",
+          prose(100),
+          "",
+        ].join("\n"),
+      });
+      const entries = measureInvariantEntryWords(files);
+      expect([...entries.keys()]).toEqual(["INV-MONEY-001"]);
+      // 500 words of prose plus the four non-canonical heading tokens.
+      expect(entries.get("INV-MONEY-001").words).toBe(504);
+      expect(auditDefinitionHeadingShapes(files).length).toBeGreaterThanOrEqual(4);
+    });
+
+    it("counts an entry that runs to the end of the file", () => {
+      expect(measureInvariantEntryWords(repoWithEntry(37)).get("INV-MONEY-001").words).toBe(37);
+    });
+  });
+
+  describe("entry budget", () => {
+    it("accepts an entry of exactly the budget", () => {
+      expect(budgetProblems(repoWithEntry(INVARIANT_ENTRY_WORD_BUDGET))).toEqual([]);
+    });
+
+    it("fails an entry one word over, naming id, place, count and budget", () => {
+      const problems = budgetProblems(repoWithEntry(INVARIANT_ENTRY_WORD_BUDGET + 1));
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("INV-MONEY-001 at docs/invariants/money.md:3");
+      expect(problems[0]).toContain(`is ${INVARIANT_ENTRY_WORD_BUDGET + 1} words`);
+      expect(problems[0]).toContain(`the budget is ${INVARIANT_ENTRY_WORD_BUDGET}`);
+      expect(problems[0]).toContain("neither an approved exception nor a ratchet record");
+    });
+
+    it("fails through the whole audit, so the CLI enforces it", () => {
+      const problems = auditDocs(repoWithEntry(INVARIANT_ENTRY_WORD_BUDGET + 50));
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain(`is ${INVARIANT_ENTRY_WORD_BUDGET + 50} words`);
+    });
+  });
+
+  describe("the register", () => {
+    it("treats an absent register as no exceptions and no debt", () => {
+      const files = repoWithEntry(INVARIANT_ENTRY_WORD_BUDGET);
+      expect(files.has(WORD_BUDGET_REGISTER)).toBe(false);
+      expect(parseWordBudgetRegister(files)).toEqual({
+        exceptions: new Map(),
+        ratchet: new Map(),
+        problems: [],
+      });
+    });
+
+    it("lets an approved exception carry an entry up to its own ceiling, and no further", () => {
+      const rows = {
+        exceptions: ["| `INV-MONEY-001` | 400 | #2789 | one atomic rule; splitting it fragments the money model |"],
+      };
+      expect(
+        budgetProblems(repoWithEntry(400, { [WORD_BUDGET_REGISTER]: register(rows) })),
+      ).toEqual([]);
+
+      const problems = budgetProblems(
+        repoWithEntry(401, { [WORD_BUDGET_REGISTER]: register(rows) }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("INV-MONEY-001 at docs/invariants/money.md:3 is 401 words");
+      expect(problems[0]).toContain("approved-exception ceiling is 400");
+      expect(problems[0]).toContain("#2789");
+    });
+
+    it("fails an exception whose ceiling the default budget already covers", () => {
+      const problems = budgetProblems(
+        repoWithEntry(10, {
+          [WORD_BUDGET_REGISTER]: register({
+            exceptions: [`| \`INV-MONEY-001\` | ${INVARIANT_ENTRY_WORD_BUDGET} | #2789 | reason |`],
+          }),
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("not above the default budget");
+    });
+
+    it("fails an exception for an entry that has become compliant", () => {
+      const problems = budgetProblems(
+        repoWithEntry(10, {
+          [WORD_BUDGET_REGISTER]: register({
+            exceptions: ["| `INV-MONEY-001` | 400 | #2789 | reason |"],
+          }),
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("no longer needs the exception");
+    });
+
+    it("fails an exception row missing its issue or its reason", () => {
+      for (const row of [
+        "| `INV-MONEY-001` | 400 | | reason |",
+        "| `INV-MONEY-001` | 400 | #2789 | |",
+        "| `INV-MONEY-001` | 400 | 2789 | reason |",
+        "| `INV-MONEY-001` | four hundred | #2789 | reason |",
+      ]) {
+        const problems = budgetProblems(
+          repoWithEntry(10, { [WORD_BUDGET_REGISTER]: register({ exceptions: [row] }) }),
+        );
+        expect(problems, row).toHaveLength(1);
+        expect(problems[0], row).toContain("not a well-formed exception row");
+      }
+    });
+
+    it("holds a ratchet record exactly: grown fails, shrunk fails, equal passes", () => {
+      const at = { [WORD_BUDGET_REGISTER]: register({ ratchet: ["| `INV-MONEY-001` | 500 |"] }) };
+
+      expect(budgetProblems(repoWithEntry(500, at))).toEqual([]);
+
+      const grown = budgetProblems(repoWithEntry(501, at));
+      expect(grown).toHaveLength(1);
+      expect(grown[0]).toContain("is 501 words; its ratchet record is 500");
+      expect(grown[0]).toContain("may only shrink");
+
+      const shrunk = budgetProblems(repoWithEntry(499, at));
+      expect(shrunk).toHaveLength(1);
+      expect(shrunk[0]).toContain("is 499 words; its ratchet record is 500");
+      expect(shrunk[0]).toContain("Record 499");
+    });
+
+    it("fails a ratchet record for an entry that is now within budget", () => {
+      const problems = budgetProblems(
+        repoWithEntry(INVARIANT_ENTRY_WORD_BUDGET, {
+          [WORD_BUDGET_REGISTER]: register({ ratchet: ["| `INV-MONEY-001` | 500 |"] }),
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("compliant now");
+    });
+
+    it("fails an id recorded twice, or in both tables", () => {
+      const problems = budgetProblems(
+        repoWithEntry(500, {
+          [WORD_BUDGET_REGISTER]: register({
+            exceptions: ["| `INV-MONEY-001` | 600 | #2789 | reason |"],
+            ratchet: ["| `INV-MONEY-001` | 500 |"],
+          }),
+        }),
+      );
+      expect(problems.filter((problem) => problem.includes("a second time"))).toHaveLength(1);
+    });
+
+    it("fails a record for an id nothing defines", () => {
+      const problems = budgetProblems(
+        repoWithEntry(10, {
+          [WORD_BUDGET_REGISTER]: register({ ratchet: ["| `INV-MONEY-002` | 500 |"] }),
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("INV-MONEY-002");
+      expect(problems[0]).toContain("nothing under docs/invariants/ defines it");
+    });
+
+    it("fails a lookalike id in a record instead of skipping the row", () => {
+      // The same U+2011 that would make a heading invisible: here it would make
+      // the ratchet record parse as nothing and leave the entry unguarded.
+      const problems = budgetProblems(
+        repoWithEntry(10, {
+          [WORD_BUDGET_REGISTER]: register({
+            ratchet: ["| `INV‑MONEY‑001` | 500 |"],
+          }),
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("not a well-formed ratchet row");
+    });
+
+    it("fails an id-shaped row that sits outside both tables", () => {
+      const problems = budgetProblems(
+        repoWithEntry(10, {
+          [WORD_BUDGET_REGISTER]: [
+            "# Word budgets",
+            "",
+            "## Something else",
+            "",
+            "| `INV-MONEY-001` | 500 |",
+            "",
+          ].join("\n"),
+        }),
+      );
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("outside both budget tables");
+    });
+
+    it("ignores a fenced example row in the register", () => {
+      const problems = budgetProblems(
+        repoWithEntry(10, {
+          [WORD_BUDGET_REGISTER]: [
+            "# Word budgets",
+            "",
+            "## Migration ratchet",
+            "",
+            "```markdown",
+            "| `INV-MONEY-001` | 500 |",
+            "```",
+            "",
+          ].join("\n"),
+        }),
+      );
+      expect(problems).toEqual([]);
+    });
+  });
+
+  describe("the real repository", () => {
+    it("states the enforced numbers in SCHEME.md, so the doc and the gate agree", () => {
+      const scheme = readFileSync(path.join(REPO_ROOT, INVARIANT_SCHEME), "utf8");
+      expect(scheme).toMatch(new RegExp(`\\*\\*${INDEX_ROW_WORD_CAP} words\\*\\*`));
+      expect(scheme).toMatch(new RegExp(`\\*\\*${INVARIANT_ENTRY_WORD_BUDGET} words\\*\\*`));
+    });
+
+    it("carries a register whose every row parses", () => {
+      const files = loadTrackedFiles(REPO_ROOT);
+      expect(files.has(WORD_BUDGET_REGISTER)).toBe(true);
+      expect(parseWordBudgetRegister(files).problems).toEqual([]);
+    });
+
+    it("prints the same figures from --words that the audit holds the tree to", () => {
+      const files = loadTrackedFiles(REPO_ROOT);
+      const inventory = formatWordInventory(files);
+      const entries = measureInvariantEntryWords(files);
+      const [largestId, largest] = [...entries].sort(([, a], [, b]) => b.words - a.words)[0];
+      expect(inventory.split("\n")[0]).toContain(`${largest.words}  ${largestId}`);
+      expect(inventory).toContain(`${entries.size} entries`);
+    });
+  });
+});
+
+describe("word budgets — gate-bypass review", () => {
+  describe("gate-bypass review (#2789 F1-F7)", () => {
+    const prose = (n) => Array.from({ length: n }, (_, i) => `w${i + 1}`).join(" ");
+    const repoWithEntry = (n, extra = {}) =>
+      repo({
+        "docs/invariants/money.md": ["# Money", "", "## INV-MONEY-001", "", prose(n), ""].join(
+          "\n",
+        ),
+        ...extra,
+      });
+    const register = ({ exceptions = [], ratchet = [] } = {}) =>
+      [
+        "# Word budgets",
+        "",
+        "## Approved exceptions",
+        "",
+        "| ID | Ceiling | Deciding issue | Reason |",
+        "| --- | ---: | --- | --- |",
+        ...exceptions,
+        "",
+        "## Migration ratchet",
+        "",
+        "| ID | Words |",
+        "| --- | ---: |",
+        ...ratchet,
+        "",
+      ].join("\n");
+
+    describe("F1 — invisible characters cannot glue words", () => {
+      // Each is a format character (Cf) except U+2800, the Braille blank.
+      const glue = {
+        "U+200B ZERO WIDTH SPACE": "​",
+        "U+2060 WORD JOINER": "⁠",
+        "U+00AD SOFT HYPHEN": "­",
+        "U+180E MONGOLIAN VOWEL SEPARATOR": "᠎",
+        "U+2800 BRAILLE PATTERN BLANK": "⠀",
+      };
+
+      it.each(Object.entries(glue))("counts words joined by %s separately", (_, ch) => {
+        const joined = Array.from({ length: 30 }, (_, i) => `w${i}`).join(ch);
+        expect(countWords(joined)).toBe(30);
+        // The bypass measured 300 glued words as 10 tokens.
+        const groups = Array.from({ length: 10 }, () =>
+          Array.from({ length: 30 }, (_, i) => `x${i}`).join(ch),
+        ).join(" ");
+        expect(countWords(groups)).toBe(300);
+      });
+
+      it("still counts a hyphenated word, a contraction and a marked word once", () => {
+        expect(countWords("date-only isn’t Māori")).toBe(3);
+      });
+
+      it("counts a path per segment and an issue number as one word", () => {
+        expect(countWords("`src/lib/date-only.ts` #2789")).toBe(5);
+      });
+
+      it.each(Object.entries(glue))(
+        "fails any tracked Markdown file carrying %s, naming file, line and column",
+        (_, ch) => {
+          const files = repoWithEntry(10, {
+            "docs/guide.md": `# Guide\n\nSee [invariants](DOMAIN_INVARIANTS.md).\n\nplain ${ch}glued\n`,
+          });
+          files.set(
+            "docs/README.md",
+            `${files.get("docs/README.md")}- [Guide](guide.md)\n`,
+          );
+          const problems = auditInvisibleCharacters(files);
+          expect(problems).toHaveLength(1);
+          expect(problems[0]).toContain("docs/guide.md:5:7");
+          expect(problems[0]).toContain(
+            `U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}`,
+          );
+          expect(auditDocs(files).filter((p) => p.includes("invisible"))).toHaveLength(1);
+        },
+      );
+
+      it("does not report the byte-order mark twice, and ignores non-Markdown files", () => {
+        const files = repoWithEntry(10, {
+          "src/lib/x.ts": "const zwsp = 'a​b';\n",
+        });
+        expect(auditInvisibleCharacters(files)).toEqual([]);
+        files.set("docs/invariants/money.md", `﻿${files.get("docs/invariants/money.md")}`);
+        expect(auditInvisibleCharacters(files)).toEqual([]);
+        expect(auditEncoding(files).some((p) => p.includes("byte-order mark"))).toBe(true);
+      });
+
+      it("an oversize entry glued with U+2800 fails the budget AND the invisible audit", () => {
+        const glued = Array.from({ length: 10 }, () =>
+          Array.from({ length: 31 }, (_, i) => `g${i}`).join("⠀"),
+        ).join(" ");
+        const problems = auditDocs(repoWithEntry(0).set(
+          "docs/invariants/money.md",
+          ["# Money", "", "## INV-MONEY-001", "", glued, ""].join("\n"),
+        ));
+        expect(problems.some((p) => p.includes("is 310 words; the budget is 300"))).toBe(true);
+        expect(problems.filter((p) => p.includes("U+2800")).length).toBeGreaterThan(0);
+      });
+    });
+
+    describe("F2 — an entry ends only at a definition or a section heading", () => {
+      const bodyOf = (n, extraLines) =>
+        ["# Money", "", ...extraLines(n), ""].join("\n");
+
+      it("keeps a deeper narrative heading and its prose inside the entry", () => {
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## INV-MONEY-001",
+            "",
+            prose(200),
+            "",
+            "### Background",
+            "",
+            prose(200),
+          ]),
+        });
+        expect(measureInvariantEntryWords(files).get("INV-MONEY-001").words).toBe(401);
+        expect(auditDocs(files).some((p) => p.includes("is 401 words"))).toBe(true);
+      });
+
+      it("keeps a SAME-level narrative heading inside a ### entry; only the ## section ends it", () => {
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## Section one",
+            "",
+            "### INV-MONEY-001",
+            "",
+            prose(200),
+            "",
+            "### Background",
+            "",
+            prose(200),
+            "",
+            "## Section two",
+            "",
+            prose(500),
+          ]),
+        });
+        // 200 + "Background" + 200; the 500 words under the next section are structure.
+        expect(measureInvariantEntryWords(files).get("INV-MONEY-001").words).toBe(401);
+      });
+
+      it("a ## section heading between ## definitions ends the preceding entry", () => {
+        // The shape of integrations.md and membership-lifecycle.md: `##` rules,
+        // then a `##` section whose own rules are `###`. The section heading
+        // introduces a nested group, so it is structure, not narrative.
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## INV-MONEY-001",
+            "",
+            prose(10),
+            "",
+            "## Xero member grouping and the rules that govern it",
+            "",
+            prose(50),
+            "",
+            "### INV-MONEY-002",
+            "",
+            prose(5),
+          ]),
+        });
+        const entries = measureInvariantEntryWords(files);
+        expect(entries.get("INV-MONEY-001").words).toBe(10);
+        expect(entries.get("INV-MONEY-002").words).toBe(5);
+      });
+
+      it("a same-level narrative heading stays inside even when a nested group follows later in the file", () => {
+        // The probe: a `## Rationale` inserted into a `##` entry that precedes
+        // the file's nested-group block. Only a section heading IMMEDIATELY
+        // followed by a deeper definition is structure.
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## INV-MONEY-001",
+            "",
+            prose(10),
+            "",
+            "## Rationale",
+            "",
+            prose(50),
+            "",
+            "## Section",
+            "",
+            "### INV-MONEY-002",
+            "",
+            prose(5),
+          ]),
+        });
+        const entries = measureInvariantEntryWords(files);
+        expect(entries.get("INV-MONEY-001").words).toBe(61);
+        expect(entries.get("INV-MONEY-002").words).toBe(5);
+      });
+
+      it("a same-level narrative heading directly followed by another same-level definition stays inside", () => {
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## Section",
+            "",
+            "### INV-MONEY-001",
+            "",
+            prose(10),
+            "",
+            "### Background",
+            "",
+            prose(20),
+            "",
+            "### INV-MONEY-002",
+            "",
+            prose(5),
+          ]),
+        });
+        const entries = measureInvariantEntryWords(files);
+        expect(entries.get("INV-MONEY-001").words).toBe(31);
+        expect(entries.get("INV-MONEY-002").words).toBe(5);
+      });
+
+      it("the pipe rule is stated when a reason cell carries one", () => {
+        const problems = parseWordBudgetRegister(
+          repoWithEntry(10, {
+            [WORD_BUDGET_REGISTER]: register({ exceptions: ["| `INV-MONEY-001` | 400 | #2789 | a | b |"] }),
+          }),
+        ).problems;
+        expect(problems[0]).toContain("may not contain a `|`");
+      });
+
+      it("treats a closed ATX heading (### Background ###) the same way", () => {
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## INV-MONEY-001",
+            "",
+            prose(200),
+            "",
+            "### Background ###",
+            "",
+            prose(200),
+          ]),
+        });
+        expect(measureInvariantEntryWords(files).get("INV-MONEY-001").words).toBe(401);
+      });
+
+      it("keeps a Setext-underlined heading inside a ## entry", () => {
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## INV-MONEY-001",
+            "",
+            prose(200),
+            "",
+            "Background",
+            "----------",
+            "",
+            prose(200),
+          ]),
+        });
+        expect(measureInvariantEntryWords(files).get("INV-MONEY-001").words).toBe(401);
+      });
+
+      it("still ends at the next canonical definition and at the file's section heading", () => {
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": bodyOf(0, () => [
+            "## INV-MONEY-001",
+            "",
+            prose(10),
+            "",
+            "## INV-MONEY-002",
+            "",
+            prose(20),
+            "",
+            "# Appendix",
+            "",
+            prose(100),
+          ]),
+        });
+        const entries = measureInvariantEntryWords(files);
+        expect(entries.get("INV-MONEY-001").words).toBe(10);
+        expect(entries.get("INV-MONEY-002").words).toBe(20);
+      });
+    });
+
+    describe("F3 — a homoglyph in the id's letters is caught, not skipped", () => {
+      it("does not let a Cyrillic І in ІNV-… end an entry, and the shape audit names it", () => {
+        // U+0406 CYRILLIC CAPITAL LETTER BYELORUSSIAN-UKRAINIAN I, not ASCII I.
+        const files = repoWithEntry(0, {
+          "docs/invariants/money.md": ["# Money", "", "## Section", "", "### INV-MONEY-001", "", prose(200), "", "## ІNV-MONEY-002", "", prose(200), ""].join("\n"),
+        });
+        const entries = measureInvariantEntryWords(files);
+        expect([...entries.keys()]).toEqual(["INV-MONEY-001"]);
+        expect(entries.get("INV-MONEY-001").words).toBe(401);
+        const problems = auditDefinitionHeadingShapes(files);
+        expect(problems.some((p) => p.includes("U+0406"))).toBe(true);
+      });
+
+      it("fails a homoglyph id in a register row instead of skipping it", () => {
+        const problems = auditWordBudgets(
+          repoWithEntry(10, {
+            [WORD_BUDGET_REGISTER]: register({ ratchet: ["| `ІNV-MONEY-001` | 500 |"] }),
+          }),
+        );
+        expect(problems.some((p) => p.includes("not a well-formed ratchet row"))).toBe(true);
+      });
+    });
+
+    describe("F4 — the documented numbers are pinned exactly", () => {
+      const scheme = () => readFileSync(path.join(REPO_ROOT, INVARIANT_SCHEME), "utf8");
+      const section81 = (text) => {
+        const start = text.indexOf("### 8.1 ");
+        expect(start).toBeGreaterThan(0);
+        const rest = text.slice(start);
+        const end = rest.search(/\n---\n|\n## /);
+        return end > 0 ? rest.slice(0, end) : rest;
+      };
+      const boldWordValues = (text) =>
+        [...text.matchAll(/\*\*(\d+) words\*\*/g)].map((m) => Number(m[1]));
+
+      it("§8.1 states both budgets in the exact sentence shapes", () => {
+        const s = section81(scheme());
+        expect(s).toMatch(
+          new RegExp(`An index-row description is at most \\*\\*${INDEX_ROW_WORD_CAP} words\\*\\*`),
+        );
+        expect(s).toMatch(
+          new RegExp(`An invariant entry is at most \\*\\*${INVARIANT_ENTRY_WORD_BUDGET} words\\*\\*`),
+        );
+        expect(new Set(boldWordValues(s))).toEqual(
+          new Set([INDEX_ROW_WORD_CAP, INVARIANT_ENTRY_WORD_BUDGET]),
+        );
+      });
+
+      it("every **N words** in SCHEME.md and WORD_BUDGETS.md is one of the two constants", () => {
+        const registerText = readFileSync(path.join(REPO_ROOT, WORD_BUDGET_REGISTER), "utf8");
+        const values = [...boldWordValues(scheme()), ...boldWordValues(registerText)];
+        expect(values.length).toBeGreaterThanOrEqual(4);
+        expect(new Set(values)).toEqual(new Set([INDEX_ROW_WORD_CAP, INVARIANT_ENTRY_WORD_BUDGET]));
+      });
+
+      it("would fail if §8.1 said 13", () => {
+        const mutated = scheme().replace(
+          `An index-row description is at most **${INDEX_ROW_WORD_CAP} words**`,
+          "An index-row description is at most **13 words**",
+        );
+        expect(mutated).not.toBe(scheme());
+        expect(new Set(boldWordValues(section81(mutated)))).not.toEqual(
+          new Set([INDEX_ROW_WORD_CAP, INVARIANT_ENTRY_WORD_BUDGET]),
+        );
+      });
+    });
+
+    describe("F5 — every row of a catalogue table is an id row", () => {
+      it("fails a continuation row with an empty first cell", () => {
+        const files = repo();
+        files.set(
+          "docs/DOMAIN_INVARIANTS.md",
+          `${files.get("docs/DOMAIN_INVARIANTS.md").trimEnd()}\n| | and forty more words that the cap never sees |\n`,
+        );
+        const problems = auditIndexCatalogueRows(files);
+        expect(problems).toHaveLength(1);
+        expect(problems[0]).toContain("docs/DOMAIN_INVARIANTS.md:8");
+        expect(problems[0]).toContain("not a backticked invariant id");
+        expect(auditDocs(files).filter((p) => p.includes("not a backticked"))).toHaveLength(1);
+      });
+
+      it("fails a prose row too, and leaves the header and separator alone", () => {
+        const files = repo();
+        files.set(
+          "docs/DOMAIN_INVARIANTS.md",
+          `${files.get("docs/DOMAIN_INVARIANTS.md").trimEnd()}\n| See above | more |\n`,
+        );
+        expect(auditIndexCatalogueRows(files)).toHaveLength(1);
+        expect(auditIndexCatalogueRows(repo())).toEqual([]);
+      });
+
+      it("ignores tables whose header is not ID, such as the routing table", () => {
+        const files = repo();
+        files.set(
+          "docs/DOMAIN_INVARIANTS.md",
+          `${files.get("docs/DOMAIN_INVARIANTS.md")}\n| File | Prefixes | Read it when |\n| --- | --- | --- |\n| [\`money.md\`](invariants/money.md) | \`INV-MONEY\` | cents |\n`,
+        );
+        expect(auditIndexCatalogueRows(files)).toEqual([]);
+      });
+    });
+
+    describe("F6 — register rows parse in linear time", () => {
+      it("parses an exception row padded with 16k spaces well under a bound", () => {
+        const padded = `| \`INV-MONEY-001\` | 400 | #2789 | reason${" ".repeat(16_000)}|`;
+        const files = repoWithEntry(10, { [WORD_BUDGET_REGISTER]: register({ exceptions: [padded] }) });
+        const started = process.hrtime.bigint();
+        const parsed = parseWordBudgetRegister(files);
+        const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+        expect(parsed.problems).toEqual([]);
+        expect(parsed.exceptions.get("INV-MONEY-001").reason).toBe("reason");
+        expect(elapsedMs).toBeLessThan(50);
+      });
+
+      it("refuses a cell that carries a literal pipe rather than guessing the columns", () => {
+        const problems = parseWordBudgetRegister(
+          repoWithEntry(10, {
+            [WORD_BUDGET_REGISTER]: register({
+              exceptions: ["| `INV-MONEY-001` | 400 | #2789 | a | b |"],
+            }),
+          }),
+        ).problems;
+        expect(problems).toHaveLength(1);
+        expect(problems[0]).toContain("not a well-formed exception row");
+      });
+    });
+
+    describe("F7 — numeric and reason cells are strict", () => {
+      it.each([
+        ["| `INV-MONEY-001` | 04615 |", "leading zero"],
+        ["| `INV-MONEY-001` | 0 |", "zero"],
+        ["| `INV-MONEY-001` | 4,615 |", "thousands separator"],
+      ])("rejects the ratchet count %s (%s)", (row) => {
+        const problems = parseWordBudgetRegister(
+          repoWithEntry(10, { [WORD_BUDGET_REGISTER]: register({ ratchet: [row] }) }),
+        ).problems;
+        expect(problems).toHaveLength(1);
+        expect(problems[0]).toContain("not a well-formed ratchet row");
+      });
+
+      it.each([
+        ["| `INV-MONEY-001` | 5001 | #2789 | reason |", "ceiling above the maximum"],
+        ["| `INV-MONEY-001` | 0400 | #2789 | reason |", "leading zero"],
+        ["| `INV-MONEY-001` | 400 | #2789 | - |", "dash reason"],
+        ["| `INV-MONEY-001` | 400 | #2789 | — |", "em-dash reason"],
+      ])("rejects the exception row %s (%s)", (row) => {
+        const problems = parseWordBudgetRegister(
+          repoWithEntry(10, { [WORD_BUDGET_REGISTER]: register({ exceptions: [row] }) }),
+        ).problems;
+        expect(problems).toHaveLength(1);
+        expect(problems[0]).toContain("not a well-formed exception row");
+      });
+
+      it("accepts the maximum ceiling itself", () => {
+        const parsed = parseWordBudgetRegister(
+          repoWithEntry(10, {
+            [WORD_BUDGET_REGISTER]: register({
+              exceptions: [`| \`INV-MONEY-001\` | ${WORD_BUDGET_EXCEPTION_CEILING_MAX} | #2789 | atomic |`],
+            }),
+          }),
+        );
+        expect(parsed.problems).toEqual([]);
+        expect(parsed.exceptions.get("INV-MONEY-001").ceiling).toBe(WORD_BUDGET_EXCEPTION_CEILING_MAX);
+      });
+    });
+  });
+});
+
+describe("the checker's own source", () => {
+  it("carries no control byte, so it cannot trip its own rule", () => {
+    // #3072's first attempt wrote a literal NUL into the very docblock
+    // explaining that a literal NUL is an accident, which would have failed the
+    // check it was adding. Every byte class in this file is built with
+    // `String.fromCharCode`, and this keeps it that way.
+    const checkerSource = readFileSync(
+      path.join(REPO_ROOT, "scripts/ci/check-doc-index-integrity.mjs"),
+      "utf8",
+    );
+
+    expect(
+      auditControlCharacters(
+        new Map([["scripts/ci/check-doc-index-integrity.mjs", checkerSource]]),
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("agent-doc word ceilings (#4462)", () => {
+  const prose = (n) => Array.from({ length: n }, (_, i) => `w${i + 1}`).join(" ");
+  const register = (rows) =>
+    ["# Word budgets", "", "## Agent docs", "", "| File | Ceiling |", "| --- | ---: |", ...rows, ""].join("\n");
+  const files = (pages, rows) =>
+    new Map([
+      ...Object.entries(pages),
+      ...(rows === undefined ? [] : [[WORD_BUDGET_REGISTER, register(rows)]]),
+    ]);
+
+  it("passes a page at or under its ceiling and within the slack", () => {
+    const pages = { "docs/agents/A.md": prose(100) };
+    expect(auditAgentDocWordBudgets(files(pages, ["| `docs/agents/A.md` | 100 |"]))).toEqual([]);
+    expect(
+      auditAgentDocWordBudgets(files(pages, [`| \`docs/agents/A.md\` | ${100 + AGENT_DOC_BUDGET_SLACK} |`])),
+    ).toEqual([]);
+  });
+
+  it("fails a page over its ceiling", () => {
+    const problems = auditAgentDocWordBudgets(files({ "docs/agents/A.md": prose(101) }, ["| `docs/agents/A.md` | 100 |"]));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("docs/agents/A.md is 101 words; its ceiling is 100");
+  });
+
+  it("fails a ceiling this change sets more than the slack above its page", () => {
+    const loose = `| \`docs/agents/A.md\` | ${101 + AGENT_DOC_BUDGET_SLACK} |`;
+    const head = files({ "docs/agents/A.md": prose(100) }, [loose]);
+    // Added against a base that had no row, or raised against one that had a tighter one.
+    for (const base of [files({}, []), files({}, ["| `docs/agents/A.md` | 100 |"])]) {
+      const problems = auditAgentDocWordBudgets(head, base);
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain(`sets the ceiling for docs/agents/A.md to ${101 + AGENT_DOC_BUDGET_SLACK}`);
+    }
+    // A row the change leaves alone only reports drift, as information.
+    expect(auditAgentDocWordBudgets(head, files({}, [loose]))).toEqual([]);
+    expect(auditAgentDocWordBudgets(head)).toEqual([]);
+    expect(agentDocBudgetDrift(head)).toEqual([
+      expect.objectContaining({ rel: "docs/agents/A.md", words: 100, ceiling: 101 + AGENT_DOC_BUDGET_SLACK }),
+    ]);
+  });
+
+  it("keeps main green when two lanes each shrink one page without touching its row", () => {
+    // main: A at 300 words, ceiling 300. Lane 1 cuts 30 words, lane 2 cuts a
+    // different 30; each is green alone (within the slack). Merged, A is 240
+    // and the untouched row is 60 above it, which a floor on every row would
+    // fail on main with neither lane at fault.
+    const row = ["| `docs/agents/A.md` | 300 |"];
+    const base = files({ "docs/agents/A.md": prose(300) }, row);
+    expect(auditAgentDocWordBudgets(files({ "docs/agents/A.md": prose(270) }, row), base)).toEqual([]);
+    const merged = files({ "docs/agents/A.md": prose(240) }, row);
+    expect(auditAgentDocWordBudgets(merged, base)).toEqual([]);
+    // Through auditDocs too, which hands the audit its baseline. (Reachability
+    // is another audit, and this fixture has no hub linking the page.)
+    const budgetFindings = (map) =>
+      auditDocs(map, { baselineFiles: base }).filter((p) => p.includes("docs/agents/A.md") && !p.includes("not reachable"));
+    expect(budgetFindings(merged)).toEqual([]);
+    expect(budgetFindings(files({ "docs/agents/A.md": prose(240) }, ["| `docs/agents/A.md` | 299 |"]))).toHaveLength(1);
+    expect(agentDocBudgetDrift(merged)).toHaveLength(1);
+    // Growth past an unchanged ceiling still fails.
+    expect(auditAgentDocWordBudgets(files({ "docs/agents/A.md": prose(301) }, row), base)).toHaveLength(1);
+  });
+
+  it("fails an unregistered page, including when the register is missing", () => {
+    for (const rows of [[], undefined]) {
+      const problems = auditAgentDocWordBudgets(files({ "docs/agents/NEW.md": prose(3) }, rows));
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("docs/agents/NEW.md is 3 words and has no row");
+    }
+  });
+
+  it("fails stale, duplicate and malformed rows, and ignores nested pages and other docs", () => {
+    const problems = auditAgentDocWordBudgets(
+      files(
+        { "docs/agents/A.md": prose(10), "docs/agents/codex/skills/X.md": prose(9999), "docs/OTHER.md": prose(9999) },
+        [
+          "| `docs/agents/A.md` | 10 |",
+          "| `docs/agents/A.md` | 10 |",
+          "| `docs/agents/GONE.md` | 10 |",
+          "| docs/agents/A.md | 10 |",
+          "| `docs/agents/A.md` | 010 |",
+        ],
+      ),
+    );
+    expect(problems).toHaveLength(4);
+    expect(problems.filter((problem) => problem.includes("a second time"))).toHaveLength(1);
+    expect(problems.filter((problem) => problem.includes("not a well-formed row"))).toHaveLength(2);
+    expect(problems.filter((problem) => problem.includes("docs/agents/GONE.md, which is not a tracked file"))).toHaveLength(1);
+  });
+
+  it("holds the real repository, and runs inside auditDocs", () => {
+    const tracked = loadTrackedFiles(REPO_ROOT);
+    expect(auditAgentDocWordBudgets(tracked)).toEqual([]);
+    const grown = new Map(tracked);
+    grown.set("docs/agents/MODELS.md", `${tracked.get("docs/agents/MODELS.md")}\n${prose(200)}\n`);
+    expect(auditDocs(grown).some((problem) => problem.startsWith("docs/agents/MODELS.md is "))).toBe(true);
+  });
+
+  it("states the enforced slack in the register, so the doc and the gate agree", () => {
+    const text = readFileSync(path.join(REPO_ROOT, WORD_BUDGET_REGISTER), "utf8").replace(/\s+/g, " ");
+    expect(text).toContain(`at most ${AGENT_DOC_BUDGET_SLACK} words above its page`);
+  });
+});
+
+
+describe("screen map contracts (#4469)", () => {
+  function fixture() {
+    return new Map([
+      ["docs/UX_FLOW_MAP.md", "# Map\n### Members\n\nScreen: `/admin/members`.\n\nJourney: Find a member."],
+      ["docs/COVERAGE_MATRIX.md", "| `members` | membership |"],
+      [WORD_BUDGET_REGISTER, "| `docs/UX_FLOW_MAP.md` | 30 |"],
+      ["docs/user-guide/README.md", "![Dashboard showing upcoming stays](../images/public/member-dashboard.png)"],
+    ]);
+  }
+
+  it("accepts a screen section and an illustrated guide", () => {
+    expect(auditUxFlowMap(fixture())).toEqual([]);
+  });
+
+  it("rejects an area mentioned outside a screen section", () => {
+    const files = fixture();
+    files.set("docs/UX_FLOW_MAP.md", "# Map\nScreen: `/admin/members`.");
+    expect(auditUxFlowMap(files)).toEqual([expect.stringContaining("/admin/members needs a screen section")]);
+  });
+
+  it("recognises multiple screen sections in the same area", () => {
+    const files = fixture();
+    files.set("docs/COVERAGE_MATRIX.md", "| `members` | membership |\n| `committee` | membership |");
+    files.set("docs/UX_FLOW_MAP.md", files.get("docs/UX_FLOW_MAP.md") + "\n### Committee\n\nScreen: `/admin/committee`.");
+    files.set(WORD_BUDGET_REGISTER, "| `docs/UX_FLOW_MAP.md` | 100 |");
+    expect(auditUxFlowMap(files)).toEqual([]);
+  });
+
+  it("detects a new admin area without map coverage", () => {
+    const files = fixture();
+    files.set("docs/COVERAGE_MATRIX.md", "| `members` | membership |\n| `new-area` | support |");
+    expect(auditUxFlowMap(files)).toEqual([expect.stringContaining("/admin/new-area")]);
+  });
+
+  it("enforces the registered budget and fails when it is absent", () => {
+    const files = fixture();
+    files.set(WORD_BUDGET_REGISTER, "| `docs/UX_FLOW_MAP.md` | 1 |");
+    expect(auditUxFlowMap(files)).toEqual([expect.stringContaining("exceeds its 1-word ceiling")]);
+    files.delete(WORD_BUDGET_REGISTER);
+    expect(auditUxFlowMap(files)).toEqual([expect.stringContaining("missing screen-map word ceiling")]);
+  });
+
+  it("rejects an unillustrated guide and an image without alt text", () => {
+    const files = fixture();
+    for (const content of ["# Guide", "![](../images/public/member-dashboard.png)"]) {
+      files.set("docs/user-guide/README.md", content);
+      expect(auditUxFlowMap(files)).toEqual([expect.stringContaining("docs/user-guide/README.md")]);
+    }
+  });
+  it("ignores screen sections, budgets and illustrations in literal blocks", () => {
+    for (const wrap of [(text) => `\`\`\`md\n${text}\n\`\`\``, (text) => `<!--\n${text}\n-->`]) {
+      const screens = fixture();
+      screens.set("docs/UX_FLOW_MAP.md", wrap(screens.get("docs/UX_FLOW_MAP.md")));
+      expect(auditUxFlowMap(screens)).toEqual([expect.stringContaining("needs a screen section")]);
+      const budget = fixture();
+      budget.set(WORD_BUDGET_REGISTER, wrap(budget.get(WORD_BUDGET_REGISTER)));
+      expect(auditUxFlowMap(budget)).toEqual([expect.stringContaining("missing screen-map word ceiling")]);
+      const guide = fixture();
+      guide.set("docs/user-guide/README.md", wrap(guide.get("docs/user-guide/README.md")));
+      expect(auditUxFlowMap(guide)).toEqual([expect.stringContaining("embed a named user-guide screenshot")]);
+    }
+  });
+
+  it("does not count a screenshot shown as an inline code example", () => {
+    const files = fixture();
+    files.set("docs/user-guide/README.md", "Example: `" + files.get("docs/user-guide/README.md") + "`");
+    expect(auditUxFlowMap(files)).toEqual([expect.stringContaining("embed a named user-guide screenshot")]);
+  });
+
+});

@@ -1,0 +1,1573 @@
+import { queueOrganiserExtraForChange } from "@/lib/organiser-extra-invoice-queue";
+import { NextRequest, NextResponse } from "next/server";
+import { bookingPromoCodeLabel, bookingPromoRedemptions } from "@/lib/booking-promo-redemptions";
+import { repriceBookingPromotions } from "@/lib/booking-promotions";
+import { bookingOwner } from "@/lib/booking-owner";
+import {
+  checkOwnDependantIdentityForParty,
+  claimedMemberPathIds,
+  OwnDependantIdentityRefusedError,
+} from "@/lib/booking-dependant-identity";
+import {
+  dependantIdentitySpeaksOnBehalf,
+  standaloneAddGuestDependantRefusalMessage,
+} from "@/lib/booking-dependant-identity-doors";
+import { hostingCoverageParticipantRetryResponse } from "@/lib/adult-member-hosting-retry-response";
+import {
+  type AgeTier,
+  type BookingGuest,
+  type MemberGuestConsentStatus,
+} from "@prisma/client";
+import { auth } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import {
+  bookingGuestDietaryCreateData,
+  resolveBookingGuestDietary,
+  resolveBookingGuestDietarySeeding,
+} from "@/lib/member-dietary-booking-writes";
+import {
+  acquireLodgeCapacityLock,
+  checkCapacityForGuestRanges,
+} from "@/lib/capacity";
+import { getLodgeCapacity } from "@/lib/lodge-capacity";
+import { getDefaultLodgeId, lodgeNullTolerantScope } from "@/lib/lodges";
+import {
+  type SeasonRateData,
+} from "@/lib/pricing";
+import {
+  assertMembershipTypeBookingAllowed,
+  getMembershipTypeBookingPolicyErrorBody,
+  MembershipTypeBookingPolicyError,
+  priceBookingGuestsWithMembershipTypePolicy,
+} from "@/lib/membership-type-policy";
+import {
+  calculateBookingHoldDecision,
+  toEditTimeGroupDiscountConfig,
+  toSeasonRateData,
+} from "@/lib/policies/booking-route-decisions";
+import {
+  recordBookingNightAdjustments,
+  type PromoAdjustmentTarget,
+} from "@/lib/night-adjustment-write";
+import type { PromoCoverageNotice } from "@/lib/promo-cap-coverage";
+import { ApiError as SharedApiError } from "@/lib/api-error";
+import { ORGANISER_CHILD_CHARGE_REFUSAL, paidByOrganiserCard, paidByOrganiserInternetBanking } from "@/lib/group-organiser-paid";
+import { refuseOrganiserBankChildPriceChangeInGroupCancel } from "@/lib/group-cancel-in-progress";
+import { logAudit } from "@/lib/audit";
+import { getClientIp } from "@/lib/rate-limit-http";
+import { sendBookingModifiedEmail } from "@/lib/email";
+import { bookingHasOpenFinancialReview } from "@/lib/booking-financial-review-visibility";
+import {
+  editedBookingTotalCents,
+  refuseNegativeStoredGuestTotals,
+  valuedNightLocksForGuest,
+  withUnattachedStrandMoney,
+} from "@/lib/edit-night-valuation";
+import {
+  assertNoPendingEditFinancialReview,
+  EditFinancialReviewPendingError,
+} from "@/lib/edit-financial-review";
+import { queueXeroBookingEditSettlement } from "@/lib/xero-booking-edit-settlement";
+import {
+  NO_ADDITIONAL_ASK,
+  sizeAdditionalAsk,
+  type AdditionalAsk,
+} from "@/lib/additional-payment-ask";
+import { foldWaitingAsks } from "@/lib/additional-ask-reissue";
+import { queueEditAskFollowUps } from "@/lib/unpaid-ask-billed-offset-note";
+import { NO_FOLDED_WAITING_ASKS, NO_UNPAID_ASK_SETTLEMENT, unpaidAskOffsetHistory, type FoldedWaitingAsks } from "@/lib/unpaid-ask-offset-marker";
+import { resolveOrganiserBillingForNet } from "@/lib/organiser-billing";
+import { primaryInvoiceSettlementHistory, writeEditOnPayment } from "@/lib/booking-primary-invoice-claim";
+import { createModificationAdditionalPaymentIntent } from "@/lib/booking-modification-settlement";
+import { additionalAskEmailTerms } from "@/lib/additional-ask-email-terms";
+import logger from "@/lib/logger";
+import { requiredNightPriceCents } from "@/lib/required-price-cents";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { getNonMemberHoldPolicy } from "@/lib/cancellation";
+import { nonMemberHoldEnd } from "@/lib/non-member-hold-end";
+import { requireActiveSessionUser } from "@/lib/session-guards";
+import {
+  assertLinkedBookingMembersCanBeBooked,
+  BookingGuestValidationError,
+  getBookingGuestValidationErrorResponse,
+  normalizeBookingGuestInputs,
+  resolveLinkedBookingMembersWithBoundary,
+} from "@/lib/booking-guests";
+import {
+  loadMemberGuestAddPolicy,
+  matchMemberGuestNotificationRows,
+  planMemberGuestConsentWrites,
+  type MemberGuestConsentGuestFields,
+  type MemberGuestConsentWritePlanEntry,
+} from "@/lib/member-guest-add-policy";
+import {
+  handleMemberGuestAddRefusal,
+  startMemberGuestRefusalClock,
+} from "@/lib/member-guest-probe-guard";
+import {
+  guestConsentStatus,
+  type MemberGuestAddActor,
+} from "@/lib/member-guest-consent";
+import { findUnpaidMemberGuestNames } from "@/lib/booking-member-guest-subscriptions";
+import { resolveSubscriptionLockoutMode } from "@/lib/member-subscription-eligibility";
+import {
+  buildPaidUpAdultRefusalBody,
+  evaluateNonMemberPricingRequirements,
+  PaidUpAdultMemberRequiredError,
+  toSubscriptionLockoutParticipants,
+} from "@/lib/subscription-lockout-enforcement";
+import {
+  ADULT_SUPERVISION_REVIEW_REASON,
+  requiresAdultSupervisionReview,
+} from "@/lib/booking-review";
+import {
+  activeLifecycleEditRefusal,
+  getBookingEditPolicy,
+} from "@/lib/booking-edit-policy";
+import {
+  canAskCardForIncrease,
+  hasIssuedPrimaryXeroInvoice,
+} from "@/lib/booking-payment-state";
+import { clubTime } from "@/lib/club-time/server";
+import { dateOnlyInstantOf } from "@/lib/club-time";
+import { assertBookingNotQuotePriced } from "@/lib/booking-modify";
+import { reconcileBedAllocationsForBookingWithGlobalLockHeld } from "@/lib/bed-allocation-lifecycle";
+import {
+  hostingCoverageActorOptions,
+  reconcileAdultMemberHostingReviewWithSiblings,
+} from "@/lib/adult-member-hosting-review";
+import { AdultMemberHostingRequiredError, buildAdultMemberHostingRefusalBody } from "@/lib/adult-member-hosting-refusal";
+import { settleHostingCoverageAfterCommit } from "@/lib/adult-member-hosting-coverage-drain";
+import {
+  SameOwnerCoverageOverrideRequiredError,
+  SameOwnerCoverageWouldBreakError,
+  buildSameOwnerCoverageOverrideRequiredBody,
+  buildSameOwnerCoverageRefusalBody,
+} from "@/lib/adult-member-hosting-same-owner";
+import { seasonYearOfStoredDate } from "@/lib/financial-year";
+import {
+  authorizationRoleFromAccessRoles,
+  hasAdminAccess,
+} from "@/lib/access-roles";
+import {
+  assertNoBookingMemberNightConflicts,
+  BookingMemberNightConflictError,
+  getBookingMemberNightConflictResponse,
+} from "@/lib/booking-member-night-conflicts";
+import { bookingFinalPriceCents } from "@/lib/booking-final-price";
+import { postModificationLedgerLines } from "@/lib/booking-ledger-modification-sync";
+import { resolveBookingMoneyPostingContext } from "@/lib/member-money/doors";
+import { computeModificationPricing } from "@/lib/booking-modification-pricing";
+import {
+  loadModificationLinesAuditFields,
+  pricingSideFromStoredGuests,
+} from "@/lib/booking-modification-lines";
+import { clubFormatValues } from "@/lib/club-format-server";
+import { lodgeGuestLimitMessage } from "@/lib/lodge-booking-readiness";
+import { LOCK1_HOLDER_TRANSACTION_BUDGET } from "@/lib/db-transaction";
+import { addGuestsSchema } from "@/lib/booking-add-guests-request";
+import {
+  TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE,
+  transactionContendedResponse,
+} from "@/lib/transaction-contended-response";
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  // #2388: taken at the top so the collapsed-refusal timing floor covers the
+  // whole request.
+  const startedAt = startMemberGuestRefusalClock();
+  const session = await auth();
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+  }
+
+  const inactiveResponse = await requireActiveSessionUser(session.user.id);
+  if (inactiveResponse) {
+    return inactiveResponse;
+  }
+  const isAdmin = hasAdminAccess(session.user);
+  const actorRole = authorizationRoleFromAccessRoles(session.user);
+
+  const { id: bookingId } = await params;
+
+  const json = await parseJsonRequestBody(request);
+  if (!json.ok) return json.response;
+
+  const parsed = addGuestsSchema.safeParse(json.body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid input", details: parsed.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  // #1769b (#1705 semantics): only an admin actor may carry the per-action
+  // member-email choice on this dual-actor route. A member self-service caller
+  // carrying the flag is refused, so a member can never suppress their own
+  // booking-modified email; member behaviour is otherwise unchanged.
+  if (parsed.data.notifyMember !== undefined && !isAdmin) {
+    return NextResponse.json(
+      { error: "Admin override is not available for this account" },
+      { status: 403 }
+    );
+  }
+  // Absent for any non-admin caller (defence in depth behind the 403 gate).
+  const notifyMember = isAdmin ? parsed.data.notifyMember : undefined;
+
+  // No party-size check here (#3407 review): the booking, and so its lodge, is
+  // not loaded yet, so the only capacity at hand would be the DEFAULT lodge's,
+  // which can only refuse wrongly at another lodge. The payload is bounded by
+  // the schema's `GUEST_CHANGE_LIST_BOUND`; the real rule is the per-lodge check inside the
+  // transaction below, under the lodge's capacity lock.
+  const { guests: newGuests } = parsed.data;
+
+  const ipAddress = getClientIp(request);
+
+  // "+ Add Member Guest" (epic #2305, MG2 #2307). Read the module flag and the
+  // policy singleton HERE, OUTSIDE the transaction below.
+  //
+  // This is the call site the ordering rule was written for. The resolver runs
+  // INSIDE `prisma.$transaction`, after `acquireLodgeCapacityLock`, so the
+  // obvious-looking place to read these values is right next to where they are
+  // used — and that would hold the lodge's capacity lock across two extra queries
+  // on every guest add, including the ones with no member guest in them.
+  // `planMemberGuestConsentWrites` is pure, so only the READS have to move out.
+  const memberGuestPolicy = await loadMemberGuestAddPolicy();
+  // MG4-D-a, brought forward: `isAdmin` is exactly the flag that passes
+  // `skipAuthorization` on this route, so an admin add is consent-free and
+  // always-notify, stamped with the admin who made it.
+  const memberGuestActor: MemberGuestAddActor = isAdmin
+    ? { kind: "ADMIN", adminMemberId: session.user.id }
+    : { kind: "MEMBER" };
+
+  // #2543 — read the lockout policy HERE, outside the transaction, for exactly
+  // the reason stated above: the gate below runs after `acquireLodgeCapacityLock`
+  // and `resolveSubscriptionLockoutMode` can reseed the financial-year cache from
+  // Xero. A provider call under the capacity lock is forbidden, so the read moves
+  // out and only the decision stays in.
+  const subscriptionLockoutMode = await resolveSubscriptionLockoutMode();
+
+  // #3123 — and the club's day, read HERE for exactly the same reason: the edit
+  // policy below runs after `acquireLodgeCapacityLock` and under the global
+  // cohort key, and resolving the club's persisted zone in there would be a
+  // `clubTimeSettings.findUnique` taking a second pooled connection while those
+  // locks are held (`INV-LOCK-004`). `getBookingEditPolicy` is a pure synchronous
+  // classifier and now takes the day as a value.
+  //
+  // ONE day answers three questions on this path, and they must agree: the edit
+  // policy's gate, and — inside the transaction — the promotion's validity
+  // window (`validateAndCalculatePromoDiscount`) and the reduction refund's
+  // settlement tier. Two reads could disagree across club midnight and let an
+  // add-guest edit be admitted under one day and priced under another.
+  const todayAtClub = (await clubTime()).today();
+  const clubTodayDateOnly = dateOnlyInstantOf(todayAtClub);
+  // #3029 (W10, `INV-MOD-059`) — whether an added linked member is seeded from
+  // their dietary/allergy profile. The toggle, read HERE for the same reason.
+  const guestDietarySeeding = await resolveBookingGuestDietarySeeding();
+  // The club's format (#3565), resolved once, before any transaction or
+  // lock below — never per amount and never inside a transaction.
+  const format = await clubFormatValues();
+  // #4627: the journal's posting context, resolved before the transaction (`INV-LOCK-004`).
+  const journal = await resolveBookingMoneyPostingContext();
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+      // Lock the booking's lodge before re-reading it; the booking's lodge
+      // cannot change, so the pre-read outside the lock is safe for key
+      // selection.
+      const lockTarget = await tx.booking.findUnique({
+        where: { id: bookingId },
+        select: { lodgeId: true },
+      });
+      const bookingLodgeId =
+        lockTarget?.lodgeId ?? (await getDefaultLodgeId(tx));
+      await acquireLodgeCapacityLock(tx, bookingLodgeId);
+
+      const booking = await tx.booking.findUnique({
+        where: { id: bookingId },
+        include: {
+          guests: {
+            include: {
+              nights: { select: { stayDate: true, priceCents: true, priceSource: true } },
+            },
+          },
+          payment: true,
+          member: true,
+          // #3369: the owner may be an Organisation; bookingOwner() reads both.
+          organisation: { select: { name: true, email: true } },
+          promoRedemptions: {
+            include: {
+              guestTargets: { select: { bookingGuestId: true } },
+              promoCode: {
+                include: {
+                  assignments: { select: { memberId: true } },
+                  lodges: { select: { lodgeId: true } },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!booking) {
+        throw new ApiError("Booking not found", 404);
+      }
+
+      // #3827: every code the booking carries, in its stored order.
+      const promoRedemptions = bookingPromoRedemptions(booking).filter(
+        (redemption) => redemption.promoCode,
+      );
+
+      if (
+        bookingOwner(booking).memberId !== session.user.id &&
+        !isAdmin
+      ) {
+        throw new ApiError("Forbidden", 403);
+      }
+
+      // #3200: this door admits no finished stay, which is why the shared
+      // invoice test further down — it answers COMPLETED as "invoice issued" —
+      // has nothing new to handle here. Widening this gate is a real change.
+      // #3245: derived, not restated. `includeFinishedStay` stays off, so the
+      // COMPLETED exclusion survives the convergence unchanged.
+      const editRefusal = activeLifecycleEditRefusal(booking.status, actorRole);
+      if (editRefusal) throw new ApiError(editRefusal, 400);
+
+      const editPolicy = getBookingEditPolicy({
+        status: booking.status,
+        role: actorRole,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        today: clubTodayDateOnly,
+      });
+      if (!editPolicy.canModify) {
+        throw new ApiError(
+          editPolicy.reason ?? "This booking cannot be modified",
+          400
+        );
+      }
+      await assertBookingNotQuotePriced(tx, bookingId);
+      if (editPolicy.mode !== "future") {
+        throw new ApiError(
+          "Use the full booking edit flow for in-progress booking guest changes",
+          400
+        );
+      }
+
+      /**
+       * #3032 (epic #2797): the FOURTH money-affecting door, and it was the one
+       * with no fence on it.
+       *
+       * ADDING A GUEST IS UNCONDITIONALLY MONEY-AFFECTING - there is no
+       * identity-only shape here to exempt, which is why `moneyAffecting` is a
+       * literal rather than a predicate. This route reprices EVERY existing guest
+       * (`allGuestsForPricing` below), computes `priceDiffCents` against
+       * `booking.finalPriceCents`, charges on a positive delta, and then WRITES
+       * the new `finalPriceCents` back.
+       *
+       * What that does to a booking under review is worse than an ordinary
+       * compounding: an unreadable strand carries no locked night prices, so the
+       * reprice revalues it at today's rate - the #3031 defect - and the overstated
+       * total the review exists to hold gets silently absorbed into the stored
+       * figure. The admin then completes the review and credits the member against
+       * a total that has already had the same money taken out of it, so it leaves
+       * twice.
+       *
+       * PLACED LIKE THE OTHER THREE DOORS: inside the transaction, after
+       * `pg_advisory_xact_lock(1)` and `acquireLodgeCapacityLock`, after the
+       * post-lock re-read, and BEFORE any write - so a refused addition changes
+       * nothing at all. And below the 403 above, deliberately: telling a stranger
+       * that the club is reviewing a booking's money is a leak, and a 409 where a
+       * 403 belongs is a wrong answer besides.
+       */
+      await assertNoPendingEditFinancialReview({
+        bookingId,
+        moneyAffecting: true,
+        store: tx,
+      });
+
+      const lodgeCapacity = await getLodgeCapacity(bookingLodgeId, tx);
+      if (booking.guests.length + newGuests.length > lodgeCapacity) {
+        throw new ApiError(
+          lodgeGuestLimitMessage(lodgeCapacity, (limit) => `A booking cannot exceed ${limit} guests`),
+          400,
+        );
+      }
+
+      // Normalization can widen a linked guest's tier to the member's
+      // stored AgeTier, so the element type widens ageTier (only) beyond
+      // the bookable-tier zod inference.
+      let normalizedNewGuests: Array<
+        Omit<(typeof newGuests)[number], "ageTier"> & { ageTier: AgeTier } &
+          MemberGuestConsentGuestFields
+      > = newGuests;
+      // The cross-family rows this add will create, keyed by target member id.
+      // Populated inside the transaction and consumed AFTER it commits.
+      let memberGuestEntries = new Map<string, MemberGuestConsentWritePlanEntry>();
+      /**
+       * OWN-DEPENDANT IDENTITY (#3451, `INV-GUEST-019`; option C, "refuse with
+       * a pointer" on this door). No screen and no field for an answer, so a
+       * typed guest named as one of the booking OWNER's recorded dependants is
+       * refused, pointing at Edit Booking. After the 403, and BEFORE the member
+       * lookup against the CLAIMED ids (`claimedMemberPathIds`): after it, this
+       * 409 versus the lookup's collapsed refusal told a prober whether another
+       * claimed id was a real member. The read runs on `tx` and takes no lock.
+       */
+      {
+        const ownerMemberId = bookingOwner(booking).memberId;
+        const dependantIdentityRefusal = await checkOwnDependantIdentityForParty(tx, {
+          bookerMemberId: ownerMemberId,
+          party: newGuests,
+          memberPathMemberIds: claimedMemberPathIds(newGuests),
+        });
+        if (dependantIdentityRefusal) {
+          throw new OwnDependantIdentityRefusedError(
+            dependantIdentityRefusal,
+            ownerMemberId,
+          );
+        }
+      }
+      try {
+        const { members: linkedMembers, boundary } =
+          await resolveLinkedBookingMembersWithBoundary(
+            tx,
+            bookingOwner(booking).memberId,
+            newGuests.map((guest) => guest.memberId),
+            {
+              skipAuthorization: isAdmin,
+              memberGuestWideningEnabled: memberGuestPolicy.wideningEnabled,
+            }
+          );
+        await assertLinkedBookingMembersCanBeBooked(
+          tx,
+          linkedMembers,
+          session.user.id,
+          {
+            actorRole,
+            onBehalfOfMemberId: isAdmin ? bookingOwner(booking).memberId : null,
+            // D-8: a blocked cross-family member is refused neutrally.
+            crossFamilyMemberIds: boundary.beyondFamilyMemberIds,
+          }
+        );
+        // Planned before the person-night guard and the unpaid-subscription check
+        // below, because both read the D-8 marker this attaches.
+        const consentPlan = planMemberGuestConsentWrites({
+          guests: normalizeBookingGuestInputs(newGuests, linkedMembers),
+          boundary,
+          actor: memberGuestActor,
+          now: new Date(),
+          bookingCheckIn: booking.checkIn,
+          policy: memberGuestPolicy,
+        });
+        normalizedNewGuests = consentPlan.guests;
+        memberGuestEntries = consentPlan.entriesByMemberId;
+      } catch (error) {
+        if (error instanceof BookingGuestValidationError) {
+          throw error;
+        }
+        throw error;
+      }
+
+      await assertNoBookingMemberNightConflicts(tx, {
+        actorMemberId: session.user.id,
+        actorRole,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        guests: normalizedNewGuests,
+        excludeBookingId: bookingId,
+        // Resolved above, before this transaction opened (`INV-LOCK-004`) — the
+        // same club day the edit policy and the removal window already read.
+        today: clubTodayDateOnly,
+      }, format);
+
+      const seasonYear = seasonYearOfStoredDate(booking.checkIn);
+      await assertMembershipTypeBookingAllowed(tx, {
+        ownerMemberId: bookingOwner(booking).memberId,
+        guests: [
+          ...booking.guests,
+          ...normalizedNewGuests.map((guest) => ({
+            isMember: guest.isMember,
+            memberId: guest.memberId ?? null,
+          })),
+        ],
+        seasonYear,
+        // Finding 2 (privacy re-review of MG3 #2308).
+        skipAuthorization: isAdmin,
+      });
+
+      if (!isAdmin) {
+        const unpaidMemberGuests = await findUnpaidMemberGuestNames(tx, {
+          bookingMemberId: bookingOwner(booking).memberId,
+          checkIn: booking.checkIn,
+          guests: normalizedNewGuests,
+        });
+
+        // #2543: mode-gated exactly as on the four sibling paths. The call above
+        // still runs under NON_MEMBER_PRICING so the D-8 cross-family refusal is
+        // untouched; only this refusal is the lockout policy's to relax.
+        if (
+          subscriptionLockoutMode === "HARD_BLOCK" &&
+          unpaidMemberGuests.length > 0
+        ) {
+          throw new ApiError(
+            `The following member guests have unpaid subscriptions: ${unpaidMemberGuests.join(", ")}. All member guests must have a paid subscription before booking.`,
+            403
+          );
+        }
+
+        // #2543 — the paid-up-adult requirement over the party AFTER the add.
+        // Adding a guest is a booking write, so a booking that was legal when it
+        // was made can be pushed out of compliance by an add, and the same
+        // exception-request door opens.
+        const nonMemberPricing = await evaluateNonMemberPricingRequirements(tx, {
+          mode: subscriptionLockoutMode,
+          lodgeId: bookingLodgeId,
+          seasonYear,
+          checkIn: booking.checkIn,
+          checkOut: booking.checkOut,
+          // Owner decision, 3 Aug 2026: an unfinancial owner triggers the
+          // requirement whether or not they hold a bed on the booking they are
+          // adding to.
+          bookingOwnerMemberId: bookingOwner(booking).memberId,
+          // D-12 over the whole post-add party. `toSubscriptionLockoutParticipants`
+          // reads a persisted row's `consentStatus` and a pre-persist row's planned
+          // `memberGuestConsent.consentStatus`, which is exactly the two shapes
+          // here, so both lists go through the one helper rather than each
+          // inventing its own mapping. A cross-family member guest is added PENDING
+          // — they have not accepted yet — so they must not be the paid-up adult
+          // who satisfies the requirement; otherwise the rule is trivially
+          // satisfiable, since the invite need never be accepted. A family-scope
+          // add carries no consent columns at all, and absent means present,
+          // exactly as #2364 has it. An added guest carries no per-guest stay range
+          // on this route, so a null envelope falls back to the booking's, which is
+          // what the participant mapper does.
+          participants: toSubscriptionLockoutParticipants([
+            ...booking.guests,
+            ...normalizedNewGuests,
+          ]),
+        });
+        if (nonMemberPricing?.violation) {
+          throw new PaidUpAdultMemberRequiredError(nonMemberPricing.violation);
+        }
+      }
+
+      // Capacity check excluding this booking (using tx to participate in advisory lock)
+      const capacity = await checkCapacityForGuestRanges(
+        bookingLodgeId,
+        booking.checkIn,
+        booking.checkOut,
+        [
+          ...booking.guests,
+          ...normalizedNewGuests.map((guest) => ({
+            stayStart: booking.checkIn, stayEnd: booking.checkOut,
+            memberId: guest.memberId ?? null,
+          })),
+        ],
+        bookingId,
+        tx
+      );
+
+      if (!capacity.available) {
+        throw new ApiError(
+          "Not enough beds available to add these guests",
+          400
+        );
+      }
+
+      // Load seasons for pricing
+      const seasons = await tx.season.findMany({
+        where: { active: true, ...lodgeNullTolerantScope(bookingLodgeId) },
+        include: { membershipTypeRates: true },
+      });
+
+      // #2756: through the shared mapper, which carries the season's `type`.
+      // INV-MOD-006 names this route as the one that prices the whole post-add
+      // party, but the hand-rolled literal it used dropped `type`, so the discount
+      // it exists to apply could never qualify at a club on the DEFAULT
+      // `summerOnly: true` setting.
+      const seasonRateData: SeasonRateData[] = toSeasonRateData(seasons);
+
+      // Calculate price for new guests
+      const newGuestInputs = normalizedNewGuests.map((g) => ({
+        ageTier: g.ageTier as AgeTier,
+        isMember: g.isMember,
+        memberId: g.memberId ?? null,
+      }));
+
+      // Price the whole post-add party together (#1095): the group discount
+      // depends on party size per night, so a new guest joining a qualifying
+      // party must price at the discounted rate — a standalone new-guest
+      // pricing pass can never see the party. Existing guests are fully
+      // locked (#1036), so the new guests' slices of this breakdown are
+      // exactly their own prices.
+      const allGuestsForPricing = [
+        ...booking.guests.map((g) => ({
+          bookingGuestId: g.id,
+          ageTier: g.ageTier as AgeTier,
+          isMember: g.isMember,
+          memberId: g.memberId ?? null,
+          // Price existing guests over exactly the nights they hold (#1093):
+          // their stored night set (or stay envelope for pre-#713 guests
+          // without rows), never the full booking range — a partial-stay
+          // guest must not grow phantom nights because someone else was added.
+          stayStart: g.stayStart,
+          stayEnd: g.stayEnd,
+          nights: g.nights && g.nights.length > 0 ? g.nights : null,
+          // Existing guests keep their valued nightly prices (#1036, #4317
+          // `INV-MOD-028`): adding a guest must cost exactly the added guest's
+          // own price, so every night already held is locked.
+          ...valuedNightLocksForGuest(g, booking),
+        })),
+        ...newGuestInputs,
+      ];
+      // The rows themselves, not the pricing view: they carry each guest's
+      // consent (stored, or planned for an added row), and only an agreed adult
+      // counts (#3770, owner decision).
+      const requiresAdminReview = requiresAdultSupervisionReview([
+        ...booking.guests,
+        ...normalizedNewGuests.map((guest) => ({
+          ageTier: guest.ageTier,
+          consentStatus: guestConsentStatus(guest),
+        })),
+      ]);
+      const adminReviewReason = requiresAdminReview
+        ? ADULT_SUPERVISION_REVIEW_REASON
+        : null;
+
+      const groupDiscountSetting = await tx.groupDiscountSetting.findUnique({
+        where: { id: "default" },
+      });
+
+      let fullPriceBreakdown;
+      try {
+        fullPriceBreakdown = await priceBookingGuestsWithMembershipTypePolicy(tx, {
+          ownerMemberId: bookingOwner(booking).memberId,
+          checkIn: booking.checkIn,
+          checkOut: booking.checkOut,
+          guests: allGuestsForPricing,
+          seasons: seasonRateData,
+          // Edit-time mapper (#2770, INV-MOD-026): adding a guest to an
+          // existing booking is the archetypal later edit, so the club's
+          // `applyToEdits` switch decides whether the added guest's nights earn
+          // the discount. Off resolves to no config, so the added guest prices
+          // exactly as they would at a club with no group discount; the party
+          // already on the booking keeps its locked nightly prices either way
+          // (#1036, INV-MOD-005).
+          groupDiscount: toEditTimeGroupDiscountConfig(groupDiscountSetting),
+          seasonYear,
+          // #2543 — the mode this request already resolved. This call runs inside
+          // the transaction holding the per-lodge capacity lock, so being handed
+          // the mode also removes a second pooled connection from under the lock.
+          subscriptionLockoutMode,
+          // Finding 2 (privacy re-review of MG3 #2308).
+          skipAuthorization: isAdmin,
+        });
+      } catch (error) {
+        if (error instanceof MembershipTypeBookingPolicyError) {
+          throw error;
+        }
+        throw new ApiError(
+          "No season rate found for the booking dates",
+          400
+        );
+      }
+      // #4317 (D11, review M2): a negative stored guest total, which the
+      // database forbids, refuses the add; nothing has been written yet.
+      refuseNegativeStoredGuestTotals(logger, { bookingId, site: "guests-add" }, booking.guests);
+      // #4317: a strand holding no night keeps its stored total on itself.
+      fullPriceBreakdown = withUnattachedStrandMoney(fullPriceBreakdown, allGuestsForPricing);
+
+      /**
+       * The breakdown row for one position of the party pass.
+       *
+       * `fullPriceBreakdown.guests` is index-aligned with `allGuestsForPricing`
+       * by the pricing engine's construction, but `PriceBreakdown` declares no
+       * length relation to its input, so a short breakdown type-checks cleanly
+       * and would otherwise be read past. A missing row here is a wiring defect
+       * in whoever built the breakdown, and there is no honest amount to sell a
+       * night at or to promo-allocate against — refused by name, never guessed
+       * (#3031, #2801). One home for that condition: both readers below go
+       * through it, so neither repeats the answer.
+       */
+      const pricedPartyMember = (index: number) => {
+        const priced = fullPriceBreakdown.guests[index];
+        if (priced === undefined) {
+          throw new Error(
+            `The add-guest route has no priced guest at breakdown position ${index} of ${fullPriceBreakdown.guests.length} (#3031).`
+          );
+        }
+        return priced;
+      };
+
+      // Create BookingGuest records from their slice of the full-party
+      // breakdown, persisting one BookingGuestNight row per priced night
+      // (#1093) so added guests join the uniform night-row model: without
+      // rows, a later edit would reprice their whole stay at current season
+      // rates instead of honouring the prices they booked at (#1036).
+      //
+      // Each created guest's promo-allocation row is built in this same pass
+      // (#2801): the created `BookingGuest`, the normalized input it came from
+      // and the breakdown row that priced it are all in hand here, so they are
+      // carried together instead of being three arrays re-indexed against each
+      // other afterwards.
+      const createdGuests: BookingGuest[] = [];
+      type PartyGuestNightRate = {
+        bookingGuestId: string;
+        memberId: string | null;
+        isMember: boolean;
+        perNightRates: ReturnType<typeof pricedPartyMember>["perNightCents"];
+        nightDates: ReturnType<typeof pricedPartyMember>["nightDates"];
+        firstNight: Date;
+        /** #3827 (D-3813-4): only a guest actually staying can benefit from a code. */
+        consentStatus: MemberGuestConsentStatus | null;
+      };
+      const newGuestNightRates: PartyGuestNightRate[] = [];
+      // #3029: each added row's snapshot, from the linked members' CURRENT
+      // profiles through this transaction's client.
+      const newGuestDietary = await resolveBookingGuestDietary(
+        tx,
+        guestDietarySeeding,
+        normalizedNewGuests,
+      );
+      for (const [newGuestIndex, newGuest] of normalizedNewGuests.entries()) {
+        const priced = pricedPartyMember(
+          booking.guests.length + newGuestIndex
+        );
+        const guest = await tx.bookingGuest.create({
+          data: {
+            bookingId,
+            firstName: newGuest.firstName,
+            lastName: newGuest.lastName,
+            ageTier: newGuest.ageTier,
+            isMember: newGuest.isMember,
+            memberId: newGuest.memberId || null,
+            stayStart: booking.checkIn,
+            stayEnd: booking.checkOut,
+            priceCents: priced.priceCents,
+            // Persist the rate-type snapshot at creation (#1930, E4) so a later
+            // Xero line picks the matching item code.
+            rateMembershipTypeId: priced.rateMembershipTypeId,
+            // Member-guest consent (MG2 #2307), already decided by
+            // `buildMemberGuestConsentWrite`. Spread only when present: a
+            // family-scope or non-member guest writes exactly what it wrote
+            // before.
+            ...(newGuest.memberGuestConsent ?? {}),
+            ...bookingGuestDietaryCreateData(newGuestDietary[newGuestIndex]),
+            nights: {
+              create: (priced.nightDates ?? []).map((stayDate, k) => ({
+                stayDate,
+                // #3167 (epic #2797): NO `?? 0` — the rule and the #3167
+                // census are in `required-price-cents.ts`. What is specific
+                // here is the blast radius: this is the one writer that puts
+                // night rows on an EXISTING booking, beside rows already
+                // carrying real sold prices, so a magic zero would not read as
+                // the caller bug it is — it would surface much later as an
+                // unexplained review on somebody else's day.
+                priceCents: requiredNightPriceCents(
+                  priced.perNightCents,
+                  k,
+                  stayDate,
+                  "the add-guest route"
+                ),
+                priceSource: "SOLD",
+              })),
+            },
+          },
+        });
+        createdGuests.push(guest);
+        newGuestNightRates.push({
+          bookingGuestId: guest.id,
+          memberId: newGuest.memberId ?? null,
+          isMember: newGuest.isMember,
+          perNightRates: priced.perNightCents,
+          nightDates: priced.nightDates,
+          // nightDates carry each guest's actual priced nights (partial stays
+          // included); firstNight remains the booking's check-in so internal
+          // work-party promos date their window from the stay start.
+          firstNight: booking.checkIn,
+          consentStatus: guest.consentStatus,
+        });
+      }
+
+      // The party in the order the pricing pass saw it: the existing guests
+      // (whose pricing inputs `allGuestsForPricing` derives from these very
+      // rows, position for position), then the guests created above in arrival
+      // order. Each half reads its own source, so no position is looked up in
+      // an array it did not come from — which is also why `bookingGuestId` is
+      // now always a real id rather than a nullable one.
+      const guestNightRates: PartyGuestNightRate[] = [
+        ...booking.guests.map((guest, index) => {
+          const priced = pricedPartyMember(index);
+          return {
+            bookingGuestId: guest.id,
+            memberId: guest.memberId ?? null,
+            isMember: guest.isMember,
+            perNightRates: priced.perNightCents,
+            nightDates: priced.nightDates,
+            firstNight: booking.checkIn,
+            consentStatus: guest.consentStatus,
+          };
+        }),
+        ...newGuestNightRates,
+      ];
+
+      // #4317: every existing night is locked at its valued figure, so the
+      // headline moves by exactly the added guests (`INV-MOD-028`), carrying any
+      // gap a parked edit froze into it (review H1, `editedBookingTotalCents`).
+      const newTotalPriceCents = editedBookingTotalCents(booking, fullPriceBreakdown.totalPriceCents);
+
+      // Recalculate promo discount
+      let newDiscountCents = 0;
+      let newPromoAdjustmentCents = 0;
+      let promoRemoved = false;
+      let promoCoverage: PromoCoverageNotice | null = null;
+      let remainingPromoCodeLabel = bookingPromoCodeLabel(booking);
+      // #3276: what the promotion took off each night or guest; empty when the
+      // booking carries none.
+      let adjustmentTargets: PromoAdjustmentTarget[] = [];
+
+      if (promoRedemptions.length > 0) {
+        // #3827: every code the booking carries, through the one re-price,
+        // which row-locks each code and re-reads its usage counter before the
+        // caps are checked (#2299, INV-MONEY-023). Adding a member guest to an
+        // assigned promo makes that member a NEW beneficiary, so this path can
+        // take a total-redemptions slot, not just keep one. The per-lodge
+        // capacity lock is already held, so the order stays lodge -> promo rows.
+        // #2390: adding guests is the edit most likely to outgrow a cap.
+        // Everyone already benefiting keeps the discount; the new arrivals are
+        // priced normally and named in the response.
+        const repriced = await repriceBookingPromotions(tx, {
+          bookingId,
+          redemptions: promoRedemptions,
+          memberId: bookingOwner(booking).memberId,
+          bookingCheckIn: booking.checkIn,
+          totalPriceCents: newTotalPriceCents,
+          guests: guestNightRates,
+          lodgeId: bookingLodgeId,
+          // #3123 — resolved above, before this transaction opened
+          // (`INV-LOCK-004`).
+          todayAtClub,
+        });
+        newDiscountCents = repriced.newDiscountCents;
+        newPromoAdjustmentCents = repriced.newPromoAdjustmentCents;
+        promoRemoved = repriced.promoRemoved;
+        promoCoverage = repriced.promoCoverage;
+        remainingPromoCodeLabel = repriced.remainingPromoCodeLabel;
+        adjustmentTargets = repriced.adjustmentTargets;
+      }
+
+      // #3276: after the last night write and the promotion write, record what
+      // the promotion took off every night of every guest the engine priced —
+      // the existing guests included, since it re-decided the whole booking.
+      await recordBookingNightAdjustments(tx, {
+        format,
+        bookingId,
+        guestIds: guestNightRates.map((guest) => guest.bookingGuestId),
+        targets: adjustmentTargets,
+        writer: "the add-guest route",
+      });
+
+      const newFinalPriceCents = bookingFinalPriceCents({
+        totalPriceCents: newTotalPriceCents,
+        promoAdjustmentCents: newPromoAdjustmentCents,
+      });
+      const priceDiffCents = newFinalPriceCents - booking.finalPriceCents;
+      // #3949 review round 6: settling itself (not through `applyPaymentAdjustments`), it asks the same refusal here.
+      await refuseOrganiserBankChildPriceChangeInGroupCancel(tx, booking, { priceDiffCents, changeFeeCents: 0 });
+
+      // Update hasNonMembers
+      const addingNonMembers = normalizedNewGuests.some((g) => !g.isMember);
+      const hasNonMembers = booking.hasNonMembers || addingNonMembers;
+
+      // Recalculate member-priority hold state if this edit leaves non-members
+      // on a pre-payment booking. Disabled or inside-window holds are cleared.
+      let nonMemberHoldUntil = booking.nonMemberHoldUntil;
+      let holdAdjustedStatus = booking.status;
+      if (
+        hasNonMembers &&
+        (booking.status === "PENDING" || booking.status === "PAYMENT_PENDING")
+      ) {
+        const holdPolicy = await getNonMemberHoldPolicy(booking.checkIn, booking.lodgeId, tx);
+        const holdDecision = calculateBookingHoldDecision({
+          hasNonMembers,
+          checkIn: booking.checkIn,
+          holdDays: holdPolicy.holdDays,
+          holdEnabled: holdPolicy.enabled,
+        });
+        if (holdDecision.shouldBePending && booking.status === "PENDING") {
+          nonMemberHoldUntil = nonMemberHoldEnd(booking.checkIn, holdPolicy.holdDays);
+        } else {
+          nonMemberHoldUntil = null;
+          if (booking.status === "PENDING") {
+            holdAdjustedStatus = "PAYMENT_PENDING";
+          }
+        }
+      } else if (!hasNonMembers) {
+        nonMemberHoldUntil = null;
+      }
+
+      // Calculate additional amount for confirmed+paid bookings
+      let additionalAmountCents = 0;
+      // #3371: the card ask as the minter's own value type, carrying what
+      // minting it will absorb. Zero here never mints, so the Xero-only and
+      // nothing-owed endings below are safe without remembering to say so.
+      let additionalAsk: AdditionalAsk = NO_ADDITIONAL_ASK;
+      let foldedWaitingAsks: FoldedWaitingAsks = NO_FOLDED_WAITING_ASKS;
+      /**
+       * #3200: "has the main Xero invoice already been raised?" is asked at four
+       * edit doors and DEFINED in one — `hasIssuedPrimaryXeroInvoice`
+       * (`INV-SSOT-001`). The other three reach it through
+       * `applyPaymentAdjustments`; this door settles for itself, so it reads the
+       * rule rather than restating it. Restating it is what went wrong: the copy
+       * took its status list from the eligibility gate above instead, omitting
+       * COMPLETED. History on #3200.
+       *
+       * #3244 finished the job #3200 left: the SUCCEEDED-only test that used to
+       * sit here is now `hasCapturedPayment`, the same predicate the other three
+       * doors reach through `applyPaymentAdjustments`
+       * (`booking-modify-settlement.ts`). All four now answer "has money
+       * already moved through this card?" identically. Owner decision, 17 Sep
+       * 2026, on #3244 — the alternative of treating a fully-refunded booking
+       * as unpaid was rejected because it would have replaced one divergence
+       * with another.
+       *
+       * It WIDENS and does not narrow. `PARTIALLY_REFUNDED` and `REFUNDED` now
+       * count as paid, so the difference is charged instead of collected from
+       * nobody — the reachable defect this issue was filed for.
+       *
+       * A guest add only ever raises the price, so this door asks the
+       * INCREASE question, `canAskCardForIncrease` — the status half of
+       * `hasCapturedPayment`, without its `amountCents > 0` clause, so a
+       * ZERO-DOLLAR booking (a stay fully covered by credit or a 100% promo,
+       * `{ amountCents: 0, status: SUCCEEDED }`) is still asked for the added
+       * guest's price whether or not Xero is connected. #3502 (owner decision,
+       * 6 Oct 2026) moved the other three doors onto the same answer through
+       * `applyPaymentAdjustments`; this door used to hold its own copy of it.
+       */
+      const hasSucceededPayment = canAskCardForIncrease(booking);
+      const organiserBilling = await resolveOrganiserBillingForNet(tx, booking, priceDiffCents); // #4299 N-a: refuses only an increase
+      const hasIssuedXeroInvoice = organiserBilling !== null || hasIssuedPrimaryXeroInvoice(booking);
+      // #4299 (`INV-PAY-148`): an organiser-paid bank place's add is invoiced to the organiser, never asked of the joiner.
+      const billedToOrganiserCents = organiserBilling && priceDiffCents > 0 ? priceDiffCents : 0;
+
+      // #3340: this door sizes through sizeAdditionalAsk, like the other four. The Stripe
+      // arm carries the ask minting retires; the Xero arm below bills only this edit.
+      if (hasSucceededPayment && priceDiffCents > 0 && paidByOrganiserCard(booking)) {
+        // #3653: the organiser paid for this booking out of one combined card
+        // payment; an ask here would charge the joiner. Refused before commit,
+        // exactly as `applyPaymentAdjustments` refuses the other doors' asks.
+        throw new ApiError(ORGANISER_CHILD_CHARGE_REFUSAL, 409);
+      } else if (hasSucceededPayment && priceDiffCents > 0) {
+        // #3954, #4744: a waiting re-issue or increase retry joins this ask.
+        foldedWaitingAsks = await foldWaitingAsks(tx, booking);
+        additionalAsk = sizeAdditionalAsk({
+          priceDiffCents,
+          // A guest add never charges a change fee.
+          changeFeeCents: 0,
+          payment: booking.payment,
+          foldedWaitingAskCents: foldedWaitingAsks.cents,
+        });
+        additionalAmountCents = additionalAsk.amountCents;
+      } else if (hasIssuedXeroInvoice && priceDiffCents > 0) {
+        additionalAmountCents = priceDiffCents - billedToOrganiserCents;
+      }
+
+      // #3980 (`INV-PAY-136`): this door settles for itself, so it makes the edits'
+      // one payment write itself (no fee: an add charges none); 409 if the link moved.
+      const settledAgainstPrimaryInvoice = await writeEditOnPayment(tx, { payment: booking.payment, changeFeeCents: 0, settledAgainstCombinedInvoice: paidByOrganiserInternetBanking(booking) });
+
+      // This route only adds guests, so the no-adult rule can only change
+      // from flagged → cleared (by adding an adult). When that happens, wipe
+      // the review state IN PLACE: the booking keeps its status. It cannot be
+      // parked in AWAITING_REVIEW here — the edit door above refuses that
+      // status — so the only release from review is the officer review route
+      // (#3500, `INV-MOD-013`). The rule cannot newly trip through this route.
+      const reviewCleared = booking.requiresAdminReview && !requiresAdminReview;
+      const reviewFieldUpdates = reviewCleared
+        ? {
+            requiresAdminReview: false,
+            adminReviewReason: null,
+            memberReviewJustification: null,
+            adminReviewStatus: null,
+            adminReviewNotes: null,
+            adminReviewedById: null,
+            adminReviewedAt: null,
+          }
+        : {
+            requiresAdminReview,
+            adminReviewReason,
+          };
+
+      const updatedBooking = await tx.booking.update({
+        where: { id: bookingId },
+        data: {
+          totalPriceCents: newTotalPriceCents,
+          discountCents: newDiscountCents,
+          promoAdjustmentCents: newPromoAdjustmentCents,
+          finalPriceCents: newFinalPriceCents,
+          hasNonMembers,
+          nonMemberHoldUntil,
+          status: holdAdjustedStatus,
+          ...reviewFieldUpdates,
+        },
+        include: { guests: true, payment: true },
+      });
+
+      await reconcileBedAllocationsForBookingWithGlobalLockHeld({
+        bookingId,
+        db: tx,
+        previousRange: {
+          checkIn: booking.checkIn,
+          checkOut: booking.checkOut,
+        },
+      });
+
+      // #2364. Adding guests is the most likely way a hosting hazard both
+      // appears (a non-member joins nights nobody covers) and disappears (an
+      // adult member is added to cover them), so the review is re-derived from
+      // the rows just written. `tx` because this transaction holds the per-lodge
+      // capacity lock.
+      //
+      // #2576 §6: adding guests changes the participant-night picture, which can
+      // take exact-night cover away from another booking on this account (a night
+      // range that shifts, an adult member whose row is replaced). The disposition
+      // travels with the actor.
+      await reconcileAdultMemberHostingReviewWithSiblings(bookingId, tx, {
+          ...hostingCoverageActorOptions({
+            // #3232: a guest change moves nobody's dates, so no vacated window.
+            vacatedRange: null,
+          actorRole,
+          hasBookingsEditAccess: isAdmin,
+          actorMemberId: session.user.id,
+          ...(parsed.data.hostingCoverageOverride
+            ? { override: parsed.data.hostingCoverageOverride }
+            : {}),
+        }),
+      });
+
+      /**
+       * #3530: the lines behind `priceDiffCents`. BEFORE is the guest snapshot
+       * this transaction loaded, in memory; AFTER is the guest rows the add has
+       * just WRITTEN, re-read here so the new guests' identity, category, rate
+       * and night prices are exactly what landed.
+       */
+      const { priceLines, sides: pricingSides } = await computeModificationPricing(
+            { bookingId, site: "guest-add", promoCodes: { store: tx, before: booking } },
+            async () => {
+              // The re-read is narration's own I/O and runs INSIDE the guard:
+              // a failure here stores no lines and fails no edit.
+              const writtenGuests = await tx.bookingGuest.findMany({
+                where: { bookingId },
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  ageTier: true,
+                  isMember: true,
+                  rateMembershipTypeId: true,
+                  priceCents: true,
+                  stayStart: true,
+                  stayEnd: true,
+                  nights: { select: { stayDate: true, priceCents: true, priceSource: true } },
+                },
+              });
+              const promoCode = bookingPromoCodeLabel(booking);
+              // Both sides VALUED (#4317): an add rewrites no existing guest's
+              // rows, so an existing guest reads the same on each side and
+              // cancels, and the added guests are itemised at what they bought.
+              return {
+                before: pricingSideFromStoredGuests(booking.guests, {
+                  promoAdjustmentCents: booking.promoAdjustmentCents,
+                  promoCode,
+                }),
+                after: pricingSideFromStoredGuests(writtenGuests, {
+                  promoAdjustmentCents: newPromoAdjustmentCents,
+                  promoCode: remainingPromoCodeLabel,
+                }),
+              };
+            },
+            priceDiffCents,
+            logger,
+          );
+
+      // Create BookingModification record
+      const bookingModification = await tx.bookingModification.create({
+        data: {
+          bookingId,
+          memberId: session.user.id,
+          modificationType: "GUEST_ADD",
+          previousData: {
+            guestCount: booking.guests.length,
+            totalPriceCents: booking.totalPriceCents,
+            discountCents: booking.discountCents,
+            promoAdjustmentCents: booking.promoAdjustmentCents,
+            finalPriceCents: booking.finalPriceCents,
+          },
+          newData: {
+            guestCount: updatedBooking.guests.length,
+            addedGuests: normalizedNewGuests.map((g) => ({
+              firstName: g.firstName,
+              lastName: g.lastName,
+              ageTier: g.ageTier,
+              isMember: g.isMember,
+            })),
+            totalPriceCents: newTotalPriceCents,
+            discountCents: newDiscountCents,
+            promoAdjustmentCents: newPromoAdjustmentCents,
+            finalPriceCents: newFinalPriceCents,
+            // #2390: the same sentence the member was shown, kept on the
+            // booking's own history so the split has an answer later.
+            ...(promoCoverage ? { promoCoverageNote: promoCoverage.message } : {}),
+            // #3954, #4744: the waiting asks this add folded into its own.
+            ...unpaidAskOffsetHistory({ ...NO_UNPAID_ASK_SETTLEMENT, foldedWaitingAsks }),
+            ...primaryInvoiceSettlementHistory({ settledAgainstPrimaryInvoice }), // #3980: the gap's anchor
+          },
+          priceDiffCents,
+          changeFeeCents: 0,
+          ...(priceLines ? { priceLines } : {}),
+        },
+      });
+
+      // #4744: a folded increase's ask is durable from this commit, under the door's key.
+      await queueEditAskFollowUps(tx, {
+        bookingId,
+        paymentId: booking.payment?.id ?? null,
+        bookingModificationId: bookingModification.id,
+        door: "guestAdd",
+        settled: {
+          additionalAsk,
+          hasIssuedXeroInvoice,
+          unpaidAskBilledOffsetCents: 0,
+          xeroRefundAmountCents: 0,
+          organiserChildRefund: null,
+          foldedWaitingAsks,
+        },
+      });
+
+      // #3582: the same before and after, per night, on the booking ledger —
+      // under the `lock(1)` this transaction took first.
+      await queueOrganiserExtraForChange(tx, booking, bookingModification);
+      await postModificationLedgerLines({
+        store: tx,
+        journal,
+        bookingId,
+        lodgeId: booking.lodgeId,
+        bookingModification,
+        sides: pricingSides,
+        site: "guest-add",
+      });
+
+      return {
+        booking: updatedBooking,
+        addedGuests: createdGuests,
+        priceDiffCents,
+        additionalAmountCents,
+        billedToOrganiserCents,
+        additionalAsk,
+        // An add never lowers the price (#3954 retires asks only on a reduction).
+        retiredAdditionalAsks: [],
+        promoRemoved,
+        promoCoverage,
+        oldGuestCount: booking.guests.length,
+        hasSucceededPayment,
+        hasIssuedXeroInvoice,
+        paymentStatus: booking.payment?.status ?? null,
+        paymentSource: booking.payment?.source ?? null,
+        paymentReference: booking.payment?.reference ?? null,
+        xeroInvoiceNumber: booking.payment?.xeroInvoiceNumber ?? null,
+        paymentId: booking.payment?.id ?? null,
+        paymentCustomerId: booking.payment?.stripeCustomerId ?? null,
+        memberEmail: bookingOwner(booking).member.email,
+        memberName: `${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName}`,
+        memberFirstName: bookingOwner(booking).member.firstName,
+        memberId: bookingOwner(booking).memberId,
+        addedGuestNames: normalizedNewGuests.map((guest) => `${guest.firstName} ${guest.lastName}`),
+        bookingModificationId: bookingModification.id,
+        priceLines,
+        // MG2 #2307: the cross-family rows to tell about, matched to the guest
+        // ids this transaction actually created. Carried OUT of the transaction
+        // so the sends happen after the commit — no provider call may sit inside
+        // a booking transaction holding the capacity lock.
+        memberGuestNotificationRows: matchMemberGuestNotificationRows({
+          createdGuests: createdGuests,
+          entriesByMemberId: memberGuestEntries,
+        }),
+        // #2284 (S2): every member id this add created a guest row for, carried
+        // out of the transaction so the family-scope FYI can be sent after the
+        // commit. The dispatcher decides which are family scope.
+        familyAddMemberIds: createdGuests
+          .map((guest) => guest.memberId)
+          .filter((memberId): memberId is string => Boolean(memberId)),
+      };
+    }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+
+    // #2576 §7/§8: drain the bounded re-evaluation this add committed, if any.
+    // Adding guests can move an account's cover in either direction, so this both
+    // opens incidents and resolves ones the add has just fixed.
+    await settleHostingCoverageAfterCommit({ bookingId });
+
+    // AFTER the commit, and awaited rather than fire-and-forget: an unsent consent
+    // request leaves a PENDING row holding a bed (D-4) that nobody was ever asked
+    // about, and a `void` promise is what a serverless freeze after the response
+    // drops.
+    if (result.memberGuestNotificationRows.length > 0) {
+      // Loaded lazily: the sender pulls in the whole email/template graph, and
+      // only a booking that actually added a cross-family member guest needs it.
+      const { sendMemberGuestAddNotifications } = await import(
+        "@/lib/member-guest-consent-notifications"
+      );
+      // Belt and braces around a function documented never to reject: the booking
+      // is ALREADY COMMITTED here, so an unexpected throw would hand the member an
+      // error for a booking that exists. A notification problem is logged, never
+      // surfaced as a booking failure.
+      try {
+        await sendMemberGuestAddNotifications({
+          bookingId,
+          rows: result.memberGuestNotificationRows,
+          actor: memberGuestActor,
+        });
+      } catch (err) {
+        logger.error(
+          { err, bookingId },
+          "Failed to dispatch member-guest add notifications",
+        );
+      }
+    }
+
+    // #2284 (S2): tell FAMILY co-members (or the adults acting for them) that
+    // this add put them on the booking. Runs regardless of the memberGuests
+    // module and filters to family scope itself, so it never doubles the
+    // member-guest dispatch above.
+    if (result.familyAddMemberIds.length > 0) {
+      const { sendFamilyMemberBookingAddNotifications } = await import(
+        "@/lib/family-booking-add-notifications"
+      );
+      try {
+        await sendFamilyMemberBookingAddNotifications({
+          bookingId,
+          bookerMemberId: bookingOwner(result.booking).memberId,
+          actorMemberId: session.user.id,
+          addedMemberIds: result.familyAddMemberIds,
+        });
+      } catch (err) {
+        logger.error(
+          { err, bookingId },
+          "Failed to dispatch family booking-add notifications",
+        );
+      }
+    }
+
+    // Create additional PaymentIntent for price increases (outside transaction
+    // to avoid holding the advisory lock). Shared settlement helper (#1096):
+    // a transient Stripe failure enqueues a durable recovery operation keyed
+    // to this modification instead of only logging.
+    const additionalMint = await createModificationAdditionalPaymentIntent({
+      format,
+      bookingId,
+      // Guest adds never decrease the price, so the shared settlement
+      // context's refund side is always zero here.
+      result: { ...result, pendingRefundAmountCents: 0, organiserChildRefund: null, ownCardRefund: null, refundHeldForDispute: false },
+      door: "guestAdd",
+      failureMessage:
+        "Failed to create additional PaymentIntent for guest addition",
+    });
+
+    // Audit log. #3530: what the figure is made of, line by line and in dollars.
+    const linesAudit = await loadModificationLinesAuditFields(prisma, result.priceLines, logger, format);
+    logAudit({
+      action: "booking.modify.guests.add",
+      memberId: session.user.id,
+      targetId: bookingId,
+      subjectMemberId: bookingOwner(result.booking).memberId,
+      entityType: "BookingModification",
+      entityId: result.bookingModificationId,
+      category: "booking",
+      outcome: "success",
+      summary: "Booking guests added",
+      details: JSON.stringify({
+        addedGuests: result.addedGuestNames,
+        priceDiffCents: result.priceDiffCents,
+        ...linesAudit,
+      }),
+      metadata: {
+        bookingId,
+        addedGuests: result.addedGuestNames,
+        priceDiffCents: result.priceDiffCents,
+        ...linesAudit,
+        newGuestCount: result.booking.guests.length,
+        // #1769b honesty rule: the guest-add modified email always sends when a
+        // member exists, so record the notify choice whenever it was
+        // suppressed (notifyMember === false already implies admin via the 403
+        // gate above).
+        ...(notifyMember === false ? { notifyMember: false } : {}),
+      },
+      ipAddress,
+    });
+
+    void queueXeroBookingEditSettlement({
+      bookingId,
+      bookingModificationId: result.bookingModificationId,
+      createdByMemberId: session.user.id,
+      hasIssuedXeroInvoice: result.hasIssuedXeroInvoice,
+      originalPaymentStatus: result.paymentStatus,
+      priceDiffCents: result.priceDiffCents,
+      changeFeeCents: 0,
+      datesChanged: false,
+      requiresAdditionalStripePayment:
+        result.hasIssuedXeroInvoice && result.priceDiffCents > 0 && result.hasSucceededPayment,
+      additionalPaymentIntentId: additionalMint.additionalPaymentIntentId,
+    }).catch((err) =>
+      logger.error({ err, bookingId }, "Failed to queue Xero settlement for guest addition")
+    );
+
+    // Send email
+    // #3369: the OWNER, not a re-read of a member row. A school's booking has no
+    // member to re-read, and the projection carries the same person-shaped name
+    // and address the invented school member used to supply — so the school still
+    // receives the message it received before this stage, at the same address.
+    // The relation was loaded in the same transaction, so this is no staler than
+    // the read it replaces.
+    // #3369: the owner as the transaction already resolved them — a school's
+    // booking has no member row to re-read, and these are the person-shaped
+    // projection the invented school member used to supply.
+    const member = {
+      email: result.memberEmail,
+      firstName: result.memberFirstName,
+    };
+    if (notifyMember !== false) {
+      /*
+        #3032 (epic #2797): whether the club is still working out an amount on
+        this booking as the email is written. The booking's CURRENT state, read
+        through the same `bookingHasOpenFinancialReview` the booking-detail
+        banner and the My Bookings row use, so the email and the page the member
+        clicks through to cannot disagree (`INV-SSOT`).
+
+        #3166: this used to say "adding a guest raises no review of its own",
+        and that is no longer true. An add to a booking whose price history
+        cannot be read now parks and raises a task inside the transaction that
+        just committed, so this read finds THIS edit's own review and the member
+        is told in the same email that tells them the guest was added. Left as a
+        live read rather than a hard-coded value precisely so a change like this
+        one could not make it a lie.
+      */
+      const financialReviewPending = await bookingHasOpenFinancialReview(
+        result.booking.id,
+      );
+
+      sendBookingModifiedEmail({
+        bookingId: result.booking.id,
+        recipientMemberId: result.memberId,
+        email: member.email,
+        firstName: member.firstName,
+        modificationType: "GUEST_ADD",
+        oldCheckIn: result.booking.checkIn,
+        oldCheckOut: result.booking.checkOut,
+        newCheckIn: result.booking.checkIn,
+        newCheckOut: result.booking.checkOut,
+        oldGuestCount: result.oldGuestCount,
+        newGuestCount: result.booking.guests.length,
+        oldFinalPriceCents: result.booking.finalPriceCents - result.priceDiffCents,
+        newFinalPriceCents: result.booking.finalPriceCents,
+        changeFeeCents: 0,
+        refundAmountCents: 0,
+        // Guest adds never decrease the price, so nothing is refunded.
+        refundByBankTransfer: null,
+        appliedCreditGivenBackCents: 0,
+        ...additionalAskEmailTerms(result, additionalMint), // #4052: the figure and its method, decided together
+        billedToOrganiserCents: result.billedToOrganiserCents, // #4299
+        // A guest add only raises a price.
+        unpaidAskCancelled: false,
+        paymentReference: result.paymentReference,
+        xeroInvoiceNumber: result.xeroInvoiceNumber,
+        // #2390: same words as the edit preview and the booking history.
+        promoCoverageNote: result.promoCoverage?.message ?? null,
+        addedGuests: result.addedGuests, // #4030: named in the change rows
+        financialReviewPending,
+        refundDestination: "own",
+        lodgeId: result.booking.lodgeId,
+      }, format).catch((err) =>
+        logger.error({ err, bookingId }, "Failed to send booking modified email")
+      );
+    }
+
+    return NextResponse.json({
+      booking: result.booking,
+      addedGuests: result.addedGuests,
+      priceDiffCents: result.priceDiffCents,
+      additionalAmountCents: result.additionalAmountCents,
+      billedToOrganiserCents: result.billedToOrganiserCents, // #4299: the organiser was invoiced, not this member
+      additionalPaymentClientSecret: additionalMint.additionalPaymentClientSecret ?? null,
+      promoRemoved: result.promoRemoved,
+      // #2390: who the promotion still covers, and who it does not. Null unless
+      // a usage cap left somebody out.
+      promoCoverage: result.promoCoverage,
+    });
+  } catch (err) {
+    /**
+     * #3032: the pending-review 409, ABOVE every other branch in this chain.
+     *
+     * `EditFinancialReviewPendingError` extends the SHARED `ApiError`, so the
+     * `SharedApiError` branch far below would answer it with the right status and
+     * the right sentence and NO `code` - and the surface that can offer "the club
+     * is pricing your last change" would show a bare error instead. Nothing would
+     * fail and nothing would log. It sits at the top rather than merely above that
+     * branch so no future subclass branch can be inserted in front of it.
+     */
+    /**
+     * #3032: the pending-review 409, ABOVE every other branch in this chain.
+     *
+     * `EditFinancialReviewPendingError` extends the SHARED `ApiError`, so the
+     * `SharedApiError` branch far below would answer it with the right status and
+     * the right sentence and NO `code` - and the surface that can offer "the club
+     * is pricing your last change" would show a bare error instead. Nothing would
+     * fail and nothing would log. It sits at the top rather than merely above that
+     * branch so no future subclass branch can be inserted in front of it.
+     */
+    if (err instanceof EditFinancialReviewPendingError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.status },
+      );
+    }
+    // The add commits before its notifications and additional-ask steps, so a
+    // contended lock(1) transaction (INV-LOCK-006) asks for a status check.
+    const contended = transactionContendedResponse(
+      err,
+      "Guest add contended for the lock(1) budget",
+      { message: TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE, context: { bookingId } },
+    );
+    if (contended) return contended;
+    const hostingRetry = hostingCoverageParticipantRetryResponse(err);
+    if (hostingRetry) return hostingRetry;
+    // #3451: the create route's code, with a sentence pointing at Edit Booking.
+    if (err instanceof OwnDependantIdentityRefusedError) {
+      return NextResponse.json(
+        {
+          code: err.refusal.code,
+          error: standaloneAddGuestDependantRefusalMessage(err.refusal, {
+            onBehalf: dependantIdentitySpeaksOnBehalf({
+              actorIsAdmin: isAdmin,
+              actorId: session.user.id,
+              ownerMemberId: err.ownerMemberId,
+            }),
+          }),
+        },
+        { status: err.refusal.status },
+      );
+    }
+    if (err instanceof MembershipTypeBookingPolicyError) {
+      // Finding 2 (privacy re-review of MG3 #2308). The membership-type refusal
+      // is D-8's FOURTH collapsing refusal, so when it collapsed it owes the
+      // same three mitigations as its siblings — the throttle unit, the audit
+      // row naming actor and target, and the timing floor. A no-op for every
+      // other membership-type block: the handler returns immediately unless the
+      // error carries `crossFamilyMemberIds`, which only a collapsed one does.
+      await handleMemberGuestAddRefusal({
+        request,
+        actorMemberId: session.user.id,
+        error: err,
+        route: "bookings/guests-add",
+        startedAt,
+        throttle: "CHARGE_NOW",
+        skipAuthorization: isAdmin,
+      });
+      return NextResponse.json(
+        getMembershipTypeBookingPolicyErrorBody(err),
+        { status: err.status },
+      );
+    }
+    if (err instanceof BookingGuestValidationError) {
+      // #2388, refusal path only. Unlike the quote routes, this one resolves its
+      // members INSIDE `prisma.$transaction` while holding the per-lodge capacity
+      // lock, so the throttle cannot be applied on the success path there — a
+      // rate-limit counter write is a second connection, and taking one while
+      // holding that lock is how a deadlock gets introduced. Spending the budget
+      // here instead (the transaction has already rolled back) still counts every
+      // probe, and the channel #2388 describes is built out of refusals anyway. A
+      // SUCCESSFUL add on this route is not a probe: it mutates a real booking and
+      // emails the person it added.
+      await handleMemberGuestAddRefusal({
+        request,
+        actorMemberId: session.user.id,
+        error: err,
+        route: "bookings/guests-add",
+        startedAt,
+        throttle: "CHARGE_NOW",
+        skipAuthorization: isAdmin,
+      });
+      return NextResponse.json(
+        getBookingGuestValidationErrorResponse(err),
+        { status: err.status }
+      );
+    }
+    if (err instanceof BookingMemberNightConflictError) {
+      return NextResponse.json(
+        getBookingMemberNightConflictResponse(err.conflicts, format),
+        { status: 409 },
+      );
+    }
+    if (err instanceof ApiError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    // #2543 — must be tested BEFORE the shared-ApiError branch below (it is a
+    // subclass): the refusal carries the frozen exception evidence that tells
+    // the member they may ask a Booking Officer, and the generic branch would
+    // flatten it to a bare sentence and close that door.
+    if (err instanceof PaidUpAdultMemberRequiredError) {
+      return NextResponse.json(buildPaidUpAdultRefusalBody(err.violation), {
+        status: err.status,
+      });
+    }
+    // #2569 — same reason, same order: `AdultMemberHostingRequiredError` extends
+    // ApiError, so it must be tested BEFORE the generic branch or the ENFORCED
+    // hosting refusal is flattened to a bare sentence and the member loses the
+    // exception door. Host identities are withheld from this body (#2569 §5).
+    if (err instanceof AdultMemberHostingRequiredError) {
+      return NextResponse.json(
+        buildAdultMemberHostingRefusalBody(err.violation),
+        { status: err.status },
+      );
+    }
+    // #2576 §6, ABOVE the shared-ApiError branch below: this refusal is a
+    // subclass, and answered generically the member loses the list of their own
+    // bookings, lodges and nights that tells them what to fix.
+    if (err instanceof SameOwnerCoverageWouldBreakError) {
+      return NextResponse.json(buildSameOwnerCoverageRefusalBody(err), {
+        status: err.status,
+      });
+    }
+    // #2576 §7. The officer is not refused: they are shown which bookings and
+    // nights the change would strand and asked to confirm it with a reason.
+    if (err instanceof SameOwnerCoverageOverrideRequiredError) {
+      return NextResponse.json(
+        buildSameOwnerCoverageOverrideRequiredBody(err),
+        { status: err.status },
+      );
+    }
+    // Shared-lib domain errors (e.g. the #1032 quote-priced edit block from
+    // assertBookingNotQuotePriced) are the shared ApiError class, distinct
+    // from this route's local ApiError above.
+    if (err instanceof SharedApiError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    // #1888 — unexpected (non-typed) errors must not leak their message to
+    // the client; the raw error stays in the log only.
+    logger.error({ err, bookingId }, "Failed to add guests to booking");
+    return NextResponse.json(
+      { error: "Failed to add guests" },
+      { status: 400 }
+    );
+  }
+}
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number
+  ) {
+    super(message);
+  }
+}

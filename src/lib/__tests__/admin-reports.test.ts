@@ -1,0 +1,509 @@
+import { describe, expect, it } from "vitest";
+import { addDays } from "date-fns";
+import { BookingStatus, PaymentStatus } from "@prisma/client";
+import fc from "fast-check";
+import { withTimeZone } from "@/lib/__tests__/helpers/timezone";
+import {
+  buildBookingTrendSeries,
+  buildRevenueSeries,
+  getBookingRevenueByNight,
+  getRevenueGranularity,
+  summarizeOverlappingGuests,
+  type RevenueBookingLike,
+} from "@/lib/admin-reports";
+import { isInNetCollectedBookingScope, summarizeCollectedCash } from "@/lib/payment-net-collected";
+
+/** A payment on a live booking that has not been soft-deleted. */
+const LIVE = {
+  deletedAt: null,
+  status: "PAID",
+  creditsApplied: [],
+  creditsFromCancellation: [],
+  manualRefundTasks: [],
+  organiserSettled: false, parentBookingId: null,
+};
+// A card payment with a captured ledger row: the capture evidence a refunded
+// status needs to count in Net Collected (`getNetCollectedPaymentParts`).
+// #3372 (7 Oct 2026): no card refund outstanding unless a case says so.
+const CARD = { source: "STRIPE", _count: { transactions: 1 }, recoveryOperations: [], refunds: [] };
+
+const EXPECTED_REPORT_STATUS_VALUES = [
+  "PENDING",
+  "PAYMENT_PENDING",
+  "CONFIRMED",
+  "PAID",
+  "AWAITING_REVIEW",
+  "COMPLETED",
+] as const;
+
+const EXPECTED_EXCLUDED_REPORT_STATUS_VALUES = [
+  "DRAFT",
+  "WAITLISTED",
+  "WAITLIST_OFFERED",
+  "CANCELLED",
+  "BUMPED",
+] as const;
+
+const date = (value: string) => new Date(`${value}T00:00:00.000Z`);
+const EN_NZ = { locale: "en-NZ" } as const;
+const DE_CH = { locale: "de-CH" } as const;
+
+function booking(
+  overrides: Partial<RevenueBookingLike> = {},
+): RevenueBookingLike {
+  return {
+    id: "booking-1",
+    checkIn: date("2026-04-07"),
+    checkOut: date("2026-04-10"),
+    finalPriceCents: 100,
+    status: BookingStatus.PAID,
+    guests: [],
+    ...overrides,
+  };
+}
+
+describe("admin reports helpers", () => {
+  it("chooses daily, weekly, and monthly granularity at the boundaries", () => {
+    const start = date("2026-04-01");
+    expect(getRevenueGranularity(start, addDays(start, 13))).toBe("daily");
+    expect(getRevenueGranularity(start, addDays(start, 14))).toBe("weekly");
+    expect(getRevenueGranularity(start, addDays(start, 89))).toBe("weekly");
+    expect(getRevenueGranularity(start, addDays(start, 90))).toBe("monthly");
+  });
+
+  it("allocates 100 cents across three leap-day stay nights as 34/33/33", () => {
+    const row = booking({
+      checkIn: date("2028-02-28"),
+      checkOut: date("2028-03-02"),
+    });
+    expect(getBookingRevenueByNight(row, date("2028-02-28"), date("2028-03-01"))).toEqual([
+      { date: "2028-02-28", revenueCents: 34 },
+      { date: "2028-02-29", revenueCents: 33 },
+      { date: "2028-03-01", revenueCents: 33 },
+    ]);
+  });
+
+  it("assigns the remainder before slicing when the first night is outside the report", () => {
+    const row = booking();
+    expect(getBookingRevenueByNight(row, date("2026-04-08"), date("2026-04-08"))).toEqual([
+      { date: "2026-04-08", revenueCents: 33 },
+    ]);
+  });
+
+  it("preserves every integer cent across the full stay (property)", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 10_000_000 }),
+        fc.integer({ min: 1, max: 60 }),
+        (totalCents, nights) => {
+          const checkIn = date("2026-01-01");
+          const checkOut = addDays(checkIn, nights);
+          const allocations = getBookingRevenueByNight(
+            booking({ checkIn, checkOut, finalPriceCents: totalCents }),
+            checkIn,
+            addDays(checkOut, -1),
+          );
+          expect(allocations).toHaveLength(nights);
+          expect(allocations.reduce((sum, value) => sum + value.revenueCents, 0)).toBe(
+            totalCents,
+          );
+          expect(
+            Math.max(...allocations.map((value) => value.revenueCents)) -
+              Math.min(...allocations.map((value) => value.revenueCents)),
+          ).toBeLessThanOrEqual(1);
+        },
+      ),
+    );
+  });
+
+  it("counts each booking once per overlapped bucket while summing nightly revenue", () => {
+    const result = buildRevenueSeries(
+      [booking({ finalPriceCents: 300 }), booking({ id: "booking-2", finalPriceCents: 600 })],
+      date("2026-04-01"),
+      date("2026-04-14"),
+      EN_NZ,
+    );
+    expect(result.granularity).toBe("daily");
+    expect(result.data).toHaveLength(14);
+    expect(result.data[6]).toMatchObject({
+      periodStart: "2026-04-07",
+      label: "Tue, 7 Apr",
+      revenueCents: 300,
+      bookingCount: 2,
+    });
+  });
+
+  describe("writes its axis and tooltip text in the club's date format (#5258)", () => {
+    const labelsOf = (
+      rangeStart: string,
+      rangeEnd: string,
+      format: typeof EN_NZ | typeof DE_CH,
+    ) =>
+      buildRevenueSeries([booking({ finalPriceCents: 300 })], date(rangeStart), date(rangeEnd), format)
+        .data.slice(0, 2)
+        .map(({ label, tooltipLabel }) => ({ label, tooltipLabel }));
+
+    it("daily", () => {
+      expect(labelsOf("2026-04-01", "2026-04-14", EN_NZ)).toEqual([
+        { label: "Wed, 1 Apr", tooltipLabel: "Wednesday, 1 April 2026" },
+        { label: "Thu, 2 Apr", tooltipLabel: "Thursday, 2 April 2026" },
+      ]);
+      expect(labelsOf("2026-04-01", "2026-04-14", DE_CH)).toEqual([
+        { label: "Mi., 1. Apr.", tooltipLabel: "Mittwoch, 1. April 2026" },
+        { label: "Do., 2. Apr.", tooltipLabel: "Donnerstag, 2. April 2026" },
+      ]);
+    });
+
+    it("weekly", () => {
+      expect(labelsOf("2026-04-01", "2026-04-15", EN_NZ)).toEqual([
+        { label: "Week of 30 Mar", tooltipLabel: "Week of 30 Mar 2026 to 5 Apr 2026" },
+        { label: "Week of 6 Apr", tooltipLabel: "Week of 6 Apr 2026 to 12 Apr 2026" },
+      ]);
+      expect(labelsOf("2026-04-01", "2026-04-15", DE_CH)).toEqual([
+        { label: "Week of 30. März", tooltipLabel: "Week of 30.03.2026 to 05.04.2026" },
+        { label: "Week of 6. Apr.", tooltipLabel: "Week of 06.04.2026 to 12.04.2026" },
+      ]);
+    });
+
+    it("monthly", () => {
+      expect(labelsOf("2026-08-01", "2026-11-02", EN_NZ)).toEqual([
+        { label: "Aug 2026", tooltipLabel: "August 2026" },
+        { label: "Sept 2026", tooltipLabel: "September 2026" },
+      ]);
+      expect(labelsOf("2026-08-01", "2026-11-02", DE_CH)).toEqual([
+        { label: "Aug. 2026", tooltipLabel: "August 2026" },
+        { label: "Sept. 2026", tooltipLabel: "September 2026" },
+      ]);
+    });
+
+    it("changes only the text: buckets, keys and cents are the same in every locale", () => {
+      const withoutText = (format: typeof EN_NZ | typeof DE_CH) => {
+        const series = buildRevenueSeries(
+          [booking({ finalPriceCents: 300 }), booking({ id: "booking-2", finalPriceCents: 601 })],
+          date("2026-04-01"),
+          date("2026-04-15"),
+          format,
+        );
+        return {
+          granularity: series.granularity,
+          data: series.data.map(({ periodStart, periodEnd, revenueCents, bookingCount }) => ({
+            periodStart,
+            periodEnd,
+            revenueCents,
+            bookingCount,
+          })),
+        };
+      };
+      expect(withoutText(DE_CH)).toEqual(withoutText(EN_NZ));
+    });
+  });
+
+  it("does not count a multi-night booking more than once in a weekly bucket", () => {
+    const result = buildRevenueSeries(
+      [booking({ finalPriceCents: 300 })],
+      date("2026-04-01"),
+      date("2026-04-14"),
+      EN_NZ,
+    );
+    expect(result.granularity).toBe("daily");
+
+    const weekly = buildRevenueSeries(
+      [booking({ finalPriceCents: 300 })],
+      date("2026-04-01"),
+      date("2026-04-15"),
+      EN_NZ,
+    );
+    expect(weekly.granularity).toBe("weekly");
+    expect(weekly.data.find((bucket) => bucket.periodStart === "2026-04-06")).toMatchObject({
+      revenueCents: 300,
+      bookingCount: 1,
+    });
+  });
+
+  it("allocates a 100-cent cross-month stay before monthly bucketing", () => {
+    const row = booking({
+      checkIn: date("2026-04-30"),
+      checkOut: date("2026-05-03"),
+      finalPriceCents: 100,
+    });
+
+    expect(
+      getBookingRevenueByNight(row, date("2026-04-30"), date("2026-05-02")),
+    ).toEqual([
+      { date: "2026-04-30", revenueCents: 34 },
+      { date: "2026-05-01", revenueCents: 33 },
+      { date: "2026-05-02", revenueCents: 33 },
+    ]);
+
+    const result = buildRevenueSeries(
+      [row],
+      date("2026-02-01"),
+      date("2026-05-02"),
+      EN_NZ,
+    );
+    expect(result.granularity).toBe("monthly");
+    expect(result.data.find((bucket) => bucket.periodStart === "2026-04-01")).toMatchObject({
+      revenueCents: 34,
+      bookingCount: 1,
+    });
+    expect(result.data.find((bucket) => bucket.periodStart === "2026-05-01")).toMatchObject({
+      revenueCents: 66,
+      bookingCount: 1,
+    });
+    expect(result.data.reduce((sum, bucket) => sum + bucket.revenueCents, 0)).toBe(100);
+  });
+
+  it("excludes the exhaustive literal non-report status list", () => {
+    expect(Object.values(BookingStatus).sort()).toEqual(
+      [...EXPECTED_REPORT_STATUS_VALUES, ...EXPECTED_EXCLUDED_REPORT_STATUS_VALUES].sort(),
+    );
+    const result = buildRevenueSeries(
+      [
+        ...EXPECTED_EXCLUDED_REPORT_STATUS_VALUES.map((status, index) =>
+          booking({
+            id: `excluded-${status}`,
+            status: status as BookingStatus,
+            finalPriceCents: 5_000 + index,
+          }),
+        ),
+        booking({ id: "paid", status: BookingStatus.PAID, finalPriceCents: 300 }),
+      ],
+      date("2026-04-01"),
+      date("2026-04-14"),
+      EN_NZ,
+    );
+    expect(result.data.reduce((sum, bucket) => sum + bucket.revenueCents, 0)).toBe(300);
+  });
+
+  it("counts a spanning booking once in each overlapped week with its current status", () => {
+    const trends = buildBookingTrendSeries(
+      [booking({ checkIn: date("2026-04-12"), checkOut: date("2026-04-15") })],
+      date("2026-04-10"),
+      date("2026-04-25"),
+    );
+    expect(trends.map(({ week, total, paid }) => ({ week, total, paid }))).toEqual([
+      { week: "2026-04-06", total: 1, paid: 1 },
+      { week: "2026-04-13", total: 1, paid: 1 },
+      { week: "2026-04-20", total: 0, paid: 0 },
+    ]);
+  });
+
+  it("counts distinct guest rows by their own half-open envelope despite sparse night rows", () => {
+    const result = summarizeOverlappingGuests(
+      [
+        booking({
+          guests: [
+            {
+              id: "member-guest",
+              isMember: true,
+              stayStart: date("2026-04-07"),
+              stayEnd: date("2026-04-10"),
+            },
+            {
+              id: "sparse-guest",
+              isMember: false,
+              stayStart: date("2026-04-07"),
+              stayEnd: date("2026-04-10"),
+              nights: [{ stayDate: date("2026-04-07") }, { stayDate: date("2026-04-09") }],
+            },
+            {
+              id: "departed-guest",
+              isMember: false,
+              stayStart: date("2026-04-07"),
+              stayEnd: date("2026-04-08"),
+            },
+            {
+              id: "arriving-after-selection",
+              isMember: false,
+              stayStart: date("2026-04-09"),
+              stayEnd: date("2026-04-10"),
+            },
+          ],
+        }),
+      ],
+      date("2026-04-08"),
+      date("2026-04-08"),
+    );
+    // Reports counts guest rows, not guest-nights. Both envelopes overlap the
+    // selected night even though one guest has a gap in its sparse night rows.
+    expect(result).toEqual({ totalGuests: 2, memberGuests: 1, nonMemberGuests: 1 });
+  });
+
+  it("derives net collected cash from payment aggregates without double-counting additions", () => {
+    expect(
+      summarizeCollectedCash([
+        {
+          status: PaymentStatus.PARTIALLY_REFUNDED,
+          amountCents: 12_100,
+          refundedAmountCents: 1_000,
+          ...CARD, booking: LIVE,
+        },
+        {
+          status: PaymentStatus.PENDING,
+          amountCents: 9_000,
+          refundedAmountCents: 0,
+          ...CARD, booking: LIVE,
+        },
+      ]).netCollectedCents,
+    ).toBe(11_100);
+  });
+
+  /*
+    #3372: the derivation of net collected cash (now in the
+    `booking-payment-state.ts` leaf, which the Reports route reads through
+    `summarizeNetCollectedWithLedgerGap`) hands back its working — gross captured, refunded and
+    credited, net — so the dashboard card can print the breakdown beneath the
+    headline instead of re-deriving it. Which statuses are "captured" is `isCapturedPaymentStatus`'s
+    call, so a PENDING or FAILED amount never enters the gross, while its
+    (zero) refund column is still read.
+  */
+  it("breaks collected cash down into captured gross, refunded and net", () => {
+    expect(
+      summarizeCollectedCash([
+        // The #3340 booking: $130.00 captured, $65.00 refunded.
+        {
+          status: PaymentStatus.PARTIALLY_REFUNDED,
+          amountCents: 13_000,
+          refundedAmountCents: 6_500,
+          ...CARD, booking: LIVE,
+        },
+        { status: PaymentStatus.SUCCEEDED, amountCents: 5_000, refundedAmountCents: 0, ...CARD, booking: LIVE },
+        { status: PaymentStatus.REFUNDED, amountCents: 2_000, refundedAmountCents: 2_000, ...CARD, booking: LIVE },
+        // Uncaptured: never in the gross, whatever the amount.
+        { status: PaymentStatus.PENDING, amountCents: 9_000, refundedAmountCents: 0, ...CARD, booking: LIVE },
+        { status: PaymentStatus.FAILED, amountCents: 4_000, refundedAmountCents: 0, ...CARD, booking: LIVE },
+        // A row with no status at all is uncaptured.
+        { status: null, amountCents: 1_000, refundedAmountCents: 0, ...CARD, booking: LIVE },
+      ]),
+    ).toEqual({
+      capturedGrossCents: 20_000,
+      refundedCents: 8_500,
+      handBackOwedCents: 0,
+      cardRefundOwedCents: 0,
+      lateCaptureOwedCents: 0,
+      lateCashCreditedCents: 0,
+      keptCreditCents: 0,
+      netCollectedCents: 11_500,
+    });
+  });
+
+  /*
+    #3372, owner decision A: the one Net Collected booking scope lives in the
+    derivation, so no surface can choose its own. A soft-deleted booking's
+    payment contributes to neither the gross nor the refund; the scope does not
+    read the booking's status, so a cancelled booking counts the money it kept out of what was paid.
+  */
+  it("applies the one Net Collected booking scope: a deleted booking's payment counts for nothing", () => {
+    const deleted = { ...LIVE, deletedAt: new Date("2026-04-02T00:00:00.000Z") };
+    expect(
+      summarizeCollectedCash([
+        // A cancelled booking's payment that kept a $50.00 fee.
+        {
+          status: PaymentStatus.PARTIALLY_REFUNDED,
+          amountCents: 20_000,
+          refundedAmountCents: 15_000,
+          ...CARD, booking: LIVE,
+        },
+        // A soft-deleted booking: out of scope, gross and refund alike.
+        { status: PaymentStatus.SUCCEEDED, amountCents: 7_000, refundedAmountCents: 0, ...CARD, booking: deleted },
+        { status: PaymentStatus.REFUNDED, amountCents: 3_000, refundedAmountCents: 3_000, ...CARD, booking: deleted },
+      ]),
+    ).toEqual({
+      capturedGrossCents: 20_000,
+      refundedCents: 15_000,
+      handBackOwedCents: 0,
+      cardRefundOwedCents: 0,
+      lateCaptureOwedCents: 0,
+      lateCashCreditedCents: 0,
+      keptCreditCents: 0,
+      netCollectedCents: 5_000,
+    });
+    expect(isInNetCollectedBookingScope({ deletedAt: null })).toBe(true);
+    expect(isInNetCollectedBookingScope(deleted)).toBe(false);
+  });
+
+  it("floors each payment at zero and counts its refund only up to what it took", () => {
+    // A refund larger than the capture cannot happen through the refund
+    // writers. Owner review on #3811: each payment adds what it received and
+    // has not refunded, so the excess $5.00 neither goes below zero nor comes
+    // off another payment, and the breakdown's refund is what came back out of
+    // money that came in - gross less net, so the card's line adds up.
+    expect(
+      summarizeCollectedCash([
+        { status: PaymentStatus.REFUNDED, amountCents: 1_000, refundedAmountCents: 1_500, ...CARD, booking: LIVE },
+        { status: PaymentStatus.SUCCEEDED, amountCents: 4_000, refundedAmountCents: 0, ...CARD, booking: LIVE },
+      ]),
+    ).toEqual({
+      capturedGrossCents: 5_000,
+      refundedCents: 1_000,
+      handBackOwedCents: 0,
+      cardRefundOwedCents: 0,
+      lateCaptureOwedCents: 0,
+      lateCashCreditedCents: 0,
+      keptCreditCents: 0,
+      netCollectedCents: 4_000,
+    });
+  });
+});
+
+/*
+  CT-4 (#2870), epic #2988 -- the overlapping-guest count is calendar-day
+  arithmetic, so no zone may reach it.
+
+  `BookingGuest.stayStart`/`stayEnd` and `Booking.checkIn`/`checkOut` are
+  `@db.Date`, and `src/app/api/admin/reports/route.ts` hands the window in the
+  same encoding, so all four sides of the overlap test are UTC-midnight
+  encodings of a day (INV-DATE-010).
+
+  BOTH SIDES USED TO BE ZONE-DEPENDENT, IN TWO DIFFERENT ZONES. The guest keys
+  went through `formatDateOnlyForTimeZone`, which reads `APP_TIME_ZONE`; the
+  range keys went through date-fns `format`, which reads the HOST's zone. Both
+  are the identity for a zone at or ahead of UTC, so New Zealand never saw it,
+  and the two agreeing is what made the whole thing look correct rather than
+  merely lucky.
+
+  Measured on the fixture below with the host moved behind UTC and the
+  environment left at Pacific/Auckland -- which is a real deployment shape, not
+  a contrivance: a container that sets `NEXT_PUBLIC_TZ` but not `TZ` -- the old
+  code returned ZERO guests where there is one. The guest holds the only night
+  in the window, and the range keys slid back a day while the guest keys did
+  not.
+
+  This test therefore does the one thing the property allows: it asks the same
+  question from three different host zones, one behind UTC, one at it and one
+  ahead, and requires the same answer from all three. It is also why fixing only
+  the guest half would have been a regression rather than a fix -- that would
+  break the mirror image, a self-consistent host and club both behind UTC, which
+  the old code got right by accident.
+*/
+describe("summarizeOverlappingGuests is host-timezone independent (CT-4, #2870)", () => {
+  function countOneNightGuest() {
+    return summarizeOverlappingGuests(
+      [
+        booking({
+          checkIn: date("2026-04-08"),
+          checkOut: date("2026-04-09"),
+          guests: [
+            {
+              id: "one-night-guest",
+              isMember: true,
+              stayStart: date("2026-04-08"),
+              stayEnd: date("2026-04-09"),
+            },
+          ],
+        }),
+      ],
+      date("2026-04-08"),
+      date("2026-04-08"),
+    ).totalGuests;
+  }
+
+  it.each(["America/Denver", "UTC", "Pacific/Auckland"])(
+    "counts the guest holding the only night in the window, on a host in %s",
+    (hostZone) => {
+      // `stayEnd` is half-open -- a departure morning (INV-DATE-003) -- so this
+      // guest holds exactly the night of the 8th, which is the whole window.
+      expect(withTimeZone(hostZone, countOneNightGuest)).toBe(1);
+    },
+  );
+});

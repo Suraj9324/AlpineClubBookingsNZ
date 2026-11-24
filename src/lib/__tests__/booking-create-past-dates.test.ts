@@ -1,0 +1,768 @@
+/**
+ * Retroactive-create service behaviour (#1695) for createConfirmedBooking:
+ * defence-in-depth past-date re-check, over-capacity warn-and-confirm, the
+ * per-create member-email choice, and the audit metadata.
+ *
+ * The over-capacity error class lives in its own module, so only
+ * checkCapacityForGuestRanges is stubbed (importOriginal spread) — the real
+ * OverCapacityConfirmationRequiredError keeps working with `instanceof`.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { postBindingCharge } from "@/lib/booking-ledger-pending-charge";
+import { postStoredBookingConfirmationLedgerLines } from "@/lib/booking-ledger-confirmation-sync";
+import { memberMoneyTestContext } from "./support/member-money-fixtures";
+import { bookingGuestDietarySeeding } from "@/lib/member-dietary-booking-writes";
+import { AgeTier, BookingStatus } from "@prisma/client";
+import {
+  OverCapacityConfirmationRequiredError,
+  WholeLodgeHoldBlockedError,
+} from "@/lib/over-capacity-confirmation";
+import { addDaysDateOnly, getTodayDateOnly, formatDateOnly } from "@/lib/date-only";
+
+const h = vi.hoisted(() => ({
+  transaction: vi.fn(),
+  executeRaw: vi.fn(),
+  seasonFindMany: vi.fn(),
+  bookingCreate: vi.fn(),
+  bookingUpdate: vi.fn(),
+  paymentCreate: vi.fn(),
+  bookingFindUnique: vi.fn(),
+  memberFindUnique: vi.fn(),
+  lodgeFindFirst: vi.fn(),
+  lodgeFindUnique: vi.fn().mockResolvedValue({ id: "lodge-1", active: true }),
+  memberLodgeAccessFindMany: vi.fn(),
+  bookingGuestFindMany: vi.fn(),
+  checkCapacityForGuestRanges: vi.fn(),
+  reconcileBedAllocationsForBooking: vi.fn(),
+  logAudit: vi.fn(),
+  sendBookingConfirmedEmail: vi.fn(),
+  sendBookingPendingEmail: vi.fn(),
+  sendAdminNewBookingAlert: vi.fn(),
+}));
+
+// #4628: a bank-transfer booking's pending journal charge is proved against PostgreSQL
+// (`booking-ledger-pending-charge.realdb.test.ts`); this fake store does not carry the journal.
+vi.mock("@/lib/booking-ledger-pending-charge", () => ({
+  postBindingCharge: vi.fn(async () => {}),
+  postPendingModificationCharge: vi.fn(async () => {}),
+  postPendingCancellationCharge: vi.fn(async () => {}),
+}));
+// #4660: likewise a $0 create's confirmation lines and R01 (`booking-ledger-journal.realdb.test.ts`).
+vi.mock("@/lib/booking-ledger-confirmation-sync", () => ({
+  postStoredBookingConfirmationLedgerLines: vi.fn(async () => {}),
+}));
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    $transaction: (fn: (tx: unknown) => Promise<unknown>) => h.transaction(fn),
+    member: { findUnique: (...a: unknown[]) => h.memberFindUnique(...a) },
+    booking: { findUnique: (...a: unknown[]) => h.bookingFindUnique(...a) },
+  },
+}));
+
+vi.mock("@/lib/capacity", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/capacity");
+  return {
+    ...actual,
+    checkCapacityForGuestRanges: (...a: unknown[]) =>
+      h.checkCapacityForGuestRanges(...a),
+  };
+});
+
+// Partial: `admin-modules` (reached through the capacity counter since the
+// #3817 one-space rule) reads `normalizeClubModuleSettings` at import time.
+vi.mock("@/lib/module-settings", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/module-settings")),
+  loadEffectiveModuleFlags: vi.fn().mockResolvedValue({ xeroIntegration: false }),
+}));
+
+vi.mock("@/lib/promo", () => ({
+  redeemPromoCode: vi.fn(),
+  shouldPersistPromoRedemption: vi.fn().mockReturnValue(false),
+  validateAndCalculatePromoDiscount: vi.fn(),
+}));
+
+vi.mock("@/lib/work-party", () => ({
+  resolveWorkPartyEventPromoForBooking: vi.fn(),
+}));
+
+vi.mock("@/lib/email", () => ({
+  sendAdminNewBookingAlert: (...a: unknown[]) => h.sendAdminNewBookingAlert(...a),
+  sendBookingConfirmedEmail: (...a: unknown[]) => h.sendBookingConfirmedEmail(...a),
+  sendBookingPendingEmail: (...a: unknown[]) => h.sendBookingPendingEmail(...a),
+  sendWaitlistConfirmationEmail: vi.fn(),
+}));
+
+vi.mock("@/lib/xero-operation-outbox", () => ({
+  enqueueXeroBookingInvoiceOperation: vi.fn().mockResolvedValue({ queueOperationId: null }),
+  enqueueXeroAppliedCreditAllocationOperation: vi.fn().mockResolvedValue({ queueOperationId: null }),
+  kickQueuedXeroOutboxOperationsIfConnected: vi.fn().mockResolvedValue({}),
+}));
+
+vi.mock("@/lib/member-credit", () => ({
+  applyCreditToBooking: vi.fn(),
+  getMemberCreditBalance: vi.fn().mockResolvedValue(0),
+  // #3369: the one home for the account-credit refusal four settlement paths
+  // share. Real, not stubbed: the mock must not turn a refusal into a pass.
+  requireMemberCreditRecipient: (memberId: string | null) => {
+    if (!memberId) throw new Error("no account to credit (#3369)");
+    return memberId;
+  },
+}));
+
+vi.mock("@/lib/payment-transactions", () => ({
+  recordInternetBankingPaymentTransaction: vi.fn(),
+}));
+
+vi.mock("@/lib/audit", () => ({ logAudit: (...a: unknown[]) => h.logAudit(...a) }));
+
+vi.mock("@/lib/booking-review", () => ({
+  ADULT_SUPERVISION_REVIEW_REASON: "no-adult",
+  requiresAdultSupervisionReview: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock("@/lib/bed-allocation-lifecycle", () => ({
+  reconcileBedAllocationsForBookingWithGlobalLockHeld: (...a: unknown[]) =>
+    h.reconcileBedAllocationsForBooking(...a),
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+import {
+  createConfirmedBooking,
+  type BookingGuestInput,
+} from "@/lib/booking-create";
+import { requireCalendarDate } from "@/lib/club-time";
+import { enqueueXeroBookingInvoiceOperation } from "@/lib/xero-operation-outbox";
+import {
+  XERO_INVOICE_EMAIL_SEND,
+  XERO_INVOICE_EMAIL_WITHHELD_AT_CREATION,
+} from "@/lib/xero-invoice-email-instruction";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+
+// #3123 (`INV-LOCK-004`) — `createConfirmedBooking` is transaction-aware, so its
+// caller resolves the CLUB's day and threads it in. Pinned to the frozen clock's
+// club day, which is what the service used to read for itself.
+const FIXTURE_CLUB_DAY = requireCalendarDate("2026-07-01");
+
+/**
+ * The club's zone, named rather than left to `getTodayDateOnly`'s `APP_TIME_ZONE`
+ * default, which #3123 deletes. `createConfirmedBooking` resolves its own "today"
+ * through `readClubTimeZoneOutsideRequest()`; prisma is mocked here with no
+ * `clubTimeSettings` delegate, so that read fails soft to the environment seed
+ * and then to `Pacific/Auckland`. Naming it keeps this file's fixtures anchored
+ * to the same day the service is measuring from.
+ */
+const CLUB_ZONE = "Pacific/Auckland";
+
+// Relative dates so the scenarios never rot with the wall clock. The plain
+// on-behalf / email tests use a future window; the retroactive scenarios use a
+// past window, because the service applies the retroactive semantics (capacity
+// warn-and-confirm) only when the resolved envelope starts in the past.
+const checkIn = addDaysDateOnly(getTodayDateOnly(CLUB_ZONE), 30);
+const checkOut = addDaysDateOnly(getTodayDateOnly(CLUB_ZONE), 32);
+const pastCheckIn = addDaysDateOnly(getTodayDateOnly(CLUB_ZONE), -10);
+const pastCheckOut = addDaysDateOnly(getTodayDateOnly(CLUB_ZONE), -8);
+
+function seasonWithRate(rateCents: number) {
+  return [
+    {
+      id: "season-1",
+      startDate: addDaysDateOnly(getTodayDateOnly(CLUB_ZONE), -400),
+      endDate: addDaysDateOnly(getTodayDateOnly(CLUB_ZONE), 60),
+      // Membership-type-keyed rates (#1930, E4): both FULL and NON_MEMBER
+      // priced at the same rate here, matching the old member/non-member pair.
+      membershipTypeRates: [
+        { membershipTypeId: "type-full", ageTier: AgeTier.ADULT, pricePerNightCents: rateCents },
+        { membershipTypeId: "type-nonmember", ageTier: AgeTier.ADULT, pricePerNightCents: rateCents },
+      ],
+    },
+  ];
+}
+
+function guest(isMember: boolean, firstName: string): BookingGuestInput {
+  return {
+    firstName,
+    lastName: "Test",
+    ageTier: AgeTier.ADULT,
+    isMember,
+    stayStart: checkIn,
+    stayEnd: checkOut,
+  };
+}
+
+function pastGuest(isMember: boolean, firstName: string): BookingGuestInput {
+  return { ...guest(isMember, firstName), stayStart: pastCheckIn, stayEnd: pastCheckOut };
+}
+
+// A retroactive on-behalf create: past envelope + the admin flag.
+function retroInput(
+  overrides: Partial<Parameters<typeof createConfirmedBooking>[0]> = {},
+) {
+  return baseInput([pastGuest(true, "Alice")], {
+    checkIn: pastCheckIn,
+    checkOut: pastCheckOut,
+    allowPastDates: true,
+    ...overrides,
+  });
+}
+
+let createdCount = 0;
+const tx = {
+  $executeRaw: (...a: unknown[]) => h.executeRaw(...a),
+  season: { findMany: (...a: unknown[]) => h.seasonFindMany(...a) },
+  // Rate resolver (#1930, E4): FULL and NON_MEMBER share the rate here, so the
+  // NON_MEMBER_DEFAULT fallback prices identically to the old member path.
+  member: { findMany: async () => [] },
+  seasonalMembershipAssignment: { findMany: async () => [] },
+  membershipType: {
+    findMany: async () => [
+      { id: "type-nonmember", key: "NON_MEMBER" },
+      { id: "type-full", key: "FULL" },
+    ],
+  },
+  // #2364: the hosting review is reconciled inside the booking write, so
+  // every prisma/tx double a booking path runs against needs this client.
+  adultMemberHostingPolicy: { findMany: vi.fn().mockResolvedValue([]) },
+  booking: {
+    create: (...a: unknown[]) => h.bookingCreate(...a),
+    update: (...a: unknown[]) => h.bookingUpdate(...a),
+    findFirst: vi.fn().mockResolvedValue(null),
+    // #2364: the create transaction reconciles the hosting review from the rows
+    // it just wrote. Answering undefined is the "booking not found" branch,
+    // which writes nothing — right for a double that models the create alone.
+    findUnique: vi.fn(),
+    findMany: vi.fn().mockResolvedValue([]),
+  },
+  payment: { create: (...a: unknown[]) => h.paymentCreate(...a) },
+  lodge: {
+    findFirst: (...a: unknown[]) => h.lodgeFindFirst(...a),
+    findUnique: (...a: unknown[]) => h.lodgeFindUnique(...a),
+  },
+  bookingGuest: { findMany: (...a: unknown[]) => h.bookingGuestFindMany(...a) },
+  // #3276: the night adjustment build-up writer reads and rewrites these.
+  bookingGuestNightAdjustment: {
+    deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    createMany: vi.fn().mockResolvedValue({ count: 0 }),
+    findMany: vi.fn().mockResolvedValue([]),
+  },
+  bookingGuestNight: {
+    findMany: vi.fn().mockResolvedValue([]),
+    updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+  },
+  promoRedemption: { findUnique: vi.fn().mockResolvedValue(null), findMany: vi.fn().mockResolvedValue([]), findFirst: vi.fn().mockResolvedValue(null) },
+  memberLodgeAccess: {
+    findMany: (...a: unknown[]) => h.memberLodgeAccessFindMany(...a),
+  },
+};
+
+function baseInput(
+  guests: BookingGuestInput[],
+  overrides: Partial<
+    Omit<Parameters<typeof createConfirmedBooking>[0], "lodgeId">
+  > = {},
+) {
+  const hasNonMembers = guests.some((g) => !g.isMember);
+  return {
+    effectiveMemberId: "member-1",
+    isOnBehalf: true,
+    sessionUserId: "admin-1",
+    checkIn,
+    checkOut,
+    guests,
+    status: hasNonMembers ? BookingStatus.PENDING : BookingStatus.PAYMENT_PENDING,
+    shouldBePending: hasNonMembers,
+    holdDays: 7,
+    lodgeId: "lodge-1",
+    guestDietarySeeding: bookingGuestDietarySeeding(false),
+    todayAtClub: FIXTURE_CLUB_DAY,
+    format: CLUB_FORMAT_TEST,
+    journal: memberMoneyTestContext(),
+    ...overrides,
+  } as Parameters<typeof createConfirmedBooking>[0];
+}
+
+function auditMetadata(action: string): Record<string, unknown> | undefined {
+  const call = h.logAudit.mock.calls.find(
+    (c) => (c[0] as { action: string }).action === action,
+  );
+  return call ? (call[0] as { metadata: Record<string, unknown> }).metadata : undefined;
+}
+
+function armMocks() {
+  createdCount = 0;
+  h.transaction.mockImplementation(async (fn: (store: typeof tx) => Promise<unknown>) => fn(tx));
+  h.executeRaw.mockResolvedValue(undefined);
+  h.seasonFindMany.mockResolvedValue(seasonWithRate(2500));
+  h.checkCapacityForGuestRanges.mockResolvedValue({ available: true, nightDetails: [] });
+  h.reconcileBedAllocationsForBooking.mockResolvedValue(undefined);
+  h.bookingUpdate.mockResolvedValue({});
+  h.paymentCreate.mockResolvedValue({ id: "pay-1" });
+  h.sendBookingConfirmedEmail.mockResolvedValue(undefined);
+  h.sendBookingPendingEmail.mockResolvedValue(undefined);
+  h.sendAdminNewBookingAlert.mockResolvedValue(undefined);
+  h.memberFindUnique.mockResolvedValue({
+    id: "member-1",
+    firstName: "Mem",
+    lastName: "Ber",
+    email: "m@example.com",
+  });
+  h.lodgeFindFirst.mockResolvedValue({ id: "lodge-1" });
+  h.memberLodgeAccessFindMany.mockResolvedValue([]);
+  h.bookingGuestFindMany.mockResolvedValue([]);
+  h.bookingCreate.mockImplementation((args: { data: Record<string, unknown> }) => {
+    createdCount += 1;
+    const id = `booking-${createdCount}`;
+    const guestRows = (args.data.guests as { create: Array<Record<string, unknown>> }).create.map(
+      (g, i) => ({ ...g, id: `${id}-g${i}` }),
+    );
+    return Promise.resolve({ ...args.data, id, guests: guestRows });
+  });
+  h.bookingFindUnique.mockResolvedValue({
+    id: "booking-1",
+    lodgeId: "lodge-1",
+    checkIn,
+    checkOut,
+    finalPriceCents: 0,
+    discountCents: 0,
+    promoAdjustmentCents: 0,
+    member: { email: "m@example.com", firstName: "Mem" },
+    guests: [{ id: "g1" }],
+    promoRedemptions: [],
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  armMocks();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("createConfirmedBooking retroactive behaviour (#1695)", () => {
+  it("rejects a past check-in when allowPastDates is set but the create is not on-behalf", async () => {
+    await expect(
+      createConfirmedBooking(
+        baseInput([{ ...guest(true, "Alice"), stayStart: pastCheckIn, stayEnd: pastCheckOut }], {
+          isOnBehalf: false,
+          effectiveMemberId: "member-1",
+          sessionUserId: "member-1",
+          checkIn: pastCheckIn,
+          checkOut: pastCheckOut,
+          allowPastDates: true,
+        }),
+      ),
+    ).rejects.toThrow("Cannot book in the past");
+
+    expect(h.bookingCreate).not.toHaveBeenCalled();
+  });
+
+  it("throws OverCapacityConfirmationRequiredError with the over-capacity nights when unconfirmed", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue({
+      available: false,
+      nightDetails: [
+        { date: checkIn, availableBeds: -2 },
+        { date: checkOut, availableBeds: 3 },
+      ],
+    });
+
+    let thrown: unknown;
+    try {
+      await createConfirmedBooking(retroInput());
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(OverCapacityConfirmationRequiredError);
+    expect((thrown as OverCapacityConfirmationRequiredError).nightDetails).toEqual([
+      { date: formatDateOnly(checkIn), availableBeds: -2 },
+    ]);
+    expect(h.bookingCreate).not.toHaveBeenCalled();
+  });
+
+  it("creates over capacity when confirmed and records capacityOverridden in the audit", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue({
+      available: false,
+      nightDetails: [{ date: checkIn, availableBeds: -2 }],
+    });
+
+    const outcome = await createConfirmedBooking(
+      retroInput({ confirmOverCapacity: true }),
+    );
+
+    expect(outcome.type).toBe("created");
+    expect(h.bookingCreate).toHaveBeenCalledTimes(1);
+    expect(auditMetadata("booking.created")).toMatchObject({
+      allowPastDates: true,
+      confirmOverCapacity: true,
+      capacityOverridden: true,
+    });
+    expect(auditMetadata("booking.created_on_behalf")).toMatchObject({
+      capacityOverridden: true,
+      notifyMember: true,
+    });
+  });
+
+  it("override NON-BYPASS: a confirmed on-behalf over-capacity create onto a whole-lodge-held night throws WholeLodgeHoldBlockedError and never creates the booking (ADR-001 decision 5, issue #118)", async () => {
+    // Numeric beds are irrelevant: the night is held (availableBeds pinned to 0,
+    // never negative) so it is not confirmable. Even with confirmOverCapacity
+    // the admin is refused.
+    h.checkCapacityForGuestRanges.mockResolvedValue({
+      available: false,
+      nightDetails: [
+        { date: pastCheckIn, occupiedBeds: 2, availableBeds: 0, wholeLodgeHeld: true },
+      ],
+    });
+
+    let thrown: unknown;
+    try {
+      await createConfirmedBooking(retroInput({ confirmOverCapacity: true }));
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(WholeLodgeHoldBlockedError);
+    expect((thrown as WholeLodgeHoldBlockedError).blockedNights).toEqual([
+      formatDateOnly(pastCheckIn),
+    ]);
+    // The whole point: no booking is written onto a held lodge.
+    expect(h.bookingCreate).not.toHaveBeenCalled();
+  });
+
+  it("suppresses the $0 confirmation email when notifyMember is false", async () => {
+    h.seasonFindMany.mockResolvedValue(seasonWithRate(0));
+
+    await createConfirmedBooking(
+      baseInput([guest(true, "Alice")], { notifyMember: false }),
+    );
+
+    expect(h.sendBookingConfirmedEmail).not.toHaveBeenCalled();
+  });
+
+  it("sends the $0 confirmation email when notifyMember is not suppressed (member pin)", async () => {
+    h.seasonFindMany.mockResolvedValue(seasonWithRate(0));
+
+    await createConfirmedBooking(baseInput([guest(true, "Alice")]));
+
+    expect(h.sendBookingConfirmedEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it("posts a $0 create's confirmation once, inside the create, from the caller's journal context (#4660)", async () => {
+    h.seasonFindMany.mockResolvedValue(seasonWithRate(0));
+    const journal = memberMoneyTestContext();
+
+    const outcome = await createConfirmedBooking(baseInput([guest(true, "Alice")], { journal }));
+
+    expect(outcome).toMatchObject({ type: "created", isZeroDollarConfirmed: true });
+    expect(postStoredBookingConfirmationLedgerLines).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(postStoredBookingConfirmationLedgerLines).mock.calls[0]).toEqual([tx, expect.any(String), journal]);
+  });
+
+  it("posts no confirmation for a create that is still owed money (#4660)", async () => {
+    await createConfirmedBooking(baseInput([guest(true, "Alice")]));
+    expect(postStoredBookingConfirmationLedgerLines).not.toHaveBeenCalled();
+  });
+
+  const pendingInput = () =>
+    baseInput([guest(false, "Bob")], {
+      status: BookingStatus.PENDING,
+      shouldBePending: true,
+      cancelIfGuestsBumped: true,
+      holdDays: 7,
+    });
+
+  it("suppresses the pending-hold email when notifyMember is false", async () => {
+    await createConfirmedBooking({ ...pendingInput(), notifyMember: false });
+    expect(h.sendBookingPendingEmail).not.toHaveBeenCalled();
+  });
+
+  it("sends the pending-hold email when notifyMember is not suppressed (member pin)", async () => {
+    await createConfirmedBooking(pendingInput());
+    expect(h.sendBookingPendingEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it("records no retroactive audit fields for a normal on-behalf create", async () => {
+    await createConfirmedBooking(baseInput([guest(true, "Alice")]));
+
+    const created = auditMetadata("booking.created");
+    expect(created).not.toHaveProperty("allowPastDates");
+    expect(created).not.toHaveProperty("capacityOverridden");
+    // notifyMember is always recorded on the on-behalf entry.
+    expect(auditMetadata("booking.created_on_behalf")).toMatchObject({
+      notifyMember: true,
+    });
+    // #1771: an in-capacity create never persists the override columns.
+    const createData = h.bookingCreate.mock.calls[0][0].data;
+    expect(createData).not.toHaveProperty("capacityOverriddenAt");
+    expect(createData).not.toHaveProperty("capacityOverriddenByMemberId");
+  });
+
+  it("allows a past check-in for the internal inherited-stay marker without retroactive semantics (group-join / waitlist-confirm pin)", async () => {
+    const outcome = await createConfirmedBooking(
+      baseInput([pastGuest(true, "Alice")], {
+        isOnBehalf: false,
+        effectiveMemberId: "member-1",
+        sessionUserId: "member-1",
+        checkIn: pastCheckIn,
+        checkOut: pastCheckOut,
+        allowPastCheckIn: true,
+      }),
+    );
+
+    expect(outcome.type).toBe("created");
+    // No retroactive audit fields: the marker skips only the past-date throw.
+    const created = auditMetadata("booking.created");
+    expect(created).not.toHaveProperty("allowPastDates");
+  });
+
+  it("records no retroactive allowPastDates for a future-dated on-behalf override (audit shape pin)", async () => {
+    // Was: hard capacity block for a future-dated create carrying
+    // allowPastDates. #1767 makes every on-behalf create warn-and-confirm;
+    // this now pins that the audit distinguishes a forward override
+    // (allowPastDates false) from the retroactive one (allowPastDates true).
+    h.checkCapacityForGuestRanges.mockResolvedValue({
+      available: false,
+      nightDetails: [{ date: checkIn, availableBeds: -2 }],
+    });
+
+    const outcome = await createConfirmedBooking(
+      baseInput([guest(true, "Alice")], {
+        allowPastDates: true,
+        confirmOverCapacity: true,
+      }),
+    );
+
+    expect(outcome.type).toBe("created");
+    expect(auditMetadata("booking.created")).toMatchObject({
+      allowPastDates: false,
+      confirmOverCapacity: true,
+      capacityOverridden: true,
+    });
+  });
+
+});
+
+describe("createConfirmedBooking forward-dated on-behalf over-capacity (#1767)", () => {
+  const overCapacity = () =>
+    h.checkCapacityForGuestRanges.mockResolvedValue({
+      available: false,
+      nightDetails: [
+        { date: checkIn, availableBeds: -2 },
+        { date: checkOut, availableBeds: 3 },
+      ],
+    });
+
+  it("throws OverCapacityConfirmationRequiredError with the over-capacity nights when unconfirmed", async () => {
+    overCapacity();
+
+    let thrown: unknown;
+    try {
+      await createConfirmedBooking(baseInput([guest(true, "Alice")]));
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(OverCapacityConfirmationRequiredError);
+    expect((thrown as OverCapacityConfirmationRequiredError).nightDetails).toEqual([
+      { date: formatDateOnly(checkIn), availableBeds: -2 },
+    ]);
+    expect(h.bookingCreate).not.toHaveBeenCalled();
+  });
+
+  it("creates over capacity when confirmed, auditing capacityOverridden with allowPastDates false", async () => {
+    overCapacity();
+
+    const outcome = await createConfirmedBooking(
+      baseInput([guest(true, "Alice")], { confirmOverCapacity: true }),
+    );
+
+    expect(outcome.type).toBe("created");
+    expect(h.bookingCreate).toHaveBeenCalledTimes(1);
+    expect(auditMetadata("booking.created")).toMatchObject({
+      allowPastDates: false,
+      confirmOverCapacity: true,
+      capacityOverridden: true,
+    });
+    expect(auditMetadata("booking.created_on_behalf")).toMatchObject({
+      capacityOverridden: true,
+    });
+    // #1771: the override is also persisted on the booking with the acting admin.
+    const createData = h.bookingCreate.mock.calls[0][0].data;
+    expect(createData.capacityOverriddenAt).toBeInstanceOf(Date);
+    expect(createData.capacityOverriddenByMemberId).toBe("admin-1");
+  });
+
+  it("keeps the hard capacity block for a member self-create even when the flag is smuggled in (members can never overbook)", async () => {
+    // Group join and cross-lodge waitlist confirm also pass isOnBehalf false,
+    // so this pin covers those internal callers too.
+    overCapacity();
+
+    const outcome = await createConfirmedBooking(
+      baseInput([guest(true, "Alice")], {
+        isOnBehalf: false,
+        sessionUserId: "member-1",
+        confirmOverCapacity: true,
+      }),
+    );
+
+    expect(outcome.type).toBe("capacityExceeded");
+    expect(h.bookingCreate).not.toHaveBeenCalled();
+  });
+
+  it("warn-and-confirms a non-member hold-eligible (PENDING) party over capacity and stamps the persisted override — #1771 retired the v1 carve-out", async () => {
+    // The v1 carve-out (#1767) hard-blocked this because cron-confirm-pending
+    // would silently bump the confirmed overbook at the hold window. #1771
+    // persists the override on the booking and teaches that cron to honour it,
+    // so the hold-eligible PENDING overbook is now admitted and marked.
+    overCapacity();
+
+    const outcome = await createConfirmedBooking(
+      baseInput([guest(false, "Bob")], {
+        status: BookingStatus.PENDING,
+        shouldBePending: true,
+        confirmOverCapacity: true,
+      }),
+    );
+
+    expect(outcome.type).toBe("created");
+    expect(h.bookingCreate).toHaveBeenCalledTimes(1);
+    // The persisted override is stamped on the create with the acting admin.
+    const createData = h.bookingCreate.mock.calls[0][0].data;
+    expect(createData.capacityOverriddenAt).toBeInstanceOf(Date);
+    expect(createData.capacityOverriddenByMemberId).toBe("admin-1");
+  });
+
+  it("returns the capacityExceeded outcome under waitlistIntent so the route's waitlist fallback still runs", async () => {
+    overCapacity();
+
+    const outcome = await createConfirmedBooking(
+      baseInput([guest(true, "Alice")], { waitlistIntent: true }),
+    );
+
+    expect(outcome.type).toBe("capacityExceeded");
+    expect(h.bookingCreate).not.toHaveBeenCalled();
+  });
+
+  it("warn-and-confirms the $0/credit-covered final capacity claim too", async () => {
+    // A $0 booking skips the first capacity gate and re-checks at the
+    // final-claim site; both sites share the on-behalf override.
+    h.seasonFindMany.mockResolvedValue(seasonWithRate(0));
+    overCapacity();
+
+    let thrown: unknown;
+    try {
+      await createConfirmedBooking(baseInput([guest(true, "Alice")]));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(OverCapacityConfirmationRequiredError);
+
+    vi.clearAllMocks();
+    armMocks();
+    h.seasonFindMany.mockResolvedValue(seasonWithRate(0));
+    overCapacity();
+
+    const outcome = await createConfirmedBooking(
+      baseInput([guest(true, "Alice")], { confirmOverCapacity: true }),
+    );
+    expect(outcome.type).toBe("created");
+    expect(auditMetadata("booking.created")).toMatchObject({
+      capacityOverridden: true,
+      allowPastDates: false,
+    });
+  });
+});
+
+/*
+  #2929 (MAD epic #2725) — the on-behalf "do not email the member" choice does
+  not stop at this application's own confirmation email. It is turned into a
+  typed instruction and RECORDED ON THE OUTBOX OPERATION, because the Xero
+  invoice this create asks for is raised by a worker afterwards, and possibly by
+  an operator retry days afterwards. By then nothing of this request survives
+  except the row.
+
+  These tests pin the create's side of that: what it records, on which paths,
+  and what it still refuses to touch.
+*/
+describe("createConfirmedBooking carries the on-behalf email choice to its invoice (#2929)", () => {
+  const internetBanking = (
+    overrides: Partial<Parameters<typeof createConfirmedBooking>[0]> = {},
+  ) =>
+    baseInput([guest(true, "Alice")], {
+      paymentMethod: "internet_banking",
+      ...overrides,
+    });
+
+  function enqueuedInvoiceOptions() {
+    const call = vi.mocked(enqueueXeroBookingInvoiceOperation).mock.calls.at(-1);
+    return call?.[1];
+  }
+
+  it("records the withhold when the officer chose not to email the member", async () => {
+    await createConfirmedBooking(internetBanking({ notifyMember: false }));
+
+    expect(enqueueXeroBookingInvoiceOperation).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        invoiceEmailDelivery: XERO_INVOICE_EMAIL_WITHHELD_AT_CREATION,
+      }),
+    );
+  });
+
+  it("records a send when the officer made the ordinary choice", async () => {
+    await createConfirmedBooking(internetBanking({ notifyMember: true }));
+
+    expect(enqueuedInvoiceOptions()).toMatchObject({
+      invoiceEmailDelivery: XERO_INVOICE_EMAIL_SEND,
+    });
+  });
+
+  it("binds the charge in the journal inside the create, from its caller's context (#4628)", async () => {
+    const journal = memberMoneyTestContext();
+    await createConfirmedBooking(internetBanking({ journal }));
+    expect(postBindingCharge).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(postBindingCharge).mock.calls[0]![1]).toBe(journal);
+  });
+
+  it("records a send when no choice was made at all", async () => {
+    // An absent flag is not a withhold. `notifyMember` is honoured only for
+    // on-behalf creates, and its absence means the officer expressed nothing.
+    await createConfirmedBooking(internetBanking());
+
+    expect(enqueuedInvoiceOptions()).toMatchObject({
+      invoiceEmailDelivery: XERO_INVOICE_EMAIL_SEND,
+    });
+  });
+
+  it("never records a withhold on a member's own booking, whatever flag arrives", async () => {
+    // A member booking for themselves is always emailed (`INV-LOCKOUT-041`), so
+    // there is no choice here to carry — and a stray `notifyMember: false` from
+    // a caller must not become a silent withhold of the member's own invoice.
+    await createConfirmedBooking(
+      internetBanking({ isOnBehalf: false, notifyMember: false }),
+    );
+
+    expect(enqueuedInvoiceOptions()).toMatchObject({
+      invoiceEmailDelivery: XERO_INVOICE_EMAIL_SEND,
+    });
+  });
+
+  it("changes nothing persistent: the switch is not set and no later email is decided here", async () => {
+    await createConfirmedBooking(internetBanking({ notifyMember: false }));
+
+    // The rejected alternative, pinned. `Booking.noEmails` is the BROADER,
+    // persistent setting; this one creation's choice must never become it, or
+    // every later reminder, change and cancellation email would be suppressed
+    // too and an officer would have to find and clear a switch they never set.
+    const createData = vi.mocked(h.bookingCreate).mock.calls[0][0].data;
+    expect(createData).not.toHaveProperty("noEmails");
+    for (const [args] of vi.mocked(h.bookingUpdate).mock.calls) {
+      expect((args as { data?: Record<string, unknown> }).data ?? {}).not.toHaveProperty(
+        "noEmails",
+      );
+    }
+  });
+});

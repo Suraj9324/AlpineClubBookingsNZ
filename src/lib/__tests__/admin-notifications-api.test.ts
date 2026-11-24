@@ -1,0 +1,293 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    member: {
+      count: vi.fn(),
+      findUnique: vi.fn(),
+    },
+    notificationPreference: {
+      upsert: vi.fn(),
+    },
+    auditLog: {
+      create: vi.fn(),
+    },
+    $transaction: vi.fn().mockImplementation((operation: unknown) => {
+      if (Array.isArray(operation)) {
+        return Promise.all(operation);
+      }
+
+      return (operation as (tx: unknown) => Promise<unknown>)({});
+    }),
+  },
+}));
+
+vi.mock("@/lib/auth", () => ({ auth: vi.fn() }));
+const mockRequireActiveSessionUser = vi.fn<(...args: unknown[]) => Promise<Response | null>>(async () => null);
+vi.mock("@/lib/session-guards", async () => ({
+  requireAdmin: (await import("./helpers/require-admin-mock"))
+    .evaluateRequireAdminMock,
+  requireActiveSessionUser: (...args: Parameters<typeof mockRequireActiveSessionUser>) => mockRequireActiveSessionUser(...args),
+}));
+vi.mock("@/lib/audit", () => ({
+  buildStructuredAuditLogCreateArgs: vi.fn((event) => ({ data: event })),
+  getAuditRequestContext: vi.fn(() => ({ ipAddress: "127.0.0.1" })),
+}));
+vi.mock("@/lib/logger", () => ({
+  default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+import { PUT } from "@/app/api/admin/notifications/route";
+import {
+  adminSession,
+  jsonRequest,
+  memberFactory,
+  memberSession,
+} from "@/lib/__tests__/helpers";
+
+const mockedAuth = vi.mocked(auth);
+
+const fullAdminPreferences = {
+  adminNewBooking: true,
+  adminPaymentFailure: true,
+  adminPendingDeadline: true,
+  adminBookingBumped: true,
+  adminXeroSyncError: true,
+  adminCapacityWarning: true,
+  adminDailyDigest: true,
+  adminWaitlistOffer: true,
+  adminFamilyGroupRequest: true,
+  adminRefundRequest: true,
+  adminIssueReport: true,
+};
+
+function notificationsRequest(body: Record<string, unknown>) {
+  return jsonRequest("/api/admin/notifications", body, { method: "PUT" });
+}
+
+describe("Admin notifications API", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns 403 for non-admin users", async () => {
+    mockedAuth.mockResolvedValue(memberSession({ id: "member-1" }));
+
+    const req = notificationsRequest({
+      memberId: "admin-2",
+      preferences: { adminNewBooking: false },
+    });
+
+    const res = await PUT(req);
+    expect(res.status).toBe(403);
+  });
+
+  it("returns 400 when the target user is not an admin", async () => {
+    mockedAuth.mockResolvedValue(adminSession({ id: "admin-1" }));
+    vi.mocked(prisma.member.findUnique).mockResolvedValue({
+      ...memberFactory({
+        id: "member-2",
+        firstName: "Not",
+        lastName: "Admin",
+        email: "member@example.com",
+        role: "USER",
+      }),
+      accessRoles: [{ role: "USER" }],
+      notificationPreference: null,
+    } as never);
+
+    const req = notificationsRequest({
+      memberId: "member-2",
+      preferences: { adminNewBooking: false },
+    });
+
+    const res = await PUT(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("updates admin notification preferences", async () => {
+    mockedAuth.mockResolvedValue(adminSession({ id: "admin-1" }));
+    vi.mocked(prisma.member.findUnique).mockResolvedValue({
+      ...memberFactory({
+        id: "admin-2",
+        firstName: "Jane",
+        lastName: "Doe",
+        email: "jane@example.org",
+        role: "ADMIN",
+      }),
+      accessRoles: [{ role: "ADMIN" }],
+      notificationPreference: null,
+    } as never);
+    vi.mocked(prisma.notificationPreference.upsert).mockResolvedValue({
+      ...fullAdminPreferences,
+      adminNewBooking: false,
+    } as never);
+
+    const req = notificationsRequest({
+      memberId: "admin-2",
+      preferences: { adminNewBooking: false },
+    });
+
+    const res = await PUT(req);
+    expect(res.status).toBe(200);
+
+    expect(prisma.notificationPreference.upsert).toHaveBeenCalledWith({
+      where: { memberId: "admin-2" },
+      create: {
+        memberId: "admin-2",
+        adminNewBooking: false,
+      },
+      update: {
+        adminNewBooking: false,
+      },
+      select: expect.objectContaining({
+        adminNewBooking: true,
+        adminPaymentFailure: true,
+        adminDailyDigest: true,
+        adminIssueReport: true,
+      }),
+    });
+
+    const body = await res.json();
+    expect(body.preferences.adminNewBooking).toBe(false);
+    // #1422: the dedicated review-required preference resolves to its default
+    // (true) so muting new-booking alerts never silences the review alert.
+    expect(body.preferences.adminBookingReviewRequired).toBe(true);
+    // #1938: the dedicated member-delete-request preference resolves to its
+    // default (true) so muting other categories never silences the delete-request
+    // review alert.
+    expect(body.preferences.adminMemberDeleteRequest).toBe(true);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "ADMIN_NOTIFICATION_PREFERENCES_UPDATED",
+          actor: { memberId: "admin-1" },
+          subject: { memberId: "admin-2" },
+          category: "admin",
+          metadata: {
+            changedPreferenceKeys: ["adminNewBooking"],
+            changes: [
+              {
+                key: "adminNewBooking",
+                before: true,
+                after: false,
+              },
+            ],
+          },
+        }),
+      })
+    );
+  });
+
+  // #2548: recipients are every admin-portal user, not only Full Admins, and a
+  // category outside the target's areas is refused rather than banked.
+  function bookingOfficerTarget() {
+    return {
+      ...memberFactory({
+        id: "officer-1",
+        firstName: "Bea",
+        lastName: "Officer",
+        email: "officer@example.org",
+        role: "USER",
+      }),
+      accessRoles: [
+        {
+          role: "ADMIN_BOOKINGS",
+          roleDefinitionId: null,
+          roleDefinition: null,
+        },
+      ],
+      notificationPreference: null,
+    } as never;
+  }
+
+  it("updates a scoped Booking Officer's own-area preference", async () => {
+    mockedAuth.mockResolvedValue(adminSession({ id: "admin-1" }));
+    vi.mocked(prisma.member.findUnique).mockResolvedValue(bookingOfficerTarget());
+    vi.mocked(prisma.notificationPreference.upsert).mockResolvedValue({
+      ...fullAdminPreferences,
+      adminBookingChangeRequest: false,
+    } as never);
+
+    const res = await PUT(
+      notificationsRequest({
+        memberId: "officer-1",
+        preferences: { adminBookingChangeRequest: false },
+      })
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.preferences.adminBookingChangeRequest).toBe(false);
+    // Other booking categories stay on; finance categories are masked off
+    // because the officer's role cannot edit finance.
+    expect(body.preferences.adminNewBooking).toBe(true);
+    expect(body.preferences.adminPaymentFailure).toBe(false);
+    expect(body.preferences.adminDailyDigest).toBe(false);
+  });
+
+  it("refuses a category the target's role cannot receive", async () => {
+    mockedAuth.mockResolvedValue(adminSession({ id: "admin-1" }));
+    vi.mocked(prisma.member.findUnique).mockResolvedValue(bookingOfficerTarget());
+
+    const res = await PUT(
+      notificationsRequest({
+        memberId: "officer-1",
+        preferences: { adminRefundRequest: true },
+      })
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("Refund requests");
+    expect(prisma.notificationPreference.upsert).not.toHaveBeenCalled();
+  });
+
+  it("accepts a definition-backed custom role that owns the area", async () => {
+    mockedAuth.mockResolvedValue(adminSession({ id: "admin-1" }));
+    vi.mocked(prisma.member.findUnique).mockResolvedValue({
+      ...memberFactory({
+        id: "custom-1",
+        firstName: "Cass",
+        lastName: "Custom",
+        email: "custom@example.org",
+        role: "USER",
+      }),
+      accessRoles: [
+        {
+          role: null,
+          roleDefinitionId: "ardef_custom",
+          roleDefinition: {
+            id: "ardef_custom",
+            overviewLevel: "VIEW",
+            bookingsLevel: "NONE",
+            membershipLevel: "EDIT",
+            financeLevel: "NONE",
+            lodgeLevel: "NONE",
+            contentLevel: "NONE",
+            supportLevel: "NONE",
+          },
+        },
+      ],
+      notificationPreference: null,
+    } as never);
+    vi.mocked(prisma.notificationPreference.upsert).mockResolvedValue({
+      ...fullAdminPreferences,
+      adminFamilyGroupRequest: false,
+    } as never);
+
+    const res = await PUT(
+      notificationsRequest({
+        memberId: "custom-1",
+        preferences: { adminFamilyGroupRequest: false },
+      })
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.preferences.adminFamilyGroupRequest).toBe(false);
+    expect(body.preferences.adminMemberDeleteRequest).toBe(true);
+    expect(body.preferences.adminNewBooking).toBe(false);
+  });
+});

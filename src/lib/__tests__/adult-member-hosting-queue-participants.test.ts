@@ -1,0 +1,1132 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { describe, expect, it, vi } from "vitest";
+
+import { enqueueHostingCoverageReevaluation } from "@/lib/adult-member-hosting-coverage-queue";
+import { tryLockHostingCoverageOwners } from "@/lib/adult-member-hosting-coverage-lock";
+import { buildMemberMergeHostingCoveragePlan } from "@/lib/adult-member-hosting-merge-coverage-plan";
+
+import { stripComments } from "./support/strip-comments";
+
+/**
+ * #3123 — the club's day now arrives at these lock-bound entry points as a
+ * REQUIRED argument, resolved by the caller outside its transaction
+ * (`INV-LOCK-004`). This is the same day the frozen clock's default instant
+ * produced before the migration, so every assertion below is unchanged.
+ */
+const CLUB_TODAY_DATE_ONLY = new Date("2026-07-01T00:00:00.000Z");
+import {
+  acquireHostingCoverageQueueParticipantProof,
+  HOSTING_COVERAGE_RETRY_CODE,
+  HOSTING_COVERAGE_RETRY_BODY,
+  HOSTING_COVERAGE_RETRY_MESSAGE,
+  HostingCoverageParticipantFenceUnavailableError,
+  HostingCoverageParticipantRetryError,
+  hostingCoverageParticipantOwnerId,
+  isPostgresLockNotAvailable,
+  isHostingCoverageParticipantRetry,
+  lockActiveBookingRequestLinkedMembers,
+  lockHostingCoverageMemberLifecycleTarget,
+  lockMemberMergeHostingCoverageParticipants,
+  MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS,
+  withMemberMergeParticipantRows,
+  type HostingCoverageQueueParticipantProof,
+} from "@/lib/adult-member-hosting-queue-participants";
+import { lockCapturedLoserOwnedBookings, MemberMergeBookingOwnershipDriftError } from "@/lib/member-merge-booking-lock";
+
+const SOURCE = {
+  bookingId: "booking-1",
+  ownerMemberId: "owner-1",
+  lodgeId: "lodge-1",
+} as const;
+
+function makeDb(
+  foundIds = ["actor-1", "owner-1"],
+  source: {
+    bookingId: string;
+    ownerMemberId: string;
+    lodgeId: string;
+  } = SOURCE,
+) {
+  return {
+    // PostgreSQL adapters may report 0 for SELECT ... FOR KEY SHARE. The
+    // authoritative identity proof is the typed Member read below.
+    $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw: vi
+      .fn()
+      .mockResolvedValue(foundIds.slice().sort().map((id) => ({ id }))),
+    member: {
+      findMany: vi
+        .fn()
+        .mockResolvedValue(foundIds.slice().sort().map((id) => ({ id }))),
+    },
+    booking: {
+      findMany: vi.fn().mockResolvedValue([
+        {
+          id: source.bookingId,
+          memberId: source.ownerMemberId,
+          lodgeId: source.lodgeId,
+        },
+      ]),
+    },
+    hostingCoverageReevaluation: {
+      create: vi.fn().mockResolvedValue({ id: "queue-1" }),
+    },
+  };
+}
+
+describe("hosting coverage queue participant fence (#2597)", () => {
+  it("locks a lifecycle target with exact FOR UPDATE NOWAIT and rejects a missing row", async () => {
+    const db = {
+      $executeRaw: vi.fn().mockResolvedValue(1),
+    };
+
+    await expect(
+      lockHostingCoverageMemberLifecycleTarget(db as never, "target-1"),
+    ).resolves.toBeUndefined();
+    const query = db.$executeRaw.mock.calls[0][0] as {
+      strings?: readonly string[];
+      values?: readonly unknown[];
+    };
+    expect(query.strings?.join("?")).toMatch(
+      /FROM "Member"\s+WHERE "id" = \?\s+FOR UPDATE NOWAIT\s*$/,
+    );
+    expect(query.strings?.join("?")).not.toContain("FOR NO KEY UPDATE");
+    expect(query.values).toEqual(["target-1"]);
+
+    db.$executeRaw.mockResolvedValueOnce(0);
+    await expect(
+      lockHostingCoverageMemberLifecycleTarget(db as never, "target-1"),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+  });
+
+  it("maps direct and wrapped lifecycle-target 55P03 errors to the stable retry", async () => {
+    const db = {
+      $executeRaw: vi
+        .fn()
+        .mockRejectedValueOnce({ code: "55P03" })
+        .mockRejectedValueOnce({
+          driverAdapterError: { cause: { originalCode: "55P03" } },
+        })
+        .mockRejectedValueOnce(new Error("connection lost")),
+    };
+
+    await expect(
+      lockHostingCoverageMemberLifecycleTarget(db as never, "target-1"),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    await expect(
+      lockHostingCoverageMemberLifecycleTarget(db as never, "target-1"),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    await expect(
+      lockHostingCoverageMemberLifecycleTarget(db as never, "target-1"),
+    ).rejects.toThrow("connection lost");
+  });
+
+  it("locks and re-reads exact sorted linked members as active and unarchived", async () => {
+    const db = {
+      $executeRaw: vi.fn().mockResolvedValue(0),
+      member: {
+        findMany: vi.fn().mockResolvedValue([
+          { id: "member-a", active: true, archivedAt: null },
+          { id: "member-b", active: true, archivedAt: null },
+        ]),
+      },
+    };
+
+    await expect(
+      lockActiveBookingRequestLinkedMembers(
+        db as never,
+        ["member-b", "member-a", "member-b"],
+      ),
+    ).resolves.toBeUndefined();
+
+    const query = db.$executeRaw.mock.calls[0][0] as {
+      strings?: readonly string[];
+      values?: readonly unknown[];
+    };
+    expect(query.strings?.join("?")).toMatch(
+      /FROM "Member"\s+WHERE "id" IN \(\?,\?\)\s+ORDER BY "id"\s+FOR KEY SHARE\s*$/,
+    );
+    expect(query.values).toEqual(["member-a", "member-b"]);
+    expect(db.member.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ["member-a", "member-b"] } },
+      orderBy: { id: "asc" },
+      select: { id: true, active: true, archivedAt: true },
+    });
+  });
+
+  it("maps linked-member row-lock 55P03 without running the eligibility read", async () => {
+    const db = {
+      $executeRaw: vi.fn().mockRejectedValue({ code: "55P03" }),
+      member: { findMany: vi.fn() },
+    };
+
+    await expect(
+      lockActiveBookingRequestLinkedMembers(db as never, ["member-a"]),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    expect(db.member.findMany).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      members: [{ id: "member-a", active: false, archivedAt: null }],
+      state: "inactive",
+    },
+    {
+      members: [{ id: "member-a", active: true, archivedAt: new Date() }],
+      state: "archived",
+    },
+    { members: [], state: "missing" },
+  ])("rejects a $state linked member after the row lock", async ({ members }) => {
+    const db = {
+      $executeRaw: vi.fn().mockResolvedValue(0),
+      member: { findMany: vi.fn().mockResolvedValue(members) },
+    };
+
+    await expect(
+      lockActiveBookingRequestLinkedMembers(db as never, ["member-a"]),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+  });
+
+  it("locks the sorted de-duplicated owner and actor in one NOWAIT statement", async () => {
+    const db = makeDb();
+    const proof = await acquireHostingCoverageQueueParticipantProof(
+      { sources: [SOURCE, SOURCE], actorMemberId: "actor-1" },
+      db as never,
+    );
+
+    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(
+      (db.$executeRaw.mock.calls[0][0] as { values?: unknown[] }).values,
+    ).toEqual(["actor-1", "owner-1"]);
+    expect(
+      (
+        db.$executeRaw.mock.calls[0][0] as {
+          strings?: readonly string[];
+        }
+      ).strings?.join("?"),
+    ).toMatch(/ORDER BY "id"\s+FOR KEY SHARE NOWAIT/);
+    expect(db.member.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ["actor-1", "owner-1"] } },
+      orderBy: { id: "asc" },
+      select: { id: true },
+    });
+
+    await expect(
+      enqueueHostingCoverageReevaluation(
+        {
+          memberId: "owner-1",
+          lodgeId: "lodge-1",
+          nights: ["2026-08-01"],
+          cause: "SYSTEM_CHANGE",
+          actorMemberId: "actor-1",
+          sourceBookingId: "booking-1",
+        },
+        proof,
+        db as never,
+      ),
+    ).resolves.toBe("queue-1");
+  });
+
+  it("rejects a forged proof and performs no queue write", async () => {
+    const db = makeDb();
+    // Structurally valid on purpose: this only fails because the capability was
+    // not issued by the participant-lock helper. An empty cast would still
+    // explode later if the WeakSet guard were deleted and would not kill that
+    // security-relevant mutation.
+    const forged = Object.freeze({
+      lockedMemberIds: Object.freeze(["owner-1"]),
+      sources: Object.freeze([SOURCE]),
+    }) as HostingCoverageQueueParticipantProof;
+
+    await expect(
+      enqueueHostingCoverageReevaluation(
+        {
+          memberId: "owner-1",
+          lodgeId: "lodge-1",
+          nights: ["2026-08-01"],
+          cause: "SYSTEM_CHANGE",
+          sourceBookingId: "booking-1",
+        },
+        forged,
+        db as never,
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      code: HOSTING_COVERAGE_RETRY_CODE,
+      message: HOSTING_COVERAGE_RETRY_MESSAGE,
+    });
+    expect(db.hostingCoverageReevaluation.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a final actor or owner absent from the exact locked set", async () => {
+    const db = makeDb(["owner-1"]);
+    const proof = await acquireHostingCoverageQueueParticipantProof(
+      { sources: [SOURCE] },
+      db as never,
+    );
+
+    await expect(
+      enqueueHostingCoverageReevaluation(
+        {
+          memberId: "owner-1",
+          lodgeId: "lodge-1",
+          nights: ["2026-08-01"],
+          cause: "OFFICER_OVERRIDE",
+          actorMemberId: "actor-late",
+          reason: "Approved",
+          sourceBookingId: "booking-1",
+        },
+        proof,
+        db as never,
+      ),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    expect(db.hostingCoverageReevaluation.create).not.toHaveBeenCalled();
+  });
+
+  it("maps direct and recursively wrapped 55P03 without parsing messages", async () => {
+    expect(isPostgresLockNotAvailable({ code: "55P03" })).toBe(true);
+    expect(
+      isPostgresLockNotAvailable({
+        meta: {
+          cause: {
+            driverAdapterError: {
+              cause: { cause: { originalCode: "55P03" } },
+            },
+          },
+        },
+      }),
+    ).toBe(true);
+    expect(isPostgresLockNotAvailable({ message: "55P03" })).toBe(false);
+
+    for (const error of [
+      { code: "55P03" },
+      {
+        meta: {
+          cause: {
+            driverAdapterError: {
+              cause: { cause: { originalCode: "55P03" } },
+            },
+          },
+        },
+      },
+    ]) {
+      const db = makeDb();
+      db.$executeRaw.mockRejectedValueOnce(error);
+      await expect(
+        acquireHostingCoverageQueueParticipantProof(
+          { sources: [SOURCE] },
+          db as never,
+        ),
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        code: HOSTING_COVERAGE_RETRY_CODE,
+      });
+      expect(db.member.findMany).not.toHaveBeenCalled();
+      expect(db.hostingCoverageReevaluation.create).not.toHaveBeenCalled();
+    }
+  });
+
+  it("recognises only the stable retry code through retained service causes", () => {
+    const direct = new HostingCoverageParticipantRetryError();
+    expect(isHostingCoverageParticipantRetry(direct)).toBe(true);
+    expect(
+      isHostingCoverageParticipantRetry({ cause: { error: direct } }),
+    ).toBe(true);
+    expect(
+      isHostingCoverageParticipantRetry({
+        message: HOSTING_COVERAGE_RETRY_MESSAGE,
+      }),
+    ).toBe(false);
+    expect(HOSTING_COVERAGE_RETRY_BODY).toEqual({
+      error: HOSTING_COVERAGE_RETRY_MESSAGE,
+      code: HOSTING_COVERAGE_RETRY_CODE,
+    });
+  });
+
+  it("refuses missing typed identities after the raw lock", async () => {
+    const db = makeDb(["owner-1"]);
+    await expect(
+      acquireHostingCoverageQueueParticipantProof(
+        { sources: [SOURCE], actorMemberId: "actor-gone" },
+        db as never,
+      ),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+  });
+
+  it("ignores a zero raw SELECT result and trusts the exact typed identity read", async () => {
+    const db = makeDb(["actor-1", "owner-1"]);
+
+    await expect(
+      acquireHostingCoverageQueueParticipantProof(
+        { sources: [SOURCE], actorMemberId: "actor-1" },
+        db as never,
+      ),
+    ).resolves.toBeDefined();
+    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(db.member.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A merge participant client. Every statement goes through `$executeRaw`;
+   * `lockCounts` answers the row-lock statements (Member `FOR UPDATE`, Booking
+   * `FOR NO KEY UPDATE`) in turn with the number of
+   * rows each locked (or a rejection), and everything else (savepoints, the
+   * lock bound) returns 0. The typed read returns `typed`.
+   */
+  function mergeParticipantDb(
+    lockCounts: Array<number | { reject: unknown }>,
+    typed = ["loser-1", "master-1", "owner-1"],
+  ) {
+    const answers = [...lockCounts];
+    const db = {
+      $executeRaw: vi.fn((sql: { strings?: readonly string[] }) => {
+        if (!/FOR (NO KEY )?UPDATE/.test((sql.strings ?? []).join("?"))) return Promise.resolve(0);
+        const next = answers.shift();
+        if (next === undefined) throw new Error("an unexpected row-lock statement");
+        return typeof next === "number" ? Promise.resolve(next) : Promise.reject(next.reject);
+      }),
+      member: { findMany: vi.fn().mockResolvedValue(typed.map((id) => ({ id }))) },
+    };
+    /** Every statement in issue order, whitespace folded. */
+    const statements = () =>
+      db.$executeRaw.mock.calls.map(([sql]) => ({
+        text: (sql.strings ?? []).join("?").replace(/\s+/g, " ").trim(),
+        values: (sql as { values?: readonly unknown[] }).values ?? [],
+      }));
+    return { db, statements };
+  }
+
+  const PARTICIPANTS = { masterId: "master-1", loserId: "loser-1", ownerMemberIds: ["owner-1"] };
+  const ALL = ["loser-1", "master-1", "owner-1"];
+  const ATTEMPT = 'SELECT 1 FROM "Member" WHERE "id" IN (?,?,?) ORDER BY "id" FOR UPDATE SKIP LOCKED';
+  const PROBE = 'SELECT 1 FROM "Member" WHERE "id" = ? FOR UPDATE SKIP LOCKED';
+  const WAIT = 'SELECT 1 FROM "Member" WHERE "id" = ? FOR UPDATE';
+
+  it("refuses a merge participant set when the typed read omits a locked id", async () => {
+    const { db } = mergeParticipantDb([3], ["master-1", "owner-1"]);
+    await expect(
+      lockMemberMergeHostingCoverageParticipants(db as never, PARTICIPANTS),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+  });
+
+  it("runs the attempt's writes inside the savepoint and rolls them back before waiting for one Member row (#4876)", async () => {
+    // First attempt locks 2 of 3. The writes (the marker) sit inside that
+    // savepoint, the rollback comes before the single-row wait, and the value
+    // kept is the second attempt's.
+    const { db, statements } = mergeParticipantDb([2, 1, 0, 1, 3]);
+    let attempts = 0;
+    const locked = await withMemberMergeParticipantRows(db as never, async () => {
+      attempts += 1;
+      await db.$executeRaw({ strings: ["SELECT 1 /* moves */"], values: [] } as never);
+      return { participantIds: ALL, result: attempts };
+    });
+    expect(locked.result).toBe(2);
+    expect(locked.lockedMemberIds).toEqual(ALL);
+    expect(statements().map((statement) => statement.text)).toEqual([
+      "SAVEPOINT member_merge_participants_attempt",
+      "SELECT 1 /* moves */",
+      ATTEMPT,
+      PROBE,
+      PROBE,
+      "ROLLBACK TO SAVEPOINT member_merge_participants_attempt",
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+      "SAVEPOINT member_merge_participant_wait",
+      "SELECT set_config('lock_timeout', ?, true)",
+      WAIT,
+      "ROLLBACK TO SAVEPOINT member_merge_participant_wait",
+      "RELEASE SAVEPOINT member_merge_participant_wait",
+      "SAVEPOINT member_merge_participants_attempt",
+      "SELECT 1 /* moves */",
+      ATTEMPT,
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+    ]);
+  });
+
+  it("rolls the attempt back and does not retry when its writes refuse (#4876)", async () => {
+    const { db, statements } = mergeParticipantDb([]);
+    let attempts = 0;
+    await expect(
+      withMemberMergeParticipantRows(db as never, async () => {
+        attempts += 1;
+        throw new Error("booking ownership changed");
+      }),
+    ).rejects.toThrow("booking ownership changed");
+    expect(attempts).toBe(1);
+    expect(statements().map((statement) => statement.text)).toEqual([
+      "SAVEPOINT member_merge_participants_attempt",
+      "ROLLBACK TO SAVEPOINT member_merge_participants_attempt",
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+    ]);
+    expect(db.member.findMany).not.toHaveBeenCalled();
+  });
+
+  it("takes every participant row in one SKIP LOCKED statement inside a released savepoint, with no lock bound, when none is busy (#4855)", async () => {
+    const { db, statements } = mergeParticipantDb([3]);
+    await expect(
+      lockMemberMergeHostingCoverageParticipants(db as never, PARTICIPANTS),
+    ).resolves.toEqual(ALL);
+    expect(statements().map((statement) => statement.text)).toEqual([
+      "SAVEPOINT member_merge_participants_attempt",
+      ATTEMPT,
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+    ]);
+    expect(statements()[1].values).toEqual(ALL);
+  });
+
+  it("waits for a busy row ALONE, holding none of the others, then takes the whole set (#4855, #2623 T6)", async () => {
+    // The first attempt skips master-1 (a writer's key share): it locks 2 of 3,
+    // and the row-by-row probe finds loser-1 held (by this attempt) and
+    // master-1 not. Merge releases what it locked, waits for master-1 by itself
+    // under what is left of the 10s bound, releases it and its bound with the
+    // savepoint, and tries again.
+    const { db, statements } = mergeParticipantDb([2, 1, 0, 1, 3]);
+    await expect(
+      lockMemberMergeHostingCoverageParticipants(db as never, PARTICIPANTS),
+    ).resolves.toEqual(ALL);
+    const texts = statements().map((statement) => statement.text);
+    expect(texts).toEqual([
+      "SAVEPOINT member_merge_participants_attempt",
+      ATTEMPT,
+      PROBE,
+      PROBE,
+      "ROLLBACK TO SAVEPOINT member_merge_participants_attempt",
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+      "SAVEPOINT member_merge_participant_wait",
+      "SELECT set_config('lock_timeout', ?, true)",
+      WAIT,
+      "ROLLBACK TO SAVEPOINT member_merge_participant_wait",
+      "RELEASE SAVEPOINT member_merge_participant_wait",
+      "SAVEPOINT member_merge_participants_attempt",
+      ATTEMPT,
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+    ]);
+    expect(statements()[2].values).toEqual(["loser-1"]);
+    expect(statements()[3].values).toEqual(["master-1"]);
+    // The wait is BLOCKING (a short overlap still succeeds) and bounded by the
+    // remaining budget, never more than the T6 bound and never 0 ("forever").
+    expect(texts.join("\n")).not.toContain("NOWAIT");
+    const bound = Number(statements()[7].values[0]);
+    expect(bound).toBeGreaterThan(0);
+    expect(bound).toBeLessThanOrEqual(MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS);
+    expect(statements()[8].values).toEqual(["master-1"]);
+    // No bound outlives its savepoint: nothing restores it by hand (#2623 F4).
+    expect(texts.join("\n")).not.toMatch(/SET LOCAL lock_timeout|RESET/);
+  });
+
+  it("maps a single-row wait that runs out of budget onto the stable retry, after recovering the transaction (#2623 T6)", async () => {
+    // PostgreSQL raises a `lock_timeout` cancellation as SQLSTATE 55P03, the code
+    // NOWAIT raises, so the bounded wait lands on the error member merge already
+    // converts into its clean "nothing was saved" 409.
+    const { db, statements } = mergeParticipantDb([
+      2, 0,
+      { reject: { driverAdapterError: { cause: { originalCode: "55P03" } } } },
+    ]);
+    await expect(
+      lockMemberMergeHostingCoverageParticipants(db as never, PARTICIPANTS),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    expect(statements().slice(-2).map((statement) => statement.text)).toEqual([
+      "ROLLBACK TO SAVEPOINT member_merge_participant_wait",
+      "RELEASE SAVEPOINT member_merge_participant_wait",
+    ]);
+    expect(db.member.findMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses when a busy participant row turns out to be gone", async () => {
+    const { db } = mergeParticipantDb([2, 0, 0]);
+    await expect(
+      lockMemberMergeHostingCoverageParticipants(db as never, PARTICIPANTS),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    expect(db.member.findMany).not.toHaveBeenCalled();
+  });
+
+  it("cannot spin: once the T6 budget is spent it refuses instead of trying again", async () => {
+    // Every wait frees its row at once, but the row is busy again on the next
+    // attempt; the monotonic clock moves past the bound, and no third attempt starts.
+    let now = 1_000;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      const { db } = mergeParticipantDb([2, 0, 1, 2, 0, 1]);
+      const answer = db.$executeRaw.getMockImplementation()!;
+      let waits = 0;
+      db.$executeRaw.mockImplementation((sql) => {
+        const text = (sql.strings ?? []).join("?");
+        if (/FOR UPDATE\s*$/.test(text)) {
+          waits += 1;
+          now += waits === 1 ? MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS / 2 : MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS;
+        }
+        return answer(sql);
+      });
+      await expect(
+        lockMemberMergeHostingCoverageParticipants(db as never, PARTICIPANTS),
+      ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+      expect(waits).toBe(2);
+      const lockBounds = db.$executeRaw.mock.calls
+        .map(([sql]) => sql as { strings?: readonly string[]; values?: readonly unknown[] })
+        .filter((statement) => (statement.strings ?? []).join("?").includes("lock_timeout"))
+        .map((statement) => Number(statement.values?.[0]));
+      // Each wait gets only what is left: the full bound, then half of it.
+      expect(lockBounds).toEqual([MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS, MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS / 2]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("bounds each wait by what is left AFTER the attempt and its probe, so the waits stay inside the 10s total", async () => {
+    // The attempt and the probe themselves take time (here 3s, then 2s). The
+    // wait is handed what is left at the moment it starts, never the figure
+    // read before the attempt; and with nothing left it refuses without waiting.
+    let now = 1_000;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      const { db, statements } = mergeParticipantDb([2, 0, 1, 2, 0]);
+      const answer = db.$executeRaw.getMockImplementation()!;
+      let attempts = 0;
+      db.$executeRaw.mockImplementation((sql) => {
+        const text = (sql.strings ?? []).join("?");
+        if (text.includes('IN (') && text.includes("SKIP LOCKED")) {
+          attempts += 1;
+          now += attempts === 1 ? 3_000 : MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS;
+        } else if (text.includes("SKIP LOCKED")) {
+          now += 2_000;
+        }
+        return answer(sql);
+      });
+      await expect(
+        lockMemberMergeHostingCoverageParticipants(db as never, PARTICIPANTS),
+      ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+      const texts = statements().map((statement) => statement.text);
+      const bounds = statements().filter((statement) => statement.text.includes("lock_timeout")).map((statement) => Number(statement.values[0]));
+      expect(bounds).toEqual([MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS - 5_000]);
+      // The second attempt spent the rest: no second wait was started.
+      expect(texts.filter((text) => text === WAIT)).toHaveLength(1);
+      expect(attempts).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  const CAPTURED_BOOKINGS = ["mrg-book-z", "mrg-book-a"];
+  const SORTED_BOOKINGS = ["mrg-book-a", "mrg-book-z"];
+  const BOOKING_SET =
+    'SELECT 1 FROM "Booking" WHERE "id" IN (?,?) ORDER BY "id" FOR NO KEY UPDATE SKIP LOCKED';
+  const BOOKING_PROBE = 'SELECT 1 FROM "Booking" WHERE "id" = ? FOR NO KEY UPDATE SKIP LOCKED';
+  const BOOKING_WAIT = 'SELECT 1 FROM "Booking" WHERE "id" = ? FOR NO KEY UPDATE';
+
+  it("takes the captured bookings in one SKIP LOCKED statement and releases the attempt only after the Member rows, with no lock bound (#4860)", async () => {
+    const { db, statements } = mergeParticipantDb([2, 3]);
+    await expect(
+      withMemberMergeParticipantRows(db as never, async () => {
+        await lockCapturedLoserOwnedBookings(db as never, CAPTURED_BOOKINGS);
+        return { participantIds: ALL, result: "held" };
+      }),
+    ).resolves.toMatchObject({ result: "held", lockedMemberIds: ALL });
+    expect(statements().map((statement) => statement.text)).toEqual([
+      "SAVEPOINT member_merge_participants_attempt",
+      BOOKING_SET,
+      ATTEMPT,
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+    ]);
+    expect(statements()[1].values).toEqual(SORTED_BOOKINGS);
+    expect(statements().some((statement) => statement.text.includes("lock_timeout"))).toBe(false);
+  });
+
+  it("rolls the attempt back before waiting for the one skipped booking, under what is left of the budget (#4860)", async () => {
+    let now = 1_000;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      const { db, statements } = mergeParticipantDb([1, 0, 1, 2, 3]);
+      const answer = db.$executeRaw.getMockImplementation()!;
+      db.$executeRaw.mockImplementation((sql) => {
+        const text = (sql.strings ?? []).join("?");
+        if (text.includes('"Booking"') && text.includes("IN (")) now += 4_000;
+        return answer(sql);
+      });
+      await expect(
+        withMemberMergeParticipantRows(db as never, async () => {
+          await lockCapturedLoserOwnedBookings(db as never, CAPTURED_BOOKINGS);
+          return { participantIds: ALL, result: "held" };
+        }),
+      ).resolves.toMatchObject({ result: "held" });
+      const texts = statements().map((statement) => statement.text);
+      expect(texts).toEqual([
+        "SAVEPOINT member_merge_participants_attempt",
+        BOOKING_SET,
+        BOOKING_PROBE,
+        "ROLLBACK TO SAVEPOINT member_merge_participants_attempt",
+        "RELEASE SAVEPOINT member_merge_participants_attempt",
+        "SAVEPOINT member_merge_booking_wait",
+        "SELECT set_config('lock_timeout', ?, true)",
+        BOOKING_WAIT,
+        "ROLLBACK TO SAVEPOINT member_merge_booking_wait",
+        "RELEASE SAVEPOINT member_merge_booking_wait",
+        "SAVEPOINT member_merge_participants_attempt",
+        BOOKING_SET,
+        ATTEMPT,
+        "RELEASE SAVEPOINT member_merge_participants_attempt",
+      ]);
+      const rollback = texts.indexOf("ROLLBACK TO SAVEPOINT member_merge_participants_attempt");
+      const wait = texts.indexOf(BOOKING_WAIT);
+      expect(rollback).toBeGreaterThan(-1);
+      expect(wait).toBeGreaterThan(rollback);
+      expect(statements()[2].values).toEqual(["mrg-book-a"]);
+      expect(statements()[7].values).toEqual(["mrg-book-a"]);
+      expect(Number(statements()[6].values[0])).toBe(MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS - 4_000);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("keeps the booking-ownership refusal when wait cleanup exhausts the budget (#4860)", async () => {
+    let now = 1_000;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      const { db, statements } = mergeParticipantDb([1, 0, 1]);
+      const answer = db.$executeRaw.getMockImplementation()!;
+      db.$executeRaw.mockImplementation((sql) => {
+        const text = (sql.strings ?? []).join("?");
+        if (text === "RELEASE SAVEPOINT member_merge_booking_wait") {
+          now += MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS;
+        }
+        return answer(sql);
+      });
+      await expect(
+        withMemberMergeParticipantRows(db as never, async () => {
+          await lockCapturedLoserOwnedBookings(db as never, CAPTURED_BOOKINGS);
+          return { participantIds: ALL, result: "held" };
+        }),
+      ).rejects.toBeInstanceOf(MemberMergeBookingOwnershipDriftError);
+      expect(statements().filter((statement) => statement.text === BOOKING_SET)).toHaveLength(1);
+      expect(statements().slice(-2).map((statement) => statement.text)).toEqual([
+        "ROLLBACK TO SAVEPOINT member_merge_booking_wait",
+        "RELEASE SAVEPOINT member_merge_booking_wait",
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("names the hosting participants, not the booking, when a later Member wait spends the budget (#4860)", async () => {
+    // Booking wait frees at once; the retried attempt then finds master-1 busy,
+    // and the Member wait's cleanup spends the rest. The refusal names the
+    // Member contention that used the budget up, not the earlier booking wait.
+    let now = 1_000;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      const { db } = mergeParticipantDb([1, 0, 1, 2, 2, 1, 0, 1]);
+      const answer = db.$executeRaw.getMockImplementation()!;
+      db.$executeRaw.mockImplementation((sql) => {
+        const text = (sql.strings ?? []).join("?");
+        if (text === "RELEASE SAVEPOINT member_merge_participant_wait") {
+          now += MEMBER_MERGE_PARTICIPANT_LOCK_TIMEOUT_MS;
+        }
+        return answer(sql);
+      });
+      let attempts = 0;
+      await expect(
+        withMemberMergeParticipantRows(db as never, async () => {
+          attempts += 1;
+          await lockCapturedLoserOwnedBookings(db as never, CAPTURED_BOOKINGS);
+          return { participantIds: ALL, result: "held" };
+        }),
+      ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+      expect(attempts).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("issues no booking statement when the captured set is empty (#4860)", async () => {
+    const { db, statements } = mergeParticipantDb([3]);
+    await withMemberMergeParticipantRows(db as never, async () => {
+      await lockCapturedLoserOwnedBookings(db as never, []);
+      return { participantIds: ALL, result: "none" };
+    });
+    expect(statements().some((statement) => statement.text.includes('"Booking"'))).toBe(false);
+    expect(statements().map((statement) => statement.text)).toEqual([
+      "SAVEPOINT member_merge_participants_attempt",
+      ATTEMPT,
+      "RELEASE SAVEPOINT member_merge_participants_attempt",
+    ]);
+  });
+
+  it("refuses, without a second attempt, when the booking wait finds the row gone or the budget runs out (#4860)", async () => {
+    const gone = mergeParticipantDb([1, 0, 0]);
+    let goneAttempts = 0;
+    await expect(
+      withMemberMergeParticipantRows(gone.db as never, async () => {
+        goneAttempts += 1;
+        await lockCapturedLoserOwnedBookings(gone.db as never, CAPTURED_BOOKINGS);
+        return { participantIds: ALL, result: goneAttempts };
+      }),
+    ).rejects.toBeInstanceOf(MemberMergeBookingOwnershipDriftError);
+    expect(goneAttempts).toBe(1);
+
+    const timedOut = mergeParticipantDb([
+      1, 0,
+      { reject: { driverAdapterError: { cause: { originalCode: "55P03" } } } },
+    ]);
+    await expect(
+      withMemberMergeParticipantRows(timedOut.db as never, async () => {
+        await lockCapturedLoserOwnedBookings(timedOut.db as never, CAPTURED_BOOKINGS);
+        return { participantIds: ALL, result: "held" };
+      }),
+    ).rejects.toBeInstanceOf(MemberMergeBookingOwnershipDriftError);
+    expect(timedOut.statements().slice(-2).map((statement) => statement.text)).toEqual([
+      "ROLLBACK TO SAVEPOINT member_merge_booking_wait",
+      "RELEASE SAVEPOINT member_merge_booking_wait",
+    ]);
+  });
+
+  it("refuses source owner or lodge drift after the participant lock", async () => {
+    const ownerDriftDb = makeDb(["owner-1"], {
+      ...SOURCE,
+      ownerMemberId: "owner-moved",
+    });
+    await expect(
+      acquireHostingCoverageQueueParticipantProof(
+        { sources: [SOURCE] },
+        ownerDriftDb as never,
+      ),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+
+    const lodgeDriftDb = makeDb(["owner-1"], {
+      ...SOURCE,
+      lodgeId: "lodge-moved",
+    });
+    await expect(
+      acquireHostingCoverageQueueParticipantProof(
+        { sources: [SOURCE] },
+        lodgeDriftDb as never,
+      ),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+  });
+
+  it("tries sorted coverage-owner keys and fails without waiting on a later key", async () => {
+    const queryRaw = vi
+      .fn()
+      .mockResolvedValueOnce([{ locked: true }])
+      .mockResolvedValueOnce([{ locked: false }]);
+    await expect(
+      tryLockHostingCoverageOwners(
+        { $queryRaw: queryRaw },
+        ["owner-b", "owner-a", "owner-a"],
+      ),
+    ).resolves.toBe(false);
+    expect(queryRaw).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails loudly when the coverage try-lock returns an unverified shape", async () => {
+    await expect(
+      tryLockHostingCoverageOwners(
+        {
+          $queryRaw: vi.fn().mockResolvedValue([{ held: true }]),
+        },
+        ["owner-1"],
+      ),
+    ).rejects.toThrow(/hosting coverage owner try-lock/);
+  });
+
+  it("plans merge SYSTEM_CHANGE rows actorless and names applicable owner keys", async () => {
+    const booking = {
+      id: "booking-1",
+      memberId: "owner-1",
+      lodgeId: "lodge-1",
+      checkIn: new Date("2026-08-01T00:00:00Z"),
+      checkOut: new Date("2026-08-03T00:00:00Z"),
+    };
+    const db = {
+      booking: {
+        findMany: vi.fn(({ where }: { where: Record<string, unknown> }) =>
+          Promise.resolve(
+            "guests" in where || "id" in where ? [booking] : [],
+          ),
+        ),
+      },
+      adultMemberHostingPolicy: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: "policy-1",
+            scopeKey: "club-wide",
+            lodgeId: null,
+            mode: "ENFORCED",
+            capacityMode: "NO_HOLD",
+            version: 1,
+            hostScopeSameBooking: true,
+            hostScopeSameBookingOwner: true,
+          },
+        ]),
+      },
+    };
+    const plan = await buildMemberMergeHostingCoveragePlan(
+      {
+        today: CLUB_TODAY_DATE_ONLY,
+        masterId: "master-1",
+        capturedLoserOwnedBookingIds: ["booking-1"],
+      },
+      db as never,
+    );
+    expect(plan.coverageOwnerIds).toEqual(["owner-1"]);
+    expect(plan.items).toHaveLength(1);
+    expect(plan.items[0]).toMatchObject({
+      memberId: "owner-1",
+      sourceBookingId: "booking-1",
+      cause: "SYSTEM_CHANGE",
+      actorMemberId: null,
+    });
+  });
+});
+
+/**
+ * A2 (#2618 review): the fence must be impossible to disable by passing a
+ * client that cannot lock. An issued proof is a capability — it enters the
+ * module's WeakSet and therefore satisfies
+ * assertHostingCoverageQueueParticipantsLocked at every downstream call site —
+ * so issuing one without the lock would not merely skip a check here, it would
+ * silently switch the check off everywhere the proof travels.
+ */
+/**
+ * A narrow double does not have the key AT ALL, so the fixture deletes it rather
+ * than spreading around it — the shape the real test doubles had is the shape the
+ * refusal has to catch. (Also drops the two unused-binding lint warnings the
+ * destructuring form left behind.)
+ */
+function withoutRawLockClient(db: ReturnType<typeof makeDb>): never {
+  const client: Record<string, unknown> = { ...db };
+  delete client.$executeRaw;
+  return client as never;
+}
+
+describe("participant proof cannot exist without its lock", () => {
+  it("refuses a client that cannot take the row lock instead of issuing a proof", async () => {
+    const withoutRawLock = withoutRawLockClient(makeDb());
+
+    await expect(
+      acquireHostingCoverageQueueParticipantProof(
+        { sources: [SOURCE], actorMemberId: "actor-1" },
+        withoutRawLock as never,
+      ),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantFenceUnavailableError);
+  });
+
+  it("does not dress the wiring fault as retryable contention", async () => {
+    // A 409 retry contract here would invite an endless client retry loop: no
+    // amount of retrying grows the client a $executeRaw method.
+    const withoutRawLock = withoutRawLockClient(makeDb());
+
+    const error = await acquireHostingCoverageQueueParticipantProof(
+      { sources: [SOURCE], actorMemberId: "actor-1" },
+      withoutRawLock as never,
+    ).catch((err: unknown) => err);
+
+    // It must have thrown at all — a returned proof here would mean the fence
+    // was bypassed, which is the failure this whole describe block exists for.
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    expect(isHostingCoverageParticipantRetry(error)).toBe(false);
+  });
+
+  it("takes FOR KEY SHARE NOWAIT over the exact sorted participant set", async () => {
+    const db = makeDb();
+
+    await acquireHostingCoverageQueueParticipantProof(
+      { sources: [SOURCE], actorMemberId: "actor-1" },
+      db as never,
+    );
+
+    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    const sql = JSON.stringify(db.$executeRaw.mock.calls[0][0]);
+    expect(sql).toContain("FOR KEY SHARE NOWAIT");
+    // Sorted and deduplicated, so concurrent acquirers cannot deadlock.
+    expect(db.member.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: { in: ["actor-1", "owner-1"] } },
+        orderBy: { id: "asc" },
+      }),
+    );
+  });
+
+  it("refuses when a locked participant row has vanished", async () => {
+    // The lock proves nothing if the row set it protected is not the row set
+    // that comes back.
+    const db = makeDb(["owner-1"]);
+
+    await expect(
+      acquireHostingCoverageQueueParticipantProof(
+        { sources: [SOURCE], actorMemberId: "actor-1" },
+        db as never,
+      ),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+  });
+
+  it("refuses when the source booking's owner drifted under the lock", async () => {
+    const db = makeDb();
+    db.booking.findMany.mockResolvedValue([
+      { id: SOURCE.bookingId, memberId: "someone-else", lodgeId: SOURCE.lodgeId },
+    ]);
+
+    await expect(
+      acquireHostingCoverageQueueParticipantProof(
+        { sources: [SOURCE], actorMemberId: "actor-1" },
+        db as never,
+      ),
+    ).rejects.toBeInstanceOf(HostingCoverageParticipantRetryError);
+  });
+});
+
+/**
+ * THE SOURCE CONTRACT (#2619, #2810).
+ *
+ * The behavioural tests above prove the seam refuses the ONE shape of unlockable
+ * client they hand it. That is worth having and it is not enough, because the
+ * bypass those tests replaced was reintroducible by a plausible refactor rather
+ * than by a mistake. What stood here before #2634 read, in full sincerity:
+ *
+ *   "Hosting service unit tests use deliberately narrow in-memory delegates. A
+ *    real Prisma client exposes both raw methods; requiring that production shape
+ *    keeps those existing test doubles narrow without weakening the runtime-issued
+ *    proof at the queue boundary."
+ *
+ * That is what somebody writes when a suite of narrow doubles is failing and an
+ * early return makes them pass. It reads as housekeeping locally. What it did was
+ * hand back a proof — a CAPABILITY, which then satisfies
+ * `assertHostingCoverageQueueParticipantsLocked` at every downstream call site —
+ * for a lock that was never taken.
+ *
+ * A differently shaped early return placed above the lock would not be caught by a
+ * runtime test that hands over one specific unlockable client. So this block
+ * asserts on the source: not that the module behaves, but that the SHAPE cannot
+ * come back.
+ */
+describe("participant fence source contract (#2619)", () => {
+  /** Resolved from this file, not `process.cwd()`, so the run directory is irrelevant. */
+  const MODULE_PATH = join(
+    import.meta.dirname,
+    "..",
+    "adult-member-hosting-queue-participants.ts",
+  );
+
+  /**
+   * Source with comments removed.
+   *
+   * A comment that NAMES a pattern must not read as using it — otherwise the
+   * docblock above, which quotes the bypass it exists to describe, would fail the
+   * very assertions it is explaining.
+   */
+  function readModuleCode(): string {
+    return stripComments(readFileSync(MODULE_PATH, "utf8"));
+  }
+
+  /**
+   * The acquire function's own body.
+   *
+   * Scoped to the one function because the module has two other legitimate
+   * `issueProof` callers — `proveMemberMergeHostingCoverageParticipants` takes its
+   * lock through a different path entirely. Asserting over the whole file would
+   * either fail honest code or, worse, be loosened until it asserted nothing.
+   */
+  function acquireFunctionBody(code: string): string {
+    const start = code.indexOf(
+      "export async function acquireHostingCoverageQueueParticipantProof",
+    );
+    expect(
+      start,
+      "the acquire function has been renamed — this contract now guards nothing",
+    ).toBeGreaterThan(-1);
+    const end = code.indexOf("\nexport ", start + 1);
+    return code.slice(start, end === -1 ? undefined : end);
+  }
+
+  it("never names $queryRaw, which this module has never called", () => {
+    // The dropped half of the old condition, and the reason a client that COULD
+    // lock was read as unlockable: the bypass demanded a method the module does
+    // not use and `ParticipantDb` does not declare.
+    expect(readModuleCode()).not.toContain("$queryRaw");
+  });
+
+  it("issues no proof before the row lock, and refuses a client that cannot lock", () => {
+    const body = acquireFunctionBody(readModuleCode());
+
+    // The exact bypass #2619 removed, and the general shape of it.
+    expect(body).not.toMatch(
+      /return\s+issueProof\(\s*memberIds\s*,\s*params\.sources/,
+    );
+    expect(body).toContain(
+      "throw new HostingCoverageParticipantFenceUnavailableError()",
+    );
+
+    // ORDER IS THE CONTRACT. Every `issueProof` in this function must sit after
+    // the lock statement, so no path can hand back an unlocked capability —
+    // including one added later under a condition nobody thought to test.
+    const lockAt = body.indexOf("FOR KEY SHARE NOWAIT");
+    expect(
+      lockAt,
+      "the acquire function no longer takes a FOR KEY SHARE NOWAIT lock",
+    ).toBeGreaterThan(-1);
+    const proofCalls = [...body.matchAll(/issueProof\(/g)];
+    expect(
+      proofCalls.length,
+      "the acquire function issues no proof at all — this contract is vacuous",
+    ).toBeGreaterThan(0);
+    for (const match of proofCalls) {
+      expect(match.index).toBeGreaterThan(lockAt);
+    }
+  });
+
+  it("keeps the refusal outside the retryable 409 hierarchy", () => {
+    // Not a style point. `isHostingCoverageParticipantRetry` matches on the code,
+    // and that 409 drives hold-release, group-booking and payment-link branches
+    // plus operator copy telling them to reload and try again. A wiring fault can
+    // never clear by retrying, so dressing it as contention would invite an
+    // endless loop. It has to fall through to a generic 500.
+    const error = new HostingCoverageParticipantFenceUnavailableError();
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(HostingCoverageParticipantRetryError);
+    expect(isHostingCoverageParticipantRetry(error)).toBe(false);
+    expect((error as unknown as { code?: unknown }).code).toBeUndefined();
+    expect(
+      (error as unknown as { statusCode?: unknown }).statusCode,
+    ).toBeUndefined();
+  });
+});
+
+describe("what a hosting-coverage participant is (#3369, one home since #3480)", () => {
+  // The fence's re-read and every producer in the review module ask this one
+  // predicate, so the two halves of a proof are taken over the same set. A
+  // member-owned booking is a participant, keyed on its owner; an
+  // organisation-owned booking — a school's, since #3369 — is not.
+  it("names the owning member of a member-owned booking", () => {
+    expect(hostingCoverageParticipantOwnerId({ memberId: "member-1" })).toBe("member-1");
+  });
+
+  it("answers null for an organisation-owned booking, which holds no member-nights", () => {
+    expect(hostingCoverageParticipantOwnerId({ memberId: null })).toBeNull();
+  });
+
+  it("drops an organisation-owned booking from the fence's re-read rather than fingerprinting it", async () => {
+    // The verifier's side of the agreement: handed a member-owned source, it
+    // re-reads a set that also contains a school booking and issues a proof over
+    // the member-owned one alone, instead of reporting the school as a change.
+    const db = {
+      $executeRaw: vi.fn(async () => 1),
+      member: {
+        findMany: vi.fn(async () => [{ id: "member-1" }]),
+      },
+      booking: {
+        findMany: vi.fn(async () => [
+          { id: "b-member", memberId: "member-1", lodgeId: "lodge-a" },
+        ]),
+      },
+    } as never;
+    const proof = await acquireHostingCoverageQueueParticipantProof(
+      {
+        sources: [{ bookingId: "b-member", ownerMemberId: "member-1", lodgeId: "lodge-a" }],
+        actorMemberId: null,
+      },
+      db,
+    );
+    expect(proof.sources.map((source) => source.bookingId)).toEqual(["b-member"]);
+  });
+});

@@ -1,0 +1,2775 @@
+import { XERO_ACTIVE_OPERATION_STATUSES } from "./xero-active-operation-statuses";
+import { storedShortBookingId } from "@/lib/booking-reference";
+import { NOT_CARD_REFUND_REVERSAL_INVOICE } from "@/lib/xero-card-refund-reversal-outbox";
+import { bookingOwner } from "@/lib/booking-owner";
+import { settleHostingCoverageAfterCommit } from "@/lib/adult-member-hosting-coverage-drain";
+import { enqueueOwnHostingCoverageReevaluation } from "@/lib/adult-member-hosting-review";
+import { reconcileHostingReviewForSystemCancellation } from "@/lib/adult-member-hosting-system-cancellation";
+import { prisma } from "@/lib/prisma";
+import {
+  BookingEventType,
+  BookingStatus,
+  PaymentSource,
+  PaymentStatus,
+  PaymentTransactionKind,
+  Prisma,
+} from "@prisma/client";
+import {
+  findPaymentTransactionByIntentId, lockPaymentForRefundedTotal,
+  planStripeRefundAllocation,
+  refundPaymentTransactions,
+  upsertPaymentIntentTransaction,
+} from "@/lib/payment-transactions";
+import { readSupersededCaptureHeldBack } from "@/lib/superseded-capture-hold-back";
+import {
+  enqueueCapacityClaimFailedRefundRecovery,
+  enqueueDuplicateCaptureRefundRecovery,
+  markCapacityClaimFailedRefundRecoverySucceeded,
+  markDuplicateCaptureRefundRecoverySucceeded,
+  recordCapacityClaimFailedRefundRecoveryInlineError,
+  recordDuplicateCaptureRefundRecoveryInlineError,
+} from "@/lib/payment-recovery";
+import {
+  buildBookingModificationRefundMetadata,
+  buildCapacityClaimFailedRefundRecoveryIdempotencyKey,
+  buildCapacityClaimFailedRefundStripeKeyPrefix,
+  buildDuplicateCaptureRefundRecoveryIdempotencyKey,
+  buildDuplicateCaptureRefundStripeKeyPrefix,
+} from "@/lib/payment-recovery-keys";
+import { keepRefusedPrePersistedRefundOwed, RefusedCardRefundError, type RefundAttempt } from "@/lib/refused-card-refund-retry";
+import { closeDoorRow } from "@/lib/pre-persisted-refund-close";
+import { alertCaptureKeptWithoutRecordedSettler, judgeCaptureOnPaidBooking, recordNewCaptureAlertOwed } from "@/lib/duplicate-capture-guard";
+import { CLEAR_SETTLING_TRANSACTION, findSettlingInternetBankingTransactionId, recordSettlingTransaction } from "@/lib/payment-settler";
+import { acquireLodgeCapacityLock, checkCapacityForGuestRanges } from "@/lib/capacity";
+import { findAppliedCreditDeallocationFence } from "@/lib/xero-applied-credit-operation-serialization";
+import {
+  deriveBookingAppliedCreditCents,
+  giveBackAppliedCredit,
+  lockMemberCreditLedger,
+  restoreCreditFromBooking,
+} from "@/lib/member-credit";
+import { createAuditLog } from "@/lib/audit";
+import { cancelPaymentIntentIfCancellable } from "@/lib/stripe";
+import {
+  MANUAL_SETTLEMENT_REVERSAL_EVENT_KIND,
+  MANUAL_SETTLEMENT_REVERSAL_EVENT_REASON,
+  type ManualSettlementReversalEventSnapshot,
+} from "@/lib/manual-settlement-reversal-event";
+import { closeCapacityRaceRefundRecordingEvent, recordBookingEvent, recordDuplicateCaptureRefundEvent } from "@/lib/booking-events";
+import { alertCapacityRaceRefundShortfall, raiseCapacityRaceRefundShortfallTask } from "@/lib/capacity-race-refund-shortfall";
+import { sendAdminDuplicateCaptureRefundAlert, sendAdminPaymentFailureAlert } from "@/lib/email";
+import logger from "@/lib/logger";
+import { formatCents } from "@/lib/utils";
+import { clearStaleCreditElection } from "@/lib/booking-credit-election";
+import { reportUnappliedCreditElection } from "@/lib/booking-credit-election-report";
+import { reconcileBedAllocationsForBookingWithLodgeLockHeld } from "@/lib/bed-allocation-lifecycle";
+import { releaseBookingPromoRedemptions } from "@/lib/promo";
+import { getDefaultLodgeId } from "@/lib/lodges";
+import {
+  bookingAmountOwedCents,
+  bookingWorthCents,
+  isManualSettleFromPaymentStatus,
+  MANUAL_CAPTURED_PAYMENT_REFUSAL,
+  MANUAL_SETTLE_FROM_PAYMENT_STATUS_LIST,
+} from "@/lib/booking-payment-state";
+import { CAPTURED_NOT_FULLY_REFUNDED_TRANSACTION_STATUS_LIST } from "@/lib/payment-transaction-status";
+import {
+  enqueueManualSettlementIntentCancellations,
+  manualSettleIntentHygieneAuditFields,
+  withdrawManualSettlementIntentCancellations,
+} from "@/lib/manual-settlement-intent-hygiene";
+import { supersededMachineryOwnsCapture } from "@/lib/superseded-capture-ownership";
+import { reportSupersededCaptureRefused } from "@/lib/superseded-capture-refusal";
+import { isAdditionalAmountUncollected } from "@/lib/unpaid-finished-stays";
+import {
+  bookingHasCapacityOverride,
+  isPaidLikeBookingStatus,
+  RELEASE_ADMIN_CAPACITY_HOLD_UPDATE,
+  RELEASE_WHOLE_LODGE_HOLD_UPDATE,
+} from "@/lib/booking-status";
+import { postCancellationLedgerLines } from "@/lib/booking-ledger-cancellation-sync";
+import { syncBookingLedgerSettlements } from "@/lib/booking-ledger-settlement-sync";
+import { postBookingConfirmationLedgerLines } from "@/lib/booking-ledger-confirmation-sync";
+import { lockBookingRowForOwnerRead, postBookingReceipts, postRefundObligation, resolveBookingMoneyPostingContext, type BookingJournalContext } from "@/lib/member-money/doors";
+import type { ClubFormat } from "@/lib/club-format";
+import { ManualBookingPaymentError } from "@/lib/manual-booking-payment-error";
+
+type ReconciliationBooking = Prisma.BookingGetPayload<{
+  include: {
+    guests: true;
+    member: true;
+    // #3369: the owner may be an Organisation; bookingOwner() reads both.
+    organisation: { select: { name: true; email: true } };
+  };
+}>;
+
+import type {
+  BookingSettlementSource,
+  ManualAdditionalCoverage,
+  ManualSettlementSource,
+  MarkBookingPaymentSucceededResult,
+  StripeSettlementSource,
+} from "@/lib/payment-reconciliation-sources";
+import { LOCK1_HOLDER_TRANSACTION_BUDGET } from "@/lib/db-transaction";
+import { readClearedCreditElectionCents, readSettledAdditionalPayment } from "@/lib/manual-mark-paid-metadata";
+import { consumeCaptureAwaitingSettle } from "@/lib/unsettled-capture-marker";
+
+const PAYABLE_SUCCESS_STATUS_LIST = [
+  BookingStatus.PAYMENT_PENDING,
+  BookingStatus.CONFIRMED,
+  BookingStatus.PENDING,
+  BookingStatus.DRAFT,
+] as const;
+
+const PAYABLE_SUCCESS_STATUSES = new Set<string>(PAYABLE_SUCCESS_STATUS_LIST);
+
+// #2397: the payment statuses a manual settlement may settle FROM, and the
+// refusal for everything else, live in the leaf `booking-payment-state` module
+// so the read-time refusal below, the fenced write's WHERE and the admin page's
+// advisory state all consume ONE list. The fence alone used to leave the read
+// path offering an action that was certain to 409, with a message ("changed
+// while you were recording it") that was simply untrue — nothing had changed.
+
+async function alertRefundFailure({
+  booking,
+  paymentIntentId,
+  amountCents,
+  error,
+  format,
+}: {
+  booking: ReconciliationBooking;
+  paymentIntentId: string;
+  amountCents: number;
+  error: unknown;
+  /** The club's format (#3565), resolved before any transaction by the caller. */
+  format: ClubFormat;
+}) {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+
+  sendAdminPaymentFailureAlert({
+    memberName: `${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName}`,
+    checkIn: booking.checkIn,
+    checkOut: booking.checkOut,
+    amountCents,
+    errorMessage: `Payment succeeded but final capacity claim failed and automatic refund failed: ${errorMessage}`,
+    paymentIntentId,
+  }, format).catch((alertErr) =>
+    logger.error(
+      { err: alertErr, bookingId: booking.id, paymentIntentId },
+      "Failed to alert admins about capacity refund failure"
+    )
+  );
+}
+
+const MANUAL_XERO_INVOICE_REFUSAL =
+  "This booking has an outstanding Xero invoice — record the payment against the invoice in Xero instead.";
+const MANUAL_XERO_QUEUED_MINT_REFUSAL =
+  "A Xero invoice for this booking is already queued — let it finish, then record the payment against the invoice in Xero.";
+const MANUAL_GROUP_SETTLEMENT_REFUSAL =
+  "This booking was settled as part of a group booking — record the payment against the group settlement instead.";
+
+/**
+ * B5 (#2262) guard 2, read side. Every piece of evidence that a Xero invoice
+ * exists — or is about to — for this payment. Run under lock(1) inside the
+ * settlement/reversal transaction, before any write.
+ *
+ * The payment-level and transaction-level conditions are ALSO re-asserted in
+ * the fenced write, because an invoice can be minted between this read and that
+ * write. The object-link and outbox-operation evidence are read-time refusals:
+ * they cannot be expressed as a Payment WHERE, and the settle-time refusal plus
+ * the choke-point and handler fences in the Xero mint path close that race from
+ * the other side.
+ */
+async function assertNoXeroInvoiceEvidence(
+  tx: Prisma.TransactionClient,
+  payment: {
+    id: string;
+    xeroInvoiceId: string | null;
+    xeroRefundCreditNoteId: string | null;
+  }
+) {
+  if (payment.xeroInvoiceId || payment.xeroRefundCreditNoteId) {
+    throw new ManualBookingPaymentError(MANUAL_XERO_INVOICE_REFUSAL, 409);
+  }
+
+  // Transaction-stamped-but-payment-null is a MODELED drift state, not a
+  // hypothesis: the zero-cash inbound arm stamps the transaction rows in writes
+  // that do not also stamp the payment, and the repair classifier backfills the
+  // payment-level id from exactly that transaction-level evidence. A
+  // payment-level check alone is a hole.
+  const stampedTransaction = await tx.paymentTransaction.findFirst({
+    where: { paymentId: payment.id, xeroInvoiceId: { not: null } },
+    select: { id: true },
+  });
+  if (stampedTransaction) {
+    throw new ManualBookingPaymentError(MANUAL_XERO_INVOICE_REFUSAL, 409);
+  }
+
+  const activeInvoiceLink = await tx.xeroObjectLink.findFirst({
+    where: {
+      localModel: "Payment",
+      localId: payment.id,
+      xeroObjectType: "INVOICE",
+      role: "PRIMARY_INVOICE",
+      active: true,
+    },
+    select: { id: true },
+  });
+  if (activeInvoiceLink) {
+    throw new ManualBookingPaymentError(MANUAL_XERO_INVOICE_REFUSAL, 409);
+  }
+
+  const completedMint = await tx.xeroSyncOperation.findFirst({
+    where: {
+      direction: "OUTBOUND",
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModel: "Payment",
+      localId: payment.id,
+      status: "SUCCEEDED",
+      // A failed-card-refund reversal is not a bill the member was sent (`INV-PAY-151`).
+      ...NOT_CARD_REFUND_REVERSAL_INVOICE,
+    },
+    select: { id: true },
+  });
+  if (completedMint) {
+    throw new ManualBookingPaymentError(MANUAL_XERO_INVOICE_REFUSAL, 409);
+  }
+
+  // An invoice mint that is queued but has not fired yet. Without this the
+  // common ordering — an operation enqueued minutes before the cron picks it up
+  // — lets a mark-paid commit while a real awaiting-payment invoice is about to
+  // be created AND EMAILED to the member for money already collected in cash.
+  // The repair classifier already models this exact state as its own finding
+  // (BLOCKED_BY_XERO_OPERATION), so it is a real, observed state.
+  //
+  // Deliberately a SUPERSET of the choke point's own predicate: WAITING_PAYMENT
+  // is included alongside PENDING/RUNNING because such an operation is
+  // unambiguously a mint that has not happened yet and will fire later.
+  const inFlightMint = await tx.xeroSyncOperation.findFirst({
+    where: {
+      direction: "OUTBOUND",
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModel: "Payment",
+      localId: payment.id,
+      status: { in: [...XERO_ACTIVE_OPERATION_STATUSES] },
+      ...NOT_CARD_REFUND_REVERSAL_INVOICE,
+    },
+    select: { id: true },
+  });
+  if (inFlightMint) {
+    throw new ManualBookingPaymentError(MANUAL_XERO_QUEUED_MINT_REFUSAL, 409);
+  }
+}
+
+/**
+ * B5 (#2262): everything the manual path decides BEFORE the shared settlement
+ * body writes anything — the third lock tier, every refusal, and the settlement
+ * amount. Split out only so the shared body below stays readable; every step
+ * the four guards care about (locks, capacity, fences, bed reconciliation,
+ * events) still lives in the one settlement body.
+ *
+ * Runs under lock(1) + the per-lodge lock, and takes the MEMBER-CREDIT lock as
+ * the third tier (global -> lodge -> member-credit, the same composition
+ * switch-to-internet-banking uses) before deriving the amount, so the derived
+ * figure cannot race an applied-credit writer.
+ */
+async function prepareManualSettlement(
+  tx: Prisma.TransactionClient,
+  booking: ReconciliationBooking,
+  settlement: ManualSettlementSource
+) {
+  // Third lock tier. Credit writers serialise on a per-member key, not lock(1),
+  // so the switch-to-internet-banking precedent deliberately refuses to rely on
+  // other writers holding lock(1); this path does the same.
+  const creditLedgerMemberId = bookingOwner(booking).memberId;
+  // #3369: the credit ledger is a MEMBER ledger and an organisation-owned
+  // booking has none, so there is no key to take. Passing a null key would
+  // either throw inside the helper or degenerate to a shared advisory key,
+  // which is an `INV-LOCK` hazard that shows up only under concurrency.
+  if (creditLedgerMemberId) {
+    await lockMemberCreditLedger(creditLedgerMemberId, tx);
+  }
+
+  if (booking.status === BookingStatus.PAID) {
+    // Refusal, never the duplicate-adjudication branch: no manual money fact
+    // has been written yet, so rolling back is exact and the admin keeps the
+    // cash rather than the club recording it twice.
+    throw new ManualBookingPaymentError(
+      "This booking is already paid — nothing was recorded.",
+      409
+    );
+  }
+
+  if (!PAYABLE_SUCCESS_STATUSES.has(booking.status)) {
+    throw new ManualBookingPaymentError(
+      `This booking cannot be paid from status ${booking.status}.`,
+      409
+    );
+  }
+
+  // Guard 2, conservative v1 group fence (owner-decided 28 Jul). organiserSettled
+  // is set once, under lock(1), by the group-settlement path, so the post-lock
+  // re-read decides it permanently. Each-pays group members and the organiser's
+  // own parent booking are deliberately NOT fenced.
+  if (booking.organiserSettled) {
+    throw new ManualBookingPaymentError(MANUAL_GROUP_SETTLEMENT_REFUSAL, 409);
+  }
+
+  const payment = await tx.payment.findUnique({
+    where: { bookingId: booking.id },
+    select: {
+      id: true,
+      status: true,
+      xeroInvoiceId: true,
+      xeroRefundCreditNoteId: true,
+      manuallyMarkedPaidAt: true,
+      refundedAmountCents: true,
+      // #3750: a change fee recorded on the payment is owed with the rest.
+      changeFeeCents: true,
+      // #2397: the upward-modification delta and its collection state, read
+      // under the same locks as the amount law below.
+      additionalAmountCents: true,
+      additionalPaymentStatus: true,
+      // #2397 F4: the member's live card instrument for that delta, so the
+      // settlement can spare it when the cash did not cover the delta.
+      additionalPaymentIntentId: true,
+    },
+  });
+
+  if (payment) {
+    if (payment.manuallyMarkedPaidAt) {
+      throw new ManualBookingPaymentError(
+        "This booking's payment is already recorded as a manual settlement.",
+        409
+      );
+    }
+    // THE ORDER OF THE THREE REFUSALS BELOW IS DELIBERATE AND SHARED (#2397).
+    // `getBookingManualPaymentState` (src/lib/manual-booking-payment-state.ts)
+    // applies the same three in the same order, so a booking that trips more
+    // than one is given the SAME sentence before the click and after it —
+    // refund history, then already-captured, then Xero evidence. Refund history
+    // goes first because it is the most specific truth available: a fully
+    // REFUNDED payment is also a captured one, and "already carries refund
+    // history" names a remedy ("resolve the refund first") that the captured
+    // message can only gesture at. Xero goes last so the cheap in-memory
+    // refusals settle it without the three lookups `assertNoXeroInvoiceEvidence`
+    // costs inside this locked transaction. Any change here must be made in
+    // both files.
+    //
+    // L7 (#2262): a manually settled payment carries NO prior refund history.
+    // Money already handed back through the ledger cannot be reconciled with a
+    // cash settlement recorded over the top of it — the reversal's fences and
+    // the settle's own mirror both assume refundedAmountCents starts at 0 —
+    // so the settle refuses rather than recording an irreconcilable row. The
+    // fenced write below re-asserts this as a WHERE condition.
+    if (payment.refundedAmountCents !== 0) {
+      throw new ManualBookingPaymentError(
+        "This booking's payment already carries refund history — it cannot be recorded as a manual settlement. Cancel and rebook, or resolve the refund first.",
+        409
+      );
+    }
+    // #2397: the read-time twin of the fenced write's status clause. Without
+    // it, a booking whose card capture stranded before its status promotion
+    // (the #1418 confirm-pending-guests / cron-confirm-pending incident state:
+    // booking still CONFIRMED or PAYMENT_PENDING, payment already SUCCEEDED)
+    // passed every read guard, opened the whole dialog — including #2397's own
+    // "does the cash cover the extra?" question, since an upward modification
+    // in that window is exactly what records an uncollected delta — and then
+    // failed at the fence with "changed while you were recording it", which was
+    // false and would repeat on every retry. Refuse where the truth is known.
+    if (!isManualSettleFromPaymentStatus(payment.status)) {
+      throw new ManualBookingPaymentError(MANUAL_CAPTURED_PAYMENT_REFUSAL, 409);
+    }
+    await assertNoXeroInvoiceEvidence(tx, payment);
+  }
+
+  // The amount law. The manual path NEVER accepts a client-supplied settlement
+  // amount: it recomputes the effective price under the full lock set.
+  const creditAppliedCents = await deriveBookingAppliedCreditCents(
+    booking.id,
+    tx
+  );
+  const recordedChangeFeeCents = payment?.changeFeeCents ?? null;
+  const effectiveAmountCents = bookingAmountOwedCents({
+    finalPriceCents: booking.finalPriceCents,
+    changeFeeCents: recordedChangeFeeCents,
+    appliedCreditCents: creditAppliedCents,
+  });
+
+  if (!Number.isSafeInteger(effectiveAmountCents)) {
+    throw new ManualBookingPaymentError(
+      "This booking's amount owing is not a whole number of cents — refresh and check the booking's price.",
+      409
+    );
+  }
+  if (effectiveAmountCents <= 0) {
+    // Verified: no $0 booking is stranded without one of these paths.
+    throw new ManualBookingPaymentError(
+      "This booking has nothing owing — use Force confirm / Confirm pending guests instead.",
+      409
+    );
+  }
+  if (effectiveAmountCents !== settlement.expectedAmountCents) {
+    throw new ManualBookingPaymentError(
+      "The amount owing changed while you were recording this payment — refresh and check the figure before recording it.",
+      409
+    );
+  }
+
+  // The ledger mirror holds by construction (effective = final - credit), but
+  // assert it explicitly so a future change to either derivation is caught here
+  // rather than in the ledger.
+  if (
+    effectiveAmountCents + creditAppliedCents !==
+    bookingWorthCents({ finalPriceCents: booking.finalPriceCents, changeFeeCents: recordedChangeFeeCents })
+  ) {
+    throw new ManualBookingPaymentError(
+      "This booking's payment ledger does not reconcile — refresh and try again.",
+      409
+    );
+  }
+
+  // #2397 — the outstanding upward-modification delta, and the admin's answer
+  // about it.
+  //
+  // The MONEY half of the shared owed test is enough here: this settle always
+  // lands the booking on PAID, which is inside the owed status list, so the
+  // status half is constant-true by construction (see the merge-point note on
+  // `isAdditionalAmountUncollected`). Whatever the answer, the chase that #2386
+  // adds and every admin surface read the same two columns, so agreeing with
+  // them is a matter of writing those columns, not of inventing a parallel
+  // "manually settled extra" state.
+  const outstandingAdditionalCents = isAdditionalAmountUncollected(payment)
+    ? payment.additionalAmountCents
+    : 0;
+  const coverage = settlement.additionalCoverage;
+
+  if (outstandingAdditionalCents === 0 && coverage !== null) {
+    throw new ManualBookingPaymentError(
+      "The extra owing on this booking was settled or removed while you were recording this payment — refresh and check the figures before recording it.",
+      409
+    );
+  }
+  if (outstandingAdditionalCents > 0 && coverage === null) {
+    throw new ManualBookingPaymentError(
+      "This booking has an extra owing that was not on your screen — refresh and say whether the cash covers it before recording this payment.",
+      409
+    );
+  }
+  if (
+    coverage !== null &&
+    coverage.expectedAdditionalAmountCents !== outstandingAdditionalCents
+  ) {
+    throw new ManualBookingPaymentError(
+      "The extra owing changed while you were recording this payment — refresh and check the figure before recording it.",
+      409
+    );
+  }
+
+  // The extra is a SLICE of the amount owing, never a sum on top of it: an
+  // upward modification raises `Booking.finalPriceCents` by the same delta it
+  // records on the payment, and this settle collects `finalPriceCents - credit`
+  // in one go. An extra LARGER than the whole amount owing therefore cannot be
+  // a slice of it (a modification change fee is added to the recorded extra but
+  // never to `finalPriceCents`, so this is reachable) — refuse rather than guess
+  // which part of it the cash covered. Checked for BOTH answers, because both
+  // now derive their settled figure from the same subtraction.
+  //
+  // #2397 F5: the remedy named here has to be one that EXISTS. There is no
+  // "settle the extra separately" door for an admin — the only two things that
+  // actually work are the member paying the extra on their own booking page
+  // (the card the addition minted, which this settle deliberately leaves live
+  // when it is not covered — see `enqueueManualSettlementIntentCancellations`),
+  // or an admin correcting the booking's price so the extra is a slice of it
+  // again.
+  if (outstandingAdditionalCents > effectiveAmountCents) {
+    throw new ManualBookingPaymentError(
+      "The extra recorded on this booking is larger than the amount owing, so this payment cannot settle it. Ask the member to pay the extra from their booking page, or correct the booking's price, then record this payment.",
+      409
+    );
+  }
+
+  const additionalSettlementCents =
+    coverage !== null && coverage.covered ? outstandingAdditionalCents : 0;
+  const uncollectedAdditionalCents =
+    outstandingAdditionalCents - additionalSettlementCents;
+
+  // THE SETTLED FIGURE (owner decision, 31 Jul 2026). The club records what it
+  // actually took, not what the booking is worth:
+  //
+  //  * covered   — the cash was the whole amount owing, so the settled figure is
+  //    `finalPriceCents - credit` and the extra is a slice of it (the PRIMARY
+  //    transaction drops by the delta, the ADDITIONAL transaction carries it);
+  //  * NOT covered — only the amount owing BEFORE the change was handed over, so
+  //    the extra is subtracted from the settled figure. It stays outstanding and
+  //    is still chased, and the books say $100 received / $21 owing rather than
+  //    $121 received / $21 owing, which was the old contradiction.
+  //
+  // The PRIMARY transaction is the same figure either way; the only difference
+  // is whether an ADDITIONAL row exists alongside it saying the delta was
+  // collected too.
+  const settlementAmountCents = effectiveAmountCents - uncollectedAdditionalCents;
+
+  if (settlementAmountCents <= 0) {
+    // Everything owing IS the extra, and the admin has said the cash did not
+    // cover it — so there is nothing to record. Refusing beats writing a $0
+    // settlement that would flip the booking to PAID for no money.
+    throw new ManualBookingPaymentError(
+      "Everything owing on this booking is the extra you have said the cash does not cover, so there is nothing to record. Ask the member to pay it from their booking page, or record this payment once the cash covers it.",
+      409
+    );
+  }
+
+  // THE GENERALISED LEDGER MIRROR. `amountCents + creditAppliedCents =
+  // finalPriceCents` was only ever the special case where nothing is left owing;
+  // it CANNOT hold on a partially settled booking, and asserting it would forbid
+  // the honest "no" answer outright. What holds in every case — and what already
+  // held for a CARD-settled booking carrying an uncollected addition, so this
+  // makes the manual path match the card path rather than diverging from it — is
+  //
+  //     amountCents + creditAppliedCents + (uncollected addition) = finalPriceCents
+  //
+  // i.e. every cent of the booking's price is either collected, paid with
+  // credit, or still owed. The covered answer leaves the third term at 0 and
+  // reduces to the original mirror exactly.
+  //
+  // #2397 F6 — and it is deliberately NOT asserted here, because it CANNOT be.
+  // At this point `settlementAmountCents` is DEFINED as `effectiveAmountCents -
+  // uncollectedAdditionalCents`, and `effectiveAmountCents + creditAppliedCents
+  // === finalPriceCents` was already asserted a few lines above, so the identity
+  // reduces to `finalPrice === finalPrice`: a tautology in these locals that
+  // could never fire. Nor would re-reading the values after the writes help —
+  // inside this one transaction the re-read can only return what these same
+  // locals just wrote.
+  //
+  // What actually enforces the mirror at runtime, in order:
+  //  1. CONSTRUCTION. The primary and additional ledger rows are a SPLIT of one
+  //     figure (`manualPrimaryTransactionAmountCents +
+  //     additionalSettlementCents = settlementAmountCents`), and that same
+  //     figure is what `Payment.amountCents` is set to — so the reconciler's
+  //     own derivation (sum of captured rows) reproduces it rather than
+  //     inflating it.
+  //  2. THE FENCE. The fenced `payment.updateMany` below re-asserts the
+  //     outstanding delta, the settle-from status, the zero refund history and
+  //     the absence of Xero evidence as WHERE clauses, so a concurrent writer
+  //     that moved any of them yields count 0 -> 409 instead of a write whose
+  //     third term is stale. That is the real runtime net.
+  //  3. AFTER THE FACT. The booking-ledger census (#3583, `INV-MONEY-037`,
+  //     `pnpm run booking-ledger:census`) reads COMMITTED data and checks what
+  //     this settle wrote against the lines it posted, for every booking:
+  //     `amountCents` against the captures (the CASH_RECORDED line is this
+  //     settled figure), `creditAppliedCents` against the applied credit, and
+  //     the uncollected addition against `max(0, owed(b))` while its ask is
+  //     live. A booking whose figures disagree is listed with both. It is the
+  //     only one of the three that can fire at all, because it is not reading
+  //     back its own writes — and it is an operator-run command, not a
+  //     scheduled job or an alert, so (1) and (2) are what keep this settle
+  //     honest at the moment it runs. It replaced #1620's
+  //     `ib-hold-clearing-audit.ts` strand scan, which reported this residual
+  //     only for internet-banking payments still carrying unallocated credit.
+
+  return {
+    /** `finalPriceCents - credit`: everything the booking still owes. */
+    amountOwingCents: effectiveAmountCents,
+    /** What this settlement records as RECEIVED — the figure that is written. */
+    settlementAmountCents,
+    creditAppliedCents,
+    paymentId: payment?.id ?? null,
+    outstandingAdditionalCents,
+    additionalSettlementCents,
+    uncollectedAdditionalCents,
+    previousAdditionalPaymentStatus: payment?.additionalPaymentStatus ?? null,
+    /**
+     * #2397 F4: the live card instrument for the outstanding extra, if the
+     * member has one. When the cash does NOT cover the extra this intent is
+     * deliberately spared the settlement's intent cancellation, because it is
+     * the only self-service door left to the money the club is still owed.
+     */
+    additionalPaymentIntentId: payment?.additionalPaymentIntentId ?? null,
+  };
+}
+
+/**
+ * The ONE booking-settlement body (#2262 guard 1). Both the Stripe capture and
+ * the admin's manual cash settlement execute it, so the lock ordering, the
+ * post-lock re-read, the capacity check with its #1771 override carve-out, the
+ * status-fenced PAID claim and the bed reconciliation are literally the same
+ * lines for both — there is no sibling path that can drift.
+ *
+ * Runs INSIDE a caller-provided transaction; every provider call (Stripe
+ * refunds/cancels, email) belongs to the callers, after commit.
+ */
+async function settleBookingPaymentInTransaction(
+  tx: Prisma.TransactionClient,
+  bookingId: string,
+  settlement: BookingSettlementSource,
+  /** #4627: the journal's posting context, resolved before the caller's transaction (`INV-LOCK-004`). */
+  journal: BookingJournalContext,
+) {
+    // Two-tier lock protocol (#1881). A Stripe capture does BOTH tiers of work:
+    // it flips the booking's status + moves money (the booking-status/money
+    // tier), AND it claims capacity (the per-lodge tier). It must therefore
+    // hold BOTH locks, and the global lock(1) is taken FIRST — always
+    // global-before-per-lodge, so the ordering is deadlock-free against every
+    // other two-lock writer (invoice-paid-effects, confirm-pending-guests).
+    // Without lock(1) this capture no longer mutually excluded the cancel /
+    // hold-release / settlement paths (which serialise on lock(1)); a concurrent
+    // cancel could interleave and the bare PAID write below could resurrect a
+    // just-cancelled booking. The per-lodge lock still serialises the capacity
+    // claim against per-lodge creators.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+
+    // Pre-lock read: only the lodge lock key. lodgeId is immutable, so keying
+    // the per-lodge lock from this read is safe; every status/capacity-relevant
+    // field is taken from the post-lock re-read below.
+    const lockTarget = await tx.booking.findUnique({
+      where: { id: bookingId },
+      select: { lodgeId: true },
+    });
+
+    if (!lockTarget) {
+      throw new Error("Booking not found");
+    }
+
+    const bookingLodgeId = lockTarget.lodgeId ?? (await getDefaultLodgeId(tx));
+    await acquireLodgeCapacityLock(tx, bookingLodgeId);
+    // #4840: a manual settle names its officer on the Payment row below (the FK takes KEY SHARE on that Member row)
+    // before its PAID claim, so it takes the booking row first: booking row, then Member, the order member merge and
+    // every booking writer share. Taken after, it deadlocks a merge of that officer holding this row outside its prefix.
+    if (settlement.kind === "manual") await lockBookingRowForOwnerRead(tx, bookingId);
+
+    // Re-read the full booking under the lock; the status/amount checks, the
+    // capacity check and the PAID/CANCELLED claim below consume ONLY this
+    // post-lock snapshot.
+    const booking = await tx.booking.findUnique({
+      where: { id: bookingId },
+      include: {
+        guests: { include: { nights: true } }, // per-night sets (issue #713)
+        member: true,
+        // #3369: the owner may be an Organisation; bookingOwner() reads both.
+        organisation: { select: { name: true, email: true } },
+        // #3750: a change fee recorded on the payment is part of the worth.
+        payment: { select: { changeFeeCents: true } },
+      },
+    });
+
+    if (!booking) {
+      throw new Error("Booking not found");
+    }
+
+    // #3792 (INV-LOCK-002): the member credit-ledger key third, before the Payment
+    // upsert, the order the inbound credit-note sync takes them in; the capacity
+    // void's restore and the manual settle's ledger read re-enter it. The owner is
+    // NOT immutable: member merge re-points it holding the lodge key, so it is read
+    // from this post-lodge-lock snapshot, and the restore below reuses this id.
+    // #3369: an organisation-owned booking has no member, so no key.
+    const settleCreditLedgerMemberId = bookingOwner(booking).memberId;
+    if (settleCreditLedgerMemberId) await lockMemberCreditLedger(settleCreditLedgerMemberId, tx);
+
+    // B5 (#2262): the manual path's third lock tier, every guard-2 refusal and
+    // the amount law, all decided from this same post-lock snapshot and all
+    // BEFORE the first write below.
+    const manual =
+      settlement.kind === "manual"
+        ? await prepareManualSettlement(tx, booking, settlement)
+        : null;
+
+    // The amount this settlement moves. The Stripe path takes the captured
+    // amount as given (and validates it against the booking below); the manual
+    // path recomputed it under the locks and never accepts one from a client.
+    // #2397: for the manual path this is what the club actually RECEIVED, which
+    // is the amount owing minus any extra the admin said the cash did not cover
+    // — never the booking's whole worth when only part of it was handed over.
+    const settlementAmountCents =
+      manual !== null
+        ? manual.settlementAmountCents
+        : (settlement as StripeSettlementSource).amountCents;
+
+    // #1641 — split the captured amount into cash + credit so the mirror invariant
+    // `amountCents + creditAppliedCents = finalPriceCents` holds for BOTH a new
+    // effective capture (credit = applied) and a full-price capture (credit = 0,
+    // its applied credit given back below, #3864 — never a Xero over-allocation).
+    // This is derived from the captured amount alone; the ledger is only read below
+    // when the amount is NOT the full price (to admit the effective capture).
+    // The manual path already derived both halves under the MEMBER-CREDIT lock.
+    // #3750: the booking's worth is its price plus a change fee recorded on the
+    // payment, read once here for the mirror and the amount check below.
+    const settleWorthCents = bookingWorthCents({
+      finalPriceCents: booking.finalPriceCents,
+      changeFeeCents: booking.payment?.changeFeeCents ?? null,
+    });
+    const mirrorCreditAppliedCents =
+      manual !== null
+        ? manual.creditAppliedCents
+        : Math.max(0, settleWorthCents - settlementAmountCents);
+
+    // #2397 — the slice of this settlement that pays off the outstanding
+    // upward-modification delta, when the admin said the cash covers it. Zero
+    // on every other settlement, which is every settlement today.
+    const manualAdditionalSettlementCents = manual?.additionalSettlementCents ?? 0;
+    const manualOutstandingAdditionalCents =
+      manual?.outstandingAdditionalCents ?? 0;
+    const manualUncollectedAdditionalCents =
+      manual?.uncollectedAdditionalCents ?? 0;
+    const manualAmountOwingCents =
+      manual?.amountOwingCents ?? settlementAmountCents;
+    const manualPreviousAdditionalPaymentStatus =
+      manual?.previousAdditionalPaymentStatus ?? null;
+    // The cash is SPLIT, never increased: the additional transaction carries the
+    // delta and the primary carries the rest, so the two rows sum to
+    // `settlementAmountCents` = `Payment.amountCents` — the money the club
+    // actually took. This is exactly the shape a card-paid booking with a later
+    // addition has, so `reconcilePaymentAggregates` re-deriving the payment from
+    // its ledger reproduces these figures instead of inflating them.
+    //
+    // The PRIMARY figure is deliberately the SAME under both answers — the
+    // booking's worth before the change. "Covered" adds an ADDITIONAL row beside
+    // it; "not covered" leaves the delta uncollected and out of the settled
+    // total. That is why one subtraction serves both, and why the answer can
+    // never change what the primary row says was received.
+    const manualPrimaryTransactionAmountCents =
+      settlementAmountCents - manualAdditionalSettlementCents;
+    // #4516 (M4b): the rows this officer settle writes, which alone its receipts may collect.
+    const manualReceiptRowIds: string[] = [];
+
+    const payment = await tx.payment.upsert({
+      where: { bookingId },
+      create: {
+        bookingId,
+        amountCents: settlementAmountCents,
+        creditAppliedCents: mirrorCreditAppliedCents,
+        status: PaymentStatus.PENDING,
+      },
+      update: {},
+    });
+    // #4217 (`INV-LOCK-002`): the Payment row before any ledger row (the lookup below may backfill).
+    await lockPaymentForRefundedTotal(tx, payment.id);
+
+    let refundedIntentHistory = false;
+    // #4285 review: the arriving capture's row was already SUCCEEDED (a replay), with no saved-card "not yet settled" flag (#5240).
+    let arrivingAlreadyCaptured = false;
+
+    if (settlement.kind === "stripe") {
+      // #1765 — refund history is immutable: an intent whose transaction was
+      // refunded (fully or partially) must never be re-admitted as settlement,
+      // whichever path (intent-route recovery, confirm-payment, webhook
+      // redelivery, payment link) carries the succeeded intent back here.
+      // Without this guard a redelivered success event for a refunded intent
+      // would clobber the transaction row back to SUCCEEDED and, when the
+      // booking price never changed, settle the booking at zero net cash. The
+      // lookup backfills pre-ledger payments so legacy refund history is caught
+      // too. Crashed-webhook recovery is untouched: its transaction is still
+      // PENDING/PROCESSING (success was never recorded locally).
+      const priorTransaction = await findPaymentTransactionByIntentId({
+        paymentIntentId: settlement.paymentIntentId,
+        store: tx,
+      });
+      refundedIntentHistory =
+        priorTransaction !== null &&
+        (priorTransaction.status === PaymentStatus.REFUNDED ||
+          priorTransaction.status === PaymentStatus.PARTIALLY_REFUNDED);
+      arrivingAlreadyCaptured = priorTransaction?.status === PaymentStatus.SUCCEEDED && !(await consumeCaptureAwaitingSettle(tx, settlement.paymentIntentId));
+
+      if (!refundedIntentHistory) {
+        await upsertPaymentIntentTransaction({
+          paymentId: payment.id,
+          kind: PaymentTransactionKind.PRIMARY,
+          paymentIntentId: settlement.paymentIntentId,
+          amountCents: settlement.amountCents,
+          status: PaymentStatus.SUCCEEDED,
+          paymentMethodId: settlement.paymentMethodId,
+          store: tx,
+        });
+      }
+    } else {
+      // B5 (#2262) manual transaction mint. Shaped after the inbound-Xero mint
+      // (an INTERNET_BANKING PRIMARY row, no Stripe intent id) minus the
+      // invoice stamping, because this settlement has no invoice by definition.
+      //
+      // DELIBERATE DIVERGENCE 1 — FAILED rows are excluded from the update
+      // predicate, where the inbound mint excludes only REFUNDED /
+      // PARTIALLY_REFUNDED. A reversal marks this feature's manual row FAILED at
+      // the old amount; resurrecting it would settle the booking at a stale
+      // figure. Do not "restore" the inbound predicate here.
+      //
+      // DELIBERATE DIVERGENCE 2 — on count 0 this CREATES UNCONDITIONALLY. The
+      // inbound mint first looks for ANY existing IB PRIMARY row and only
+      // creates when none exists; copied here that fallback would find the
+      // reversal's FAILED row and mint nothing, leaving a PAID payment with no
+      // settled transaction. Refund history on the payment is left untouched
+      // (#1765 / #1357 raise-only spirit).
+      const mintablePrimary = {
+        paymentId: payment.id,
+        source: PaymentSource.INTERNET_BANKING,
+        kind: PaymentTransactionKind.PRIMARY,
+        status: {
+          notIn: [
+            PaymentStatus.REFUNDED,
+            PaymentStatus.PARTIALLY_REFUNDED,
+            PaymentStatus.FAILED,
+          ],
+        },
+      };
+      manualReceiptRowIds.push(...(await tx.paymentTransaction.findMany({ where: mintablePrimary, select: { id: true } })).map((row) => row.id));
+      const mintedUpdate = await tx.paymentTransaction.updateMany({
+        where: mintablePrimary,
+        data: {
+          status: PaymentStatus.SUCCEEDED,
+          amountCents: manualPrimaryTransactionAmountCents,
+          reason: "manual_mark_paid",
+        },
+      });
+
+      if (mintedUpdate.count === 0) {
+        const minted = await tx.paymentTransaction.create({
+          data: {
+            paymentId: payment.id,
+            kind: PaymentTransactionKind.PRIMARY,
+            source: PaymentSource.INTERNET_BANKING,
+            stripePaymentIntentId: null,
+            amountCents: manualPrimaryTransactionAmountCents,
+            status: PaymentStatus.SUCCEEDED,
+            reason: "manual_mark_paid",
+          },
+        });
+        manualReceiptRowIds.push(minted.id);
+      }
+
+      // #2397 — the ADDITIONAL half, minted the same way and only when the
+      // admin said this cash covers the outstanding extra. Same two deliberate
+      // divergences as the PRIMARY mint above, for the same reasons: FAILED
+      // rows are excluded from the update predicate (a reversal marks this
+      // feature's own row FAILED at the old amount, and resurrecting it would
+      // settle the extra at a stale figure), and count 0 CREATES
+      // unconditionally rather than falling back to "any existing ADDITIONAL
+      // row" — a fallback would adopt the member's stale, still-PENDING STRIPE
+      // additional intent row and claim a card capture that never happened.
+      //
+      // A durable row rather than only the summary column, because
+      // `reconcilePaymentAggregates` re-derives `additionalAmountCents` /
+      // `additionalPaymentStatus` from the LATEST ADDITIONAL transaction: a
+      // column-only write would be silently undone by the next ledger
+      // reconcile and the member would start being chased again for cash the
+      // club already holds.
+      if (manualAdditionalSettlementCents > 0) {
+        const mintableAdditional = {
+          paymentId: payment.id,
+          source: PaymentSource.INTERNET_BANKING,
+          kind: PaymentTransactionKind.ADDITIONAL,
+          status: {
+            notIn: [
+              PaymentStatus.REFUNDED,
+              PaymentStatus.PARTIALLY_REFUNDED,
+              PaymentStatus.FAILED,
+            ],
+          },
+        };
+        manualReceiptRowIds.push(...(await tx.paymentTransaction.findMany({ where: mintableAdditional, select: { id: true } })).map((row) => row.id));
+        const mintedAdditional = await tx.paymentTransaction.updateMany({
+          where: mintableAdditional,
+          data: {
+            status: PaymentStatus.SUCCEEDED,
+            amountCents: manualAdditionalSettlementCents,
+            reason: MANUAL_MARK_PAID_ADDITIONAL_REASON,
+          },
+        });
+
+        if (mintedAdditional.count === 0) {
+          const minted = await tx.paymentTransaction.create({
+            data: {
+              paymentId: payment.id,
+              kind: PaymentTransactionKind.ADDITIONAL,
+              source: PaymentSource.INTERNET_BANKING,
+              stripePaymentIntentId: null,
+              amountCents: manualAdditionalSettlementCents,
+              status: PaymentStatus.SUCCEEDED,
+              reason: MANUAL_MARK_PAID_ADDITIONAL_REASON,
+            },
+          });
+          manualReceiptRowIds.push(minted.id);
+        }
+      }
+    }
+
+    // #4285: COMPLETED is PAID with the stay ended, judged the same; a finished stay's beds are left alone.
+    if (isPaidLikeBookingStatus(booking.status)) {
+      if (booking.status === BookingStatus.PAID) {
+        const previousRange = { checkIn: booking.checkIn, checkOut: booking.checkOut };
+        await reconcileBedAllocationsForBookingWithLodgeLockHeld({ bookingId: booking.id, db: tx, previousRange });
+      }
+
+      // #1992 / #4211 (`INV-PAY-043`): a capture arriving on a PAID or COMPLETED booking is judged by
+      // `duplicate-capture-guard.ts` - the recorded settler is kept, any other capture refunded, and with no
+      // record nothing is refunded and the admins check by hand. The refund debt (and #4285 an owed alert) is
+      // written here, ATOMIC with this transaction and BEFORE any Stripe call (the #1349 pattern).
+      if (!refundedIntentHistory && settlement.kind === "stripe") {
+        const verdict = await judgeCaptureOnPaidBooking(tx, {
+          bookingId: booking.id,
+          paymentId: payment.id,
+          recordedSettlerId: payment.settledByTransactionId,
+          paymentIntentId: settlement.paymentIntentId,
+          amountCents: settlement.amountCents,
+          arrivingAlreadyCaptured,
+        });
+        if (verdict.verdict === "refund") {
+          await enqueueDuplicateCaptureRefundRecovery({
+            bookingId: booking.id,
+            paymentId: payment.id,
+            paymentIntentId: settlement.paymentIntentId,
+            amountCents: verdict.refundCents,
+            allocationPlan: verdict.refundPlan,
+            store: tx,
+          });
+          return {
+            outcome: "duplicate_capture" as const,
+            booking,
+            paymentId: payment.id,
+            bumpedBookingIds: [] as string[],
+            refundPlan: verdict.refundPlan,
+            plannedRefundCents: verdict.refundCents,
+            settledPaymentIntentId: verdict.settledPaymentIntentId,
+          };
+        }
+        if (verdict.verdict === "keep_unrecorded_settler") {
+          if (verdict.reason === "new-capture") await recordNewCaptureAlertOwed(tx, { bookingId: booking.id, paymentIntentId: settlement.paymentIntentId });
+          return {
+            outcome: "duplicate_capture_kept" as const,
+            booking,
+            paymentId: payment.id,
+            bumpedBookingIds: [] as string[],
+            otherPaymentIntentId: verdict.otherPaymentIntentId,
+            otherHoldsMoney: verdict.otherHoldsMoney,
+            keptReason: verdict.reason, keptHeldCents: verdict.heldCents,
+          };
+        }
+      }
+
+      // A refunded-history redelivery on an already-PAID or COMPLETED booking
+      // (e.g. a Stripe event replay after a partial goodwill refund) stays benign —
+      // and, with the guard above, no longer clobbers the refund marker.
+      return {
+        outcome: "already_paid" as const,
+        booking,
+        paymentId: payment.id,
+        bumpedBookingIds: [] as string[],
+      };
+    }
+
+    if (refundedIntentHistory) {
+      // #1765 — the booking is not settled and the carried intent's money was
+      // handed back. Re-admitting it would settle the booking at zero net
+      // cash; the member owes a fresh payment (the create-payment-intent
+      // route mints the repay intent at the current effective price).
+      throw new Error(
+        "Refunded payment intent cannot be re-admitted as settlement; the booking needs a fresh payment (#1765)"
+      );
+    }
+
+    // #4300 (`INV-PAY-138`): nor one the superseded machinery owns (any part owed
+    // back counts). Returned, not thrown, so a webhook is not retried for days.
+    if (
+      settlement.kind === "stripe" &&
+      (await supersededMachineryOwnsCapture(tx, { paymentId: payment.id, paymentIntentId: settlement.paymentIntentId }))
+    ) {
+      return { outcome: "superseded_capture" as const, booking, paymentId: payment.id, bumpedBookingIds: [] as string[] };
+    }
+
+    if (!PAYABLE_SUCCESS_STATUSES.has(booking.status)) {
+      throw new Error(`Booking is not payable from status ${booking.status}`);
+    }
+
+    // #1641 — accept EITHER the credit-reduced effective price (new intents) OR
+    // the full finalPriceCents (legacy in-flight intents minted before the fix).
+    // A wrong-amount capture (e.g. a stale intent from a since-changed price, #1161)
+    // equals neither and is still rejected. Full price is always a legitimate
+    // settlement of a full-price booking's invoice, so admitting it can never
+    // under-charge the member. It does not re-open the double-charge only because
+    // the #3864 give-back below returns any credit such a capture leaves spent (an
+    // intent minted before an election was spent can still capture at full price).
+    //
+    // The manual path has no arriving amount to validate: it DERIVED the
+    // effective price under the MEMBER-CREDIT lock in prepareManualSettlement,
+    // asserted the mirror there, and refused a figure that had moved since the
+    // admin's dialog rendered.
+    if (settlement.kind === "stripe" && settlement.amountCents !== settleWorthCents &&
+      settlement.amountCents !== settleWorthCents - (await deriveBookingAppliedCreditCents(booking.id, tx))) {
+      throw new Error("Payment amount does not match booking total");
+    }
+
+    const capacity = await checkCapacityForGuestRanges(
+      bookingLodgeId,
+      booking.checkIn,
+      booking.checkOut,
+      booking.guests,
+      booking.id,
+      tx
+    );
+
+    // Since #737/#738 a PENDING booking holds no capacity, so there is no
+    // synchronous bump that could free a real bed. An all-member booking that
+    // does not fit against committed bookings is cancelled-and-refunded here,
+    // never bumped into a full lodge (issue #738, carried over from R1). The
+    // non-member portion of a mixed party is now its own provisional booking.
+    if (!capacity.available && bookingHasCapacityOverride(booking)) {
+      // Persisted capacity override (#1771): this booking was deliberately
+      // admitted above the ceiling by an admin. Settle it instead of cancelling
+      // — fall through to the PAID update below.
+      //
+      // Whole-lodge hold (ADR-001, issue #118) is DELIBERATELY not enforced on
+      // this settle path (and the other persisted-override settlements: cron-
+      // confirm-pending, switch-to-internet-banking, charge-saved-method,
+      // payment-link, xero-inbound invoice-paid-effects, group-settlement).
+      // Those settle a PRE-EXISTING overridden booking; a hold may have been
+      // placed over it AFTERWARDS. Per ADR-001 decision 1 (conflicts are
+      // allowed, surfaced, and manually resolved — no auto-displacement/refusal)
+      // an already-admitted booking is not a "new admission", so auto-refusing
+      // it here would contradict decision 1. The hold blocks only NEW admissions
+      // (decision 5), enforced at the admission choke points (booking-create,
+      // date/modify-plan, and the admin allowOverbook routes force-confirm /
+      // confirm-pending-guests / capacity-hold).
+      logger.info(
+        { bookingId: booking.id },
+        "Settling an over-capacity booking with a persisted capacity override (#1771); skipping the capacity cancel"
+      );
+    }
+    if (
+      !capacity.available &&
+      !bookingHasCapacityOverride(booking) &&
+      settlement.kind === "manual"
+    ) {
+      // B5 (#2262), owner-decided 28 Jul: REFUSE, do not mirror the Stripe
+      // path's cancel-and-refund. No in-system money fact exists yet — the
+      // transaction throws, nothing is written, and the admin still holds the
+      // cash — so refusal leaves zero debt, where a cancel-and-refund would
+      // record a cancellation and then reach for Stripe machinery that cannot
+      // hand back banknotes. The INVARIANT is unchanged: the same capacity
+      // check runs at the same point under the same locks, so an unpaid-for
+      // bed can never be admitted into a full or exclusively held lodge.
+      throw new ManualBookingPaymentError(
+        "This booking no longer fits the lodge — nothing was recorded; resolve capacity (or cancel the booking) before recording the payment.",
+        409
+      );
+    }
+    if (
+      !capacity.available &&
+      !bookingHasCapacityOverride(booking) &&
+      settlement.kind === "stripe"
+    ) {
+      const { paymentIntentId, amountCents } = settlement;
+      // Status-guarded void (#1881, defense in depth): claim the cancel only
+      // while the booking is still in a payable state. Under lock(1) the
+      // post-lock re-read already established that, so count 0 is a "cannot
+      // happen" — but guarding the write means a concurrent status transition
+      // that somehow slipped the lock can never be clobbered back to CANCELLED.
+      const voided = await tx.booking.updateMany({
+        where: { id: booking.id, status: { in: [...PAYABLE_SUCCESS_STATUS_LIST] } },
+        data: {
+          status: BookingStatus.CANCELLED,
+          draftExpiresAt: null,
+          ...RELEASE_ADMIN_CAPACITY_HOLD_UPDATE,
+          // Best-effort field clearing (#177): this settlement capacity-cancel
+          // has no per-booking audit context, so it mirrors the capacity-hold
+          // sibling — clear the stale hold, no released audit. NB this is the
+          // NON-override branch; the documented decision-1 carve-out settlement
+          // (the override branch above) is untouched.
+          ...RELEASE_WHOLE_LODGE_HOLD_UPDATE,
+        },
+      });
+      if (voided.count === 0) {
+        throw new Error(
+          "Booking status changed concurrently during the capacity-failed void (#1881)"
+        );
+      }
+      await reconcileBedAllocationsForBookingWithLodgeLockHeld({
+        bookingId: booking.id,
+        db: tx,
+        previousRange: {
+          checkIn: booking.checkIn,
+          checkOut: booking.checkOut,
+        },
+      });
+      await releaseBookingPromoRedemptions(tx, booking.id);
+
+      // #3369: the credit ledger is a MEMBER ledger and an organisation-owned
+      // booking has none, so there is no key to take. Passing a null key would
+      // either throw inside the helper or degenerate to a shared advisory key,
+      // which is an `INV-LOCK` hazard that shows up only under concurrency.
+      // #3792: the same id the member key above was taken on, never a re-read.
+      if (settleCreditLedgerMemberId) {
+        await restoreCreditFromBooking(settleCreditLedgerMemberId, booking.id, tx);
+      }
+      // #3611: the whole charge goes back, so nothing is kept; a booking already
+      // confirmed on the ledger (a mark-paid since reversed) has its stay taken
+      // back, under the lock(1) this settle took first.
+      await postCancellationLedgerLines({ store: tx, journal, bookingId: booking.id, lodgeId: bookingLodgeId, keptCents: 0, site: "settle:capacity-void" });
+
+      // Durable refund debt, ATOMIC with the cancel claim (mirrors the #1349
+      // enqueue-then-execute pattern in booking-cancel): freeze the refund
+      // allocation from this locked read and persist the recovery operation
+      // BEFORE any Stripe call. A transient inline refund failure below — or
+      // a process death between this commit and the refund — now leaves a
+      // PENDING operation the recovery cron replays with backoff, instead of
+      // the member's full charge stranded on a CANCELLED booking with only a
+      // best-effort alert email as remediation. The frozen plan makes
+      // inline-vs-cron replay exactly-once: both execute identical slices, so
+      // both mint identical `capacity_claim_failed_<bookingId>_<pi>_<txn>_
+      // <amount>` Stripe keys, Stripe answers repeats with the original
+      // refunds, and the ledger dedupes on refund id.
+      // #4872: leave a live superseded capture to its own refund. `amountCents` stays
+      // the capture just taken; what the plan cannot carry is still the shortfall task.
+      const heldBack = await readSupersededCaptureHeldBack(tx, payment.id);
+      const { slices: refundPlan, plannedAmountCents: plannedRefundCents } = await planStripeRefundAllocation({
+        paymentId: payment.id,
+        amountCents,
+        store: tx,
+        heldBackByTransaction: heldBack.byTransaction,
+      });
+      // #4154 (`INV-PAY-135`): what the plan does not carry is a hand-back task to check, raised with the cancel.
+      const shortfallTaskRaised = await raiseCapacityRaceRefundShortfallTask(tx, { bookingId: booking.id, paymentId: payment.id, paymentIntentId, chargedCents: amountCents, plannedRefundCents, format: settlement.format, journal });
+      if (plannedRefundCents > 0) {
+        await enqueueCapacityClaimFailedRefundRecovery({
+          bookingId: booking.id,
+          paymentId: payment.id,
+          paymentIntentId,
+          amountCents: plannedRefundCents,
+          allocationPlan: refundPlan,
+          store: tx,
+        });
+      }
+
+      // #3209 (`INV-HOST-041`). The beds are reconciled above; ADULT SUPERVISION
+      // was not. `PAYABLE_SUCCESS_STATUS_LIST` includes CONFIRMED — a coverage
+      // source — so this void can take the qualifying adult off another booking of
+      // the same member. The `enqueueOwnHostingCoverageReevaluation` further down
+      // is NOT this branch's: it is on the mutually exclusive settle path and this
+      // branch returns first, which is why a whole-file census passed here.
+      // Through the system-cancellation seam because a capacity-failed void has no
+      // actor to refuse, and last in the transaction because the coverage-owner key
+      // comes after the lodge and credit-ledger keys (`INV-LOCK-002`). Drained by
+      // `markBookingPaymentSucceeded`, which settles coverage on every outcome.
+      await reconcileHostingReviewForSystemCancellation(booking.id, tx);
+
+      return {
+        outcome: "capacity_failed" as const,
+        booking,
+        paymentId: payment.id,
+        bumpedBookingIds: [] as string[],
+        refundPlan,
+        plannedRefundCents, shortfallTaskRaised,
+      };
+    }
+
+    // B5 (#2262) — the manual settlement's own claim, and the analogue of the
+    // subscription fence. Every guard-2 refusal condition that CAN be expressed
+    // as a WHERE is re-asserted here, so an invoice minted (or a group
+    // settlement flipped) between the read above and this write yields count 0
+    // -> 409 rather than a double-apply. One clock read is shared by the
+    // provenance columns, the audit row and the member's receipt.
+    const manualSettledAt = new Date();
+    if (settlement.kind === "manual") {
+      const fenced = await tx.payment.updateMany({
+        where: {
+          id: payment.id,
+          xeroInvoiceId: null,
+          xeroRefundCreditNoteId: null,
+          manuallyMarkedPaidAt: null,
+          // M6 (#2262): the settled-FROM statuses, matching STATE_MACHINES.md
+          // — the SAME list the read-time refusal above uses, so the two can
+          // never drift (#2397).
+          status: { in: [...MANUAL_SETTLE_FROM_PAYMENT_STATUS_LIST] },
+          // L7: no refund history (re-asserting the read-time refusal).
+          refundedAmountCents: 0,
+          transactions: { none: { xeroInvoiceId: { not: null } } },
+          booking: { organiserSettled: false },
+          // #2397: re-assert the extra this settle reasoned about, exactly as
+          // every other expressible refusal is re-asserted here. A card
+          // additional that captured — or another delta recorded — between the
+          // read above and this write yields count 0 -> 409, so the settle can
+          // never stamp SUCCEEDED over a figure that has moved.
+          //
+          // #2397 F2: keyed on the OUTSTANDING delta, not on the SETTLED one,
+          // so BOTH answers are fenced. The not-covered answer needs this at
+          // least as much as the covered one: it derives the figure it records
+          // (`amountOwing - uncollected`) from that same delta, and the
+          // additional-capture writer takes no advisory lock (the confirm route
+          // and the Stripe webhook both go straight to
+          // `markPaymentIntentTransactionSucceeded`). Under read-committed a
+          // capture landing between the read above and this write would
+          // otherwise leave the club holding cash + card while `amountCents`
+          // recorded only the cash — the delta UNDER-recorded, which is the
+          // exact inverse of the rule this feature exists to enforce.
+          ...(manualOutstandingAdditionalCents > 0
+            ? {
+                additionalAmountCents: manualOutstandingAdditionalCents,
+                OR: [
+                  { additionalPaymentStatus: null },
+                  { additionalPaymentStatus: { not: "SUCCEEDED" } },
+                ],
+              }
+            : {}),
+        },
+        data: {
+          status: PaymentStatus.SUCCEEDED,
+          // Guard 4: no new PaymentSource member. A manual settlement IS an
+          // internet-banking payment as far as every two-way branch in the
+          // codebase is concerned (refund method coercion, refund planning,
+          // the reconciler); its manual-ness lives in the provenance columns.
+          source: PaymentSource.INTERNET_BANKING,
+          amountCents: settlementAmountCents,
+          creditAppliedCents: mirrorCreditAppliedCents,
+          manuallyMarkedPaidAt: manualSettledAt,
+          manuallyMarkedPaidByMemberId: settlement.actingAdminMemberId,
+          manualPaymentNote: settlement.note,
+          manuallyMarkedPaidPreviousStatus: booking.status,
+          // #2397: the one state every consumer already treats as settled —
+          // the admin list chip, the booking panel, the reports figure, the
+          // finance breakdown, the member's own pay door and the reminder cron
+          // all key on this column being "SUCCEEDED".
+          ...(manualAdditionalSettlementCents > 0
+            ? { additionalPaymentStatus: "SUCCEEDED" }
+            : {}),
+        },
+      });
+      if (fenced.count === 0) {
+        throw new ManualBookingPaymentError(
+          "This booking's payment changed while you were recording it — refresh and try again.",
+          409
+        );
+      }
+    }
+
+    // Status-guarded PAID claim (#1881, defense in depth alongside lock(1)):
+    // only settle a still-payable booking. Under lock(1) count 0 cannot happen
+    // (the re-read above already gated on this), but the guard means a cancel
+    // that somehow raced past the lock cannot be resurrected to PAID.
+    const claimed = await tx.booking.updateMany({
+      where: { id: booking.id, status: { in: [...PAYABLE_SUCCESS_STATUS_LIST] } },
+      data: { status: BookingStatus.PAID, draftExpiresAt: null, savedCardClaimAt: null },
+    });
+    if (claimed.count === 0) {
+      throw new Error(
+        "Booking status changed concurrently during the PAID claim (#1881)"
+      );
+    }
+    // #4211 (`INV-PAY-043`): the winner of this claim records which row settled
+    // the booking, in the claim's own transaction: this card capture, or the
+    // cash row the manual settle just minted.
+    await recordSettlingTransaction(tx, {
+      paymentId: payment.id,
+      transactionId:
+        settlement.kind === "stripe"
+          ? (await findPaymentTransactionByIntentId({ paymentIntentId: settlement.paymentIntentId, store: tx }))?.id ?? null
+          : await findSettlingInternetBankingTransactionId(tx, payment.id),
+    });
+
+    // INV-PAY-047: the same fenced charge poster serves cash and the new
+    // whole-lodge zero-cash settlements, after this successful PAID claim.
+    await postBookingConfirmationLedgerLines(tx, booking, journal);
+
+    // #3581: the manual settle writes its transaction rows and the payment's
+    // columns itself, so it never passes through `reconcilePaymentAggregates`
+    // where every other settlement's ledger lines converge. It runs the same
+    // sync here, after the provenance columns above are written — so its rows
+    // read as cash recorded by an officer (`INV-PAY-001`), not a bank receipt.
+    if (settlement.kind === "manual") {
+      await syncBookingLedgerSettlements({ paymentId: payment.id, store: tx });
+    }
+
+    // #2576 §9. THE SINGLE SETTLE DOOR IS A CONFIRMING PATH, and §9 names "payment
+    // completion" among the routes that must run the shared hosting evaluator
+    // immediately before confirmation rather than trusting a quote-time answer.
+    // Every card and cash route funnels through here — the Stripe webhook, the
+    // session confirm, the public payment link, the saved-card charge, the
+    // auto-confirm cron and the admin manual settlement — and
+    // `PAYABLE_SUCCESS_STATUS_LIST` includes DRAFT, which is the widest version of
+    // the gap: a member could create a draft while cover existed, cancel the
+    // booking that supplied it (a DRAFT is outside `ACTIVE_BOOKING_STATUSES`, so
+    // nothing was stranded and nothing was queued), and then pay — landing a PAID
+    // booking with uncovered non-member guest-nights at an enforcing lodge with no
+    // refusal, no incident, no owner notification and nothing in the officer queue.
+    //
+    // ENQUEUE RATHER THAN REFUSE, for the reason §8 gives for every payment path: by
+    // the time this runs the money is captured, so throwing would leave a charge
+    // pointing at a booking the club had just refused. The queue row commits WITH
+    // the settlement — so the obligation cannot be lost — and the post-commit drain
+    // re-reads the facts, raises the urgent incident and emails the owner. Both
+    // exported wrappers drain inline.
+    await enqueueOwnHostingCoverageReevaluation(booking.id, tx, {
+      cause: "SYSTEM_CHANGE",
+      actorMemberId:
+        settlement.kind === "manual" ? settlement.actingAdminMemberId : null,
+    });
+
+    // #2265 (#2319; #2262 door 3). This is the single settle door every card
+    // path funnels through — the Stripe webhook, the session confirm, the
+    // public payment link, the saved-card charge and the auto-confirm cron —
+    // AND the manual cash / off-Xero settlement, and by the time it runs, the
+    // money has been captured for the amount the intent was minted at (Stripe)
+    // or collected by hand for the full amount owing (manual). A stored credit
+    // election can therefore no longer be honoured: applying it now would debit
+    // the member's balance for cash already taken, which invents a charge
+    // rather than honouring a choice. Cash collected outside the app means the
+    // member's credit was NOT spent — so clear the election, and never leave a
+    // PAID booking advertising an election nothing will act on. Both callers
+    // report a non-null clear through reportUnappliedCreditElection after
+    // commit, so the member's booking history says "your credit is still
+    // available" and an operator can decide whether to refund the difference.
+    //
+    // Nearly always a no-op, and that is the point. Every minter of a primary
+    // intent either consumes the election first (the pay step, whose consumption
+    // is what makes the intent smaller) or cannot reach a booking that carries
+    // one (the payment link now refuses such a booking outright;
+    // charge-saved-method requires PENDING, a status no election carrier is ever
+    // in). Guarding HERE rather than in each of those callers means the invariant
+    // "no settled booking carries a stored election" holds by construction at the
+    // point of settlement, instead of resting on the provenance of five callers
+    // staying true — which is exactly the kind of incidental safety that quietly
+    // stops being safe.
+    //
+    // Guarded claim on the exact amount read, so a pay-step consumer racing this
+    // writer is never clobbered; see clearStaleCreditElection.
+    const staleCreditElectionCents = await clearStaleCreditElection(tx, booking);
+
+    // #3864 (`INV-PAY-024`), the same rule for credit already SPENT: it stays
+    // spent only for what the capture did not cover (the mirror's figure); the
+    // rest goes back through the one give-back, under the member key taken above
+    // (INV-LOCK-002), so a member never pays by card AND by credit (#1641).
+    // Asked only when there IS excess; a Xero deallocation in flight holds it
+    // for an operator rather than failing a captured payment.
+    let givenBackCreditCents = 0;
+    let heldCreditCents = 0;
+    if (settlement.kind === "stripe") {
+      const excessCreditCents = settleCreditLedgerMemberId
+        ? (await deriveBookingAppliedCreditCents(booking.id, tx)) - mirrorCreditAppliedCents
+        : 0;
+      if (excessCreditCents > 0 && (await findAppliedCreditDeallocationFence(payment.id, tx))) {
+        heldCreditCents = excessCreditCents;
+      } else if (settleCreditLedgerMemberId && excessCreditCents > 0) {
+        ({ givenBackCents: givenBackCreditCents } = await giveBackAppliedCredit(
+          {
+            memberId: settleCreditLedgerMemberId,
+            bookingId: booking.id,
+            giveBackCentsOf: (appliedCreditCents) =>
+              appliedCreditCents - mirrorCreditAppliedCents,
+            description: `Applied credit returned: booking ${storedShortBookingId(booking.id)} was paid in full by card`,
+            format: settlement.format,
+          },
+          tx
+        ));
+      }
+      await tx.payment.update({
+        where: { id: payment.id },
+        data: { creditAppliedCents: mirrorCreditAppliedCents },
+      });
+    }
+
+    await reconcileBedAllocationsForBookingWithLodgeLockHeld({
+      bookingId: booking.id,
+      db: tx,
+      previousRange: {
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+      },
+    });
+
+    if (settlement.kind === "manual") {
+      // Stripe-intent hygiene, belt-and-braces under guard 3. The member may
+      // still hold a live /pay client secret for this booking; once the club
+      // has the cash, that intent must not capture. Durable CANCEL_PAYMENT_INTENT
+      // recovery operations are enqueued here, ATOMIC with the settlement and
+      // BEFORE any Stripe call (the #1349 pattern, byte-for-byte the shape
+      // booking-cancel uses); the best-effort Stripe cancel runs after commit.
+      // If an intent captures first anyway, the widened duplicate-capture
+      // predicate above auto-refunds it.
+      // #2397 F4: the addition's own live intent is spared when — and only
+      // when — the admin said the cash did NOT cover the addition, because the
+      // club goes on asking for that money and this is the member's only door
+      // to send it. Everything else, including the addition's intent on the
+      // covered answer, is cancelled exactly as before.
+      const { cancelledIntentIds: outstandingIntentIds, adoptedIntentIds, sparedIntentId } =
+        await enqueueManualSettlementIntentCancellations(tx, {
+          bookingId: booking.id,
+          paymentId: payment.id,
+          spareAdditionalPaymentIntentId:
+            manualUncollectedAdditionalCents > 0
+              ? manual?.additionalPaymentIntentId ?? null
+              : null,
+        });
+
+      await createAuditLog(
+        {
+          action: MANUAL_MARK_PAID_AUDIT_ACTION,
+          memberId: settlement.actingAdminMemberId,
+          actorMemberId: settlement.actingAdminMemberId,
+          subjectMemberId: bookingOwner(booking).memberId,
+          targetId: booking.id,
+          entityType: "Payment",
+          entityId: payment.id,
+          category: "payment",
+          severity: "important",
+          outcome: "success",
+          summary: "Booking payment manually marked paid (cash / off-Xero)",
+          details: settlement.note,
+          metadata: {
+            bookingId: booking.id,
+            paymentId: payment.id,
+            effectiveAmountCents: settlementAmountCents,
+            creditAppliedCents: mirrorCreditAppliedCents,
+            previousStatus: booking.status,
+            hasXeroInvoiceLink: false,
+            // Every intent queued for cancellation, and (#4320) those whose
+            // cancellation another writer had already queued, which the
+            // reversal reads back.
+            ...manualSettleIntentHygieneAuditFields({
+              cancelledIntentIds: outstandingIntentIds,
+              adoptedIntentIds,
+            }),
+            // #2397 F4: the addition's live intent this settle deliberately did
+            // NOT disarm, because the extra is still owed and this is the
+            // member's door to pay it. Null on every other settlement — the
+            // covered answer included — so the audit trail distinguishes "left
+            // a way to pay" from "there was never anything to leave".
+            sparedAdditionalPaymentIntentId: sparedIntentId,
+            // #2262 door 3: a stored, unconsumed credit election this cash
+            // settlement could not honour, cleared under the same locks by the
+            // guarded claim above (null when the booking carried none). The
+            // member-visible report rides the shared
+            // UNAPPLIED_CREDIT_ELECTION_AUDIT_ACTION row written post-commit;
+            // this key keeps the money trail complete on the mark-paid entry
+            // itself — AND it is the record the reversal reads back to restore
+            // the member's election (see `reverseManualBookingPayment`), which
+            // is why it must record exactly what THIS settle cleared and null
+            // when it cleared nothing.
+            clearedCreditElectionCents: staleCreditElectionCents,
+            // #2260 honesty rule: record the email decision BOTH ways, so a
+            // reader can tell "chose not to email" from "no choice was offered".
+            notifyMember: settlement.notifyMember,
+            // #2397, the same honesty rule for the extra: record what was
+            // outstanding, whether the admin was asked at all, and what they
+            // answered — so a reader can tell "said the cash did not cover it"
+            // from "there was no extra to ask about". The settled figure and the
+            // status it replaced are ALSO what the reversal reads back, which is
+            // why they must be exactly what this settle wrote.
+            outstandingAdditionalCents: manualOutstandingAdditionalCents,
+            additionalCoverageAnswer:
+              settlement.additionalCoverage === null
+                ? null
+                : settlement.additionalCoverage.covered,
+            // #2397 (owner decision, 31 Jul 2026): the three figures a later
+            // reader needs to reconstruct which branch ran and what it meant.
+            // `effectiveAmountCents` above is the settled figure that was
+            // actually WRITTEN; this is what the booking still owed in total,
+            // and what of that was deliberately left uncollected. On the covered
+            // answer the two are `amountOwing` and 0; on the not-covered answer
+            // `effectiveAmountCents + uncollectedAdditionalCents = amountOwing`.
+            amountOwingCents: manualAmountOwingCents,
+            uncollectedAdditionalCents: manualUncollectedAdditionalCents,
+            settledAdditionalAmountCents:
+              manualAdditionalSettlementCents > 0
+                ? manualAdditionalSettlementCents
+                : null,
+            previousAdditionalPaymentStatus:
+              manualAdditionalSettlementCents > 0
+                ? manualPreviousAdditionalPaymentStatus
+                : null,
+          },
+        },
+        tx
+      );
+
+      // #2397 — the member-readable timeline entry. A second, dedicated audit
+      // row rather than a field on the one above, because the booking history is
+      // built from whitelisted audit ACTIONS: without its own action the extra
+      // would be absorbed into the mark-paid row the timeline never renders, and
+      // the money would move with nothing on the booking to say so.
+      if (manualAdditionalSettlementCents > 0) {
+        await createAuditLog(
+          {
+            action: MANUAL_MARK_PAID_ADDITIONAL_AUDIT_ACTION,
+            memberId: settlement.actingAdminMemberId,
+            actorMemberId: settlement.actingAdminMemberId,
+            subjectMemberId: bookingOwner(booking).memberId,
+            targetId: booking.id,
+            entityType: "Payment",
+            entityId: payment.id,
+            category: "payment",
+            severity: "important",
+            outcome: "success",
+            summary:
+              "Extra owing on a booking recorded as settled manually (cash / off-Xero)",
+            // JSON, because the booking-history builder parses this field.
+            details: JSON.stringify({
+              additionalAmountCents: manualAdditionalSettlementCents,
+            }),
+            metadata: {
+              bookingId: booking.id,
+              paymentId: payment.id,
+              additionalAmountCents: manualAdditionalSettlementCents,
+              previousAdditionalPaymentStatus:
+                manualPreviousAdditionalPaymentStatus,
+              settlementAmountCents,
+            },
+          },
+          tx
+        );
+      }
+
+      return {
+        outcome: "manual_paid" as const,
+        booking,
+        paymentId: payment.id,
+        bumpedBookingIds: [] as string[],
+        effectiveAmountCents: settlementAmountCents,
+        creditAppliedCents: mirrorCreditAppliedCents,
+        previousStatus: booking.status,
+        settledAt: manualSettledAt,
+        outstandingIntentIds,
+        staleCreditElectionCents,
+        amountOwingCents: manualAmountOwingCents,
+        outstandingAdditionalCents: manualOutstandingAdditionalCents,
+        settledAdditionalAmountCents: manualAdditionalSettlementCents,
+        uncollectedAdditionalCents: manualUncollectedAdditionalCents,
+        sparedAdditionalPaymentIntentId: sparedIntentId,
+        receiptTransactionIds: manualReceiptRowIds,
+      };
+    }
+
+    return {
+      outcome: "paid" as const,
+      booking,
+      paymentId: payment.id,
+      bumpedBookingIds: [] as string[],
+      staleCreditElectionCents,
+      givenBackCreditCents,
+      heldCreditCents,
+    };
+}
+
+/**
+ * #4516 (M4b): the settlement body, then R06/R07 for its payment in the same transaction. The decision is the
+ * outcome's: only a settle that paid the booking collects, and only the instrument it settled (the Stripe intent,
+ * or the rows this officer settle wrote), never other receipts on the payment.
+ */
+async function settleAndPostBookingReceipts(tx: Prisma.TransactionClient, bookingId: string, settlement: BookingSettlementSource, journal: BookingJournalContext) {
+  const result = await settleBookingPaymentInTransaction(tx, bookingId, settlement, journal);
+  const paymentId = "paymentId" in result ? result.paymentId : null;
+  if (paymentId) await postBookingReceipts(tx, journal, { paymentId, decision: {
+    collect: result.outcome === "paid" || result.outcome === "manual_paid",
+    ...(settlement.kind === "stripe" ? { paymentIntentId: settlement.paymentIntentId, effectiveAt: settlement.capturedAt }
+      : result.outcome === "manual_paid" ? { transactionIds: result.receiptTransactionIds, effectiveAt: result.settledAt } : {}),
+  } });
+  // #4516 (M4c): a capture this settle returns (a duplicate, or one the capacity race cancelled) owes its R05,
+  // after its held R06, sized by the frozen plan its recovery row carries; its sender reserves against it. Review F1
+  // (corrected in round 2): the owner is read without the booking row, defensively. W1 holds the Payment row here,
+  // so the booking row taken now would add one more Payment -> booking edge against a member merge, which takes no
+  // lock(1) and holds booking rows from its owner move on (#4823 made merge never wait for a Payment row, its own
+  // edge). No other cycle is known (journal lines name their debtor by id, with no foreign key). A merge in
+  // between leaves the debt on the merged-away member, where the family's lazy successor finds it (`refundFamilyTip`).
+  if ((result.outcome === "duplicate_capture" || result.outcome === "capacity_failed") && settlement.kind === "stripe" && result.plannedRefundCents > 0) {
+    await postRefundObligation(tx, journal, { bookingId, scope: "capture-return", id: settlement.paymentIntentId, amountCents: result.plannedRefundCents,
+      origin: "APP", debtorRead: "plain" });
+  }
+  return result;
+}
+
+export async function markBookingPaymentSucceeded({
+  bookingId,
+  paymentIntentId,
+  amountCents,
+  paymentMethodId,
+  format,
+  capturedAt,
+}: {
+  bookingId: string;
+  paymentIntentId: string;
+  amountCents: number;
+  paymentMethodId: string | null;
+  /** The club's format (#3565), resolved before any transaction by the caller. */
+  format: ClubFormat;
+  capturedAt?: Date;
+}): Promise<MarkBookingPaymentSucceededResult> {
+  const journal = await resolveBookingMoneyPostingContext();
+  const reconciliation = await prisma.$transaction((tx) =>
+    settleAndPostBookingReceipts(tx, bookingId, {
+      kind: "stripe",
+      paymentIntentId,
+      amountCents,
+      paymentMethodId,
+      format,
+      capturedAt,
+    }, journal), LOCK1_HOLDER_TRANSACTION_BUDGET
+  );
+
+
+  // #2576 §9: the settlement recorded a bounded hosting re-evaluation with its PAID
+  // claim. Drain it now the confirmation has committed, so an uncovered booking
+  // reaches the officer queue and the owner's inbox immediately rather than on the
+  // next cron pass. Best-effort; the cron sweep is the authority on completion.
+  await settleHostingCoverageAfterCommit({ bookingId });
+
+  if (reconciliation.outcome === "manual_paid") {
+    // Unreachable: the Stripe settlement source never produces it. Narrowing
+    // only, so the branches below keep their exact shapes.
+    throw new Error("Unexpected manual settlement outcome on the Stripe path");
+  }
+
+  if (reconciliation.outcome === "superseded_capture") {
+    const owner = bookingOwner(reconciliation.booking).member;
+    await reportSupersededCaptureRefused({ booking: reconciliation.booking, memberName: `${owner.firstName} ${owner.lastName}`, paymentIntentId, amountCents, paymentMethodId, format });
+    return { outcome: "superseded_capture", bookingId, bumpedBookingIds: [] };
+  }
+
+  // #3864: credit given back is reported like an election cleared.
+  const unspentCreditCents =
+    reconciliation.outcome === "paid"
+      ? (reconciliation.staleCreditElectionCents ?? 0) +
+        reconciliation.givenBackCreditCents
+      : 0;
+  if (reconciliation.outcome === "paid" && unspentCreditCents > 0) {
+    // #2265 (#2319). Post-commit, outside the transaction: the member paid the
+    // full price while holding credit they had asked to spend, so say so on
+    // their booking history and put it in front of an operator who can decide
+    // whether to refund the difference. Their balance is whole either way: never
+    // debited, or (#3864) the credit spent on it returned.
+    await reportUnappliedCreditElection({
+      format,
+      bookingId,
+      memberId: bookingOwner(reconciliation.booking).memberId,
+      memberFirstName: bookingOwner(reconciliation.booking).member.firstName,
+      memberLastName: bookingOwner(reconciliation.booking).member.lastName,
+      checkIn: reconciliation.booking.checkIn,
+      checkOut: reconciliation.booking.checkOut,
+      electionCents: unspentCreditCents,
+      paidAmountCents: amountCents,
+      source: "payment-reconciliation",
+      reference: paymentIntentId,
+      extraDetails: { paymentIntentId },
+      creditReturnedCents: reconciliation.givenBackCreditCents,
+    });
+  }
+  if (reconciliation.outcome === "paid" && reconciliation.heldCreditCents > 0) {
+    // #3864: the give-back waited on a Xero deallocation; an operator returns it.
+    await sendAdminPaymentFailureAlert({
+      memberName: `${bookingOwner(reconciliation.booking).member.firstName} ${bookingOwner(reconciliation.booking).member.lastName}`,
+      checkIn: reconciliation.booking.checkIn,
+      checkOut: reconciliation.booking.checkOut,
+      amountCents: reconciliation.heldCreditCents,
+      errorMessage: `This booking was paid in full by card, but ${formatCents(reconciliation.heldCreditCents, format)} of account credit spent on it could not be returned automatically because a Xero credit update for its payment is still in progress. Return that credit to the member by hand once the update completes.`,
+      paymentIntentId,
+    }, format).catch((err) =>
+      logger.error({ err, bookingId }, "Failed to alert admins about applied credit held on a full-price capture (#3864)")
+    );
+  }
+
+  if (reconciliation.outcome === "paid") {
+    // Single durable "paid" fact for every payment path (session, webhook,
+    // payment link, cron auto-charge). A provisional non-member child booking
+    // (parentBookingId set) is recorded as confirmed/charged; everything else
+    // is the member paying up front (issue #740).
+    await recordBookingEvent({
+      bookingId,
+      type: reconciliation.booking.parentBookingId
+        ? BookingEventType.NON_MEMBER_CONFIRMED
+        : BookingEventType.MEMBER_PAID,
+      actorMemberId: bookingOwner(reconciliation.booking).memberId,
+      amountCents,
+    });
+  }
+
+  if (reconciliation.outcome === "duplicate_capture_kept") {
+    const owner = bookingOwner(reconciliation.booking).member;
+    await alertCaptureKeptWithoutRecordedSettler({ booking: reconciliation.booking, memberName: `${owner.firstName} ${owner.lastName}`, paymentIntentId, amountCents: reconciliation.keptHeldCents, otherPaymentIntentId: reconciliation.otherPaymentIntentId, otherHoldsMoney: reconciliation.otherHoldsMoney, reason: reconciliation.keptReason, format });
+    return { outcome: "duplicate_capture_kept", bookingId, bumpedBookingIds: [] };
+  }
+
+  if (reconciliation.outcome === "duplicate_capture") {
+    // #1992 — the arriving capture is duplicate money on a booking already
+    // settled by a different intent. The durable refund debt committed with
+    // the transaction above; everything below is the inline attempt at the
+    // same frozen slice, executed OUTSIDE any database transaction. Loud on
+    // purpose: money is moving automatically.
+    const { refundPlan, plannedRefundCents, settledPaymentIntentId } =
+      reconciliation;
+    logger.error(
+      {
+        bookingId,
+        duplicatePaymentIntentId: paymentIntentId,
+        settledPaymentIntentId,
+        refundCents: plannedRefundCents,
+      },
+      "Duplicate Stripe capture on an already-paid booking (#1992); auto-refunding the duplicate capture"
+    );
+
+    // #2008 — a durable, ADMIN-ONLY BookingEvent IS recorded for this refund
+    // once its recovery operation reaches SUCCEEDED (see below), but it is a
+    // REFUNDED event carrying the `duplicate_capture_refund` discriminator so
+    // resolveBookingNarrative EXCLUDES it (isDuplicateCaptureRefundEvent) and
+    // it can never masquerade as the settlement clause of a LATER member
+    // cancellation. The rest of the audit trail is unchanged: the
+    // PaymentRecoveryOperation row, the PaymentRefund ledger entries, this log
+    // line and the admin alert below.
+    const keepRefusalOwed = (attempt: RefundAttempt) =>
+      keepRefusedPrePersistedRefundOwed({ bookingId, idempotencyKey: buildDuplicateCaptureRefundRecoveryIdempotencyKey(bookingId, paymentIntentId), plan: refundPlan, attempt, format, alertOfficers: false });
+    try {
+      const refundResult = await refundPaymentTransactions({
+        format,
+        paymentId: reconciliation.paymentId,
+        amountCents: plannedRefundCents,
+        reason: "requested_by_customer",
+        allocation: refundPlan,
+        // Shared with the recovery cron's replay (via
+        // bookingModificationRefundReasonForKeyPrefix) so the two send a
+        // byte-identical request body under the same
+        // `duplicate_capture_refund_<bookingId>_<paymentIntentId>` key prefix
+        // — Stripe replays the original refund instead of rejecting the
+        // reused key with idempotency_error.
+        metadata: buildBookingModificationRefundMetadata(
+          bookingId,
+          "duplicate_capture"
+        ),
+        idempotencyKeyPrefix: buildDuplicateCaptureRefundStripeKeyPrefix(
+          bookingId,
+          paymentIntentId
+        ),
+        obligation: { scope: "capture-return", id: paymentIntentId }, // #4516: the R05 the settle posted
+      });
+      // #4103 (`INV-PAY-130`): a refusal stays owed, re-planned; the failure branch alerts once.
+      const refused = await keepRefusalOwed(refundResult);
+      if (refused) throw refused;
+
+      // Happy-path close of the pre-persisted operation. Best-effort: a lost
+      // close leaves an open row whose replay re-requests the identical
+      // slice/keys, which Stripe answers with the original refund. #4144: only
+      // on the plan sent, so a row another writer re-planned stays owed.
+      const closed = await closeDoorRow(
+        { door: "duplicate-capture", idempotencyKey: buildDuplicateCaptureRefundRecoveryIdempotencyKey(bookingId, paymentIntentId),
+          bookingId, paymentIntentId, amountCents: plannedRefundCents, refundId: refundResult.refunds[0]?.refundId ?? null, format },
+        async (idempotencyKey) => (await markDuplicateCaptureRefundRecoverySucceeded({ idempotencyKey, sentPlan: refundPlan })).count === 1,
+      );
+
+      // #2008 — record the admin-only history event EXACTLY ONCE, gated on this
+      // call being the one that flipped the operation to SUCCEEDED. If the
+      // close was lost or the cron already closed the operation, this
+      // path records nothing and the cron-replay path owns the event, so the
+      // inline and cron paths never double-record. Post-commit, base client.
+      if (closed) {
+        await recordDuplicateCaptureRefundEvent({
+          bookingId,
+          amountCents: plannedRefundCents,
+          duplicatePaymentIntentId: paymentIntentId,
+          settledPaymentIntentId: settledPaymentIntentId ?? null,
+        });
+      }
+
+      // Alert the admins even on success: an automatic refund of a duplicate
+      // charge is an anomaly worth eyes, and the alert is the operator's cue
+      // to check how the double capture happened. Dedicated template (#2007)
+      // whose success variant states the duplicate was refunded in full.
+      sendAdminDuplicateCaptureRefundAlert({
+        memberName: `${bookingOwner(reconciliation.booking).member.firstName} ${bookingOwner(reconciliation.booking).member.lastName}`,
+        checkIn: reconciliation.booking.checkIn,
+        checkOut: reconciliation.booking.checkOut,
+        amountCents: plannedRefundCents,
+        paymentIntentId,
+        settledPaymentIntentId: settledPaymentIntentId ?? null,
+        operationReference: buildDuplicateCaptureRefundRecoveryIdempotencyKey(
+          bookingId,
+          paymentIntentId
+        ),
+        refundFailed: false,
+      }, format).catch((alertErr) =>
+        logger.error(
+          { err: alertErr, bookingId, paymentIntentId },
+          "Failed to alert admins about the auto-refunded duplicate capture"
+        )
+      );
+
+      return {
+        outcome: "duplicate_capture_refunded",
+        bookingId,
+        bumpedBookingIds: [],
+      };
+    } catch (refundError) {
+      // The refund debt already committed with the frozen slice, so nothing
+      // needs enqueueing here: the recovery cron replays it with backoff and
+      // alerts on exhaustion. Record the inline error for operator visibility
+      // and alert immediately as well.
+      logger.error(
+        { err: refundError, bookingId, paymentIntentId },
+        "Failed to auto-refund a duplicate capture; the pre-persisted recovery operation will replay the refund"
+      );
+      // #4103: one slice (the duplicate's own capture), so no refusal comes before a throw.
+      const refundErrorMessage = refundError instanceof Error ? refundError.message : String(refundError);
+      await recordDuplicateCaptureRefundRecoveryInlineError({
+        bookingId,
+        paymentIntentId,
+        message: refundErrorMessage,
+      }).catch((recordErr) =>
+        logger.error(
+          { err: recordErr, bookingId, paymentIntentId },
+          "Failed to record inline duplicate-capture refund failure on the recovery operation"
+        )
+      );
+      // #4103: a refusal whose row a worker already holds is alerted by that worker.
+      if (!(refundError instanceof RefusedCardRefundError && !refundError.replanned)) {
+        sendAdminDuplicateCaptureRefundAlert({
+          memberName: `${bookingOwner(reconciliation.booking).member.firstName} ${bookingOwner(reconciliation.booking).member.lastName}`,
+          checkIn: reconciliation.booking.checkIn,
+          checkOut: reconciliation.booking.checkOut,
+          amountCents: plannedRefundCents,
+          paymentIntentId,
+          settledPaymentIntentId: settledPaymentIntentId ?? null,
+          operationReference: buildDuplicateCaptureRefundRecoveryIdempotencyKey(
+            bookingId,
+            paymentIntentId
+          ),
+          errorMessage: refundErrorMessage,
+          refundFailed: true,
+        }, format).catch((alertErr) =>
+          logger.error(
+            { err: alertErr, bookingId, paymentIntentId },
+            "Failed to alert admins about the failed duplicate-capture refund"
+          )
+        );
+      }
+
+      return {
+        outcome: "duplicate_capture_refund_failed",
+        bookingId,
+        bumpedBookingIds: [],
+        refundError: refundErrorMessage,
+      };
+    }
+  }
+
+  if (reconciliation.outcome === "capacity_failed") {
+    // Payment succeeded but the final capacity claim failed: the booking was
+    // cancelled inside the transaction and is auto-refunded here (issue #740).
+    await recordBookingEvent({
+      bookingId,
+      type: BookingEventType.CANCELLED,
+      actorMemberId: bookingOwner(reconciliation.booking).memberId,
+      amountCents,
+      reason: // #4125: written before the attempt, so "being refunded"; REFUNDED records it made.
+        "These dates filled up before payment could be secured, so the booking was cancelled and the full amount is being refunded.",
+      snapshot: {
+        policySummary:
+          "These dates were no longer available when payment completed, so the full amount is being refunded.",
+        refundMethod: "card", cancelledBecause: "capacity_race",
+        refundPercentage: 100,
+        paidAmountCents: amountCents,
+        settledAmountCents: reconciliation.plannedRefundCents, // #4125: what the plan refunds; any rest is the club's to follow up.
+        retainedAmountCents: 0,
+      },
+    });
+
+    // The refund debt was persisted INSIDE the claim transaction with the
+    // frozen allocation plan (see the enqueue above): everything below is the
+    // inline attempt at the same slices, and any failure leaves the PENDING
+    // operation for the recovery cron — never a stranded charge that only an
+    // alert email knows about.
+    const { refundPlan, plannedRefundCents } = reconciliation;
+    // Mirror-vs-ledger drift (same guard as booking-cancel): refund what the
+    // payment ledger actually shows refundable; #4125: the officers are told the rest, once.
+    await alertCapacityRaceRefundShortfall({ bookingId, paymentIntentId, chargedCents: amountCents, plannedRefundCents, taskRaised: reconciliation.shortfallTaskRaised }, format);
+
+    const keepRefusalOwed = (attempt: RefundAttempt) =>
+      keepRefusedPrePersistedRefundOwed({ bookingId, idempotencyKey: buildCapacityClaimFailedRefundRecoveryIdempotencyKey(bookingId, paymentIntentId), plan: refundPlan, attempt, format, alertOfficers: false });
+    try {
+      if (refundPlan.length === 0 || plannedRefundCents <= 0) {
+        throw new Error(
+          "Capacity-race refund plan is empty: no captured Stripe transaction to refund"
+        );
+      }
+
+      const refundResult = await refundPaymentTransactions({
+        format,
+        paymentId: reconciliation.paymentId,
+        amountCents: plannedRefundCents,
+        reason: "requested_by_customer",
+        allocation: refundPlan,
+        // Shared with the recovery cron's replay (via
+        // bookingModificationRefundReasonForKeyPrefix) so the two send a
+        // byte-identical request body under the same
+        // `capacity_claim_failed_<bookingId>_<paymentIntentId>` key prefix —
+        // Stripe replays the original refund instead of rejecting the reused
+        // key with idempotency_error. The metadata deliberately carries only
+        // values the cron can reconstruct from the persisted operation.
+        metadata: buildBookingModificationRefundMetadata(
+          bookingId,
+          "capacity_claim_failed"
+        ),
+        idempotencyKeyPrefix: buildCapacityClaimFailedRefundStripeKeyPrefix(
+          bookingId,
+          paymentIntentId
+        ),
+        obligation: { scope: "capture-return", id: paymentIntentId }, // #4516: the R05 the settle posted
+      });
+      // #4103 (`INV-PAY-130`): a refusal stays owed, re-planned, no REFUNDED event; the failure branch alerts once.
+      const refused = await keepRefusalOwed(refundResult);
+      if (refused) throw refused;
+
+      // Happy-path close of the pre-persisted operation. Best-effort: a lost
+      // close leaves a PENDING row whose replay re-requests the identical
+      // slices/keys, which Stripe answers with the original refunds - and
+      // (#4125) records the REFUNDED event, which commits with this close only
+      // when it is the one that closed the row, for what was refunded.
+      await closeDoorRow({ door: "capacity-race", idempotencyKey: buildCapacityClaimFailedRefundRecoveryIdempotencyKey(bookingId, paymentIntentId),
+        bookingId, paymentIntentId, amountCents: plannedRefundCents, refundId: refundResult.refunds[0]?.refundId ?? null, format }, (idempotencyKey) => closeCapacityRaceRefundRecordingEvent(
+        { bookingId, amountCents: plannedRefundCents, actorMemberId: bookingOwner(reconciliation.booking).memberId },
+        async (tx) => (await markCapacityClaimFailedRefundRecoverySucceeded({ idempotencyKey, sentPlan: refundPlan, store: tx })).count === 1,
+      ));
+
+      return {
+        outcome: "cancelled_refunded",
+        capacityRefund: { chargedAmountCents: amountCents, plannedRefundCents },
+        bookingId,
+        bumpedBookingIds: [],
+      };
+    } catch (refundError) {
+      // The cancel claim already committed together with the recovery
+      // operation, so nothing needs enqueueing here: the cron replays the
+      // frozen plan with backoff and alerts on exhaustion. A partial success
+      // has recorded its completed slices; the replay re-requests the SAME
+      // slices/keys, so completed slices are replayed by Stripe, not
+      // repeated, and only the remainder moves money. Record the inline
+      // error on the operation and keep the immediate admin alert.
+      logger.error(
+        { err: refundError, bookingId, paymentIntentId },
+        "Failed to auto-refund booking after final capacity claim failed; the pre-persisted recovery operation will replay the refund"
+      );
+      // #4103: a slice refused before a later one threw is re-planned now, and named in the alert.
+      const refusedBefore = await keepRefusalOwed({ error: refundError });
+      const refundErrorMessage = [refusedBefore?.message, refundError instanceof Error ? refundError.message : String(refundError)].filter(Boolean).join(" ");
+      await recordCapacityClaimFailedRefundRecoveryInlineError({
+        bookingId,
+        paymentIntentId,
+        message: refundErrorMessage,
+      }).catch((recordErr) =>
+        logger.error(
+          { err: recordErr, bookingId, paymentIntentId },
+          "Failed to record inline capacity-race refund failure on the recovery operation"
+        )
+      );
+      // #4103: a refusal whose row a worker already holds is alerted by that worker.
+      if (!(refundError instanceof RefusedCardRefundError && !refundError.replanned)) {
+        await alertRefundFailure({
+          format,
+          booking: reconciliation.booking,
+          paymentIntentId,
+          amountCents,
+          error: refundErrorMessage,
+        });
+      }
+
+      return {
+        outcome: "cancelled_refund_failed",
+        capacityRefund: { chargedAmountCents: amountCents, plannedRefundCents },
+        bookingId,
+        bumpedBookingIds: [],
+        refundError: refundErrorMessage,
+      };
+    }
+  }
+
+  return {
+    outcome: reconciliation.outcome,
+    bookingId,
+    bumpedBookingIds: reconciliation.bumpedBookingIds,
+  };
+}
+
+/**
+ * The audit action the manual cash / off-Xero settle writes (#2262 door 3).
+ *
+ * One constant rather than a literal per call site, because the REVERSAL reads
+ * these rows back: it restores the credit election that the matching settle
+ * cleared, and it finds that settle by this exact action string. A typo'd
+ * literal on either side would silently strand the member's election, which is
+ * precisely the failure the restoration exists to prevent.
+ */
+const MANUAL_MARK_PAID_AUDIT_ACTION =
+  "booking-payment.manual-payment.mark-paid";
+
+/**
+ * #2397 — the audit action for the SECOND fact a covered settle records: the
+ * outstanding upward-modification delta was settled by the same cash.
+ *
+ * It exists as its own action because the booking-history timeline is built
+ * from a whitelist of audit actions (`src/lib/booking-history.ts`, fed by the
+ * booking page), so this is what stops the extra being absorbed silently.
+ */
+const MANUAL_MARK_PAID_ADDITIONAL_AUDIT_ACTION =
+  "booking-payment.manual-payment.additional-settled";
+
+/**
+ * The `reason` stamped on the manual ADDITIONAL PaymentTransaction, and the
+ * marker the reversal looks for. A constant rather than a literal per call site
+ * for the same reason as the audit action above: two writers and one reader.
+ */
+const MANUAL_MARK_PAID_ADDITIONAL_REASON = "manual_mark_paid_additional";
+const MANUAL_MARK_PAID_ADDITIONAL_REVERSED_REASON = "manual_mark_paid_additional_reversed";
+
+export type ManualBookingSettlementResult = {
+  bookingId: string;
+  paymentId: string;
+  /**
+   * What this settlement RECORDED AS RECEIVED, in integer cents — the figure
+   * written to `Payment.amountCents`. It is `finalPriceCents - credit` less any
+   * outstanding extra the admin said the cash did not cover (#2397), so it is
+   * the money the club actually took and never the booking's whole worth.
+   */
+  effectiveAmountCents: number;
+  creditAppliedCents: number;
+  previousStatus: BookingStatus;
+  settledAt: Date;
+  /** Live Stripe intents this settlement queued a cancellation for. */
+  outstandingIntentIds: string[];
+  /**
+   * #2262 door 3: a stored, unconsumed credit election (#2265) this cash
+   * settlement could not honour, cleared inside the settle transaction and
+   * reported post-commit (`reportUnappliedCreditElection`). Null when the
+   * booking carried none — the overwhelmingly common case.
+   */
+  staleCreditElectionCents: number | null;
+  memberFirstName: string;
+  memberEmail: string | null;
+  /**
+   * #2397. `amountOwingCents` is everything the booking owed
+   * (`finalPriceCents - credit`); `outstandingAdditionalCents` is the
+   * uncollected upward-modification delta inside it (0 when there was none);
+   * `settledAdditionalAmountCents` is how much of that delta the cash covered
+   * and `uncollectedAdditionalCents` how much it did not. Always
+   * `effectiveAmountCents + uncollectedAdditionalCents === amountOwingCents`.
+   */
+  amountOwingCents: number;
+  outstandingAdditionalCents: number;
+  settledAdditionalAmountCents: number;
+  uncollectedAdditionalCents: number;
+  /**
+   * #2397 F4: the addition's live Stripe intent this settlement deliberately
+   * left armed, because the extra it collects is still owed. Non-null ONLY on
+   * the not-covered answer, and only when the member actually has such an
+   * instrument — which is exactly the condition for telling them in the
+   * confirmation email that they can pay the balance from their booking page.
+   */
+  sparedAdditionalPaymentIntentId: string | null;
+};
+
+/**
+ * #5005 (child A, `INV-PAY-161`) — the paid-booking import's settle: a SIBLING
+ * ENTRY POINT into the manual arm of the one settlement body, called inside the
+ * import's own creating transaction. That transaction already holds lock(1) and
+ * the lodge key (both re-entrant), so this adds nothing a manual settle does not
+ * already do: the same member-credit lock, refusals, capacity check, fenced PAID
+ * claim, CASH_RECORDED line and bed reconciliation. It sends nothing — the
+ * member is not told (`notifyMember: false`) — and a booking created moments
+ * ago has no outstanding extra to cover. The caller resolves `journal` before
+ * its transaction opens (`INV-LOCK-004`).
+ */
+export async function settleImportedBookingInTransaction(
+  tx: Prisma.TransactionClient,
+  bookingId: string,
+  settlement: { actingAdminMemberId: string; note: string; expectedAmountCents: number },
+  journal: BookingJournalContext,
+) {
+  const result = await settleAndPostBookingReceipts(tx, bookingId, {
+    kind: "manual",
+    ...settlement,
+    notifyMember: false,
+    additionalCoverage: null,
+  }, journal);
+  if (result.outcome !== "manual_paid") {
+    // Unreachable, as on the officer's door: the manual source pays or throws.
+    throw new Error(`Unexpected settlement outcome on the import path: ${result.outcome}`);
+  }
+  return result;
+}
+
+/**
+ * B5 (#2262) — record a cash / off-Xero bank-transfer settlement for a booking.
+ *
+ * A SIBLING ENTRY POINT into the settlement core above, not a second settlement
+ * path: it executes the same lock ordering, the same post-lock re-read, the
+ * same capacity check with its #1771 override carve-out, the same status-fenced
+ * PAID claim and the same bed reconciliation as a Stripe capture, diverging only
+ * where a Stripe intent id is intrinsically involved.
+ *
+ * NEVER calls Xero and NEVER creates or voids an invoice; it refuses outright
+ * when any Xero invoice evidence — including a queued mint — exists.
+ */
+export async function markBookingPaymentManuallySettled({
+  bookingId,
+  actingAdminMemberId,
+  note,
+  expectedAmountCents,
+  notifyMember,
+  additionalCoverage = null,
+  format,
+}: {
+  bookingId: string;
+  actingAdminMemberId: string;
+  note: string | null;
+  expectedAmountCents: number;
+  notifyMember: boolean;
+  additionalCoverage?: ManualAdditionalCoverage | null;
+  /** The club's format (#3565), resolved before any transaction by the caller. */
+  format: ClubFormat;
+}): Promise<ManualBookingSettlementResult> {
+  const journal = await resolveBookingMoneyPostingContext();
+  const reconciliation = await prisma.$transaction((tx) =>
+    settleAndPostBookingReceipts(tx, bookingId, {
+      kind: "manual",
+      actingAdminMemberId,
+      note,
+      expectedAmountCents,
+      notifyMember,
+      additionalCoverage,
+    }, journal), LOCK1_HOLDER_TRANSACTION_BUDGET
+  );
+
+
+  // #2576 §9: the settlement recorded a bounded hosting re-evaluation with its PAID
+  // claim. Drain it now the confirmation has committed, so an uncovered booking
+  // reaches the officer queue and the owner's inbox immediately rather than on the
+  // next cron pass. Best-effort; the cron sweep is the authority on completion.
+  await settleHostingCoverageAfterCommit({ bookingId });
+
+  if (reconciliation.outcome !== "manual_paid") {
+    // Unreachable: the manual settlement source produces exactly this outcome
+    // or throws. Narrowing only.
+    throw new Error(
+      `Unexpected settlement outcome on the manual path: ${reconciliation.outcome}`
+    );
+  }
+
+  // #2265 (#2262 door 3). The settle cleared a stored credit election this cash
+  // settlement could not honour — the admin collected the full amount owing
+  // outside the app while the member held credit they had asked to spend, so
+  // that credit was NOT spent and is still on their account. Reported through
+  // the shared reporter, post-commit and best-effort by design, so the member's
+  // booking history and the operator alert read identically however the clear
+  // was reached (Stripe capture, Xero inbound, or this door).
+  //
+  // FIRST among the post-commit steps, deliberately. Everything after the commit
+  // is best-effort, but they are not equally recoverable: `recordBookingEvent`
+  // below is un-caught, so a throw there would abandon the rest of this function
+  // — and the row this reporter writes is the ONLY place the member is ever told
+  // their credit was not spent. The event, by contrast, is an internal timeline
+  // fact an operator can reconstruct from the audit log. Ordering the member's
+  // answer ahead of it shrinks the window in which a post-commit failure loses
+  // the one thing the member reads. The reporter is itself internally
+  // best-effort (it catches its own audit and email failures), so putting it
+  // first cannot cost the event either.
+  if (reconciliation.staleCreditElectionCents != null) {
+    await reportUnappliedCreditElection({
+      format,
+      bookingId,
+      memberId: bookingOwner(reconciliation.booking).memberId,
+      memberFirstName: bookingOwner(reconciliation.booking).member.firstName,
+      memberLastName: bookingOwner(reconciliation.booking).member.lastName,
+      checkIn: reconciliation.booking.checkIn,
+      checkOut: reconciliation.booking.checkOut,
+      electionCents: reconciliation.staleCreditElectionCents,
+      paidAmountCents: reconciliation.effectiveAmountCents,
+      source: "manual-mark-paid",
+      // No Stripe intent and no Xero invoice exist by definition on this door,
+      // so the booking id is the searchable reference.
+      reference: bookingId,
+      extraDetails: {
+        paymentId: reconciliation.paymentId,
+        actingAdminMemberId,
+      },
+    });
+  }
+
+  // The single durable "paid" fact, recorded by the same helper and with the
+  // same event types every other settlement path uses — with the ACTING ADMIN
+  // as the actor, so the history says who recorded it.
+  await recordBookingEvent({
+    bookingId,
+    type: reconciliation.booking.parentBookingId
+      ? BookingEventType.NON_MEMBER_CONFIRMED
+      : BookingEventType.MEMBER_PAID,
+    actorMemberId: actingAdminMemberId,
+    amountCents: reconciliation.effectiveAmountCents,
+    reason: "manual_mark_paid",
+    snapshot: {
+      kind: "manual_mark_paid",
+      actingAdminMemberId,
+      note,
+      effectiveAmountCents: reconciliation.effectiveAmountCents,
+      // #2397. Not an extra amount — a slice of `effectiveAmountCents` that the
+      // admin confirmed the cash covered, recorded here so the durable event
+      // says how the one figure was split.
+      settledAdditionalAmountCents:
+        reconciliation.settledAdditionalAmountCents || null,
+    },
+  });
+
+  // Best-effort Stripe cancels, OUTSIDE the transaction. The durable
+  // CANCEL_PAYMENT_INTENT operations committed with the settlement, so a
+  // failure here only means the recovery cron does the work instead.
+  for (const paymentIntentId of reconciliation.outstandingIntentIds) {
+    await cancelPaymentIntentIfCancellable(paymentIntentId).catch((err) =>
+      logger.warn(
+        { err, bookingId, paymentIntentId },
+        "Manual mark-paid: best-effort Stripe intent cancel failed; the recovery cron will retry"
+      )
+    );
+  }
+
+  return {
+    bookingId,
+    paymentId: reconciliation.paymentId,
+    effectiveAmountCents: reconciliation.effectiveAmountCents,
+    creditAppliedCents: reconciliation.creditAppliedCents,
+    previousStatus: reconciliation.previousStatus,
+    settledAt: reconciliation.settledAt,
+    outstandingIntentIds: reconciliation.outstandingIntentIds,
+    staleCreditElectionCents: reconciliation.staleCreditElectionCents,
+    memberFirstName: bookingOwner(reconciliation.booking).member.firstName,
+    memberEmail: bookingOwner(reconciliation.booking).member.email ?? null,
+    amountOwingCents: reconciliation.amountOwingCents,
+    outstandingAdditionalCents: reconciliation.outstandingAdditionalCents,
+    sparedAdditionalPaymentIntentId:
+      reconciliation.sparedAdditionalPaymentIntentId,
+    settledAdditionalAmountCents: reconciliation.settledAdditionalAmountCents,
+    uncollectedAdditionalCents: reconciliation.uncollectedAdditionalCents,
+  };
+}
+
+export type ManualBookingReversalResult = {
+  bookingId: string;
+  paymentId: string;
+  previousStatus: BookingStatus;
+  restoredStatus: BookingStatus;
+  reversedAmountCents: number;
+  closedRecoveryOperationIds: string[];
+  clearedInternetBankingHold: boolean;
+  /**
+   * #2262 door 3 / #2265: the stored credit election this reversal put BACK on
+   * the booking, in integer cents — exactly what the matching mark-paid had
+   * cleared. Null when that settle cleared nothing, or when the guarded restore
+   * declined because a legitimate writer had already set an election since.
+   */
+  restoredCreditElectionCents: number | null;
+  /**
+   * #2397: the outstanding extra the matching mark-paid recorded as covered by
+   * the cash, and which this reversal has put back to owing — in integer cents,
+   * or null when that settle covered no extra (or the guarded restore declined
+   * because the extra had legitimately been settled since).
+   */
+  restoredAdditionalAmountCents: number | null;
+};
+
+const MANUAL_REVERSAL_REFUSAL =
+  "This payment can no longer be reversed — cancel the booking instead.";
+
+/**
+ * B5 (#2262) — reverse a manual mark-paid (direction "unpaid").
+ *
+ * Only ever permitted on a payment THIS feature marked paid, and only while
+ * nothing has happened since that a reversal could not undo: no refund, no
+ * settled Stripe money, no open hand-back task, and no Xero invoice or queued
+ * mint acquired since the settle. Anything else is a cancellation, not a
+ * reversal.
+ *
+ * HIGH #1 — the reversal DISARMS ITS OWN HYGIENE OPERATIONS. The mark-paid may
+ * have queued CANCEL_PAYMENT_INTENT (and, via the cron's handoff,
+ * REFUND_SUPERSEDED_PAYMENT) operations for a then-live intent X.
+ * processCancelPaymentIntentOperation hands ANY succeeded intent to the refund
+ * handoff with no booking-status check, so mark-paid -> reversal -> the
+ * member's stale /pay tab captures X and legitimately settles the booking ->
+ * the cron processes the now-stale cancel op would REFUND THE REAL SETTLEMENT,
+ * leaving a PAID booking at zero net cash. Those operations must not outlive
+ * the settlement they were minted to protect. #4320: the reversal re-applies
+ * the supersede rule to the restored booking and DELETES, inside its own
+ * transaction, every live one (FAILED and retrying included) on an intent that
+ * booking can still be paid with - deletion, not a terminal status flip, since
+ * every webhook-side liveness predicate keys on `status != SUCCEEDED`. A stale
+ * intent keeps or regains its cancellation, and so does one whose cancellation
+ * another writer queued before the settle
+ * (`withdrawManualSettlementIntentCancellations`).
+ *
+ * The disarm is idempotent by construction: it is a status-fenced conditional
+ * delete, so a replayed reversal deletes zero rows — and the reversal's own
+ * fenced payment write has already 409'd by then. It can never close an
+ * operation the reversal itself depends on: the reversal enqueues no recovery
+ * work of its own and runs strictly after the settle whose operations it closes.
+ */
+export async function reverseManualBookingPayment({
+  bookingId,
+  actingAdminMemberId,
+  note,
+}: {
+  bookingId: string;
+  actingAdminMemberId: string;
+  note: string | null;
+}): Promise<ManualBookingReversalResult> {
+  const journal = await resolveBookingMoneyPostingContext();
+  const reversal = await prisma.$transaction(async (tx) => {
+    // Same two-tier ordering as the settlement body: global lock(1) first (this
+    // moves booking status and money), then the per-lodge capacity lock,
+    // because restoring a PAYMENT_PENDING booking RELEASES capacity.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+
+    const lockTarget = await tx.booking.findUnique({
+      where: { id: bookingId },
+      select: { lodgeId: true },
+    });
+    if (!lockTarget) {
+      throw new ManualBookingPaymentError("Booking not found.", 404);
+    }
+    const bookingLodgeId = lockTarget.lodgeId ?? (await getDefaultLodgeId(tx));
+    await acquireLodgeCapacityLock(tx, bookingLodgeId);
+    // #4217 (`INV-LOCK-002`): the Payment row before the recovery rows, the
+    // booking and the ledger rows this reversal writes - the recovery runner's
+    // claim hold locks it before the cancellation rows it upserts.
+    const paymentToLock = await tx.payment.findUnique({ where: { bookingId }, select: { id: true } });
+    if (paymentToLock) await lockPaymentForRefundedTotal(tx, paymentToLock.id);
+
+    const booking = await tx.booking.findUnique({
+      where: { id: bookingId },
+      include: { payment: true },
+    });
+    if (!booking) {
+      throw new ManualBookingPaymentError("Booking not found.", 404);
+    }
+    const payment = booking.payment;
+    if (!payment || !payment.manuallyMarkedPaidAt) {
+      throw new ManualBookingPaymentError(
+        "Only a manually recorded payment can be reversed here.",
+        409
+      );
+    }
+    if (booking.status !== BookingStatus.PAID) {
+      throw new ManualBookingPaymentError(MANUAL_REVERSAL_REFUSAL, 409);
+    }
+    if (payment.refundedAmountCents !== 0) {
+      throw new ManualBookingPaymentError(MANUAL_REVERSAL_REFUSAL, 409);
+    }
+
+    const refundRows = await tx.paymentRefund.count({
+      where: { paymentId: payment.id },
+    });
+    if (refundRows > 0) {
+      throw new ManualBookingPaymentError(MANUAL_REVERSAL_REFUSAL, 409);
+    }
+
+    const settledStripeTransaction = await tx.paymentTransaction.findFirst({
+      where: {
+        paymentId: payment.id,
+        source: PaymentSource.STRIPE,
+        status: {
+          in: [...CAPTURED_NOT_FULLY_REFUNDED_TRANSACTION_STATUS_LIST],
+        },
+      },
+      select: { id: true },
+    });
+    if (settledStripeTransaction) {
+      throw new ManualBookingPaymentError(
+        "A card payment has since settled this booking — reversing the manual record here would misstate the ledger.",
+        409
+      );
+    }
+
+    const openTask = await tx.manualRefundTask.findFirst({
+      where: { paymentId: payment.id, status: "OPEN" },
+      select: { id: true },
+    });
+    if (openTask) {
+      throw new ManualBookingPaymentError(
+        "There is an open manual refund task for this payment — resolve it before reversing the settlement.",
+        409
+      );
+    }
+
+    // Guard 2 again, for anything acquired SINCE the settle.
+    await assertNoXeroInvoiceEvidence(tx, payment);
+
+    // The matching settle's audit row: what it cleared, settled and adopted is
+    // what this reversal puts back or keeps.
+    const lastManualSettleAudit = await tx.auditLog.findFirst({
+      where: {
+        action: MANUAL_MARK_PAID_AUDIT_ACTION,
+        entityType: "Payment",
+        entityId: payment.id,
+      },
+      orderBy: { createdAt: "desc" },
+      select: { metadata: true },
+    });
+
+    // #2265 (#2262 door 3): RESTORE the credit election this settlement
+    // cleared, so the reversal genuinely undoes the settle rather than leaving
+    // the member's choice behind.
+    //
+    // Why restoring is the only honest answer. The election is stored on the
+    // booking and there is NO post-create control that can put it back: the
+    // only writer of `creditElectionCents` outside these settlement paths is
+    // booking-create (`applyCreditCents` at creation time), and the pay route's
+    // body is booking-id-only. So a member whose booking was marked paid and
+    // then reversed would hold credit they had asked to spend, on a booking
+    // that is payable again, with no way to re-elect it — they would be quietly
+    // charged the full price a second time.
+    //
+    // Exactly what this settle cleared, and nothing else. The amount comes from
+    // the mark-paid audit row's `clearedCreditElectionCents` (recorded
+    // in-transaction by the settle, so it is the value that settle actually took
+    // off the column, not a guess), and the restore is a GUARDED write matching
+    // `creditElectionCents: null` — the mirror image of `clearStaleCreditElection`
+    // in the settle. If a legitimate writer has since put an election on this
+    // booking, the guard matches nothing and their value stands untouched. If
+    // the settle cleared nothing, there is nothing to restore and no write
+    // happens at all.
+    //
+    // The member is not re-notified: they were told the credit was not used and
+    // is still available, which stays true throughout. A re-mark after this
+    // reversal finds the restored election, clears it again and reports again —
+    // once per settlement that took cash while the election stood, which is the
+    // honest count.
+    const clearedCreditElectionCents = readClearedCreditElectionCents(
+      lastManualSettleAudit?.metadata
+    );
+    // #2397: what that same settle recorded of the booking's outstanding extra.
+    const settledAdditional = readSettledAdditionalPayment(
+      lastManualSettleAudit?.metadata
+    );
+    let restoredCreditElectionCents: number | null = null;
+    if (clearedCreditElectionCents != null) {
+      const restored = await tx.booking.updateMany({
+        where: { id: booking.id, creditElectionCents: null },
+        data: { creditElectionCents: clearedCreditElectionCents },
+      });
+      restoredCreditElectionCents =
+        restored.count === 1 ? clearedCreditElectionCents : null;
+    }
+
+    // A stored DRAFT deliberately restores as PAYMENT_PENDING (owner-decided
+    // 28 Jul). This is code-necessary, not taste: DRAFT is a payable status, so
+    // a DRAFT booking CAN be settled, and the PAID claim cleared
+    // `draftExpiresAt` — there is nothing left to restore, so a restored DRAFT
+    // would be an expiry-less draft forever.
+    const storedPreviousStatus =
+      payment.manuallyMarkedPaidPreviousStatus ?? BookingStatus.PAYMENT_PENDING;
+    const restoredStatus =
+      storedPreviousStatus === BookingStatus.DRAFT
+        ? BookingStatus.PAYMENT_PENDING
+        : storedPreviousStatus;
+
+    // IB hold-expiry carve-out. A restored CONFIRMED booking carrying an
+    // already-passed internetBankingHoldUntil is exactly the shape
+    // releaseExpiredInternetBankingHolds sweeps — the next cron run would
+    // auto-cancel the booking and email the member minutes after a silent
+    // reversal. Clear the deadline (rather than silently extending one the
+    // member never agreed to): the booking keeps its beds with no expiry and an
+    // admin must explicitly re-arm a hold if one is wanted.
+    const clearInternetBankingHold =
+      restoredStatus === BookingStatus.CONFIRMED &&
+      payment.internetBankingHoldUntil !== null;
+
+    const reversedPayment = await tx.payment.updateMany({
+      where: {
+        id: payment.id,
+        manuallyMarkedPaidAt: { not: null },
+        refundedAmountCents: 0,
+      },
+      data: {
+        status: PaymentStatus.PENDING,
+        // `source` is deliberately left as-is: the row is still an
+        // internet-banking payment, it is simply no longer settled.
+        manuallyMarkedPaidAt: null,
+        manuallyMarkedPaidByMemberId: null,
+        manualPaymentNote: null,
+        manuallyMarkedPaidPreviousStatus: null,
+        ...CLEAR_SETTLING_TRANSACTION, // #4211: the cash row it named is no longer settled
+        ...(clearInternetBankingHold ? { internetBankingHoldUntil: null } : {}),
+      },
+    });
+    if (reversedPayment.count === 0) {
+      throw new ManualBookingPaymentError(
+        "This payment changed while you were reversing it — refresh and try again.",
+        409
+      );
+    }
+
+    const revertedBooking = await tx.booking.updateMany({
+      where: { id: booking.id, status: BookingStatus.PAID },
+      data: { status: restoredStatus },
+    });
+    if (revertedBooking.count === 0) {
+      throw new ManualBookingPaymentError(
+        "This booking changed while you were reversing the payment — refresh and try again.",
+        409
+      );
+    }
+
+    // History is preserved rather than deleted, and the row can never read
+    // "unpaid (manual)". The settle mint's predicate deliberately skips FAILED
+    // rows, so a later re-mark mints a FRESH row at the new amount instead of
+    // resurrecting this one at a stale one.
+    await tx.paymentTransaction.updateMany({
+      where: {
+        paymentId: payment.id,
+        kind: PaymentTransactionKind.PRIMARY,
+        source: PaymentSource.INTERNET_BANKING,
+        status: PaymentStatus.SUCCEEDED,
+      },
+      data: {
+        status: PaymentStatus.FAILED,
+        reason: "manual_mark_paid_reversed",
+      },
+    });
+
+    // #2397 — the extra goes back to owing, or the reversal would leave a
+    // booking that is unpaid again while its later addition still reads as
+    // collected, and no surface would ever ask for it. Both halves, in the
+    // order that keeps them consistent if either declines:
+    //  * the durable ADDITIONAL row is marked FAILED (never deleted), same
+    //    treatment and same reason-stamp shape as the PRIMARY row above, so a
+    //    later re-mark mints a fresh row rather than resurrecting a stale one;
+    //  * the summary column is restored with a GUARDED claim matching the exact
+    //    figure and status this settle wrote. If a legitimate writer has settled
+    //    the extra since (a card capture landing on the restored booking, say),
+    //    the guard matches nothing and their value stands untouched.
+    let restoredAdditionalAmountCents: number | null = null;
+    if (settledAdditional) {
+      await tx.paymentTransaction.updateMany({
+        where: {
+          paymentId: payment.id,
+          kind: PaymentTransactionKind.ADDITIONAL,
+          source: PaymentSource.INTERNET_BANKING,
+          status: PaymentStatus.SUCCEEDED,
+          reason: MANUAL_MARK_PAID_ADDITIONAL_REASON,
+        },
+        data: {
+          status: PaymentStatus.FAILED,
+          reason: MANUAL_MARK_PAID_ADDITIONAL_REVERSED_REASON,
+        },
+      });
+
+      const restoredAdditional = await tx.payment.updateMany({
+        where: {
+          id: payment.id,
+          additionalAmountCents: settledAdditional.amountCents,
+          additionalPaymentStatus: "SUCCEEDED",
+        },
+        data: { additionalPaymentStatus: settledAdditional.previousStatus },
+      });
+      restoredAdditionalAmountCents =
+        restoredAdditional.count === 1 ? settledAdditional.amountCents : null;
+    }
+
+    // HIGH #1 — disarm, inside this transaction, once the booking is restored:
+    // the supersede rule is re-applied to it, and the live superseded-intent
+    // rows of every intent it can still be paid with are DELETED (#4320).
+    // See `withdrawManualSettlementIntentCancellations`.
+    const { withdrawn: doomedOperations, stillCancelledIntentIds, rearmed, liveAdditionalAsk } =
+      await withdrawManualSettlementIntentCancellations(tx, {
+        booking,
+        paymentId: payment.id,
+        liveAdditionalPaymentIntentId: payment.additionalPaymentIntentId,
+        restoredAdditionalAmountCents,
+        settleAuditMetadata: lastManualSettleAudit?.metadata,
+      });
+    // #4320 / #4355: the extra is owed again and a card ask for it stands. The
+    // reversed cash row is newer than that ask, and the mirror is rebuilt from
+    // the newest ADDITIONAL row an officer has not withdrawn, so it would read
+    // the extra FAILED with no pointer even after the member paid the ask. The
+    // cash row is stamped withdrawn, which the rebuild reads past (`INV-ADDPAY-040`),
+    // and the pointer is put back to the ask. With no live ask the cash row
+    // stays the mirror's anchor: the extra reads owed, with no card door.
+    const restoredAdditionalPaymentIntentId =
+      restoredAdditionalAmountCents !== null ? liveAdditionalAsk : null;
+    if (restoredAdditionalPaymentIntentId !== null) {
+      await tx.paymentTransaction.updateMany({
+        where: {
+          paymentId: payment.id,
+          kind: PaymentTransactionKind.ADDITIONAL,
+          source: PaymentSource.INTERNET_BANKING,
+          status: PaymentStatus.FAILED,
+          reason: MANUAL_MARK_PAID_ADDITIONAL_REVERSED_REASON,
+          withdrawnAt: null,
+        },
+        data: { withdrawnAt: new Date() },
+      });
+      await tx.payment.updateMany({
+        where: { id: payment.id, additionalPaymentIntentId: null },
+        data: { additionalPaymentIntentId: restoredAdditionalPaymentIntentId },
+      });
+    }
+
+    // #3581: the reversal flipped the manual rows from SUCCEEDED to FAILED
+    // above, so the cash lines the settle posted no longer hold. The same sync
+    // posts their reversals — new lines, the originals untouched, each keyed by
+    // the line it reverses so a replay posts nothing (`INV-MONEY-033`).
+    await syncBookingLedgerSettlements({ paymentId: payment.id, store: tx });
+    await postBookingReceipts(tx, journal, { paymentId: payment.id });
+
+    // Releases the claimed beds only when the restore lands on
+    // PAYMENT_PENDING; a restored CONFIRMED booking deliberately keeps holding
+    // capacity, because that is what CONFIRMED means.
+    await reconcileBedAllocationsForBookingWithLodgeLockHeld({
+      bookingId: booking.id,
+      db: tx,
+      previousRange: { checkIn: booking.checkIn, checkOut: booking.checkOut },
+    });
+
+    const closedRecoveryOperationIds = doomedOperations.map(
+      (operation) => operation.id
+    );
+    // The deleted rows' content, preserved verbatim on the audit trail (the
+    // queue row is gone by design — see the disarm above).
+    const closedRecoveryOperations = doomedOperations.map((operation) => ({
+      id: operation.id,
+      type: operation.type,
+      status: operation.status,
+      paymentIntentId: operation.paymentIntentId,
+      paymentTransactionId: operation.paymentTransactionId,
+      amountCents: operation.amountCents,
+      idempotencyKey: operation.idempotencyKey,
+      attempts: operation.attempts,
+      createdAt: operation.createdAt.toISOString(),
+    }));
+
+    await createAuditLog(
+      {
+        action: "booking-payment.manual-payment.mark-unpaid",
+        memberId: actingAdminMemberId,
+        actorMemberId: actingAdminMemberId,
+        subjectMemberId: bookingOwner(booking).memberId,
+        targetId: booking.id,
+        entityType: "Payment",
+        entityId: payment.id,
+        category: "payment",
+        severity: "important",
+        outcome: "success",
+        summary: "Manual booking payment reversed",
+        details: note,
+        metadata: {
+          bookingId: booking.id,
+          paymentId: payment.id,
+          previousStatus: BookingStatus.PAID,
+          storedPreviousStatus,
+          restoredStatus,
+          reversedAmountCents: payment.amountCents,
+          closedRecoveryOperationIds,
+          closedRecoveryOperations,
+          // #4320: the intents the restored booking cannot be paid with, each
+          // with a cancellation the runner will take: one that stood, one
+          // queued afresh, or a dead one re-armed (its row id listed below).
+          stillCancelledPaymentIntentIds: stillCancelledIntentIds,
+          rearmedRecoveryOperationIds: rearmed,
+          // #4320 / #4355: the card ask the restored extra's mirror names again.
+          restoredAdditionalPaymentIntentId,
+          clearedInternetBankingHold: clearInternetBankingHold,
+          // #2265 (#2262 door 3). The member's credit election, put back on the
+          // booking by this reversal — recorded BOTH ways, like the email
+          // decision below: the cents restored, and the cents the matching
+          // settle had cleared. They differ only when the restore's guard
+          // declined (a legitimate writer had already put an election back),
+          // in which case the settle's figure is the record of what was cleared
+          // and the null says plainly that this reversal did not write it back.
+          restoredCreditElectionCents,
+          settleClearedCreditElectionCents: clearedCreditElectionCents,
+          // #2397, recorded BOTH ways for the same reason: what this reversal
+          // actually put back to owing, and what the matching settle had said
+          // the cash covered. A null restored figure against a non-null settled
+          // one says the guard declined because the extra was legitimately
+          // settled again in the meantime.
+          restoredAdditionalAmountCents,
+          settleSettledAdditionalAmountCents:
+            settledAdditional?.amountCents ?? null,
+          // #2260: a reversal never emails the member. Recorded under its own
+          // key so a raw metadata render cannot be misread as an admin having
+          // declined a choice they were never offered.
+          notifyMemberOffered: false,
+        },
+      },
+      tx
+    );
+
+    return {
+      booking,
+      paymentId: payment.id,
+      storedPreviousStatus,
+      restoredStatus,
+      reversedAmountCents: payment.amountCents,
+      closedRecoveryOperationIds,
+      clearedInternetBankingHold: clearInternetBankingHold,
+      restoredCreditElectionCents,
+      restoredAdditionalAmountCents,
+    };
+  }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+
+  // Recorded as a CANCELLED event carrying the reversal discriminator (#2008
+  // pattern): durable and never pruned, rendered honestly on the admin
+  // timeline, and EXCLUDED from the member/admin narrative so a later genuine
+  // cancellation is not misdated by it.
+  const reversalSnapshot: ManualSettlementReversalEventSnapshot = {
+    kind: MANUAL_SETTLEMENT_REVERSAL_EVENT_KIND,
+    storedPreviousStatus: reversal.storedPreviousStatus,
+    restoredStatus: reversal.restoredStatus,
+    closedRecoveryOperationIds: reversal.closedRecoveryOperationIds,
+    clearedInternetBankingHold: reversal.clearedInternetBankingHold,
+    note,
+  };
+  await recordBookingEvent({
+    bookingId,
+    type: BookingEventType.CANCELLED,
+    actorMemberId: actingAdminMemberId,
+    amountCents: reversal.reversedAmountCents,
+    reason: MANUAL_SETTLEMENT_REVERSAL_EVENT_REASON,
+    snapshot: reversalSnapshot as unknown as Prisma.InputJsonValue,
+  });
+
+  return {
+    bookingId,
+    paymentId: reversal.paymentId,
+    previousStatus: BookingStatus.PAID,
+    restoredStatus: reversal.restoredStatus,
+    reversedAmountCents: reversal.reversedAmountCents,
+    closedRecoveryOperationIds: reversal.closedRecoveryOperationIds,
+    clearedInternetBankingHold: reversal.clearedInternetBankingHold,
+    restoredCreditElectionCents: reversal.restoredCreditElectionCents,
+    restoredAdditionalAmountCents: reversal.restoredAdditionalAmountCents,
+  };
+}
+
+/**
+ * Stamps a succeeded SetupIntent's card onto the booking's Payment row — but
+ * ONLY while that row still names this intent (#3266, `INV-PAY-052`).
+ *
+ * Stripe redelivers a failed `setup_intent.succeeded` for up to three days and
+ * the processed-event dedupe only knows events that were already handled, so
+ * this can run for an intent the row has long since replaced: a member who
+ * re-saved would have had the OLD card written back over the new one. The
+ * intent id is the guard and is never written here; the mint path
+ * (`create-setup-intent`) is the only writer of `stripeSetupIntentId`. Callers
+ * decide first whether the card may be adopted at all
+ * (`classifySucceededSetupIntentCard`); this is the write-time re-check under
+ * it. `stamped: false` means the row moved on and nothing changed.
+ */
+export async function markBookingSetupIntentSucceeded({
+  bookingId,
+  setupIntentId,
+  paymentMethodId,
+}: {
+  bookingId: string;
+  setupIntentId: string;
+  paymentMethodId: string;
+}): Promise<{ stamped: boolean }> {
+  const { count } = await prisma.payment.updateMany({
+    where: { bookingId, stripeSetupIntentId: setupIntentId },
+    data: { stripePaymentMethodId: paymentMethodId },
+  });
+  if (count === 0) {
+    logger.info(
+      { bookingId, setupIntentId, paymentMethodId },
+      "SetupIntent is no longer the one the booking's payment row names; its card was not stamped",
+    );
+  }
+  return { stamped: count > 0 };
+}

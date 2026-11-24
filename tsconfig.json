@@ -1,0 +1,101 @@
+{
+  "compilerOptions": {
+    // #2693: the modern baseline. ES2022 is the oldest target every runtime
+    // this repository ships to already exceeds (Node 24 per `engines`, and the
+    // evergreen browsers Next's own browserslist selects), so the checker stops
+    // modelling downlevelled output nobody runs. `lib` names the same level
+    // explicitly rather than `esnext`, so a newer standard-library API cannot
+    // enter the type surface before the target that carries it does.
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "es2022"],
+    // Pinned false on purpose — see docs/TESTING.md → "Which project typechecks
+    // a test" for why (Next's SWC and Vite/Vitest read this key differently).
+    "useDefineForClassFields": false,
+    // #2693: no JavaScript enters a TypeScript project. Vitest still runs the
+    // `scripts/**/*.test.mjs` suites, which were never statically checked
+    // (`checkJs` was off); the four JavaScript modules TypeScript tests import
+    // carry a sibling `.d.ts` / `.d.mts` declaring their surface. The census
+    // is pinned by `src/lib/__tests__/typecheck-project-coverage.test.ts`.
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    // #2694/#2802: a lookup by index or by key (`rows[0]`, `byId[id]`) is typed
+    // as possibly missing, so a genuine absence has to be handled instead of
+    // silently becoming `undefined` flowing into later logic. Adopted in
+    // stages behind a temporary ratchet (docs/TESTING.md's git history has
+    // the mechanics); this is the permanent rule now that the tree is at
+    // zero. tsconfig.test.json and tsconfig.e2e.json extend this file and
+    // deliberately turn the flag back off for now — see the comment there.
+    "noUncheckedIndexedAccess": true,
+    // #2693: dead-code hygiene the compiler owns. An unused local or import is
+    // removed; a parameter a signature must keep is prefixed `_`, which is the
+    // repository's existing convention (`_label`, `_request`, ...); a member
+    // overriding a base-class member says so.
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true,
+    // Backup helpers also run in plain Node's TypeScript loader (memory test).
+    // Explicit relative .ts imports work there without aliases or a bundler.
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    // TypeScript's `**` skips dot-directories, so the OAuth discovery routes
+    // (ALP-653) are named or no project would read them.
+    "src/app/.well-known/**/*.ts",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts",
+    "**/*.mts"
+  ],
+  "exclude": [
+    "node_modules",
+    // Vitest's source/script tests belong to tsconfig.test.json for every
+    // supported extension.
+    "src/**/*.test.*",
+    "src/**/*.spec.*",
+    "scripts/**/*.test.*",
+    "scripts/**/*.spec.*",
+    "**/__tests__/**",
+    // #2693: the Playwright suite and its config belong to tsconfig.e2e.json,
+    // which supplies Node types without `vitest/globals` and without the Next
+    // route typegen. The Vitest suites under `src/lib/__tests__/` that import
+    // an `e2e/helpers/*` module still reach it through that import;
+    // ownership is about which project lists a file as a root.
+    "e2e/**",
+    "playwright.config.ts",
+    // #4466: the axe fixture's Playwright contract imports e2e/helpers, which
+    // the Docker build context leaves out; tsconfig.e2e.json owns it.
+    "scripts/e2e-contracts/**",
+    // #2693: the Vitest config and its setup files are the test project's
+    // roots (they exist only to run under Vitest), not the app's. #3671 added
+    // the global setup, which is one of them for the same reason.
+    "vitest.config.mts",
+    "vitest.setup.ts",
+    "vitest.clock-setup.ts",
+    "vitest.global-setup.ts",
+    // #2686: Semgrep rule fixtures. They are deliberately-broken sample code
+    // whose only reader is Semgrep's own `--test` runner — they import modules
+    // that do not resolve from that directory and they exist to be reported.
+    // Type-checking them would fail, and fixing them to type-check would stop
+    // them being fixtures.
+    ".semgrep/**"
+  ]
+}

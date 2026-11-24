@@ -1,0 +1,1550 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { BookingStatus, Prisma } from "@prisma/client";
+import { normalizeDateOnlyForTimeZone, parseDateOnly } from "@/lib/date-only";
+
+/**
+ * The zone the LEGACY oracle below reads, named rather than left to
+ * `normalizeDateOnlyForTimeZone`'s `APP_TIME_ZONE` default, which #3123 deletes.
+ * It is New Zealand because that is what `APP_TIME_ZONE` resolves to here — CI
+ * sets no `TZ`. On the exact UTC midnights `parseDateOnly` returns, that read is
+ * the identity, so the bound this expects is the same value the capacity query's
+ * own `storedDateOnly` produces.
+ */
+const CLUB_ZONE = "Pacific/Auckland";
+
+const mocks = vi.hoisted(() => ({
+  releaseBookingPromoRedemptions: vi.fn(async () => 0),
+  transaction: vi.fn(),
+  // #3864: nothing to give back unless a case says so.
+  giveBackAppliedCredit: vi.fn<(...args: unknown[]) => Promise<{ appliedCreditCents: number; givenBackCents: number; payment: null }>>(
+    async () => ({ appliedCreditCents: 0, givenBackCents: 0, payment: null }),
+  ),
+  findAppliedCreditDeallocationFence: vi.fn<(...args: unknown[]) => Promise<{ id: string; status: string } | null>>(async () => null),
+  paymentUpdate: vi.fn(),
+  // #3792: the settle's member credit-ledger key.
+  lockMemberCreditLedger: vi.fn(),
+  // #3580: the ledger's one write delegate, so a settle's charge lines are
+  // observable here.
+  ledgerCreateMany: vi.fn(),
+  // #3595: the per-booking confirmation fence asks this first.
+  ledgerFindFirst: vi.fn(),
+  // #2576 §9: the single settle door is a confirming path, so it records the bounded
+  // hosting re-evaluation with the PAID claim and drains it after the commit.
+  enqueueOwnHostingCoverage: vi.fn(async (...args: unknown[]) => {
+    void args;
+    return null;
+  }),
+  settleHostingCoverage: vi.fn(async (...args: unknown[]) => {
+    void args;
+  }),
+  // #3209: the capacity-failed void is the CANCELLING path in this same function,
+  // and it returns before reaching the enqueue above.
+  reconcileHostingForSystemCancellation: vi.fn(async (...args: unknown[]) => {
+    void args;
+  }),
+  executeRaw: vi.fn(),
+  bookingFindUnique: vi.fn(),
+  bookingFindMany: vi.fn(),
+  bookingUpdate: vi.fn(),
+  bookingUpdateMany: vi.fn(),
+  paymentUpsert: vi.fn(),
+  // #3266 — markBookingSetupIntentSucceeded's status-guarded stamp.
+  paymentUpdateMany: vi.fn(),
+  upsertPaymentIntentTransaction: vi.fn(),
+  findPaymentTransactionByIntentId: vi.fn(),
+  refundPaymentTransactions: vi.fn(),
+  planStripeRefundAllocation: vi.fn(),
+  readSupersededCaptureHeldBack: vi.fn<(...args: unknown[]) => Promise<{ byTransaction: Map<string, number>; totalCents: number }>>(async () => ({ byTransaction: new Map(), totalCents: 0 })),
+  enqueueCapacityClaimFailedRefundRecovery: vi.fn(),
+  markCapacityClaimFailedRefundRecoverySucceeded: vi.fn(),
+  recordCapacityClaimFailedRefundRecoveryInlineError: vi.fn(),
+  restoreCreditFromBooking: vi.fn(),
+  deriveBookingAppliedCreditCents: vi.fn(),
+  getMemberCreditBalance: vi.fn(),
+  sendAdminPaymentFailureAlert: vi.fn(),
+  reconcileBedAllocationsForBooking: vi.fn(),
+  lodgeFindFirst: vi.fn(),
+  lodgeSettingsFindUnique: vi.fn(),
+  // #2265 (#2319): the audit row a cleared credit election writes, which the
+  // member's own booking history renders.
+  createAuditLog: vi.fn(),
+}));
+
+// Promo arithmetic is exercised against PostgreSQL in cancelled-booking-promo-release.realdb.test.ts.
+vi.mock("@/lib/promo", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/promo")),
+  releaseBookingPromoRedemptions: mocks.releaseBookingPromoRedemptions,
+}));
+
+vi.mock("@/lib/audit", () => ({
+  createAuditLog: (...args: unknown[]) => mocks.createAuditLog(...args),
+}));
+
+// #3611: the cancellation's ledger lines are proved in booking-ledger-cancellation.test.ts and against PostgreSQL; here only the call is observed.
+const cancellationLedger = vi.hoisted(() => ({
+  postCancellationLedgerLines: vi.fn<(input: unknown) => Promise<void>>(async () => {}),
+}));
+vi.mock("@/lib/booking-ledger-cancellation-sync", () => cancellationLedger);
+// #4627: the journal half of the confirmation runs on PostgreSQL
+// (`booking-ledger-journal.realdb.test.ts`); here, that the settle hands it the lines.
+const journalDoors = vi.hoisted(() => ({
+  postRefundObligation: vi.fn(async () => null), postBookingLedgerJournal: vi.fn(async () => null), postBookingReceipts: vi.fn(async () => 0) }));
+vi.mock("@/lib/member-money/doors", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/member-money/doors")),
+  postBookingLedgerJournal: journalDoors.postBookingLedgerJournal,
+  // #4516 (M4b): the receipt hook runs on PostgreSQL (`member-money-receipts.realdb.test.ts`); here, the W1
+  // decision it is handed: a card settle collects its intent on `paid` and holds it otherwise (the officer
+  // settle's `manual_paid` is proved by that suite's real officer settle and reversal).
+  postBookingReceipts: journalDoors.postBookingReceipts,
+  // #4516 (M4c): R05 posts on PostgreSQL (`member-money-refunds.realdb.test.ts`); here, that W1 asks for it.
+  postRefundObligation: journalDoors.postRefundObligation,
+}));
+
+// #4300 (`INV-PAY-138`): the settle's superseded-capture refusal reads the
+// superseded machinery's rows, which this suite's transaction double does not
+// model; nothing here is superseded. Pinned by issue-1992-duplicate-capture-refund
+// and superseded-capture-ownership, and on PostgreSQL by superseded-intent-card-doors.
+vi.mock("@/lib/superseded-capture-hold-back", () => ({
+  readSupersededCaptureHeldBack: (...args: unknown[]) => mocks.readSupersededCaptureHeldBack(...args),
+}));
+vi.mock("@/lib/superseded-capture-ownership", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/superseded-capture-ownership")),
+  supersededMachineryOwnsCapture: async () => false,
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    $transaction: (...args: unknown[]) => mocks.transaction(...args),
+    // #3266 — markBookingSetupIntentSucceeded's status-guarded stamp.
+    payment: {
+      updateMany: (...args: unknown[]) => mocks.paymentUpdateMany(...args),
+    },
+    // #4103 — a refusal's re-plan of the pre-persisted row, outside the claim.
+    paymentRecoveryOperation: {
+      updateMany: (...args: unknown[]) => refusalReplan.updateMany(...args),
+      findUnique: async () => null,
+    },
+    // #4125: the member-facing booking events, read back by the capacity-race tests.
+    bookingEvent: { create: (...args: unknown[]) => bookingEvents.create(...args) },
+  },
+}));
+const bookingEvents = vi.hoisted(() => ({ create: vi.fn<(...args: unknown[]) => Promise<object>>(async () => ({})) }));
+const refusalReplan = vi.hoisted(() => ({ updateMany: vi.fn<(...args: unknown[]) => Promise<{ count: number }>>(async () => ({ count: 1 })) }));
+
+// #4125: the officers' once-ever alert for a capacity-race charge no refund covers; its rule is proved in its own suite.
+// #4154: and the hand-back task to check it raises in the void's claim; its rule is proved there too.
+const shortfallAlert = vi.hoisted(() => ({
+  alertCapacityRaceRefundShortfall: vi.fn<(...args: unknown[]) => Promise<boolean>>(async () => true),
+  raiseCapacityRaceRefundShortfallTask: vi.fn<(...args: unknown[]) => Promise<boolean>>(async () => true),
+}));
+vi.mock("@/lib/capacity-race-refund-shortfall", () => shortfallAlert);
+
+vi.mock("@/lib/payment-transactions", () => ({
+  // #4217: the settle locks the Payment row before its ledger lookup.
+  lockPaymentForRefundedTotal: async () => undefined,
+  upsertPaymentIntentTransaction: (...args: unknown[]) =>
+    mocks.upsertPaymentIntentTransaction(...args),
+  findPaymentTransactionByIntentId: (...args: unknown[]) =>
+    mocks.findPaymentTransactionByIntentId(...args),
+  refundPaymentTransactions: (...args: unknown[]) =>
+    mocks.refundPaymentTransactions(...args),
+  planStripeRefundAllocation: (...args: unknown[]) =>
+    mocks.planStripeRefundAllocation(...args),
+}));
+
+vi.mock("@/lib/payment-recovery", () => ({
+  enqueueCapacityClaimFailedRefundRecovery: (...args: unknown[]) =>
+    mocks.enqueueCapacityClaimFailedRefundRecovery(...args),
+  markCapacityClaimFailedRefundRecoverySucceeded: (...args: unknown[]) =>
+    mocks.markCapacityClaimFailedRefundRecoverySucceeded(...args),
+  recordCapacityClaimFailedRefundRecoveryInlineError: (...args: unknown[]) =>
+    mocks.recordCapacityClaimFailedRefundRecoveryInlineError(...args),
+}));
+
+vi.mock("@/lib/member-credit", () => ({
+  restoreCreditFromBooking: (...args: unknown[]) =>
+    mocks.restoreCreditFromBooking(...args),
+  // #3864: the settle gives back credit a full-price capture left unspent.
+  giveBackAppliedCredit: (...args: unknown[]) => mocks.giveBackAppliedCredit(...args),
+  // #3792: the settle takes the member credit-ledger key after its lodge key.
+  lockMemberCreditLedger: (...args: unknown[]) => mocks.lockMemberCreditLedger(...args),
+  deriveBookingAppliedCreditCents: (...args: unknown[]) =>
+    mocks.deriveBookingAppliedCreditCents(...args),
+  getMemberCreditBalance: (...args: unknown[]) =>
+    mocks.getMemberCreditBalance(...args),
+  // #3369: the one home for the account-credit refusal four settlement paths
+  // share. Real, not stubbed: the mock must not turn a refusal into a pass.
+  requireMemberCreditRecipient: (memberId: string | null) => {
+    if (!memberId) throw new Error("no account to credit (#3369)");
+    return memberId;
+  },
+}));
+
+vi.mock("@/lib/xero-applied-credit-operation-serialization", () => ({
+  findAppliedCreditDeallocationFence: (...args: unknown[]) =>
+    mocks.findAppliedCreditDeallocationFence(...args),
+}));
+
+vi.mock("@/lib/email", () => ({
+  sendAdminPaymentFailureAlert: (...args: unknown[]) =>
+    mocks.sendAdminPaymentFailureAlert(...args),
+}));
+
+vi.mock("@/lib/bed-allocation-lifecycle", () => ({
+  reconcileBedAllocationsForBookingWithLodgeLockHeld: (...args: unknown[]) =>
+    mocks.reconcileBedAllocationsForBooking(...args),
+}));
+
+// #2576 §9. Mocked at the module boundary like the collaborator above. The real seam
+// reads the booking and the lodge policy through the PAID claim's transaction client,
+// and this suite drives that transaction with a fake carrying only the money delegates —
+// so without this the enqueue throws and the settlement fails. Failing closed is the
+// correct production behaviour (§8 wants the obligation to commit WITH the transition),
+// which is why the fixture is what changes.
+vi.mock("@/lib/adult-member-hosting-review", () => ({
+  enqueueOwnHostingCoverageReevaluation: (...args: unknown[]) =>
+    mocks.enqueueOwnHostingCoverage(...args),
+}));
+
+vi.mock("@/lib/adult-member-hosting-coverage-drain", () => ({
+  settleHostingCoverageAfterCommit: (...args: unknown[]) =>
+    mocks.settleHostingCoverage(...args),
+}));
+
+// #3209: its own mock rather than an addition to the review mock above, because
+// the settle and void branches are mutually exclusive and the point of the
+// assertion is which one ran.
+vi.mock("@/lib/adult-member-hosting-system-cancellation", () => ({
+  reconcileHostingReviewForSystemCancellation: (...args: unknown[]) =>
+    mocks.reconcileHostingForSystemCancellation(...args),
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: {
+    error: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+import { FALLBACK_LODGE_CAPACITY as LODGE_CAPACITY } from "@/lib/lodge-capacity";
+import {
+  markBookingPaymentSucceeded,
+  markBookingSetupIntentSucceeded,
+} from "@/lib/payment-reconciliation";
+import logger from "@/lib/logger";
+import { resolveBookingNarrative, type NarrativeEvent } from "@/lib/booking-narrative";
+import { bindClubTime, requireClubTimeZone } from "@/lib/club-time";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+import { buildCapacityClaimFailedRefundRecoveryIdempotencyKey } from "@/lib/payment-recovery-keys";
+
+const tx = {
+  // #4125: the capacity race's REFUNDED event commits with the recovery row's close.
+  bookingEvent: { create: (...args: unknown[]) => bookingEvents.create(...args) },
+  $executeRaw: (...args: unknown[]) => mocks.executeRaw(...args),
+  $queryRaw: (...args: unknown[]) => mocks.executeRaw(...args),
+  lodge: {
+    findFirst: (...args: unknown[]) => mocks.lodgeFindFirst(...args),
+  },
+  // #1982 — the default lodge's capacity is a DB override (self-healed from the
+  // config bed total), not a club.json runtime fallback.
+  lodgeSettings: {
+    findUnique: (...args: unknown[]) => mocks.lodgeSettingsFindUnique(...args),
+  },
+  // #2286: the capacity engines read bed-holding hut-leader assignments
+  // (custodian occupancy). None in these cases.
+  hutLeaderAssignment: { findMany: vi.fn().mockResolvedValue([]) },
+  // #3580: the append-only money ledger. Charge lines post here on the PAID
+  // claim; nothing reads them yet.
+  bookingLedgerLine: {
+    createMany: (...args: unknown[]) => mocks.ledgerCreateMany(...args),
+    findFirst: (...args: unknown[]) => mocks.ledgerFindFirst(...args),
+  },
+  booking: {
+    findUnique: (...args: unknown[]) => mocks.bookingFindUnique(...args),
+    findMany: (...args: unknown[]) => mocks.bookingFindMany(...args),
+    update: (...args: unknown[]) => mocks.bookingUpdate(...args),
+    updateMany: (...args: unknown[]) => mocks.bookingUpdateMany(...args),
+  },
+  payment: {
+    upsert: (...args: unknown[]) => mocks.paymentUpsert(...args),
+    update: (...args: unknown[]) => mocks.paymentUpdate(...args),
+  },
+};
+
+function makeStaggeredBooking() {
+  return {
+    id: "booking-1",
+    memberId: "member-1",
+    status: BookingStatus.PAYMENT_PENDING,
+    checkIn: parseDateOnly("2026-04-10"),
+    checkOut: parseDateOnly("2026-04-12"),
+    finalPriceCents: 10000,
+    guests: [
+      {
+        id: "guest-1",
+        isMember: false,
+        stayStart: parseDateOnly("2026-04-10"),
+        stayEnd: parseDateOnly("2026-04-11"),
+      },
+      {
+        id: "guest-2",
+        isMember: false,
+        stayStart: parseDateOnly("2026-04-11"),
+        stayEnd: parseDateOnly("2026-04-12"),
+      },
+    ],
+    member: {
+      firstName: "Alice",
+      lastName: "Member",
+      email: "alice@example.com",
+    },
+  };
+}
+
+describe("markBookingPaymentSucceeded", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.transaction.mockImplementation(async (fn: (store: typeof tx) => Promise<unknown>) =>
+      fn(tx)
+    );
+    mocks.executeRaw.mockResolvedValue(undefined);
+    mocks.ledgerCreateMany.mockImplementation(
+      async ({ data }: { data: unknown[] }) => ({ count: data.length }),
+    );
+    mocks.ledgerFindFirst.mockResolvedValue(null);
+    mocks.lodgeFindFirst.mockResolvedValue({ id: "lodge-1" });
+    mocks.lodgeSettingsFindUnique.mockResolvedValue({ capacity: LODGE_CAPACITY });
+    mocks.bookingFindUnique.mockResolvedValue(makeStaggeredBooking());
+    mocks.paymentUpsert.mockResolvedValue({ id: "payment-1" });
+    mocks.upsertPaymentIntentTransaction.mockResolvedValue(undefined);
+    // #1765 — default: no prior transaction for the intent (fresh capture).
+    mocks.findPaymentTransactionByIntentId.mockResolvedValue(null);
+    mocks.bookingUpdate.mockResolvedValue({});
+    mocks.bookingUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.reconcileBedAllocationsForBooking.mockResolvedValue(undefined);
+    mocks.restoreCreditFromBooking.mockResolvedValue(undefined);
+    mocks.deriveBookingAppliedCreditCents.mockResolvedValue(0);
+    mocks.getMemberCreditBalance.mockResolvedValue(0);
+    mocks.sendAdminPaymentFailureAlert.mockResolvedValue(undefined);
+    mocks.createAuditLog.mockResolvedValue(undefined);
+    mocks.refundPaymentTransactions.mockResolvedValue({ refunds: [] });
+    mocks.planStripeRefundAllocation.mockResolvedValue({
+      slices: [{ paymentTransactionId: "txn-1", amountCents: 10000 }],
+      plannedAmountCents: 10000,
+      totalRefundableCents: 10000,
+    });
+    mocks.enqueueCapacityClaimFailedRefundRecovery.mockResolvedValue({
+      id: "recovery-op-1",
+    });
+    mocks.markCapacityClaimFailedRefundRecoverySucceeded.mockResolvedValue({
+      count: 1,
+    });
+    mocks.recordCapacityClaimFailedRefundRecoveryInlineError.mockResolvedValue({
+      count: 1,
+    });
+  });
+
+  /**
+   * #2265 (#2319). This is the single settle door every card path funnels
+   * through, and by the time it runs the money has been captured for whatever
+   * the intent was minted at. A stored credit election therefore cannot be
+   * honoured any more — applying it would debit the member's balance for cash
+   * already taken — so it is cleared, and the clear is reported rather than left
+   * silent, because a member who chose to spend credit and then paid full price
+   * otherwise has no way to tell whether their balance was touched. It was not.
+   */
+  /*
+    #3580 — the booking money ledger's first posting site.
+
+    The settle is where a booking's price becomes a fact, so it is where the
+    charge lines are posted, inside this transaction and under this claim. The
+    two cases below are the pair that matters: the lines really are written
+    from the night rows, and a booking whose projection cannot be priced does
+    not lose its settle over rows nobody reads yet.
+  */
+  it("posts the booking's charge lines on the PAID claim, from the night rows (#3580)", async () => {
+    const booking = makeStaggeredBooking();
+    mocks.bookingFindUnique.mockResolvedValue({
+      ...booking,
+      lodgeId: "lodge-1",
+      totalPriceCents: 10000,
+      promoAdjustmentCents: 0,
+      guests: booking.guests.map((guest, index) => ({
+        ...guest,
+        firstName: index === 0 ? "Alice" : "Bob",
+        lastName: "Guest",
+        ageTier: "ADULT",
+        rateMembershipTypeId: "type-1",
+        nights: [
+          {
+            stayDate: parseDateOnly(index === 0 ? "2026-04-10" : "2026-04-11"),
+            priceCents: 5000,
+          },
+        ],
+      })),
+    });
+    mocks.bookingFindMany.mockResolvedValue([]);
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_ledger",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    expect(result.outcome).toBe("paid");
+    expect(journalDoors.postBookingReceipts).toHaveBeenCalledTimes(1);
+    expect(journalDoors.postBookingReceipts).toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+      paymentId: expect.any(String),
+      decision: { collect: true, paymentIntentId: "pi_ledger", effectiveAt: undefined },
+    });
+    const rows = mocks.ledgerCreateMany.mock.calls[0]?.[0]?.data as Array<
+      Record<string, unknown>
+    >;
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.kind === "GUEST_NIGHT")).toBe(true);
+    expect(rows.every((row) => row.side === "CHARGE")).toBe(true);
+    expect(rows.every((row) => row.anchorKind === "CONFIRMATION")).toBe(true);
+    // The lines add up to what the booking says it costs — which is the whole
+    // claim the ledger will eventually replace the mirror columns on.
+    expect(rows.reduce((sum, row) => sum + (row.amountCents as number), 0)).toBe(10000);
+    // #3595: every line is keyed, and the write skips a key already posted, so
+    // a booking that passes the PAID claim twice (a reversed mark-paid, then a
+    // card payment) cannot post its charge lines twice.
+    expect(rows.every((row) => typeof row.postingKey === "string" && row.postingKey !== "")).toBe(true);
+    expect(mocks.ledgerCreateMany.mock.calls[0]?.[0]).toMatchObject({ skipDuplicates: true });
+    // #4627 (R01): the same keys go to the journal, in the settle's transaction, with its pre-resolved context.
+    expect(journalDoors.postBookingLedgerJournal).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ policyVersion: "booking-ledger-bridge-1" }),
+      expect.objectContaining({ bookingId: "booking-1", event: { kind: "confirmation" }, postingKeys: rows.map((row) => row.postingKey) }),
+    );
+  });
+
+  it("posts nothing when the booking's confirmation is already on the ledger (#3595)", async () => {
+    /*
+      The double-post the key alone could not stop. Mark-paid, reverse it (the
+      status goes back to payable), shift the dates — which recreates every
+      night row — then a card payment: the PAID claim succeeds a second time
+      and every per-night key is new. The fence asks the question once per
+      booking, under this settle's lock(1), before anything is planned.
+    */
+    mocks.ledgerFindFirst.mockResolvedValue({ id: "an-earlier-confirmation-line" });
+    const booking = makeStaggeredBooking();
+    mocks.bookingFindUnique.mockResolvedValue({
+      ...booking,
+      lodgeId: "lodge-1",
+      totalPriceCents: 10000,
+      promoAdjustmentCents: 0,
+      guests: booking.guests.map((guest) => ({
+        ...guest,
+        firstName: "Moved",
+        lastName: "Dates",
+        ageTier: "ADULT",
+        rateMembershipTypeId: null,
+        nights: [{ stayDate: parseDateOnly("2026-04-17"), priceCents: 5000 }],
+      })),
+    });
+    mocks.bookingFindMany.mockResolvedValue([]);
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_second_settle",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    expect(result.outcome).toBe("paid");
+    expect(mocks.ledgerFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { bookingId: "booking-1", anchorKind: "CONFIRMATION" },
+      }),
+    );
+    const rows = mocks.ledgerCreateMany.mock.calls[0]?.[0]?.data as unknown[] | undefined;
+    expect(rows ?? []).toEqual([]);
+  });
+
+  it("settles anyway when the charge lines cannot be BUILT, and writes none (#3580)", async () => {
+    /*
+      The half that is genuinely safe to swallow, and the only half.
+
+      A projection carrying no night rows cannot be priced. That throws in pure
+      JavaScript, before any statement reaches Postgres, so the transaction is
+      untouched and the settle — whose capture has already taken the member's
+      money — stands. The booking simply has no lines, which is the coverage
+      gap C4's census (#3583) exists to report.
+
+      THE OTHER HALF IS DELIBERATELY NOT TESTED HERE, because it cannot be:
+      a `createMany` that Postgres refuses aborts the transaction (`25P02`),
+      and no mock of a plain object can reproduce that — a test asserting the
+      settle survived a rejected mock would pass for the wrong reason and say
+      something false about production. So the write is not wrapped at all, on
+      the same rule this file's neighbours state explicitly (see
+      `adult-member-hosting-system-cancellation.ts`: "there is no `try` here on
+      purpose"). Review of #3580 is where that was caught.
+    */
+    const booking = makeStaggeredBooking();
+    mocks.bookingFindUnique.mockResolvedValue({
+      ...booking,
+      lodgeId: "lodge-1",
+      totalPriceCents: 10000,
+      promoAdjustmentCents: 0,
+      // No `nights` at all: the planner cannot price this strand.
+      guests: booking.guests.map((guest) => ({ ...guest, nights: undefined })),
+    });
+    mocks.bookingFindMany.mockResolvedValue([]);
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_ledger_unbuildable",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    expect(result.outcome).toBe("paid");
+    expect(mocks.bookingUpdateMany).toHaveBeenCalled();
+    // Nothing was written, rather than something wrong being written.
+    const rows = mocks.ledgerCreateMany.mock.calls[0]?.[0]?.data as unknown[] | undefined;
+    expect(rows ?? []).toEqual([]);
+  });
+
+  it("clears a stale credit election on the PAID claim and reports it (#2265)", async () => {
+    mocks.bookingFindUnique.mockResolvedValue({
+      ...makeStaggeredBooking(),
+      creditElectionCents: 6000,
+    });
+    mocks.bookingFindMany.mockResolvedValue([]);
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_election",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    expect(result.outcome).toBe("paid");
+    // Guarded claim on the EXACT amount read, so a pay step that consumed the
+    // election a moment earlier is never clobbered.
+    expect(mocks.bookingUpdateMany).toHaveBeenCalledWith({
+      where: { id: "booking-1", creditElectionCents: 6000 },
+      data: { creditElectionCents: null },
+    });
+    // The member's note, keyed on the action booking-history renders.
+    expect(mocks.createAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "booking.credit_election.unapplied",
+        entityId: "booking-1",
+        subjectMemberId: "member-1",
+        category: "payment",
+        details: expect.stringContaining('"creditElectionCents":6000'),
+      })
+    );
+    // And the actionable half: an officer decides whether to refund what is
+    // actually refundable, or leave the credit for the member's next stay.
+    // #2262 delta MED-2 — the figure is CLAMPED to the member's live balance,
+    // which here (the suite default) is nothing at all, so the alert must not
+    // invite a $60 refund against an empty account.
+    expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 0,
+        paymentIntentId: "pi_election",
+        errorMessage: expect.stringContaining("never debited"),
+      }), CLUB_FORMAT_TEST
+    );
+  });
+
+  /**
+   * #2262 delta MED-2, on the STRIPE door — the same reporter serves all three,
+   * so proving the clamp here proves it for the payment-link and invoice-paid
+   * doors too.
+   */
+  it("clamps the reported credit to the member's LIVE balance, never the elected figure (#2265)", async () => {
+    mocks.bookingFindUnique.mockResolvedValue({
+      ...makeStaggeredBooking(),
+      creditElectionCents: 45000,
+    });
+    mocks.bookingFindMany.mockResolvedValue([]);
+    // Elected $450 when the booking was made; $50 left by the time it settled.
+    mocks.getMemberCreditBalance.mockResolvedValue(5000);
+
+    await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_election_clamped",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    expect(mocks.createAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "booking.credit_election.unapplied",
+        metadata: expect.objectContaining({
+          creditElectionCents: 45000,
+          availableCreditCents: 5000,
+          refundableCents: 5000,
+        }),
+      })
+    );
+    expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 5000,
+        errorMessage: expect.stringContaining("at most $50.00"),
+      }), CLUB_FORMAT_TEST
+    );
+  });
+
+  it("writes nothing extra when the booking carries no election (#2265)", async () => {
+    mocks.bookingFindMany.mockResolvedValue([]);
+
+    await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_no_election",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    // NULL is the column's "nothing outstanding" state, which every pre-#2265
+    // row is already in, so the overwhelming majority of settlements must cost
+    // nothing: not even an UPDATE that matches zero rows, and certainly no audit
+    // row or alert claiming a member's credit went unapplied.
+    expect(mocks.bookingUpdateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ creditElectionCents: null }),
+      })
+    );
+    expect(mocks.createAuditLog).not.toHaveBeenCalled();
+    expect(mocks.sendAdminPaymentFailureAlert).not.toHaveBeenCalled();
+  });
+
+  it("clears the saved-card claim marker in the same guarded PAID write (#4993)", async () => {
+    mocks.bookingFindMany.mockResolvedValue([]);
+
+    await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_claimed",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    // Every saved-card promotion — cron, both routes, the webhook — settles here,
+    // so a PAID booking can never look like a stranded claim to recovery.
+    expect(mocks.bookingUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: BookingStatus.PAID, savedCardClaimAt: null }),
+      })
+    );
+  });
+
+  it("pays a staggered booking when only one bed is available on each active guest night", async () => {
+    mocks.bookingFindMany.mockResolvedValue([
+      {
+        id: "existing-booking",
+        status: BookingStatus.PAID,
+        checkIn: parseDateOnly("2026-04-10"),
+        checkOut: parseDateOnly("2026-04-12"),
+        guests: Array.from({ length: LODGE_CAPACITY - 1 }, (_, index) => ({
+          id: `existing-${index}`,
+          stayStart: parseDateOnly("2026-04-10"),
+          stayEnd: parseDateOnly("2026-04-12"),
+        })),
+      },
+    ]);
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_123",
+      amountCents: 10000,
+      paymentMethodId: "pm_123",
+    });
+
+    expect(result).toEqual({
+      outcome: "paid",
+      bookingId: "booking-1",
+      bumpedBookingIds: [],
+    });
+    // #1881 — the PAID claim is a status-guarded updateMany, not a bare update.
+    expect(mocks.bookingUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "booking-1",
+        status: { in: expect.arrayContaining([BookingStatus.PAYMENT_PENDING]) },
+      },
+      data: {
+        status: BookingStatus.PAID,
+        draftExpiresAt: null,
+        savedCardClaimAt: null,
+      },
+    });
+    expect(mocks.refundPaymentTransactions).not.toHaveBeenCalled();
+    expect(mocks.bookingUpdateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: BookingStatus.CANCELLED }),
+      })
+    );
+  });
+
+  // #1881 — a Stripe capture does both tiers of work (status/money + capacity
+  // claim), so it must take BOTH locks, global lock(1) FIRST then the per-lodge
+  // capacity lock. Without lock(1) the capture no longer mutually excluded the
+  // cancel/hold-release/settlement paths that serialise on lock(1).
+  it("takes the global lock(1) before the per-lodge capacity lock (#1881)", async () => {
+    mocks.bookingFindMany.mockResolvedValue([]);
+
+    await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_lockorder",
+      amountCents: 10000,
+      paymentMethodId: "pm_1",
+    });
+
+    const rawCalls = mocks.executeRaw.mock.calls.map((call) => {
+      const first = call[0] as unknown;
+      return Array.isArray(first) ? (first as string[]).join("|") : String(first);
+    });
+    const globalIdx = rawCalls.findIndex((sql) =>
+      sql.includes("pg_advisory_xact_lock(1)")
+    );
+    const lodgeIdx = rawCalls.findIndex((sql) =>
+      sql.includes("hashtextextended")
+    );
+    expect(globalIdx, "global lock(1) present").toBeGreaterThanOrEqual(0);
+    expect(lodgeIdx, "per-lodge lock present").toBeGreaterThanOrEqual(0);
+    expect(
+      globalIdx,
+      "global lock(1) acquired before the per-lodge lock"
+    ).toBeLessThan(lodgeIdx);
+    // #3792: then the member credit-ledger key, before the Payment upsert.
+    expect(mocks.lockMemberCreditLedger).toHaveBeenCalledTimes(1);
+    expect(mocks.executeRaw.mock.invocationCallOrder[lodgeIdx]).toBeLessThan(
+      mocks.lockMemberCreditLedger.mock.invocationCallOrder[0],
+    );
+    expect(mocks.lockMemberCreditLedger.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.paymentUpsert.mock.invocationCallOrder[0],
+    );
+  });
+
+  // #1764 — pay-while-held. An admin capacity hold makes the booking part of
+  // the capacity-holding population while still PAYMENT_PENDING; the payment
+  // claim must count it exactly ONCE: the settlement capacity re-check
+  // excludes the booking's own (held) row, and the PAID flip leaves the hold
+  // fields untouched (set-but-inert — the status clause now holds the beds).
+  it("settles an admin-held booking counting its capacity exactly once and leaving the hold record inert (#1764)", async () => {
+    const heldBooking = {
+      ...makeStaggeredBooking(),
+      adminCapacityHoldAt: parseDateOnly("2026-04-01"),
+      adminCapacityHoldByMemberId: "admin-1",
+    };
+    mocks.bookingFindUnique.mockResolvedValue(heldBooking);
+    // The lodge is otherwise FULL except for the held booking's own beds: if
+    // the claim double-counted the held booking (self-occupancy not
+    // excluded), this capacity re-check would fail and cancel-refund it.
+    mocks.bookingFindMany.mockImplementation(
+      async (args: { where?: { id?: { not?: string } } }) => {
+        // The occupancy query must exclude the settling booking itself.
+        expect(args.where?.id).toEqual({ not: "booking-1" });
+        return [
+          {
+            id: "existing-booking",
+            status: BookingStatus.PAID,
+            checkIn: parseDateOnly("2026-04-10"),
+            checkOut: parseDateOnly("2026-04-12"),
+            guests: Array.from({ length: LODGE_CAPACITY - 1 }, (_, index) => ({
+              id: `existing-${index}`,
+              stayStart: parseDateOnly("2026-04-10"),
+              stayEnd: parseDateOnly("2026-04-12"),
+            })),
+          },
+        ];
+      },
+    );
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_held",
+      amountCents: 10000,
+      paymentMethodId: "pm_held",
+    });
+
+    expect(result).toEqual({
+      outcome: "paid",
+      bookingId: "booking-1",
+      bumpedBookingIds: [],
+    });
+    // The PAID flip must not clear (or otherwise write) the hold fields:
+    // unhold-after-paid is refused at the API and the record stays inert.
+    expect(mocks.bookingUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "booking-1",
+        status: { in: expect.arrayContaining([BookingStatus.PAYMENT_PENDING]) },
+      },
+      data: {
+        status: BookingStatus.PAID,
+        draftExpiresAt: null,
+        savedCardClaimAt: null,
+      },
+    });
+  });
+
+  // #1641 — the effective-price guard. A card booking with applied credit is
+  // captured at finalPrice − applied; the guard must accept that AND the full
+  // price (legacy in-flight intents) while still rejecting any other amount.
+  describe("#1641 applied-credit effective-price guard", () => {
+    const APPLIED = 3000;
+    const FINAL = 10000;
+    const EFFECTIVE = FINAL - APPLIED; // 7000
+
+    function makeCreditBooking() {
+      return {
+        id: "booking-1",
+        memberId: "member-1",
+        status: BookingStatus.PAYMENT_PENDING,
+        lodgeId: "lodge-1",
+        checkIn: parseDateOnly("2026-05-20"),
+        checkOut: parseDateOnly("2026-05-22"),
+        finalPriceCents: FINAL,
+        guests: [],
+        member: { firstName: "Alice", lastName: "Member", email: "alice@example.com" },
+      };
+    }
+
+    beforeEach(() => {
+      mocks.bookingFindUnique.mockResolvedValue(makeCreditBooking());
+      mocks.bookingFindMany.mockResolvedValue([]); // no occupancy -> available
+      mocks.deriveBookingAppliedCreditCents.mockResolvedValue(APPLIED);
+    });
+
+    it("accepts a credit-reduced effective capture and mirrors credit = finalPrice − captured", async () => {
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking-1",
+        paymentIntentId: "pi_effective",
+        amountCents: EFFECTIVE,
+        paymentMethodId: "pm_1",
+      });
+      expect(result.outcome).toBe("paid");
+      // A webhook-first Payment (create branch) carries the split so
+      // amountCents + creditAppliedCents = finalPriceCents.
+      expect(mocks.paymentUpsert.mock.calls[0][0].create).toMatchObject({
+        amountCents: EFFECTIVE,
+        creditAppliedCents: APPLIED,
+      });
+      // #3864: the credit covered exactly what the card did not, so nothing is
+      // given back and the fence is never asked.
+      expect(mocks.giveBackAppliedCredit).not.toHaveBeenCalled();
+      expect(mocks.findAppliedCreditDeallocationFence).not.toHaveBeenCalled();
+    });
+
+    it("still accepts a legacy full-price capture (mirror credit = 0)", async () => {
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking-1",
+        paymentIntentId: "pi_legacy_full",
+        amountCents: FINAL,
+        paymentMethodId: "pm_1",
+      });
+      expect(result.outcome).toBe("paid");
+      expect(mocks.paymentUpsert.mock.calls[0][0].create).toMatchObject({
+        amountCents: FINAL,
+        creditAppliedCents: 0,
+      });
+      // #3864: the card paid it all, so every cent of applied credit goes back
+      // and the existing Payment row's mirror is written to match.
+      const [giveBack] = mocks.giveBackAppliedCredit.mock.calls[0] as unknown as [
+        { giveBackCentsOf: (applied: number) => number },
+      ];
+      expect(giveBack.giveBackCentsOf(3000)).toBe(3000);
+      expect(mocks.paymentUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { creditAppliedCents: 0 } }),
+      );
+    });
+
+    it("holds the credit for an operator, and still settles, when a Xero deallocation fences the give-back (#3864)", async () => {
+      mocks.findAppliedCreditDeallocationFence.mockResolvedValueOnce({ id: "op-1", status: "FAILED" });
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking-1",
+        paymentIntentId: "pi_legacy_full",
+        amountCents: FINAL,
+        paymentMethodId: "pm_1",
+      });
+      expect(result.outcome).toBe("paid");
+      expect(mocks.giveBackAppliedCredit).not.toHaveBeenCalled();
+      expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          amountCents: APPLIED,
+          errorMessage: expect.stringContaining("could not be returned automatically"),
+        }),
+        CLUB_FORMAT_TEST,
+      );
+    });
+
+    it("rejects an amount that is neither full nor effective", async () => {
+      await expect(
+        markBookingPaymentSucceeded({
+          format: CLUB_FORMAT_TEST,
+          bookingId: "booking-1",
+          paymentIntentId: "pi_wrong",
+          amountCents: 5000, // neither 10000 nor 7000
+          paymentMethodId: "pm_1",
+        })
+      ).rejects.toThrow("Payment amount does not match booking total");
+    });
+  });
+
+  it("consumes the POST-lock re-read (not the pre-lock read) for the capacity check (H3)", async () => {
+    // Pre-lock read is a lodgeId-only key select; the buggy order consumed its
+    // (stale) dates. Give the two reads different dates and prove the capacity
+    // occupancy query is scoped by the POST-lock dates.
+    mocks.bookingFindUnique
+      // pre-lock: the code must use ONLY .lodgeId from this read
+      .mockResolvedValueOnce({
+        lodgeId: "lodge-1",
+        checkIn: parseDateOnly("2026-01-01"),
+        checkOut: parseDateOnly("2026-01-03"),
+      })
+      // post-lock: the full re-read the capacity check/claim consume
+      .mockResolvedValueOnce({
+        id: "booking-1",
+        memberId: "member-1",
+        status: BookingStatus.PAYMENT_PENDING,
+        lodgeId: "lodge-1",
+        checkIn: parseDateOnly("2026-05-20"),
+        checkOut: parseDateOnly("2026-05-22"),
+        finalPriceCents: 10000,
+        guests: [],
+        member: { firstName: "Alice", lastName: "Member", email: "alice@example.com" },
+      });
+    mocks.bookingFindMany.mockResolvedValue([]); // no occupancy -> available
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_h3",
+      amountCents: 10000,
+      paymentMethodId: null,
+    });
+
+    expect(result.outcome).toBe("paid");
+    // Pre-lock read selects only the immutable lodge key. The owner the member
+    // credit-ledger key is taken on is NOT immutable (member merge re-points it
+    // under the lodge key), so it comes from the post-lock re-read (#3792).
+    expect(mocks.bookingFindUnique).toHaveBeenNthCalledWith(1, {
+      where: { id: "booking-1" },
+      select: { lodgeId: true },
+    });
+    // The capacity occupancy query is bounded by the POST-lock (May) dates, not
+    // the January dates that only the pre-lock read carried.
+    const occ = mocks.bookingFindMany.mock.calls[0][0];
+    expect(occ.where.checkIn.lt).toEqual(
+      normalizeDateOnlyForTimeZone(parseDateOnly("2026-05-22"), CLUB_ZONE)
+    );
+    expect(occ.where.checkOut.gt).toEqual(
+      normalizeDateOnlyForTimeZone(parseDateOnly("2026-05-20"), CLUB_ZONE)
+    );
+  });
+
+  // Regression for the R1 overbooking carried into #738: a lodge full of
+  // committed (PAID) bookings plus an overlapping PENDING booking (which holds
+  // no capacity and so is not in the occupancy query) must not let an
+  // all-member booking pay into a non-existent bed by bumping the PENDING hold.
+  // It must be cancelled-and-refunded instead.
+  it("cancels-and-refunds an all-member booking that does not fit, never bumping a PENDING hold into room", async () => {
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      status: BookingStatus.PAYMENT_PENDING,
+      checkIn: parseDateOnly("2026-04-10"),
+      checkOut: parseDateOnly("2026-04-12"),
+      finalPriceCents: 10000,
+      guests: [
+        {
+          id: "guest-1",
+          isMember: true,
+          stayStart: parseDateOnly("2026-04-10"),
+          stayEnd: parseDateOnly("2026-04-12"),
+        },
+      ],
+      member: { firstName: "Alice", lastName: "Member", email: "alice@example.com" },
+    });
+
+    // The capacity query filters to capacity-holding statuses, so the
+    // overlapping PENDING booking is intentionally absent here — only the
+    // committed PAID booking that fills the lodge is returned.
+    mocks.bookingFindMany.mockResolvedValue([
+      {
+        id: "committed-full",
+        status: BookingStatus.PAID,
+        checkIn: parseDateOnly("2026-04-10"),
+        checkOut: parseDateOnly("2026-04-12"),
+        guests: Array.from({ length: LODGE_CAPACITY }, (_, index) => ({
+          id: `committed-${index}`,
+          stayStart: parseDateOnly("2026-04-10"),
+          stayEnd: parseDateOnly("2026-04-12"),
+        })),
+      },
+    ]);
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_overbook",
+      amountCents: 10000,
+      paymentMethodId: "pm_123",
+    });
+
+    expect(result.outcome).toBe("cancelled_refunded");
+    expect(result.bumpedBookingIds).toEqual([]);
+    // #4516: the capture's receipt is recorded in full and held, never collected onto a cancelled booking.
+    expect(journalDoors.postBookingReceipts).toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+      paymentId: expect.any(String),
+      decision: { collect: false, paymentIntentId: "pi_overbook", effectiveAt: undefined },
+    });
+    // The booking is cancelled and the payment refunded — never marked PAID.
+    // #1881 — status-guarded updateMany void, not a bare update.
+    expect(mocks.bookingUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "booking-1",
+        status: { in: expect.arrayContaining([BookingStatus.PAYMENT_PENDING]) },
+      },
+      data: {
+        status: BookingStatus.CANCELLED,
+        draftExpiresAt: null,
+        adminCapacityHoldAt: null,
+        adminCapacityHoldByMemberId: null,
+        wholeLodgeHold: false,
+        wholeLodgeHoldAt: null,
+        wholeLodgeHoldByMemberId: null,
+      },
+    });
+    expect(mocks.bookingUpdateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: BookingStatus.PAID }) })
+    );
+    expect(mocks.refundPaymentTransactions).toHaveBeenCalled();
+    // The capacity_failed system void must restore applied credit at 100% — it
+    // calls restoreCreditFromBooking with NO override (exactly 3 args), so the
+    // #1164 cancellation tiering never applies to a system void.
+    expect(mocks.restoreCreditFromBooking).toHaveBeenCalledWith(
+      "member-1",
+      "booking-1",
+      expect.anything()
+    );
+    // #3209 (`INV-HOST-041`). The beds are reconciled on this branch and adult
+    // supervision was not, and it is the branch's OWN omission: the status set
+    // this void claims from includes CONFIRMED — a coverage source — while the
+    // `enqueueOwnHostingCoverageReevaluation` further down the same function is on
+    // the mutually exclusive settle path, which this branch returns before
+    // reaching. Asserting both here is what makes that distinction a regression
+    // test rather than a comment: a whole-file census could not see it.
+    expect(mocks.reconcileHostingForSystemCancellation).toHaveBeenCalledWith(
+      "booking-1",
+      expect.anything()
+    );
+    expect(mocks.enqueueOwnHostingCoverage).not.toHaveBeenCalled();
+    // The post-commit drain is unconditional on this door, so the obligation the
+    // reconcile recorded reaches the officer queue and the owner immediately.
+    expect(mocks.settleHostingCoverage).toHaveBeenCalledWith({
+      bookingId: "booking-1",
+    });
+  });
+
+  // Capacity-race auto-refund durability: when two members race for the last
+  // beds and the loser's payment_intent.succeeded lands after the winner
+  // claimed capacity, the loser's booking is cancelled inside the claim
+  // transaction and auto-refunded inline. That inline Stripe refund is the
+  // member's whole charge — a transient failure (Stripe 5xx / network) must
+  // leave a durable, cron-replayable recovery operation (the #1349
+  // enqueue-then-execute pattern), not just an admin alert email.
+  describe("capacity-race auto-refund durable recovery", () => {
+    function primeCapacityRaceLoss() {
+      mocks.bookingFindUnique.mockResolvedValue({
+        id: "booking-1",
+        memberId: "member-1",
+        status: BookingStatus.PAYMENT_PENDING,
+        checkIn: parseDateOnly("2026-04-10"),
+        checkOut: parseDateOnly("2026-04-12"),
+        finalPriceCents: 10000,
+        guests: [
+          {
+            id: "guest-1",
+            isMember: true,
+            stayStart: parseDateOnly("2026-04-10"),
+            stayEnd: parseDateOnly("2026-04-12"),
+          },
+        ],
+        member: {
+          firstName: "Alice",
+          lastName: "Member",
+          email: "alice@example.com",
+        },
+      });
+      // The winner already committed every bed.
+      mocks.bookingFindMany.mockResolvedValue([
+        {
+          id: "winner-booking",
+          status: BookingStatus.PAID,
+          checkIn: parseDateOnly("2026-04-10"),
+          checkOut: parseDateOnly("2026-04-12"),
+          guests: Array.from({ length: LODGE_CAPACITY }, (_, index) => ({
+            id: `winner-${index}`,
+            stayStart: parseDateOnly("2026-04-10"),
+            stayEnd: parseDateOnly("2026-04-12"),
+          })),
+        },
+      ]);
+    }
+
+    it("enqueues a durable refund-recovery op with the claim-frozen plan inside the cancel transaction, so a transient inline refund failure is replayed by the cron instead of stranding the charge", async () => {
+      primeCapacityRaceLoss();
+      mocks.refundPaymentTransactions.mockRejectedValue(
+        new Error("Stripe is unavailable (503)")
+      );
+
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking-1",
+        paymentIntentId: "pi_race",
+        amountCents: 10000,
+        paymentMethodId: "pm_123",
+      });
+
+      expect(result.outcome).toBe("cancelled_refund_failed");
+      expect(result.capacityRefund).toEqual({ chargedAmountCents: 10000, plannedRefundCents: 10000 });
+      expect(result.refundError).toContain("503");
+
+      // The durable debt was persisted with the transaction client (atomic
+      // with the CANCELLED flip) BEFORE the Stripe call, carrying the frozen
+      // allocation plan and the capacity_claim_failed_<bookingId>_<pi> Stripe
+      // key identity via bookingId + paymentIntentId.
+      expect(
+        mocks.enqueueCapacityClaimFailedRefundRecovery
+      ).toHaveBeenCalledTimes(1);
+      expect(mocks.enqueueCapacityClaimFailedRefundRecovery).toHaveBeenCalledWith(
+        {
+          bookingId: "booking-1",
+          paymentId: "payment-1",
+          paymentIntentId: "pi_race",
+          amountCents: 10000,
+          allocationPlan: [
+            { paymentTransactionId: "txn-1", amountCents: 10000 },
+          ],
+          store: tx,
+        }
+      );
+      // The plan was frozen from the same locked transaction read.
+      expect(mocks.planStripeRefundAllocation).toHaveBeenCalledWith({
+        paymentId: "payment-1",
+        amountCents: 10000,
+        store: tx,
+        heldBackByTransaction: expect.any(Map),
+      });
+
+      // Failure path: the operation stays PENDING for the cron (never marked
+      // succeeded), the inline error is recorded on it for operator
+      // visibility, and the existing admin alert still goes out.
+      expect(
+        mocks.markCapacityClaimFailedRefundRecoverySucceeded
+      ).not.toHaveBeenCalled();
+      expect(
+        mocks.recordCapacityClaimFailedRefundRecoveryInlineError
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({
+          bookingId: "booking-1",
+          paymentIntentId: "pi_race",
+          message: expect.stringContaining("503"),
+        })
+      );
+      expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalled();
+      // #4125: the member's history says the refund is under way, never that it was made.
+      const written = bookingEvents.create.mock.calls.map(([args]) => (args as { data: { type: string; reason: string | null; snapshot: object } }).data);
+      const cancelled = written.find((event) => event.type === "CANCELLED");
+      expect(cancelled?.reason).toBe("These dates filled up before payment could be secured, so the booking was cancelled and the full amount is being refunded.");
+      expect(cancelled?.snapshot).toMatchObject({ policySummary: "These dates were no longer available when payment completed, so the full amount is being refunded.", cancelledBecause: "capacity_race" });
+      expect(written.some((event) => event.type === "REFUNDED")).toBe(false);
+      // #3611: the cancel posts its ledger reversals in its own claim, keeping nothing.
+      expect(cancellationLedger.postCancellationLedgerLines).toHaveBeenCalledWith(
+        expect.objectContaining({ bookingId: "booking-1", keptCents: 0, site: "settle:capacity-void" }),
+      );
+    });
+
+    it("releases the voided booking's promo uses in the void's own transaction, before the hosting seam (#4909)", async () => {
+      primeCapacityRaceLoss();
+      await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST, bookingId: "booking-1", paymentIntentId: "pi_race", amountCents: 10000, paymentMethodId: "pm_123",
+      });
+      // One call covers every code the booking carries (two-code: realdb suite).
+      expect(mocks.releaseBookingPromoRedemptions.mock.calls).toEqual([[tx, "booking-1"]]);
+      expect(mocks.releaseBookingPromoRedemptions.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.reconcileHostingForSystemCancellation.mock.invocationCallOrder[0],
+      );
+    });
+
+    it("reports an empty refund plan without claiming any automatic refund (#4178)", async () => {
+      primeCapacityRaceLoss();
+      mocks.planStripeRefundAllocation.mockResolvedValue({ slices: [], plannedAmountCents: 0, totalRefundableCents: 0 });
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST, bookingId: "booking-1", paymentIntentId: "pi_race", amountCents: 10000, paymentMethodId: "pm_123",
+      });
+      expect(result.outcome).toBe("cancelled_refund_failed");
+      expect(result.capacityRefund).toEqual({ chargedAmountCents: 10000, plannedRefundCents: 0 });
+      expect(mocks.refundPaymentTransactions).not.toHaveBeenCalled();
+      expect(mocks.enqueueCapacityClaimFailedRefundRecovery).not.toHaveBeenCalled();
+    });
+
+    it("executes the inline refund from the frozen plan under the shared capacity_claim_failed Stripe key prefix and closes the pre-persisted operation on success", async () => {
+      primeCapacityRaceLoss();
+
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "booking-1",
+        paymentIntentId: "pi_race",
+        amountCents: 10000,
+        paymentMethodId: "pm_123",
+      });
+
+      expect(result.outcome).toBe("cancelled_refunded");
+      expect(result.capacityRefund).toEqual({ chargedAmountCents: 10000, plannedRefundCents: 10000 });
+      // #4125: made inline, so the REFUNDED event follows the CANCELLED one.
+      expect(bookingEvents.create.mock.calls.map(([args]) => (args as { data: { type: string } }).data.type)).toEqual(["CANCELLED", "REFUNDED"]);
+      // The durable backstop is enqueued unconditionally, before the refund.
+      expect(
+        mocks.enqueueCapacityClaimFailedRefundRecovery
+      ).toHaveBeenCalledTimes(1);
+      // The inline refund replays the frozen slices under the same
+      // `capacity_claim_failed_<bookingId>_<paymentIntentId>` prefix the cron
+      // reconstructs from the persisted operation, with the shared
+      // cron-reconstructible metadata shape — so an ambiguous failure
+      // (refunded on Stripe, response lost) is replayed, never repeated.
+      expect(mocks.refundPaymentTransactions).toHaveBeenCalledWith({
+        paymentId: "payment-1",
+        amountCents: 10000,
+        reason: "requested_by_customer",
+        allocation: [{ paymentTransactionId: "txn-1", amountCents: 10000 }],
+        format: CLUB_FORMAT_TEST,
+        metadata: { bookingId: "booking-1", reason: "capacity_claim_failed" },
+        idempotencyKeyPrefix: "capacity_claim_failed_booking-1_pi_race",
+        obligation: { scope: "capture-return", id: "pi_race" }, // #4516: the R05 the settle posted
+      });
+      // #4516 (M4c): the settle that cancelled for the capacity race posted the capture's return, sized by its plan.
+      expect(journalDoors.postRefundObligation).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({
+        scope: "capture-return", id: "pi_race", amountCents: 10000, debtorRead: "plain" })); // #4516 review F1: after its held R06
+      // Happy-path close of the pre-persisted operation.
+      expect(
+        mocks.markCapacityClaimFailedRefundRecoverySucceeded
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({
+          idempotencyKey: "capacity_claim_failed_refund_recovery_booking-1_pi_race",
+        })
+      );
+      expect(
+        mocks.recordCapacityClaimFailedRefundRecoveryInlineError
+      ).not.toHaveBeenCalled();
+      expect(mocks.sendAdminPaymentFailureAlert).not.toHaveBeenCalled();
+    });
+
+    // #4125: the REFUNDED event says what was refunded - the frozen plan's
+    // total, which is less than the charge when the payment ledger shows less
+    // refundable - never the full charge.
+    it("records the inline REFUNDED event for the planned refund, not the full charge (#4125)", async () => {
+      primeCapacityRaceLoss();
+      mocks.planStripeRefundAllocation.mockResolvedValue({
+        slices: [{ paymentTransactionId: "txn-1", amountCents: 9000 }],
+        plannedAmountCents: 9000,
+        totalRefundableCents: 9000,
+      });
+
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST, bookingId: "booking-1", paymentIntentId: "pi_race", amountCents: 10000, paymentMethodId: "pm_123",
+      });
+
+      expect(result.outcome).toBe("cancelled_refunded");
+      expect(result.capacityRefund).toEqual({ chargedAmountCents: 10000, plannedRefundCents: 9000 });
+      // #4154: the $10.00 no refund covers is a task to check, raised in the void's own claim transaction.
+      expect(shortfallAlert.raiseCapacityRaceRefundShortfallTask).toHaveBeenCalledWith(tx, {
+        bookingId: "booking-1", paymentId: expect.any(String), paymentIntentId: "pi_race", chargedCents: 10000, plannedRefundCents: 9000, format: CLUB_FORMAT_TEST,
+        // #4516 (M4d): the claim's journal context, so the bank part's hand-back R05 posts with it.
+        journal: expect.objectContaining({ currency: "NZD" }),
+      });
+      // #4125: the officers are told about the $10.00 no refund covers - and (#4154) that its task was raised.
+      expect(shortfallAlert.alertCapacityRaceRefundShortfall).toHaveBeenCalledWith(
+        { bookingId: "booking-1", paymentIntentId: "pi_race", chargedCents: 10000, plannedRefundCents: 9000, taskRaised: true },
+        CLUB_FORMAT_TEST,
+      );
+      // The close runs in the event's transaction, so the two commit together.
+      expect(mocks.markCapacityClaimFailedRefundRecoverySucceeded).toHaveBeenCalledWith({ idempotencyKey: "capacity_claim_failed_refund_recovery_booking-1_pi_race", sentPlan: [{ paymentTransactionId: "txn-1", amountCents: 9000 }], store: tx });
+      const refunded = bookingEvents.create.mock.calls
+        .map(([args]) => (args as { data: { type: string; amountCents: number | null; reason: string | null } }).data)
+        .filter((event) => event.type === "REFUNDED");
+      expect(refunded).toEqual([
+        expect.objectContaining({ amountCents: 9000, reason: "Automatic refund after lodge capacity was no longer available." }),
+      ]);
+
+      // The member's page, from exactly what this settle wrote: paid, refunded, and the rest followed up.
+      const written = bookingEvents.create.mock.calls.map(([args]) => (args as { data: Omit<NarrativeEvent, "occurredAt"> }).data);
+      expect(written.find((event) => event.type === "CANCELLED")?.snapshot).toMatchObject({ paidAmountCents: 10000, settledAmountCents: 9000, retainedAmountCents: 0 });
+      const narrative = resolveBookingNarrative({
+        club: bindClubTime(requireClubTimeZone("Pacific/Auckland"), CLUB_FORMAT_TEST),
+        booking: { status: "CANCELLED", finalPriceCents: 10000, amountOwed: { owedCents: 0, dueCents: 0, appliedCreditCents: 0 }, checkIn: new Date("2026-04-10T00:00:00.000Z"), checkOut: new Date("2026-04-12T00:00:00.000Z"), firstName: "Alice", adminReviewStatus: null, adminReviewNotes: null, adminReviewReason: null },
+        events: written.map((event) => ({ ...event, occurredAt: new Date("2026-05-05T00:00:00.000Z") })),
+      }, CLUB_FORMAT_TEST);
+      expect(narrative.message).toBe(
+        "This booking was cancelled on 5 May 2026, after you paid $100.00 on 5 May 2026, because the dates filled up while your payment was going through. $90.00 was refunded to your card on 5 May 2026; the club will be in touch about the remaining $10.00. No further payment is required.",
+      );
+    });
+
+    // #4125: the event is the close's - written only by the close that moved
+    // the row to SUCCEEDED. A close the runner already made (count 0), or one
+    // that failed, leaves the event to the runner's own close.
+    it.each([
+      ["the runner already closed the row", () => mocks.markCapacityClaimFailedRefundRecoverySucceeded.mockResolvedValue({ count: 0 })],
+      ["the close failed", () => mocks.markCapacityClaimFailedRefundRecoverySucceeded.mockRejectedValue(new Error("db down"))],
+    ])("writes no inline REFUNDED event when %s (#4125)", async (_label, arrange) => {
+      primeCapacityRaceLoss();
+      arrange();
+
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST, bookingId: "booking-1", paymentIntentId: "pi_race", amountCents: 10000, paymentMethodId: "pm_123",
+      });
+
+      expect(result.outcome).toBe("cancelled_refunded");
+      expect(bookingEvents.create.mock.calls.map(([args]) => (args as { data: { type: string } }).data.type)).toEqual(["CANCELLED"]);
+    });
+
+    // #4125: the close and its REFUNDED insert are one transaction (the
+    // rollback itself is proved against PostgreSQL in
+    // `capacity-race-refund-event.realdb.test.ts`). Here: a refused insert is
+    // logged, the settle still reports the refund made, and nothing throws.
+    it("a refused REFUNDED insert is logged and the refund still reads made (#4125)", async () => {
+      primeCapacityRaceLoss();
+      // The CANCELLED event first, then the REFUNDED insert, refused once.
+      bookingEvents.create.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("insert refused"));
+
+      const result = await markBookingPaymentSucceeded({
+        format: CLUB_FORMAT_TEST, bookingId: "booking-1", paymentIntentId: "pi_race", amountCents: 10000, paymentMethodId: "pm_123",
+      });
+
+      expect(result.outcome).toBe("cancelled_refunded");
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ bookingId: "booking-1", paymentIntentId: "pi_race", err: expect.objectContaining({ message: "insert refused" }) }),
+        "Failed to close the capacity race's refund recovery operation after its inline refund was made; the recovery runner will replay the frozen plan idempotently",
+      );
+      expect(bookingEvents.create.mock.calls.map(([args]) => (args as { data: { type: string } }).data.type)).toEqual(["CANCELLED", "REFUNDED"]);
+    });
+
+    // #4103 (`INV-PAY-130`): Stripe answers a slice `failed` or `canceled`
+    // without throwing. The pre-persisted row stays open, re-planned on the
+    // refused slice's next key; the door reports a failure (no close, so no
+    // REFUNDED event after it), and its own failure alert is the one alert.
+    describe("a capacity-race refund Stripe refuses (#4103)", () => {
+      const a = { paymentTransactionId: "txn-1", amountCents: 6000 };
+      const b = { paymentTransactionId: "txn-2", amountCents: 4000 };
+      const answer = (slice: typeof a, status: string) => ({
+        status,
+        slice,
+        refundId: `re_${slice.paymentTransactionId}`,
+        paymentIntentId: "pi_race",
+        amountCents: slice.amountCents,
+      });
+      const settle = () =>
+        markBookingPaymentSucceeded({
+          format: CLUB_FORMAT_TEST,
+          bookingId: "booking-1",
+          paymentIntentId: "pi_race",
+          amountCents: 10000,
+          paymentMethodId: "pm_123",
+        });
+      const replanned = () => (refusalReplan.updateMany.mock.calls[0]?.[0] as { where: unknown; data: { allocationPlan: unknown } } | undefined);
+
+      beforeEach(() => {
+        primeCapacityRaceLoss();
+        refusalReplan.updateMany.mockReset().mockResolvedValue({ count: 1 });
+        mocks.planStripeRefundAllocation.mockResolvedValue({ slices: [a, b], plannedAmountCents: 10000, totalRefundableCents: 10000 });
+      });
+
+      it("a clean refusal: not closed, re-planned on the next key, reported failed and alerted once", async () => {
+        mocks.refundPaymentTransactions.mockResolvedValue({ refunds: [answer(a, "failed"), answer(b, "canceled")] });
+
+        const result = await settle();
+
+        expect(result.outcome).toBe("cancelled_refund_failed");
+        expect(result.refundError).toMatch(/Stripe refused \$100\.00 .*still owed/);
+        expect(mocks.markCapacityClaimFailedRefundRecoverySucceeded).not.toHaveBeenCalled();
+        expect(replanned()).toEqual({
+          where: {
+            idempotencyKey: buildCapacityClaimFailedRefundRecoveryIdempotencyKey("booking-1", "pi_race"),
+            status: "PENDING",
+            attempts: 0,
+            allocationPlan: { equals: Prisma.DbNull },
+          },
+          data: { allocationPlan: [{ ...a, stripeKeySuffix: "refused1" }, { ...b, stripeKeySuffix: "refused1" }], lastError: result.refundError },
+        });
+        expect(mocks.recordCapacityClaimFailedRefundRecoveryInlineError).toHaveBeenCalledWith(
+          expect.objectContaining({ message: expect.stringMatching(/Stripe refused/) }),
+        );
+        expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalledTimes(1);
+      });
+
+      it("one made beside one refused: the made slice is marked, never sent again; the alert names only the refusal", async () => {
+        mocks.refundPaymentTransactions.mockResolvedValue({ refunds: [answer(a, "succeeded"), answer(b, "failed")] });
+
+        const result = await settle();
+
+        expect(result.outcome).toBe("cancelled_refund_failed");
+        expect(replanned()?.data.allocationPlan).toEqual([{ ...a, madeRefundId: "re_txn-1" }, { ...b, stripeKeySuffix: "refused1" }]);
+        expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalledWith(
+          expect.objectContaining({ errorMessage: expect.stringMatching(/Stripe refused \$40\.00/) }),
+          CLUB_FORMAT_TEST,
+        );
+        expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalledTimes(1);
+      });
+
+      it("refused then thrown: the refusal moves, the slice that threw keeps its key, and the alert names both", async () => {
+        mocks.refundPaymentTransactions.mockRejectedValue(
+          Object.assign(new Error("Refund failed after $0.00 was refunded and recorded: network"), { refunds: [answer(a, "failed")] }),
+        );
+
+        const result = await settle();
+
+        expect(result.outcome).toBe("cancelled_refund_failed");
+        expect(replanned()?.data.allocationPlan).toEqual([{ ...a, stripeKeySuffix: "refused1" }, b]);
+        expect(result.refundError).toMatch(/Stripe refused \$60\.00.*network/);
+        expect(mocks.sendAdminPaymentFailureAlert).toHaveBeenCalledTimes(1);
+      });
+
+      it("a replay whose row a worker already holds moves nothing and stays quiet: the worker alerts as it moves the slice", async () => {
+        mocks.refundPaymentTransactions.mockResolvedValue({ refunds: [answer(a, "failed"), answer(b, "failed")] });
+        refusalReplan.updateMany.mockResolvedValue({ count: 0 });
+
+        const result = await settle();
+
+        expect(result.outcome).toBe("cancelled_refund_failed");
+        expect(mocks.markCapacityClaimFailedRefundRecoverySucceeded).not.toHaveBeenCalled();
+        expect(mocks.sendAdminPaymentFailureAlert).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  // #1771 — a booking deliberately admitted above the ceiling by an admin
+  // carries a persisted capacityOverriddenAt marker. The settlement capacity
+  // re-check must NOT cancel-and-refund it: it settles to PAID exactly as if it
+  // fit, and logs that it skipped the capacity cancel.
+  it("settles an over-capacity booking with a persisted capacity override to PAID instead of cancelling (#1771)", async () => {
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "booking-1",
+      memberId: "member-1",
+      status: BookingStatus.PAYMENT_PENDING,
+      checkIn: parseDateOnly("2026-04-10"),
+      checkOut: parseDateOnly("2026-04-12"),
+      finalPriceCents: 10000,
+      // Deliberately admitted over the ceiling by an admin (#1668/#1767).
+      capacityOverriddenAt: parseDateOnly("2026-04-01"),
+      capacityOverriddenByMemberId: "admin-1",
+      guests: [
+        {
+          id: "guest-1",
+          isMember: true,
+          stayStart: parseDateOnly("2026-04-10"),
+          stayEnd: parseDateOnly("2026-04-12"),
+        },
+      ],
+      member: { firstName: "Alice", lastName: "Member", email: "alice@example.com" },
+    });
+
+    // The lodge is full: without the override this would cancel-and-refund.
+    mocks.bookingFindMany.mockResolvedValue([
+      {
+        id: "committed-full",
+        status: BookingStatus.PAID,
+        checkIn: parseDateOnly("2026-04-10"),
+        checkOut: parseDateOnly("2026-04-12"),
+        guests: Array.from({ length: LODGE_CAPACITY }, (_, index) => ({
+          id: `committed-${index}`,
+          stayStart: parseDateOnly("2026-04-10"),
+          stayEnd: parseDateOnly("2026-04-12"),
+        })),
+      },
+    ]);
+
+    const result = await markBookingPaymentSucceeded({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "booking-1",
+      paymentIntentId: "pi_override",
+      amountCents: 10000,
+      paymentMethodId: "pm_123",
+    });
+
+    expect(result.outcome).toBe("paid");
+    expect(mocks.bookingUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "booking-1",
+        status: { in: expect.arrayContaining([BookingStatus.PAYMENT_PENDING]) },
+      },
+      data: {
+        status: BookingStatus.PAID,
+        draftExpiresAt: null,
+        savedCardClaimAt: null,
+      },
+    });
+    // Never cancelled, never refunded.
+    expect(mocks.bookingUpdateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: BookingStatus.CANCELLED }),
+      })
+    );
+    expect(mocks.refundPaymentTransactions).not.toHaveBeenCalled();
+    expect(mocks.restoreCreditFromBooking).not.toHaveBeenCalled();
+    // The skip is logged.
+    expect(logger.info).toHaveBeenCalledWith(
+      { bookingId: "booking-1" },
+      expect.stringContaining("persisted capacity override (#1771)")
+    );
+  });
+});
+
+// #3266 / INV-PAY-052 — the card stamp is guarded on the row still naming the
+// SetupIntent whose card it writes, and it never writes the intent id itself.
+describe("markBookingSetupIntentSucceeded", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const stamp = () =>
+    markBookingSetupIntentSucceeded({
+      bookingId: "booking-1",
+      setupIntentId: "seti_1",
+      paymentMethodId: "pm_1",
+    });
+
+  it("stamps the card only onto a row that still names this intent, and writes nothing else", async () => {
+    mocks.paymentUpdateMany.mockResolvedValue({ count: 1 });
+
+    await expect(stamp()).resolves.toEqual({ stamped: true });
+
+    expect(mocks.paymentUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.paymentUpdateMany).toHaveBeenCalledWith({
+      where: { bookingId: "booking-1", stripeSetupIntentId: "seti_1" },
+      data: { stripePaymentMethodId: "pm_1" },
+    });
+    expect(logger.info).not.toHaveBeenCalled();
+  });
+
+  it("is a logged no-op when the row has moved on to another intent (a redelivered webhook)", async () => {
+    mocks.paymentUpdateMany.mockResolvedValue({ count: 0 });
+
+    await expect(stamp()).resolves.toEqual({ stamped: false });
+
+    expect(logger.info).toHaveBeenCalledWith(
+      { bookingId: "booking-1", setupIntentId: "seti_1", paymentMethodId: "pm_1" },
+      expect.stringContaining("no longer the one the booking's payment row names"),
+    );
+  });
+});

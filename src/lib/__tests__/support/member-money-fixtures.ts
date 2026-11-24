@@ -1,0 +1,207 @@
+/**
+ * Shared member-money journal fixtures for tests (#4626, Ledger M3a): a posting
+ * context on the frozen clock, plan builders for the common batch shapes, and a
+ * scratch PostgreSQL database holding only the journal migration, stub parent
+ * tables and the provisioned roles.
+ *
+ * The scratch database proves the engine against the journal's own constraints.
+ * Its stub parents carry no booking columns, so it is NOT for door suites: those
+ * run on the fully migrated race database, post through the plan builders here,
+ * and tear down through `booking-financial-history-teardown.ts`, as
+ * `booking-financial-history.realdb.test.ts` does.
+ */
+import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { Client } from "pg";
+import { CLUB_TAX_SETTINGS_DEFAULTS, type ClubTaxPeriod, type ClubTaxSchedule } from "@/lib/club-tax-settings";
+import { clubCalendarDateOf, requireClubTimeZone, requireInstant, type CalendarDate } from "@/lib/club-time";
+import { buildDatabaseRolesSql } from "@/lib/database-roles";
+import {
+  resolveMemberMoneyPostingContext,
+  type MemberMoneyDebtor,
+  type MemberMoneyPlan,
+  type MemberMoneyPostingContext,
+  type MemberMoneySource,
+} from "@/lib/member-money";
+import type { MemberMoneyEventKey } from "@/lib/member-money/internal/keys";
+import { FROZEN_TEST_CLOCK_BASE_ISO } from "../helpers/clock";
+import { CLUB_FORMAT_TEST } from "./club-format-fixture";
+import { assertSafeRaceDbUrl } from "./race-db-url";
+import { runEveryTeardownStep } from "./teardown-steps";
+
+export const MEMBER_MONEY_JOURNAL_MIGRATION = "prisma/migrations/20261127010000_member_money_journal/migration.sql";
+
+const TEST_ZONE = requireClubTimeZone("Pacific/Auckland");
+
+/** The frozen clock's club date: the tax anchor of every fixture booking charge unless a test names another (#4632). */
+export const MEMBER_MONEY_TEST_TAX_ANCHOR: CalendarDate = clubCalendarDateOf(requireInstant(FROZEN_TEST_CLOCK_BASE_ISO), TEST_ZONE);
+
+/**
+ * A context resolved as a door resolves it before its transaction, on the frozen
+ * test clock. `taxSettings` overrides the one baseline period; `taxSchedule`
+ * gives a whole schedule instead (#4632).
+ */
+export function memberMoneyTestContext(
+  overrides: { taxSettings?: Partial<ClubTaxPeriod>; taxSchedule?: ClubTaxSchedule; effectiveAt?: string } = {},
+): MemberMoneyPostingContext {
+  return resolveMemberMoneyPostingContext({
+    effectiveAt: requireInstant(overrides.effectiveAt ?? FROZEN_TEST_CLOCK_BASE_ISO),
+    zone: TEST_ZONE,
+    format: CLUB_FORMAT_TEST,
+    policyVersion: "policy-test-1",
+    codingVersion: "coding-test-1",
+    taxSchedule: overrides.taxSchedule ?? [{
+      ...CLUB_TAX_SETTINGS_DEFAULTS,
+      // An unregistered period names no Xero code (the schema's CHECK).
+      ...(overrides.taxSettings?.gstRegistered === false ? { xeroTaxType: null } : {}),
+      ...overrides.taxSettings,
+    }],
+  });
+}
+
+/**
+ * A booking charge as R01 posts one: Dr receivable for the total against a new
+ * charge obligation, Cr booking revenue for each component at its gross (split
+ * by the treatment in force on its tax anchor, the frozen clock's date unless
+ * given, into net revenue and GST).
+ */
+export function bookingChargePlan(input: {
+  eventKey: MemberMoneyEventKey;
+  debtor: MemberMoneyDebtor;
+  grossCents: number;
+  /** Components the gross is made of; one `<eventKey>:nights` component by default. */
+  components?: readonly { chargeIdentity: string; grossCents: number }[];
+  booking?: { bookingId: string; lodgeId: string };
+  source?: MemberMoneySource;
+  additionalSources?: MemberMoneySource[];
+  taxAnchorDate?: CalendarDate;
+}): Extract<MemberMoneyPlan, { legs: unknown }> {
+  const components = input.components ?? [{ chargeIdentity: `${input.eventKey}:nights`, grossCents: input.grossCents }];
+  const obligationKey = `${input.eventKey}:obligation`;
+  const revenueSource = input.additionalSources?.find((source) => source.kind === "BOOKING_LEDGER");
+  return {
+    kind: "CHARGE",
+    eventKey: input.eventKey,
+    origin: "APP",
+    source: input.source ?? { kind: "BOOKING", id: input.booking?.bookingId ?? input.eventKey, version: input.eventKey },
+    additionalSources: input.additionalSources,
+    reason: "test booking charge",
+    obligations: [{ key: obligationKey, kind: "CHARGE", debtor: input.debtor, faceCents: input.grossCents, evidence: { test: true } }],
+    legs: [
+      {
+        type: "amount", account: "MEMBER_RECEIVABLE", side: "DEBIT", amountCents: input.grossCents,
+        debtor: input.debtor, obligationKey, booking: input.booking, evidence: { test: "receivable" },
+      },
+      ...components.map(({ chargeIdentity, grossCents }) => ({
+        type: "revenue" as const, account: "BOOKING_REVENUE" as const, side: "CREDIT" as const, grossCents,
+        booking: input.booking, chargeIdentity, source: revenueSource,
+        taxAnchorDate: input.taxAnchorDate ?? MEMBER_MONEY_TEST_TAX_ANCHOR, evidence: { test: "nights" },
+      })),
+    ],
+  };
+}
+
+/** A unique scratch database name; a suite that needs its role names at collection time picks it up front. */
+export function memberMoneyScratchName(prefix: string): string {
+  return `${prefix}_${randomBytes(5).toString("hex")}`;
+}
+
+export function memberMoneyScratchRoles(name: string) {
+  return { migrator: `${name}_migration`, app: `${name}_app`, retention: `${name}_retention` };
+}
+
+export interface MemberMoneyScratchDatabase {
+  name: string;
+  roles: { migrator: string; app: string; retention: string };
+  /** The race server, connected to its maintenance database. */
+  admin: Client;
+  /** The scratch database as its owner. */
+  owner: Client;
+  /** A URL for the scratch database as the INSERT/SELECT-only application role. */
+  appUrl: string;
+  /**
+   * Ends the owner connection, drops the database and each role, and ends the
+   * admin connection, attempting every step even after one fails; it logs and
+   * then throws what it could not do (#5349).
+   */
+  drop(): Promise<void>;
+}
+
+/**
+ * The hook timeout for a suite that creates and drops a member-money scratch
+ * database: `drop()` force-drops the database and then each role, which a loaded
+ * runner can stretch past vitest's 10-second hook default (#5283).
+ */
+export const MEMBER_MONEY_SCRATCH_HOOK_TIMEOUT_MS = 30_000;
+
+/**
+ * A disposable database on the race server holding the journal migration, the
+ * M4a reservation migration, the stub parents they reference (`Lodge`,
+ * `Booking`, `BookingLedgerLine`, `AuditLog`, `Payment`, `PaymentTransaction`,
+ * `PaymentRefund`) and the least-privilege roles provisioning creates. The full
+ * migration history is rehearsed in `database-roles.realdb.test.ts`.
+ */
+export async function createMemberMoneyScratchDatabase(
+  url: string,
+  label: string,
+  name = memberMoneyScratchName("mm"),
+): Promise<MemberMoneyScratchDatabase> {
+  assertSafeRaceDbUrl(url, label);
+  const roles = memberMoneyScratchRoles(name);
+  const admin = new Client({ connectionString: url });
+  await admin.connect();
+  const ownerUrl = new URL(url);
+  ownerUrl.pathname = `/${name}`;
+  const owner = new Client({ connectionString: ownerUrl.toString() });
+  let connected = false;
+  const drop = () => runEveryTeardownStep(`member-money scratch ${name}`, [
+    { what: "end the owner connection", run: () => (connected ? owner.end() : undefined) },
+    { what: `drop database "${name}"`, run: () => admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`) },
+    ...Object.values(roles).map((role) => ({ what: `drop role "${role}"`, run: () => admin.query(`DROP ROLE IF EXISTS "${role}"`) })),
+    { what: "end the admin connection", run: () => admin.end() },
+  ]);
+  try {
+    await admin.query(`CREATE DATABASE "${name}"`);
+    await owner.connect();
+    connected = true;
+    await owner.query(`CREATE TABLE "Lodge" (id text PRIMARY KEY);
+      CREATE TABLE "Booking" (id text PRIMARY KEY, "lodgeId" text REFERENCES "Lodge"(id));
+      CREATE TABLE "BookingLedgerLine" (id text PRIMARY KEY);
+      CREATE TABLE "GroupBookingSettlement" (id text PRIMARY KEY);
+      CREATE TABLE "AuditLog" (id text PRIMARY KEY, "ipAddress" text, "userAgent" text)`);
+    await owner.query(`CREATE TABLE "Payment" (id text PRIMARY KEY, "bookingId" text UNIQUE REFERENCES "Booking"(id));
+      CREATE TABLE "PaymentTransaction" (id text PRIMARY KEY, "paymentId" text REFERENCES "Payment"(id), "stripePaymentIntentId" text);
+      CREATE TABLE "PaymentRefund" (id text PRIMARY KEY, "stripeRefundId" text UNIQUE, "stripePaymentIntentId" text, "paymentId" text REFERENCES "Payment"(id))`);
+    await owner.query(readFileSync(MEMBER_MONEY_JOURNAL_MIGRATION, "utf8"));
+    await owner.query(readFileSync("prisma/migrations/20261210080000_member_money_applications/migration.sql", "utf8"));
+    await owner.query(readFileSync("prisma/migrations/20261221030000_member_money_export_manifest/migration.sql", "utf8"));
+    await owner.query(readFileSync("prisma/migrations/20261222050000_member_money_export_supplementary/migration.sql", "utf8"));
+    await owner.query(readFileSync("prisma/migrations/20261223010000_member_money_refund_note_manifest/migration.sql", "utf8"));
+    await owner.query(readFileSync("prisma/migrations/20261223050000_member_money_capture_receipt_manifest/migration.sql", "utf8"));
+    await owner.query(readFileSync("prisma/migrations/20270105100000_member_money_export_combined_group_role/migration.sql", "utf8"));
+    await owner.query(readFileSync("prisma/migrations/20270105100100_member_money_export_coverage_release/migration.sql", "utf8"));
+    const statements = buildDatabaseRolesSql({
+      databaseName: name,
+      migrator: { roleName: roles.migrator, password: "m".repeat(28) },
+      app: { roleName: roles.app, password: "a".repeat(28) },
+      auditRetention: { roleName: roles.retention, password: "r".repeat(28) },
+    });
+    await owner.query("BEGIN");
+    try {
+      for (const statement of statements) await owner.query(statement);
+      await owner.query("COMMIT");
+    } catch (error) {
+      await owner.query("ROLLBACK");
+      throw error;
+    }
+  } catch (error) {
+    // Nothing a half-built scratch database made may outlive the failure. A
+    // clean-up failure is logged by drop() and must not hide the set-up error.
+    await drop().catch(() => {});
+    throw error;
+  }
+  const appUrl = new URL(ownerUrl);
+  appUrl.username = roles.app;
+  appUrl.password = "a".repeat(28);
+  return { name, roles, admin, owner, appUrl: appUrl.toString(), drop };
+}

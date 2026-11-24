@@ -1,0 +1,653 @@
+"use client";
+
+import { useEffect, useRef } from "react";
+import Link from "next/link";
+import { Alert } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { FocusedActionError } from "@/components/focused-action-error";
+import { StatusRegion } from "@/components/status-region";
+import { scrollToError } from "@/hooks/use-scroll-to-feedback";
+import { buildProfilePathWithReturnTo } from "@/lib/internal-return-path";
+import { useHelpWidgetHint } from "@/components/help-widget/help-widget-context";
+import { DatesStep } from "./_components/dates-step";
+import { GuestsStep } from "./_components/guests-step";
+import { WaitlistAlternateLodges } from "./_components/waitlist-alternate-lodges";
+import { ReviewStep } from "./_components/review-step";
+import { PayStep } from "./_components/pay-step";
+import {
+  hasWizardErrorActions,
+  WizardErrorActions,
+} from "./_components/wizard-error-actions";
+import { BOOKING_WIZARD_ERROR_ID } from "@/components/book/booking-wizard-types";
+import { RestoredWorkNotice } from "./_components/restored-work-notice";
+import { useBookingWizard } from "./_hooks/use-booking-wizard";
+
+const PROFILE_RETURN_TO_BOOK = buildProfilePathWithReturnTo("/book");
+
+export default function BookPage() {
+  const {
+    step,
+    setStep,
+    createdBooking,
+    checkIn,
+    checkOut,
+    guests,
+    notes,
+    setNotes,
+    priceQuote,
+    priceLoading,
+    error,
+    errorAttentionKey,
+    reviewReasonMissing,
+    errorPaymentTargets,
+    subscriptionInvoiceUrl,
+    subscriptionInvoiceNumber,
+    submitting,
+    savingDraft,
+    showWaitlistPrompt,
+    setShowWaitlistPrompt,
+    waitlistFullNights,
+    joiningWaitlist,
+    waitlistOnly,
+    capacityShortNights,
+    capacityShortMessage,
+    perGuestDatesEnabled,
+    handlePerGuestDatesEnabledChange,
+    multiDateRangesEnabled,
+    handleMultiDateRangesEnabledChange,
+    appliedPromos,
+    setAppliedPromos,
+    combineWorkPartyWithCodes,
+    setMultiPromoCodes,
+    expectedArrivalTime,
+    setExpectedArrivalTime,
+    requestedRoomId,
+    setRequestedRoomId,
+    cancelIfGuestsBumped,
+    setCancelIfGuestsBumped,
+    roomOptions,
+    roomRequestEnabled,
+    useCredit,
+    setUseCredit,
+    paymentMethod,
+    setPaymentMethod,
+    internetBankingEnabled,
+    groupBookingsEnabled,
+    groupTrip,
+    setGroupTrip,
+    groupPaymentMode,
+    setGroupPaymentMode,
+    internetBankingUnavailableReason,
+    internetBankingHoldSummary,
+    familyMembers,
+    dependantIdentityCollisions,
+    declaredDependantMemberIds,
+    bookCollidingGuestAsDependant,
+    declareDependantDifferentPerson,
+    withdrawDependantDeclaration,
+    subscriptionStatus,
+    subscriptionLoading,
+    availablePromoCodes,
+    promoCodesEnabled,
+    activeWorkPartyEvents,
+    attendingWorkParty,
+    setAttendingWorkParty,
+    selectedWorkPartyEventId,
+    setSelectedWorkPartyEventId,
+    workPartyError,
+    setWorkPartyError,
+    workPartyClearedNotice,
+    setWorkPartyClearedNotice,
+    guestProfileBlocks,
+    memberNightConflicts,
+    removingConflictGuestId,
+    memberReviewJustification,
+    setMemberReviewJustification,
+    requiresAdminReviewLocal,
+    handleGuestsChange,
+    addFamilyMemberAsGuest,
+    addMemberGuest,
+    memberGuestConfig,
+    familyMembersLoaded,
+    familyMembersLoadFailed,
+    retryFamilyMembersLoad,
+    memberGuestAddError,
+    handleRemoveConflictGuest,
+    handleDateSelect,
+    handleGuestsDone,
+    handleSubmit,
+    handleJoinWaitlist,
+    handleSaveAsDraft,
+    exceptionOffer,
+    replaceExceptionRequestId,
+    workPartyPrefillNotice,
+    submitExceptionRequest,
+    getGuestProfileBlockMessage,
+    getGuestProfileActionLabel,
+    nights,
+    availableCreditCents,
+    appliedCreditCents,
+    remainingToPay,
+    bookingDateStrings,
+    reviewGuestPayload,
+    cardPaymentDescription,
+    internetBankingPaymentDescription,
+    internetBankingUnavailableCopy,
+    subscriptionIsUnpaid,
+    subscriptionLockout,
+    bookingBlockedBySubscription,
+    showInviteFamilyGroupMembersLink,
+    showPaymentMethodChoice,
+    wizardSteps,
+    activeStepIndex,
+    lodgeCapacity,
+    lodges,
+    lodgeId,
+    lodgesLoading,
+    lodgeScope,
+    lodgeUnresolved,
+    retryLodgeOptions,
+    handleLodgeChange,
+    selectedLodge,
+    lodgeLabel,
+    cancellationSchedule,
+    waitlistAlternateLodgeIds,
+    setWaitlistAlternateLodgeIds,
+    restoredWorkNotice,
+    startAgain,
+  } = useBookingWizard();
+
+  // Hint the help widget which wizard step is active so its chips lead with the
+  // questions tagged for that step (epic #2094 C2). `step` is the wizard step id
+  // ("dates" | "guests" | "review" | "pay").
+  useHelpWidgetHint({ group: step });
+
+  // #2543 — the same unpaid subscription means three different things depending
+  // on the club's lockout mode, so the banner below cannot keep saying "pay it
+  // before booking": that is only true under HARD_BLOCK. An absent or
+  // unrecognised mode resolves to HARD_BLOCK, today's copy, so an older cached
+  // subscription-status response cannot silently drop a warning that still
+  // holds. The hook reads the mode once (`readSubscriptionLockoutView`) and
+  // derives `bookingBlockedBySubscription` from that same view (#4941).
+
+  // Built once so the two doors to the waitlist offer the same control with the
+  // same state (#2930 fix round). Null when there is no second eligible lodge.
+  const waitlistAlternateLodges = (
+    <WaitlistAlternateLodges
+      lodges={lodges}
+      lodgeId={lodgeId}
+      waitlistAlternateLodgeIds={waitlistAlternateLodgeIds}
+      setWaitlistAlternateLodgeIds={setWaitlistAlternateLodgeIds}
+      disabled={joiningWaitlist}
+    />
+  );
+
+  // #4945: the 409 "fully booked" card is drawn above the step indicator, so a
+  // member who pressed Continue at the foot of the review step would never see
+  // it. Each refused create retires the card before it posts, so every 409 is
+  // a fresh false-to-true arrival here. Deliberately NOT keyed on
+  // `errorAttentionKey`: a Join Waitlist refused from inside this card raises
+  // the error box above it, and that explanation must keep the focus.
+  const waitlistPromptRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!showWaitlistPrompt) return;
+    scrollToError(waitlistPromptRef, { block: "center" });
+  }, [showWaitlistPrompt]);
+
+  const exceptionOffered = exceptionOffer !== null;
+  const hasErrorActions = hasWizardErrorActions({
+    lodgeUnresolved,
+    guestProfileBlocks,
+    memberNightConflicts,
+    errorPaymentTargets,
+    exceptionOffered,
+  });
+
+  return (
+    <div className="max-w-3xl space-y-6">
+      <div className="space-y-1">
+        <Link
+          href="/dashboard"
+          className="text-sm text-muted-foreground hover:text-foreground"
+        >
+          &larr; Back to Dashboard
+        </Link>
+        <h1 className="text-3xl font-bold">Book a Stay</h1>
+      </div>
+
+      {/* #2263 — whole-lodge entry point. A separate door, not a wizard step:
+          the wizard books beds against live availability, while this asks the
+          booking officer for sole occupancy and shows the member no availability
+          at all (ADR-001 decision 6). Shown to every signed-in member. */}
+      <Card>
+        <CardContent className="flex flex-col gap-3 pt-6 sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-1">
+            <h2 className="font-semibold">Need the whole lodge?</h2>
+            <p className="text-sm text-muted-foreground">
+              For a course, a club trip or a family gathering, ask the booking
+              officer about having the lodge to yourselves.
+            </p>
+          </div>
+          <Button asChild variant="outline" className="shrink-0">
+            <Link href="/book/whole-lodge">Book the whole lodge</Link>
+          </Button>
+        </CardContent>
+      </Card>
+
+      {/* Subscription warning banner.
+
+          #2543 made this mode-aware. "Pay it before booking" / "contact the club
+          before booking" is only TRUE under HARD_BLOCK. Under
+          NON_MEMBER_PRICING the member may book — they are simply charged
+          non-member rates — and under NO_BLOCK the subscription does not gate
+          booking at all, so instructing them to settle it first is wrong in both.
+
+          The first sentence is unchanged and stays true in all three modes: the
+          subscription IS unpaid. Only the instruction after it is mode-gated,
+          and the HARD_BLOCK branch is deliberately byte-identical to the
+          pre-#2543 copy so no club whose mode did not move sees new wording.
+
+          #2779 adds a note to the HARD_BLOCK branch, and only that branch.
+          HARD_BLOCK stops a member STARTING a booking; it has never stopped them
+          paying for one an admin already saved on their behalf — the create gate
+          carries `!isAuthorizedOnBehalf` and the payment routes carry no
+          subscription gate at all (INV-LOCKOUT-069). That is deliberate: it is
+          the whole "admin books on behalf, the locked-out member picks it up and
+          pays" journey. But a member reading "contact the club before booking"
+          reasonably concludes that nothing is open to them, and closes the tab
+          before they ever look at My bookings. The sentence is conditional in its
+          wording ("if the club has already saved a booking for you"), so it is
+          true for a member who has none, and the wizard needs no extra fetch to
+          say it.
+
+          The second sentence exists because the first would otherwise be a
+          promise this member cannot always keep. A $0 draft has no payment card
+          (the booking page gates it on `finalPriceCents > 0`); the member is
+          offered Confirm instead, and `confirm-draft` answers them 403 under
+          HARD_BLOCK. Without the qualifier the banner sends that member to a
+          button that refuses them (INV-LOCKOUT-070). The wizard cannot know
+          which kind of draft is waiting — it fetches none — so the copy covers
+          both rather than guessing.
+
+          The NON_MEMBER_PRICING explanation is the SERVER's own sentence
+          (`memberRateNotice`, built by `formatUnpaidSubscriptionRateReason` in
+          the subscription-status route), rendered verbatim so the wizard and the
+          quote cannot describe the same repricing two ways. When it is missing —
+          an older cached response — the banner says nothing extra rather than
+          inventing a replacement; the payment affordance below still stands.
+
+          NO_BLOCK downgrades to the neutral `info` variant (and so to a polite
+          `role="status"`): nothing is at stake for this booking, so an assertive
+          alert would be noise. The payment affordance stays in every mode — a
+          member who wants to settle an unpaid subscription always may. */}
+      {!subscriptionLoading && subscriptionIsUnpaid && (
+        <Alert
+          variant={subscriptionLockout.mode === "NO_BLOCK" ? "info" : "warning"}
+          data-testid="subscription-unpaid-banner"
+        >
+          <p>
+            <strong>Subscription unpaid:</strong> Your subscription for the{" "}
+            {subscriptionStatus!.seasonDisplay} season is unpaid.{" "}
+            {subscriptionLockout.mode === "HARD_BLOCK" ? (
+              subscriptionInvoiceUrl ? (
+                <>Use the payment link below to pay it before booking.</>
+              ) : (
+                <>
+                  Please{" "}
+                  <Link
+                    href={PROFILE_RETURN_TO_BOOK}
+                    className="underline font-medium"
+                  >
+                    contact the club
+                  </Link>{" "}
+                  before booking.
+                </>
+              )
+            ) : null}
+          </p>
+          {subscriptionLockout.mode === "HARD_BLOCK" ? (
+            <p data-testid="subscription-hard-block-pickup-note">
+              This stops you starting a new booking. If the club has already
+              saved a booking for you, you can still open it from{" "}
+              <Link href="/bookings" className="underline font-medium">
+                My Bookings
+              </Link>{" "}
+              and pay for it. If there is nothing to pay on it, ask the club to
+              confirm that one for you.
+            </p>
+          ) : null}
+          {subscriptionLockout.mode === "NON_MEMBER_PRICING" &&
+          subscriptionLockout.memberRateNotice ? (
+            <p data-testid="subscription-non-member-pricing-notice">
+              {subscriptionLockout.memberRateNotice}
+            </p>
+          ) : null}
+          {subscriptionInvoiceUrl ? (
+            <Button asChild className="mt-3">
+              <a
+                href={subscriptionInvoiceUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Pay Your Subscription
+              </a>
+            </Button>
+          ) : subscriptionInvoiceNumber ? (
+            <p className="mt-2">
+              Invoice reference: <strong>{subscriptionInvoiceNumber}</strong> — check your email from Xero for the payment link.
+            </p>
+          ) : null}
+        </Alert>
+      )}
+
+      {/* #5148: a Join link whose work party cannot be filled in, in a region
+          mounted before the work party is fetched (#4949). */}
+      <StatusRegion
+        visible={Boolean(workPartyPrefillNotice)}
+        visibleClassName="rounded-md bg-muted p-3 text-sm text-muted-foreground"
+      >
+        {workPartyPrefillNotice}
+      </StatusRegion>
+
+      {/*
+        #4945: the wizard's ONE failure slot, rendered through the shared
+        recovery box so it is permanently mounted (one live region, registered
+        before any message arrives) and takes focus and scrolls into view when
+        a failure arrives. Most failures now come from the review step, screens
+        below this slot, where a static block left the member on a button that
+        just seemed to reset. `errorAttentionKey` re-takes attention when a
+        second press is refused with the identical sentence.
+      */}
+      <FocusedActionError
+        id={BOOKING_WIZARD_ERROR_ID}
+        error={error}
+        attentionKey={errorAttentionKey}
+        action={
+          hasErrorActions ? (
+            <WizardErrorActions
+              lodgeUnresolved={lodgeUnresolved}
+              retryLodgeOptions={retryLodgeOptions}
+              guestProfileBlocks={guestProfileBlocks}
+              getGuestProfileBlockMessage={getGuestProfileBlockMessage}
+              getGuestProfileActionLabel={getGuestProfileActionLabel}
+              memberNightConflicts={memberNightConflicts}
+              handleRemoveConflictGuest={handleRemoveConflictGuest}
+              removingConflictGuestId={removingConflictGuestId}
+              errorPaymentTargets={errorPaymentTargets}
+              exceptionOffered={exceptionOffered}
+            />
+          ) : null
+        }
+      />
+
+      {/*
+        The cross-lodge opt-in (ADR-004), built once and rendered on BOTH doors
+        to the waitlist (#2930 fix round): the 409 refusal prompt below, and the
+        review step's primary Join Waitlist, which never raises that prompt.
+
+        #4945: the prompt sits in a permanently mounted polite region, for the
+        same reason the error box above is permanently mounted — a region
+        inserted already populated is missed by some screen-reader/browser
+        pairs. Polite, not an alert: the wizard keeps exactly one assertive
+        region, and the card takes focus as well. Not atomic: a status region
+        is atomic by default, so pressing Join Waitlist (its label changes to
+        "Joining waitlist...") would re-read the whole card.
+
+        The card is a named group, not a bare div: `aria-labelledby` is ignored
+        on an element with no role, so the focused card would have had no name.
+      */}
+      <div
+        role="status"
+        aria-atomic="false"
+        className={showWaitlistPrompt ? undefined : "sr-only"}
+      >
+        {showWaitlistPrompt && (
+          <Card
+            ref={waitlistPromptRef}
+            tabIndex={-1}
+            role="group"
+            aria-labelledby="booking-waitlist-prompt-heading"
+            className="border-cat1-6 bg-cat1-3 outline-none"
+          >
+            <CardContent className="pt-6 space-y-4">
+              <div className="flex items-start gap-3">
+                <div className="rounded-full bg-cat1-3 p-2 mt-0.5">
+                  <svg className="h-5 w-5 text-cat1-11" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+                  </svg>
+                </div>
+                <div>
+                  <h2
+                    id="booking-waitlist-prompt-heading"
+                    className="font-semibold text-cat1-11"
+                  >
+                    {lodges.length > 1 && selectedLodge
+                      ? `${selectedLodge.name} is fully booked`
+                      : "Lodge is fully booked"}
+                  </h2>
+                  <p className="text-sm text-cat1-11 mt-1">
+                    {/*
+                      #2930: the server now names every night the party cannot
+                      occupy, INCLUDING the ones a whole-lodge hold blocks. Those
+                      used to be absent from `fullNights` (a held night's available
+                      beds are pinned to 0, never negative, so the old filter
+                      skipped it), which rendered here as the literal sentence
+                      "is at capacity on 0 nights" — a tell that distinguished a
+                      held lodge from a full one in plain sight, and ungrammatical
+                      besides. The empty arm below is now only reachable if the
+                      server sends no list at all, and says nothing about why.
+                    */}
+                    {waitlistFullNights.length === 0
+                      ? `${lodgeLabel} is at capacity on your dates.`
+                      : waitlistFullNights.length === 1
+                        ? `${lodgeLabel} is at capacity on ${waitlistFullNights[0]}.`
+                        : `${lodgeLabel} is at capacity on ${waitlistFullNights.length} of your nights.`}{" "}
+                    You can join the waitlist and we&apos;ll email you when a spot opens up.
+                  </p>
+                </div>
+              </div>
+              {waitlistAlternateLodges}
+              <div className="flex gap-3 justify-end">
+                <Button
+                  variant="outline"
+                  onClick={() => setShowWaitlistPrompt(false)}
+                  disabled={joiningWaitlist}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleJoinWaitlist}
+                  disabled={joiningWaitlist}
+                  className="bg-cat1-9 hover:bg-cat1-9"
+                >
+                  {joiningWaitlist ? "Joining waitlist..." : "Join Waitlist"}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+
+      {/* Step indicator */}
+      <nav aria-label="Booking progress">
+        <ol className="flex items-center gap-2 text-sm">
+          {wizardSteps.map((wizardStep, index) => {
+            const isActive = wizardStep.id === step;
+            return (
+              <li key={wizardStep.id} className="flex items-center gap-2">
+                {index > 0 && (
+                  <span aria-hidden="true" className="text-muted-foreground">
+                    &rarr;
+                  </span>
+                )}
+                <span
+                  aria-current={isActive ? "step" : undefined}
+                  className={isActive ? "app-step-active" : "text-muted-foreground"}
+                >
+                  {index + 1}. {wizardStep.label}
+                  {isActive && <span className="sr-only"> (current step)</span>}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+        {/* Announce step transitions to screen readers, which otherwise get no
+            signal when a step auto-advances and its focus target unmounts. */}
+        <p aria-live="polite" className="sr-only">
+          Step {activeStepIndex + 1} of {wizardSteps.length}:{" "}
+          {wizardSteps[activeStepIndex]?.label}
+        </p>
+      </nav>
+
+      {/* #4950 — never on the pay step, where the booking already exists. */}
+      {restoredWorkNotice && step !== "pay" && (
+        <RestoredWorkNotice notice={restoredWorkNotice} onStartAgain={startAgain} />
+      )}
+
+      {/* Step 1: Dates */}
+      {step === "dates" && (
+        <DatesStep
+          bookingBlockedBySubscription={bookingBlockedBySubscription}
+          handleDateSelect={handleDateSelect}
+          checkIn={checkIn}
+          checkOut={checkOut}
+          lodges={lodges}
+          lodgeId={lodgeId}
+          lodgesLoading={lodgesLoading}
+          lodgeScope={lodgeScope}
+          retryLodgeOptions={retryLodgeOptions}
+          handleLodgeChange={handleLodgeChange}
+          selectedLodge={selectedLodge}
+        />
+      )}
+
+      {/* Step 2: Guests */}
+      {step === "guests" && (
+        <GuestsStep
+          checkIn={checkIn}
+          checkOut={checkOut}
+          nights={nights}
+          familyMembers={familyMembers}
+          guests={guests}
+          lodgeCapacity={lodgeCapacity}
+          addFamilyMemberAsGuest={addFamilyMemberAsGuest}
+          showInviteFamilyGroupMembersLink={showInviteFamilyGroupMembersLink}
+          handleGuestsChange={handleGuestsChange}
+          perGuestDatesEnabled={perGuestDatesEnabled}
+          handlePerGuestDatesEnabledChange={handlePerGuestDatesEnabledChange}
+          multiDateRangesEnabled={multiDateRangesEnabled}
+          handleMultiDateRangesEnabledChange={handleMultiDateRangesEnabledChange}
+          priceQuote={priceQuote}
+          groupBookingsEnabled={groupBookingsEnabled}
+          groupTrip={groupTrip}
+          setGroupTrip={setGroupTrip}
+          groupPaymentMode={groupPaymentMode}
+          setGroupPaymentMode={setGroupPaymentMode}
+          setStep={setStep}
+          handleGuestsDone={handleGuestsDone}
+          priceLoading={priceLoading}
+          memberGuestEnabled={memberGuestConfig.enabled}
+          memberGuestOpenSearchEnabled={memberGuestConfig.openSearchEnabled}
+          addMemberGuest={addMemberGuest}
+          familyMembersLoaded={familyMembersLoaded}
+          familyMembersLoadFailed={familyMembersLoadFailed}
+          retryFamilyMembersLoad={retryFamilyMembersLoad}
+          memberGuestAddError={memberGuestAddError}
+          capacityShortNights={capacityShortNights}
+          capacityShortMessage={capacityShortMessage}
+          dependantIdentityCollisions={dependantIdentityCollisions}
+          declaredDependantMemberIds={declaredDependantMemberIds}
+          bookCollidingGuestAsDependant={bookCollidingGuestAsDependant}
+          declareDependantDifferentPerson={declareDependantDifferentPerson}
+          withdrawDependantDeclaration={withdrawDependantDeclaration}
+        />
+      )}
+
+      {/* Step 3: Review */}
+      {step === "review" && priceQuote && (
+        <ReviewStep
+          checkIn={checkIn}
+          checkOut={checkOut}
+          nights={nights}
+          guests={guests}
+          priceQuote={priceQuote}
+          lodgeId={lodgeId}
+          selectedLodge={selectedLodge}
+          cancellationSchedule={cancellationSchedule}
+          reviewGuestPayload={reviewGuestPayload}
+          bookingDateStrings={bookingDateStrings}
+          perGuestDatesEnabled={perGuestDatesEnabled}
+          appliedPromos={appliedPromos}
+          setAppliedPromos={setAppliedPromos}
+          combineWorkPartyWithCodes={combineWorkPartyWithCodes}
+          setMultiPromoCodes={setMultiPromoCodes}
+          availableCreditCents={availableCreditCents}
+          appliedCreditCents={appliedCreditCents}
+          remainingToPay={remainingToPay}
+          useCredit={useCredit}
+          setUseCredit={setUseCredit}
+          groupTrip={groupTrip}
+          groupBookingsEnabled={groupBookingsEnabled}
+          groupPaymentMode={groupPaymentMode}
+          showPaymentMethodChoice={showPaymentMethodChoice}
+          paymentMethod={paymentMethod}
+          setPaymentMethod={setPaymentMethod}
+          internetBankingEnabled={internetBankingEnabled}
+          internetBankingUnavailableReason={internetBankingUnavailableReason}
+          internetBankingHoldSummary={internetBankingHoldSummary}
+          cardPaymentDescription={cardPaymentDescription}
+          internetBankingPaymentDescription={internetBankingPaymentDescription}
+          internetBankingUnavailableCopy={internetBankingUnavailableCopy}
+          notes={notes}
+          setNotes={setNotes}
+          requiresAdminReviewLocal={requiresAdminReviewLocal}
+          memberReviewJustification={memberReviewJustification}
+          setMemberReviewJustification={setMemberReviewJustification}
+          expectedArrivalTime={expectedArrivalTime}
+          setExpectedArrivalTime={setExpectedArrivalTime}
+          roomRequestEnabled={roomRequestEnabled}
+          roomOptions={roomOptions}
+          requestedRoomId={requestedRoomId}
+          setRequestedRoomId={setRequestedRoomId}
+          activeWorkPartyEvents={activeWorkPartyEvents}
+          attendingWorkParty={attendingWorkParty}
+          setAttendingWorkParty={setAttendingWorkParty}
+          selectedWorkPartyEventId={selectedWorkPartyEventId}
+          setSelectedWorkPartyEventId={setSelectedWorkPartyEventId}
+          workPartyError={workPartyError}
+          setWorkPartyError={setWorkPartyError}
+          workPartyClearedNotice={workPartyClearedNotice}
+          setWorkPartyClearedNotice={setWorkPartyClearedNotice}
+          availablePromoCodes={availablePromoCodes}
+          promoCodesEnabled={promoCodesEnabled}
+          cancelIfGuestsBumped={cancelIfGuestsBumped}
+          setCancelIfGuestsBumped={setCancelIfGuestsBumped}
+          setStep={setStep}
+          handleSaveAsDraft={handleSaveAsDraft}
+          handleSubmit={handleSubmit}
+          submitting={submitting}
+          savingDraft={savingDraft}
+          memberGuestPendingHoldExpiryDays={memberGuestConfig.pendingHoldExpiryDays}
+          exceptionOffer={exceptionOffer}
+          reviewReasonMissing={reviewReasonMissing}
+          replaceExceptionRequestId={replaceExceptionRequestId}
+          submitExceptionRequest={submitExceptionRequest}
+          waitlistOnly={waitlistOnly}
+          capacityShortMessage={capacityShortMessage}
+          capacityShortNights={capacityShortNights}
+          waitlistAlternateLodges={waitlistAlternateLodges}
+          handleJoinWaitlist={handleJoinWaitlist}
+          joiningWaitlist={joiningWaitlist}
+        />
+      )}
+
+      {/* Step 4: Pay (card path only; #1084). The booking already exists in
+          the same state as the old redirect flow, so abandoning this step is
+          safe — the booking page's payment card and banner take over. */}
+      {step === "pay" && createdBooking && (
+        <PayStep createdBooking={createdBooking} />
+      )}
+    </div>
+  );
+}

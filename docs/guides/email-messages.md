@@ -1,0 +1,796 @@
+# Email Messages
+
+Audience: Operator
+
+## What it is
+
+Two things in one page: the **shared email variables** every automated email
+uses (your club name, sender display name, support and contact addresses, public
+URL), and an editor for the **wording of each audited email template** — its
+subject and body, with token chips, a live preview, and a per-template restore.
+Find it at **Admin → Setup & Configuration → Notifications & Email → Email Messages**
+(`/admin/email-messages`). It has no direct sidebar entry — open it from the
+**Email Messages** card on the Notifications & Email hub.
+
+This is the *system* email editor. The member-facing booking, payment, and
+cancellation copy lives on the separate [Booking Messages](booking-messages.md)
+page. Email Messages are edited under the **support** ("Support & System")
+permission area; a view-only support role can read but not save.
+
+## When you'd use it
+
+- Your club name, sender display name, support address, or public URL changed and
+  every email needs to reflect it.
+- The wording of a specific system email (password reset, application approved,
+  a booking notice) needs to change from the built-in default.
+- You want to preview exactly what a template renders — with real sample values
+  substituted for its tokens — before it goes to members.
+
+## Step-by-step
+
+### Update the shared email variables
+
+1. Open **Email Messages**. The top card holds the shared settings.
+
+   ![Email Messages: the shared email-variable fields above, then the Template dropdown with token chips, subject, body, and Save Template / Preview / Restore Default](../images/admin/admin-email-messages.png)
+
+2. Edit any of **Club name**, **Bookings name**, **Sender display name**,
+   **Support email**, **Contact email**, or **Public URL**, then click
+   **Save Email Settings**. These feed the `{{CLUB_NAME}}`, `{{SUPPORT_EMAIL}}`,
+   `{{BASE_URL}}` and related tokens in every template. (Lodge name, travel note,
+   and door code are no longer set here — a single-lodge club edits them on
+   **Club Identity** under [Site Appearance & Content](appearance.md); a
+   multi-lodge club sets them per lodge under **Setup → Lodges** (see
+   [Lodges](../multi-lodge/README.md)).)
+
+### Edit a template's wording
+
+1. Choose a template from the **Template** dropdown. The badges show its
+   audience (member/admin), key, a one-line trigger summary, and how often it
+   sends.
+2. Insert any of the **Tokens** chips into the **Subject** or **Body**. A
+   highlighted token is **required** — the save is rejected if you remove it
+   (for example the sign-in `{{token}}` in a magic-link email).
+3. Click **Preview** to render the subject and body with sample values, then
+   **Save Template**. Use **Restore Default** to drop your override and return to
+   the built-in wording.
+
+### Formatting: the rich body editor
+
+The body is edited in a rich editor like the message board's composer
+(fork #38): select text and use the toolbar — **bold**, *italic*,
+underline, a heading, bullet and numbered lists, and left/centre/right
+alignment — and the styling shows in place as you type. `{{token}}` markers
+are ordinary text in the editor and substitute exactly as before.
+
+What the editor deliberately does **not** offer, so emails stay on the club
+theme in every mail client: colours, fonts, text sizes, images and links
+(web addresses are written out in full, as before). Anything pasted from
+elsewhere is reduced to the allowed formatting when you save — pasted
+colours, fonts and pictures are dropped, and pasted HTML can never reach a
+member as markup. Always check **Preview**, which shows the exact email a
+member receives.
+
+A body saved before this feature keeps rendering exactly as it always has.
+When you open one, the editor shows its first line as the email's heading
+and the rest as paragraphs, ready to format — nothing changes until you
+save. The Heading toolbar button turns any line into (or back out of) that
+heading style, so the heading is always yours to keep, move or remove.
+
+**Editing the wording never changes a date, a time or a deadline in it.** Every
+date and time a token fills in is worked out before your wording is applied, and
+the built-in wording and a saved override are filled in from the same answer. So
+the two always name the same day and the same moment. If they ever appear not to,
+that is a defect worth reporting rather than something to fix by rewording.
+
+There are two kinds of date in these messages, and the difference matters if you
+are ever comparing what an email said with what a screen shows:
+
+- **A lodge night, a roster date or a season date is a calendar day.** It is the
+  day itself — 1 August is 1 August — so no timezone is involved and none can
+  move it. A club overseas reads the same night the club's own records hold.
+- **A deadline or a timestamp is a moment**, so it is shown in the club's own
+  timezone, the one set under [Club Time Zone](club-time.md). Change that
+  setting and these move; the calendar days above do not.
+
+### There is no "only if" — write lines that always read correctly
+
+The body substitutes tokens and **nothing else** — whether you write it as
+plain text or format it in the rich editor, there is no
+`if`, no conditional, no way to show a line only when a value exists. A token
+whose value is not applicable to a particular send simply renders as **nothing
+at all** — so a line you write as `Door code: {{doorCode}}` prints a bare
+`Door code:` to every member staying at a lodge that has no door code.
+
+That is why several tokens are **pre-composed whole lines** rather than bare
+values: `{{doorCodeNote}}`, `{{reasonNote}}`, `{{adminNoteLine}}`,
+`{{reviewNoteLine}}`, `{{committeeNote}}`, `{{amountRecordedNote}}`,
+`{{promoSummary}}`, `{{creditNote}}`, `{{checkoutChoreNote}}`,
+`{{provisionalGuestsNote}}` and their
+siblings each render the **entire** line — label, value and the blank line after
+it — or nothing whatsoever. Put one of those tokens on its own, with no label of
+your own in front of it, and the email reads correctly whether or not the value
+exists.
+
+`{{paymentNote}}` on the **Booking Modified** message is another: it says what
+happens to the money for the change, and the wording follows how the booking was
+paid. A card refund reads "A refund of $X has been processed to your original
+payment method." once the card refund has gone through; until then — when the
+card refund failed, timed out or was not made — it reads "A refund of $X is on
+its way to your original payment method." (#4070). A refund on a booking
+paid by internet banking or in cash, or by a card payment Stripe holds no
+record of (#5212), reads "The club will refund $X to you by
+bank transfer." — it is promised, not reported, because a treasurer still has
+to send it from the **Money to settle** card (see the [payments guide](payments.md#pay-back-a-refund-for-a-cash-booking))
+(#3827). On a group booking the organiser paid for by card, the refund goes to
+the group organiser's card, and the sentence says it has been processed there
+only once that card refund has gone through; until then it says the refund is
+on its way to the group organiser's card (#4057). On a group booking the
+organiser paid for by internet banking, the bank transfer goes to the organiser
+and the sentence reads "The club will refund $X to the group organiser
+directly, because the group organiser paid for this booking." (#3949). When
+the member's card payment is disputed with their card issuer, no card refund or
+account credit is issued: the sentence says the refund of $X is with the
+club's treasurer, who will be in touch (#4911). A
+reduction that goes back partly to the card and partly as account credit names
+both. A reduction that
+cancels the member's unpaid additional payment outright adds "The additional
+payment we asked for has been cancelled, so you no longer need to pay it."
+(#3954). An amount still to pay is named by one rule at every edit: on a
+booking the club asks by card it reads "An additional payment of $X is
+required.", also while the card request waits to be retried; on a booking paid
+by internet banking it names an Internet Banking payment against the Xero
+invoice; any other amount still to pay is named without a method (#4052).
+
+`{{paymentNote}}` on the **Your Request Was Approved** message (an approved
+booking-rule exception that created a new booking) says what is left to pay, and
+it is worked out from the money the club has actually received for that booking,
+never from the booking's status (#4069). It is one of five lines:
+
+| What the records show | The line |
+| --- | --- |
+| Money is still owed and the booking holds its beds | "There is $X to pay on this booking. Your beds are held for now; open it from your account to pay or to see the payment details." |
+| Money is still owed and the beds are not held yet | "There is $X to pay on this booking. Open it from your account to pay now — the beds are not held until it is paid." |
+| The booking is covered (by a payment, account credit, or both) | Nothing: the line is left out |
+| A group organiser pays for this stay | "Your group organiser pays for this stay." |
+| The records cannot prove what is owed, or could not be read | "To see whether anything is still to pay on this booking, open it from your account or contact the club." |
+
+$X is what the booking costs, less account credit applied to it, less the money
+the club still holds for it — a payment still pending, a refund already made or
+owed, and a card charge that was replaced and is being refunded do not count as
+held. The raw `{{amount}}` token behind the line is that same figure, `$0.00`
+once the booking is covered, and **empty** on the last two rows: an override
+that prints `{{amount}}` on its own should keep `{{paymentNote}}` beside it, or
+it will show a blank where nobody can vouch for a figure.
+
+`{{refundSentence}}` on the **Refund Appeal Approved** message works the same
+way. A card refund reads "A refund of $X will be processed to your original
+payment method."; on a booking paid by internet banking it reads "The club will
+refund $X to you by bank transfer.", and a booking paid partly by card names
+both parts (#3827). On a group joiner's booking the organiser paid for by card
+it reads "A refund of $X has been processed to the group organiser's card,
+because the group organiser paid for this booking." (or "is on its way to" while
+the card provider has not answered yet) (#3956); on one the organiser paid for
+by internet banking it reads "The club will refund $X to the group organiser
+directly, because the group organiser paid for this booking." (#3949).
+`{{amount}}` is still available
+to a saved override, but it cannot say which way the money goes, so use
+`{{refundSentence}}`.
+
+The organiser of that group gets their own message at the same time, **Group
+Organiser Joiner Refund** (#3956). Its `{{refundSentence}}` names the joiner and
+says the amount for their share is being refunded to the card the organiser paid
+with; `{{joinerName}}` and `{{amount}}` are there for an override too. It is not
+sent when the admin chose not to email, or when the organiser is the joiner.
+
+**Group Organiser Extra Invoice** (#4299) goes to the organiser of a group they
+paid for by internet banking when a change makes a joiner's place cost more:
+the extra, with any late-change fee, is billed to the organiser on its own Xero
+invoice. `{{joinerName}}` names the place, `{{changeSummary}}` the kind of
+change ("Dates Changed", "Guests Added" and so on), `{{additionalAmount}}` what
+is still owed on the invoice and `{{xeroInvoiceNumber}}` the reference to quote.
+It is sent once per invoice, scoped to the organiser's own booking, so that
+booking's **No emails** switch withholds it; an admin's choice not to email the
+member about the joiner's change does not. If the change was cut back or
+cancelled before the invoice reached Xero, it names only what is still owed,
+and is not sent when nothing is. The joiner's own **Booking Modified** message
+reads "The extra $X for this change has been invoiced to the group organiser,
+because the group organiser paid for this booking. There is nothing for you to
+pay." instead of asking them for a payment.
+
+**Payment Refunded** (`superseded-payment-refunded`, #3340) tells a member that
+a charge on a payment request the club had already replaced was refunded, with
+`{{refundedAmount}}` and `{{owingSentence}}` saying what came back and what is
+still owing. It is sent once per refund, however often the payment recovery
+queue retries the refund (#4690), and, like the organiser's extra invoice, it is
+handed to the email retry job, so it arrives after that job's usual 15-minute
+wait rather than the moment the refund is made. The booking's **No emails** switch withholds it;
+the admin alert beside it (**Superseded payment auto-refunded**) is not silenced
+by that switch.
+
+`{{amountDue}}` on the **Booking Request Approved** and **Split Guest Payment
+Link** messages is what the pay link asks the member to pay: the booking's price
+plus any change fee recorded on it, less account credit already applied - the
+same figure the `/pay/` page shows (#4058). Their default bodies read
+`Amount due: {{amountDue}}`. `{{price}}` stays the booking's own price, so an
+override written against it keeps its meaning, but it can differ from what the
+link asks for (applied credit lowers that, a recorded change fee raises it); use
+`{{amountDue}}` to name what to pay. A saved Split Guest Payment Link override
+copied from the old default reads `Amount due: {{price}}`: re-save it against
+the new default so it quotes `{{amountDue}}`.
+
+`{{promoSummary}}` on a booking that carries several promo codes shows one
+`Promo adjustment (CODE)` line per code, each with its own amount, while
+`{{promoCode}}` names every code, comma-separated (#3828). A booking with one
+code reads exactly as before.
+
+One of these blocks is several lines at once: **`{{ical}}`** on the Booking
+Confirmed message renders a short add-to-calendar section — a link that
+downloads the stay as a calendar file (`.ics`), plus links for Google Calendar
+and Outlook.com (personal Microsoft accounts — a work Microsoft 365 account
+cannot use that one), each covering the whole stay as all-day entries from
+check-in through checkout day. The links are built per booking by the system;
+the download link carries its own signed key, works for a recipient who is not
+signed in, and expires 60 days after checkout. Place the token on a line of
+its own; like every block token, it renders complete lines or nothing at all.
+In your own override wording the token renders exactly as the built-in
+message does: three tappable icons (a calendar-file tile, Google Calendar,
+Outlook.com) after the "Add this stay to your calendar:" lead-in. A mail app
+that blocks images shows the three service names instead — members never see
+the written-out addresses. Place the token on its own line inside your
+wording and Preview to see the row in place.
+
+A second, related pair works the other way round: **`{{rebookLabel}}` and
+`{{rebookPath}}`** in the **Booking Update** (bumped) message. That email goes to
+two very different people — a club member whose pending booking lost its beds,
+and the organisation or school contact whose booking came from a public booking
+request. The member can sign in and book again; the contact has no login at all,
+so sending them to the member booking page would land them on a sign-in screen
+they can never get past. The two tokens carry the caption and the destination, so
+the line `{{rebookLabel}}: {{BASE_URL}}{{rebookPath}}` reads
+`Book Again: …/book` for a member and `Contact the Club: …/contact` for a
+contact who cannot sign in. Keep them together on one line, and keep
+`{{BASE_URL}}` between them, or the link will not point anywhere useful.
+
+Two consequences worth knowing:
+
+- **Never write a label in front of a `…Note` / `…Line` token.** Writing
+  `Admin note: {{adminNoteLine}}` reintroduces the dangling label the token
+  exists to prevent.
+- **Never annotate a body with instructions to yourself.** Text such as
+  `[only when a door code is set]` is not understood by anything — it is
+  printed verbatim to the member. Older built-in wording carried such notes;
+  they were all removed in v0.13, the build refuses any that come back, and
+  **Save now refuses square-bracketed text in an override** too. The notes the
+  project itself shipped were also **stripped out of every saved customisation
+  on upgrade** — matched as the exact strings we shipped, never anything that
+  merely looks like one, so your own bracketed wording survives even when it
+  reads like ours (`[when you are 30 minutes away]` is yours, and it stays),
+  and every message changed is recorded in the audit log with the whole before
+  and after so you can see what happened. **Every message that was changed is
+  also named on this page**, with the notes removed and the lines they sat
+  beside, because one of our notes was sometimes the only thing marking a line
+  as conditional — read those lines and press Save when you are happy, which
+  clears the notice. Square-bracketed
+  text your own admins wrote is deliberately **not** deleted for you: a warning
+  at the top of this page names each template still carrying some, so open it,
+  delete the bracketed text and save, or reset it to the corrected default.
+
+### When your saved wording falls behind the built-in wording
+
+Saving your own copy of a message freezes it. If a later release improves the
+built-in wording, your copy keeps sending as you wrote it — which is the point.
+Occasionally, though, the built-in wording changes because the message now has
+to tell the recipient something it did not before, and a frozen copy quietly
+stops saying it.
+
+The page handles the two situations differently, on purpose.
+
+- **Your copy is missing something the message must say.** A warning at the top
+  names each affected template and the token to add back. The commonest case is
+  a booking confirmation saved before the promo explanation moved into
+  `{{promoSummary}}`: it now shows a subtotal and a total with nothing in
+  between to explain why they differ. Wording of your own that carries the same
+  information counts, so a hand-written `Discount ({{promoCode}}): -{{discount}}`
+  line does satisfy this particular requirement.
+- **A line of your copy goes out with nothing after the label.** A warning names
+  the exact lines and quotes them as a member would read them when the value
+  behind them is empty. This is the companion to the point above, and the same
+  hand-written discount line is the worked example:
+  `Discount ({{promoCode}}): -{{discount}}` is fine on a booking that had a
+  discount, but on an ordinary booking it sends `Discount (): -`, and on a promo
+  code that **raised** the price it sends `Discount (PEAK): -` to a member who
+  was charged more. The old built-in wording carried a note in square brackets
+  beside those lines saying when they applied; the notes were never understood
+  by anything and are now removed, so this warning is what tells you instead.
+  The fix is to delete the line, or replace it with `{{promoSummary}}`, which
+  renders the whole explanation or nothing at all.
+
+  This particular check is **deliberately cautious**, and it is worth knowing
+  which way it errs. It empties every value that any send could leave empty, all
+  at once. Some of those values are two halves of one story and are never both
+  empty in reality — an amount already paid and an amount still owing, for
+  instance: a booking is unpaid, or paid, or part-paid, and the part-paid case
+  fills in both. A line you wrote that puts both on one line can therefore be
+  listed here when it is perfectly fine. The check never misses a genuinely
+  broken line; it can name one that is not. Read each quoted line before you
+  change it.
+- **An upgrade removed one of our own notes from your copy.** Older built-in
+  wording carried square-bracketed notes, and a release removed them from every
+  saved copy because they were being emailed word for word. A warning names each
+  message that was changed, lists the notes removed, and quotes the lines they
+  were attached to. Those notes were sometimes the only thing marking a line as
+  conditional — `Payment has been processed successfully.` was one of ours, with
+  `[only when the booking is already paid]` beside it — so the line now sends
+  every time. Nothing about your own wording was changed, and the whole previous
+  copy is kept in the audit log. Read the quoted lines, edit anything that no
+  longer reads correctly, and press **Save Template**; saving clears the warning
+  whether or not you changed anything.
+- **Your copy simply reads differently.** That is stated as a plain fact under
+  the template you have open, with no warning attached, because a customisation
+  differing from the built-in wording is exactly what you asked for.
+
+In every case **Show differences** lays your saved copy beside the current
+built-in wording line by line — red is yours, green is the built-in — so you can
+decide whether to patch your own words or press **Restore Default**, knowing
+exactly what you would be giving up. Nothing is ever changed for you here.
+
+Two things to know about that comparison. It shows the copy that is currently
+**saved**, not what is in the editing boxes, and it says so when you have
+unsaved edits — save first if you want to compare what you have just typed. And
+**Restore Default deletes your wording outright**: it asks you to confirm, and
+after that the only copy is the one written to the audit log — your subject and
+body in full, not an extract — which needs someone with database access to read
+back. One caveat on "in full": the audit log masks any **line** that reads like
+it carries a password, token or card number, so the built-in password-reset
+line `Reset Password: {{BASE_URL}}/reset-password?token={{token}}` is stored as
+`Reset Password=[REDACTED]` and would have to be retyped. Every other line is
+kept exactly as you wrote it. If you are unsure, copy your wording somewhere
+safe first.
+
+For the same reason, **each template covers exactly one outcome.** Where a
+message could go two ways there are two templates to edit, not one with a
+condition inside it — `Refund Request Approved` and `Refund Request Declined`,
+`Booking Review Approved` and `Booking Review Rejected`, and so on. Edit both if
+you want both reworded; editing only one leaves the other on its built-in text.
+
+> **Upgrade note (v0.13).** The single *Refund Request Resolved* template was
+> split into **Refund Request Approved** and **Refund Request Declined**. If you
+> had customised the old one, its wording said "approved" and was also being
+> sent to members whose appeal was **declined**. Your old customisation is not
+> carried over — both new templates start from the corrected built-in wording,
+> and the leftover row is reported at the top of this page as a stale override
+> needing cleanup. Re-apply your wording to whichever of the two you want to
+> change.
+
+> **Upgrade note (#5403).** The officers' **Admin Booking Bumped** alert is sent
+> again. The pending-booking job sends it, once per booking, when it releases a
+> pending booking at its hold deadline because there is no longer room for its
+> party. Its subject names the member, the stay dates and the booking reference
+> (`{{bookingReference}}`), so officers can tell two bumps for the same member
+> apart. A subject your club saved on an earlier version has no booking
+> reference: restore the default subject, or add `{{bookingReference}}` to
+> yours. Since #5407 the Daily digest counts each alert once however many
+> officers receive it, and no longer folds alerts that share a subject, so a
+> saved subject does not change any digest count while the officers receiving
+> the alert stay the same. The built-in wording
+> gives the reason (`{{reason}}`), which also says when the member had asked
+> for the whole booking to be cancelled if their guests could not come.
+>
+> The built-in email also adds a Lodge line when the club has more than one
+> active lodge, or when the booking's lodge has been archived, as the capacity
+> warning does. That line is not part of the editable wording the editor shows,
+> so a saved copy of your own does not include it: a club with more than one
+> lodge should add `{{lodgeName}}` on a line of its own. It is empty in a
+> one-lodge club, which is why it should not sit after a label.
+>
+> The alert no longer offers `{{triggeringMemberName}}`, because the job has no
+> triggering booking to name. If a saved copy still uses that token, a warning
+> at the top of this page names the template and the token, and the template
+> itself says your saved copy uses a token it no longer supplies: swap it for
+> the chips now shown and save, or restore the default.
+
+> **Upgrade note (#5407).** A bump's notices are no longer lost if the
+> pending-booking job is interrupted, for example by a restart, between
+> releasing the booking and sending them. The member's email (subject
+> **Booking Update**, or **Booking Cancelled** when the booking was cancelled
+> because its guests could not come) and the officers' **Admin Booking Bumped**
+> alert are then sent by a later run of the same job or, since #5433, of the
+> email retry job (every 30 minutes), so a recovered notice arrives an hour or
+> more late, and a send that keeps failing before its email record is written is
+> retried about every hour to hour and a half, where it was every three hours (a
+> provider failure is still replayed by the failed-email retry). When the officers' alert could not be recorded for any
+> of them (for example when writing the email log failed and sending then
+> failed too, or the message could not be built from a saved template), it is
+> tried again a day later. The member never receives it twice. Very rarely the officers may
+> receive their alert twice: when the interruption falls just after it was
+> sent, or when sending it takes longer than an hour. Nothing about the
+> wording changed.
+
+> **Upgrade note (#5433, waitlist offers).** A waitlist offer's emails are no
+> longer lost if the job making the offer is interrupted between saving the
+> offer and sending them. The member's **Spot Available!** email and the
+> officers' **Admin Waitlist Offer** alert, and the member's **Waitlist Offer
+> Expired** email after an offer lapses, are then sent by a later run of the
+> email retry job (every 30 minutes), usually within an hour. The member never
+> receives any of them twice; officers very rarely may.
+>
+> What a member can notice: when an offer email arrives late like this, the
+> offer gets a full window from when it arrives, up to the start of the
+> check-in date in the club's time zone (owner decisions, 23 and 24 Nov 2026),
+> and the email states that new deadline. The booking page shows the same
+> deadline. The window is restarted once per offer: if that late email also
+> fails and goes out on a later run, it states the deadline already set, so the
+> member has what is left of that window. When too little of a window would be
+> left to be worth telling them (less than half an hour), or the member's
+> address cannot be emailed (none, a placeholder, or one on the bounce and
+> complaint suppression list), no offer email goes and the window is not
+> restarted; the officers are alerted instead. If an offer lapses before its
+> email reached the member (never sent, failed, bounced, or recorded but
+> refused for a suppressed address), the member is not sent a **Waitlist
+> Offer Expired** email for it: they were never told about the offer. A failed
+> offer email still waiting to be retried when the offer ends is not retried:
+> it would state a deadline that has passed. Their booking goes back on the waitlist as with any lapsed
+> offer: they keep their place, but for that place everyone else waiting for
+> the same nights is considered before them.
+>
+> What an officer can notice: a new alert, **Waitlist email not sent**
+> (`admin-waitlist-notice-unsent`). It is sent once when a member's offer email
+> could not be sent, did not reach them (for example a suppressed or
+> placeholder address), or failed and could not be retried, before it stopped
+> being useful (the later of the start of the check-in date and the offer's
+> own deadline, and at most seven days after the offer); when a member's
+> **Waitlist Offer Expired** email could not be sent within seven days; and
+> when an offer lapses with its email not known to have reached the member,
+> so a person can step in for the place the member missed (owner decision,
+> 24 Nov 2026). Officers get it once per offer, not once for the unsent email
+> and again for the lapse (very rarely twice, if recording that it went
+> fails twice). It names the member and the booking so an officer can contact
+> them. It goes to officers who receive waitlist offer alerts (the **Waitlist
+> offers** preference, which mutes both), and its wording is editable like the
+> others. Its `{{noticeNote}}` token holds the whole instruction for that
+> email. The **Admin Waitlist Offer** alert still goes for every offer, once
+> what became of the offer email is known (it may wait while a failed send is
+> retried). It says which in the new `{{offerNote}}` token: sent, withheld by
+> the booking's **No emails** switch, or not delivered (alongside the
+> **Waitlist email not sent** alert). It states the deadline in force with
+> `{{expiresAt}}`, in place of a fixed "48 hours". `{{offerNote}}` is now a
+> required token. A saved copy of that template written before this version
+> keeps sending exactly as saved, in its old wording; this page flags it as
+> missing a required token, and it cannot be saved again until you add
+> `{{offerNote}}` back or restore the default. Nothing is blocked until then.
+>
+> Three limits officers should know. The offer email is withheld if **No
+> emails** is on for the booking when the email is sent, and turning emails
+> back on later does not send it: the member is not told of the offer by
+> email. They are told if the offer expires only if emails are on at that
+> moment. So contact them directly, or retract the offer.
+> When the mail provider reports a bounce or
+> a complaint for a member's address, every earlier email to that address is
+> marked bounced too, so a member who did receive their offer can still be
+> reported in a **Waitlist email not sent** alert when it lapses; that alert
+> says only that the email is not known to have reached them. And a **Waitlist
+> Offer Expired** email that cannot be delivered raises no alert: the member
+> is simply back on the waitlist.
+>
+> During the switch to this version, a server still running the version
+> before it that expires an offer this version made and never sent sends the
+> member the **Waitlist Offer Expired** email as before, and no officers'
+> alert is raised for it.
+>
+> Offers made before the upgrade carry on as they did. Their offer email was
+> recorded without the key this version uses, so this version matches it to
+> an offer by time instead: a failed one is still retried while the booking
+> holds a live offer made no later than the email (give or take two minutes
+> for clock differences), as the admin waitlist page already matches them;
+> otherwise it is not sent and moves to the email-failure review queue. It gets no window restart and no
+> "not sent" alert; and if such an offer lapses, the member is sent **Waitlist
+> Offer Expired** as before.
+
+## Settings reference
+
+Shared email variables (top card):
+
+| Field | What it controls | Token it feeds |
+| --- | --- | --- |
+| Club name | The club's display name | `{{CLUB_NAME}}` |
+| Bookings name | The booking-system name | `{{CLUB_BOOKINGS_NAME}}` |
+| Sender display name | The "from" name on outbound email | `{{CLUB_EMAIL_FROM_NAME}}` |
+| Support email | The support address shown to members | `{{SUPPORT_EMAIL}}` |
+| Contact email | The general contact address | `{{CONTACT_EMAIL}}` |
+| Public URL | The site's base URL for links | `{{BASE_URL}}` |
+
+Per-template editor:
+
+| Rule | Detail |
+| --- | --- |
+| Allowed tokens only | Only the chips shown for that template are accepted; unknown `{{tokens}}` are rejected |
+| No conditional syntax | Tokens are substituted, nothing more. A value that does not apply renders as nothing — use the pre-composed `…Note` / `…Line` chips for anything optional, and never write `[only when …]` guidance into a body |
+| Required tokens | The highlighted chip(s) must stay in the body — removing an essential bearer token (e.g. a `/pay/<token>` or sign-in link), the lodge access details, or the promo explanation on a payment confirmation is refused. A sentence under the chips names the required tokens, and any older token that satisfies the same requirement instead (`{{promoSummary}}` **or** `{{promoAdjustment}}`/`{{discount}}`; `{{doorCodeNote}}` **or** your own label around `{{doorCode}}`) |
+| Subject safety | Sensitive token values (e.g. raw tokens) are never allowed in a subject line |
+| Override vs default | Saving stores an override; **Restore Default** deletes it and reverts to the built-in text |
+| Stale overrides | A count is shown if any stored overrides reference templates that no longer exist (a data-cleanup task) |
+| Retired tokens | A warning names any saved override still using a token its template no longer offers. A token that is not supplied renders as **nothing**, so the line it sits on can go out empty — open the named template, swap the old token for the chips now shown, and save (or reset it to the current default) |
+| Audit | Template edits are audited (who changed what, when) |
+| Authorized booking link | Concrete-booking templates offer optional `{{bookingUrl}}`. It renders the encoded booking-detail URL only for a signed-in owner, linked member, or bookings-view admin whose direct/inherited mailbox still matches the delivery address. The whole line, plus any old concrete booking href in the delivered copy, disappears for public/non-login, aggregate, stale-mailbox, or unauthorized recipients; saved override wording and bearer action links remain unchanged |
+| Pre-composed blocks | Some tokens hold a whole sentence or block the system builds for you. You can move one or leave it out, but you cannot reformat what is inside it — see below |
+
+### Tokens that hold a whole block, and what that means for you
+
+The body editor substitutes tokens and nothing else — there are no "if" tests and
+no repeating rows. So wherever a message has to say something only *sometimes*,
+or has to list *several* things, the system builds that whole piece of text and
+hands it over as one token. You will see these on the member-guest emails and on
+several booking emails; they are named `...Note` or `...Line`.
+
+Two consequences worth knowing before you edit one:
+
+- **Leave a block token on a line of its own.** Do not put a label of your own in
+  front of it. When there is nothing to say the token comes through empty, and a
+  label you added would be left stranded above nothing.
+- **The Daily digest's `{{serverVersionNote}}` is empty on an ordinary day.** It
+  carries the whole "syncing with the Alpine Central Server is paused" sentence
+  only while the server is on a different software version from this site, and
+  nothing at all otherwise — so it is optional in a digest override: leave it
+  out and the digest simply never mentions the server. The two numbers behind
+  it are also available on their own as `{{serverVersionExpected}}` and
+  `{{serverVersionActual}}`, empty on the same days.
+- **The version-only notice is a separate message, *Admin Server Version
+  Paused*.** A Lodge Operations editor who does not receive the Daily digest is
+  sent this template instead, carrying only the three tokens above and no alert
+  counts. It has its own subject and wording, which the club edits (and can
+  mute under Delivery Rules) on its own: nothing done to the Daily digest's
+  wording changes it, and nothing done to it changes the digest.
+- **The party listing on the member-guest emails is one block, heading included.**
+  `{{partyListNote}}` produces the "Everyone on this booking" heading and the list
+  of names together. You can move that block or leave it out; you cannot change
+  how each guest's line is laid out, because the editor has no way to repeat a
+  row. If a club needs a different per-guest layout, that is a change to the
+  template engine, not something an override can do.
+- **`{{paymentNote}}` on Booking Modified carries every money sentence for the
+  change.** A refund, account credit added, account credit the booking had used
+  being returned to the member (a reduction on a booking paid with credit), an
+  amount still to pay, an unpaid additional payment cancelled by the change
+  (#3954) — whichever apply, already worded and with the amount in them. A
+  refund names where it went: the member's original payment method or, on a
+  group booking the organiser paid for by card, the group organiser's card —
+  processed there, or on its way there when the card refund has not gone
+  through yet (#4057, #4070) — or a bank transfer the club will send, to the
+  group organiser when the organiser paid for it by internet banking (#3949). Keep it
+  on a line of its own, with no `$` or label in front.
+- **`{{changeSummary}}` on Booking Modified lists what changed, one line each.**
+  Dates, guest count and total appear as a Previous/New pair only when they
+  changed. When the change added people, a **Guests Added** line names each of
+  them, with their own nights in brackets for anyone not staying the whole stay
+  (#4030), and "(waiting for them to accept)" after a member from outside the
+  family who has not yet accepted their place — the same line the built-in email
+  shows. Keep the token on a line of its own.
+- **`{{settlementFigureNote}}` on *Bank transfer amount needs checking* is what
+  needs a person (#3979).** It says whether the app kept the amount it had
+  recorded instead of the cash Xero shows (and why), whether the member paid more
+  or less than the booking owes, and who corrects a recorded figure. The amounts
+  themselves are `{{amount}}` (recorded), `{{paidAmount}}` (the cash Xero shows)
+  and `{{amountOwing}}` (what the booking owes, or "as recorded"). The message is
+  locked to always send.
+- **One card payment dispute message serves all three of its alerts (#4911).**
+  It goes once when a cardholder disputes a payment, once when the dispute
+  closes, and once more if a dispute already reported lost is later reported
+  won. So the subject must keep `{{disputeSubjectLabel}}`, which says which
+  alert it is and, once closed, how it ended. A subject typed by hand would
+  title a closed dispute as a new one. `{{disputeNextStep}}` is what the
+  treasurer does now (respond in Stripe, record a lost dispute in Xero by hand,
+  or reverse that entry when a lost dispute is won; that last one also names
+  each refund task the app reopened, any it could not reopen and why, and any
+  reduction now owed to the member again, #5197), `{{disputeHoldNote}}` says
+  the app gives no card refund or account credit for the payment while the
+  dispute is open or lost, and `{{outcome}}` is the dispute's status. The
+  message is locked to always send.
+- **`{{refundMessage}}` on Booking Cancelled is the whole refund sentence.** It
+  says where the refund went or is going: the member's original payment method,
+  account credit, or a refund the club will arrange directly. Otherwise it says
+  no refund applied. A refund to the member's own card reads "has been
+  processed" only once the card refund has gone through; until then — when it
+  failed, timed out or was not made — it reads "A refund of $X is on its way to
+  your original payment method.", shown as information (#4084). When the card
+  refund can carry only part of the refund due, the sentence names what went
+  (or is on its way) to the card, then "the club will refund the remaining $Y
+  to you by bank transfer" for the part the payment's other charges hold, and
+  "the club will be in touch about the remaining $Z" for anything the club has
+  to check first, shown as information; with nothing on the card it begins
+  "The club will refund..." or reads "The club will be in touch about the $X
+  refund." (#4097). On a group
+  booking the organiser paid for by card, it names the organiser instead: the
+  refund has been processed to the group organiser's card, or is on its way
+  there when the card refund has not gone through yet.
+  If the organiser had already cancelled the whole group, it says that
+  cancellation is refunding, or has refunded, the booking to the organiser's
+  card. When the organiser cancels a group they paid for by Internet Banking,
+  it says the club will repay the organiser directly. So does a joiner
+  cancelling their own place on a group the organiser paid for by Internet
+  Banking: the refund goes back to the organiser by bank transfer, never to the
+  joiner as account credit (#3949). `{{refundAmount}}` is always this booking's own
+  refund, so it can read $0.00 while the sentence names the organiser's refund.
+  Keep it on a line of its own.
+- **Credit used elsewhere has its own payment request.** When account credit applied
+  to a booking was used in the club's accounts outside the app, the member is asked
+  to pay that amount by card with **Payment Needed For Your Lodge Booking**, not the
+  "a change to your booking" reminder, because nothing about their stay changed. It
+  needs `{{additionalAmount}}`, `{{requestedOn}}`, `{{checkIn}}`, `{{checkOut}}` and
+  `{{askCauseSentence}}`, which says why the amount is owed: the credit was used
+  elsewhere in the club's accounts, or that and a change to the booking when the two
+  were merged into one request (#4253; in either order, #4491). A merged request
+  raised by the release is emailed at once for the combined amount. A customised body saved before
+  `{{askCauseSentence}}` existed is flagged stale; put it back in when you re-save. Put
+  `{{bankTransferNote}}` on a line of its own above the Pay Now line: it prints the
+  whole bank-transfer paragraph (with the booking's invoice number as the payment
+  reference) when the club has written its bank details, and nothing otherwise, so
+  the email offers card payment only until then. Write the account details in the
+  **Bank transfer details for a payment request** booking message.
+  The member is emailed at once, then reminded every 7 days, four reminders after
+  the first email (five emails at most); if a change to the booking is made while
+  the request is unpaid, the two become one request and the email says both.
+- **The pre-arrival reminder's chore sentence only appears for clubs that run a
+  roster.** `{{checkoutChoreNote}}` on **Pre-arrival Information** produces the
+  whole sentence — that guests are on the chore roster on the morning they check
+  out, and should talk to the hut leader beforehand if they plan to leave early —
+  when the **Chores** module is switched on under **Admin → Setup → Modules**, and
+  **nothing at all** when it is off. That is deliberate: the chores module starts
+  off, and a club that keeps no roster must not tell its members to go and find a
+  hut leader about one. Put it on a line of its own and never type a label in
+  front of it. Its neighbour `{{expectedArrivalNote}}` works per booking rather
+  than per club: it prints the member's expected arrival time as a whole line when
+  they recorded one, and nothing when they did not. That time is information for
+  the hut leader only — it changes no date, no charge and nobody's chore.
+- **Never type a currency sign in front of a money token.** Tokens such as
+  `{{consequenceNote}}` already contain the formatted amount, so a `$` in front
+  of one prints `$$48.00`. For the same reason, never type a `-` or `+` in front
+  of `{{promoSummary}}`, `{{promoAdjustment}}` or `{{creditNote}}` — each already
+  carries its own sign, and Save refuses a body that does.
+- **The booking confirmation explains account credit for you.**
+  `{{creditNote}}` produces the two reconciling lines a member needs when they
+  paid part of a stay from their account credit — `Account credit applied:
+  -$120.00` and `Paid by card: $180.00` (or `Paid by bank transfer` / `Paid by
+  cash or bank transfer`, matching how the club was actually paid; or
+  `Nothing more to pay: $0.00` when the credit covered the whole stay and no
+  money changed hands at all) — and **nothing at all** for the great majority of
+  bookings, which use no credit.
+  `Total Paid` stays the booking's full price above it, so the three figures add
+  up. The built-in wording already carries this inside `{{paymentOutcome}}`; you
+  only need `{{creditNote}}` if you write your own money lines out of
+  `{{totalPaid}}` and friends — and if you do, include it, or a member charged
+  $180.00 will read `Total Paid: $300.00` with nothing to explain the difference.
+- **A confirmation that still owes money points at the invoice, not at its own
+  total.** When a booking is confirmed with payment still owing (a member
+  whole-lodge approval with the Internet Banking or Xero module off, so the
+  club raised a pay-on-account invoice), `{{paymentDueNote}}` — carried inside
+  `{{paymentOutcome}}` — ends with *"If the invoice asks for a different amount
+  — for example because the club has put account credit you hold towards it —
+  please transfer the amount the invoice shows."* The `Total Due:` figure is the
+  booking's own price; the invoice is a separate document you can adjust in
+  Xero, so the email tells the member to follow the invoice rather than the
+  email. The sentence is conditional on purpose — for most members the two
+  agree — and it states no second amount. Where the booking system holds **no**
+  account credit against the booking, which is every unpaid confirmation it
+  sends today, nothing puts a member's credit towards such an invoice for you;
+  if you want that, do it in Xero, and the member has already been told to pay
+  what the invoice asks. (Where it **does** hold credit against the booking,
+  that allocation is made for you — see the next point — so doing it by hand as
+  well spends the member's credit twice.) No new token was
+  added, so if your wording keeps `{{paymentOutcome}}` (or uses
+  `{{paymentDueNote}}` on its own) the sentence arrives with no edit at all — but
+  the same caveat as `{{creditNote}}` above applies: a body that writes its own
+  money lines out of `{{totalDue}}` and friends and carries neither of those two
+  tokens has never told an unpaid member how to pay, and still does not. Add
+  `{{paymentDueNote}}` to such a body. It renders only on the unpaid
+  confirmation and is empty everywhere else, so put it on a line of its own — a
+  label typed in front of it ("Payment: `{{paymentDueNote}}`") would leave a bare
+  `Payment:` on every confirmation that is already paid, and the editor now warns
+  you about exactly that.
+- **With both modules on, the same note sends the member to their booking page
+  instead.** A whole-lodge approval with the Internet Banking and Xero modules
+  both on raises no invoice: the member chooses on their booking page between
+  paying by card and switching to internet banking. `{{paymentDueNote}}` then
+  says the amount owing and *"Please pay it from your booking page, where you
+  can pay by card or choose to pay by internet banking"*, names no reference
+  (there is none yet, so `{{paymentReference}}` is empty) and mentions no
+  invoice. If the member asked for their account credit on the request, the
+  note states the three-line sum from the next point and asks for the
+  remainder.
+- **…unless the club's own records already show credit against that booking, in
+  which case it does the sum for the member.** If account credit has been put
+  towards the booking, `{{paymentOutcome}}` renders three lines that add up —
+  `Booking Total: $300.00`, `Account credit applied: -$120.00`,
+  `Total Due: $180.00` — and `{{paymentDueNote}}` asks for the `$180.00`,
+  explains where it came from, and asks the member to transfer that and tell the
+  club if their invoice says something different. `{{totalDue}}` carries the
+  netted `$180.00`, so a body that writes its own money lines gets the right
+  figure without you touching it; `{{creditNote}}` stays empty, because that
+  block explains a booking that has already been paid for. The invoice itself is
+  netted for you at the same time (the club's own credit records are what drive
+  that allocation), so there is nothing to do in Xero by hand — doing it anyway
+  spends the member's credit twice.
+
+  Three things are worth knowing. The figure comes from the booking system's own
+  credit records, so the email never waits on your accounting system — and if
+  the invoice has not caught up yet, the member is told to pay the email's
+  figure rather than a **larger** invoice. That is the opposite of the
+  conditional sentence above and is deliberate; it is also one-directional, so
+  an invoice asking for **less** is still the one the member pays, and either
+  way they are asked to tell the club. Next, the two edge cases: credit that
+  covers the booking exactly renders the same three lines ending in
+  `Total Due: $0.00` and asks for nothing, and credit **larger** than the
+  booking's price makes the email name no figure at all — it states the
+  `Booking Total`, leaves `{{totalDue}}` empty, asks the member to wait while
+  the club works out what is left to pay, and logs it for an admin. A booking
+  with no credit against it gets the conditional sentence exactly as before.
+  Finally, if you invoice by hand because the Xero module is off, the
+  "Whole-lodge booking needs a manual invoice" alert quotes the netted amount
+  the member was asked for — invoice that, not the booking's price.
+
+### The authenticator reset notice
+
+**Your authenticator was reset** (`officer-factor-reset`, #4618) is sent after
+a Full Admin, or the operator command, clears a member's authenticator app and
+passkeys. `{{firstName}}` is required. Keep the sentences that say their
+sessions have ended and that no new grace period starts; both are true of
+every reset.
+
+### Consent emails ignore a member's notification preferences
+
+The six member-guest emails — the consent request, the "you have been added"
+notice, the "you are no longer on that booking" notice, the outcome notice to
+whoever made the booking, the notice that somebody in the family answered on a
+member's behalf, and the lapse notice —
+deliberately do **not** follow a member's own notification-category preferences,
+and they are not affected by the per-action "email the member" choices on admin
+screens. Being asked whether you agree to be on somebody's booking is not a
+preference: a member who had muted a category would never be asked, and would
+then quietly come off the booking days later without ever having heard about it.
+
+You can still change their wording here like any other template. A booking that an
+admin has silenced does withhold them, along with everything else about that
+booking.
+
+**Three of the six are one template doing several jobs**, because the difference
+between the jobs is one sentence rather than a different message:
+
+- **"You have been added to a lodge booking"** covers a club that adds member
+  guests without asking, an officer adding somebody on a member's behalf, and a
+  place created from an approved booking request. The opening sentence says
+  which, so an admin editing the wording edits one body rather than keeping three
+  near-copies in step.
+- **"You are no longer on that lodge booking"** (#2309) covers a request called
+  off before anybody answered, a member guest taken off a booking, and a
+  booking-request booking that was re-arranged so somebody else has the place.
+  It is *not* sent when a request simply lapses — that has its own lapse notice —
+  and it is not sent to a member who took themselves off.
+- The **removal advice** at the foot of the added notice is composed from the
+  same rule the server enforces, so it never offers a "take yourself off" link
+  the server would refuse. On a booking priced by hand it names the club as the
+  only remedy, because the person who made the booking cannot help.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Everything is read-only | Your role has support view, not edit | Ask a full admin for Support & System edit access |
+| Save is rejected | You removed a required token, used an unknown token, or put a sensitive token in the subject | Read the reason in the error — it names what the email must show and which tokens do it. Re-add the highlighted token (or one of its listed alternatives); use only the listed chips; keep tokens out of the subject |
+| A token shows literally to members | It is misspelled or not allowed for that template | Use the exact chip from the **Tokens** list |
+| A line reads "Admin note:" with nothing after it | You wrote your own label in front of a value that was empty for that send | Use the matching pre-composed chip (`{{adminNoteLine}}`, `{{reasonNote}}`, `{{doorCodeNote}}` …) on its own line instead |
+| I want the original wording back | An override is in place | Click **Restore Default** for that template |
+| The change didn't reach a lodge-specific value | Lodge name/travel note/door code are per-lodge now | Set them in [Lodges](../multi-lodge/README.md), not here |
+| An email's colours are the platform default rather than our brand | Colours come from [Site Style](site-style.md), not from this page, and that style could not be read when the message was built | Nothing here needs re-saving. Check the server log for the warning that names the saved style as unreadable, and the database's health — see [Site Style](site-style.md) |
+| No email is going out at all, from anywhere | This installation is not the club's live site, or nothing has told it which it is | Nothing on this page is wrong. Open [Environment](environment-role.md): a **copy** deliberately sends nothing, and an installation nobody has declared holds mail back until you declare it. That page also shows how much has been held back |
+| Nothing is going out and this IS the live site | The deployment declares itself the live site *and* declares a local capture mailbox, which cannot both be true | Remove `USE_LOCAL_CAPTURE` (or set it to `false`) and set `USE_AWS_SES` or `USE_SMTP_RELAY` instead. Most held-back messages then go out by themselves; ones carrying a sign-in link, a door code or a payment link keep no stored copy and are listed for a manual re-send — see [Environment](environment-role.md) |
+
+## Related links
+
+- Back to the [documentation hub](../README.md).
+- Hub: [Notifications & Email](notifications.md).
+- Sibling guides: [Delivery Rules](notification-rules.md),
+  [Recipients](notification-recipients.md),
+  [Booking Messages](booking-messages.md) (member-facing booking copy),
+  [Email Deliverability](email-deliverability.md).
+- Reference: the authoritative template catalogue, approved tokens, and
+  subject/body safety rules in
+  [`../../src/lib/email-message-registry.ts`](../../src/lib/email-message-registry.ts).

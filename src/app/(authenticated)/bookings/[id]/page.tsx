@@ -1,0 +1,486 @@
+import { adminHref } from "@/lib/admin-hubs";
+import { Suspense } from "react";
+import { bookingOwner } from "@/lib/booking-owner";
+import { auth } from "@/lib/auth";
+import { notFound, redirect } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import Link from "next/link";
+import { BookingEditor } from "@/components/booking-editor";
+import { ScrollToHash } from "@/components/scroll-to-hash";
+import { SectionNav, type SectionNavItem } from "@/components/section-nav";
+import { BookingHelpExtras } from "./_components/booking-help-extras";
+import { BookingNotesAndHistory } from "./_components/booking-notes-and-history";
+import { BookingCancellationOutcome } from "./_components/booking-cancellation-outcome";
+import { BookingLifecycleActions } from "./_components/booking-lifecycle-actions";
+import { BookingPaymentCards } from "./_components/booking-payment-cards";
+import { BookingStayPreferences } from "./_components/booking-stay-preferences";
+import { BookingReviewNotices } from "./_components/booking-review-notices";
+import { BookingLinkedPartySections } from "./_components/booking-linked-party-sections";
+import { BookingConsentCards } from "./_components/booking-consent-cards";
+import { BookingStatusSection } from "./_components/booking-status-section";
+import { BookingAdminToolsSection } from "./_components/booking-admin-tools-section";
+import { BookingGuestDietaryCard } from "./_components/booking-guest-dietary-card";
+import { RemovedBookingNotice } from "@/components/removed-booking-notice";
+import { resolveBookingDetailEntry } from "./_lib/booking-detail-entry";
+import { resolveBookingDetailViewer } from "./_lib/booking-detail-viewer";
+import { resolveBookingDetailConsent } from "./_lib/booking-detail-consent";
+import { loadBookingDetailHistory } from "./_lib/booking-detail-history";
+import { resolveBookingDetailEditAccess } from "./_lib/booking-detail-edit-access";
+import { resolveBookingDetailPayment } from "./_lib/booking-detail-payment";
+import { loadOrganiserCardAppealCeiling, loadSupersededHeldBackCents } from "./_lib/booking-detail-organiser-card-appeal";
+import { loadBookingDetailWaitlistPosition } from "./_lib/booking-detail-waitlist-position";
+import { resolveBookingDetailLinkedParty } from "./_lib/booking-detail-linked-party";
+import { buildBookingDetailEditorData } from "./_lib/booking-detail-editor-data";
+import { renderBookingDetailMessages } from "./_lib/booking-detail-messages";
+import { loadBookingDetailAdminTools } from "./_lib/booking-detail-admin-tools";
+import { CancellationScheduleBlock } from "@/components/booking/cancellation-schedule-block";
+import {
+  calendarDateOfDateOnlyInstant,
+  countClubNights,
+  dateOnlyInstantOf,
+} from "@/lib/club-time";
+import { clubTime } from "@/lib/club-time/server";
+import { clubFormat } from "@/lib/club-format-server";
+import { loadEmailMessageSettingsForLodge } from "@/lib/email-message-settings";
+import { loadPublicBookingMessages } from "@/lib/booking-message-settings";
+import { loadEffectiveModuleFlags } from "@/lib/module-settings";
+import { resolveInternalReturnPath } from "@/lib/internal-return-path";
+// Kept as its OWN single-line import, deliberately: a source contract in
+// arrival-instructions-consent-gate.test.ts matches this line verbatim, because
+// D-12's exclusion has to be visibly the SHARED predicate on this page rather
+// than a hand-rolled filter. Folding it into the import below would satisfy the
+// compiler and break the guard.
+import { isOperationallyPresentConsent } from "@/lib/member-guest-consent";
+import { loadBookingDetailGuestDietary } from "./_lib/booking-detail-guest-dietary";
+import { loadBookingDetailCancellation } from "./_lib/booking-detail-cancellation";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = {
+  title: "Booking details",
+};
+
+// Candidate anchors for this long, mostly-conditional page. SectionNav prunes
+// any whose target id is absent from the DOM after mount, so listing the full
+// set here (rather than re-deriving each card's render condition) is safe.
+const BOOKING_SECTIONS: SectionNavItem[] = [
+  { id: "details", label: "Booking Details" },
+  // #2307: the member-guest consent card — present only while the viewer's own
+  // consent is being asked for; the request email deep-links to #consent.
+  { id: "consent", label: "Consent" },
+  { id: "non-member-guests", label: "Non-member Guests" },
+  { id: "group", label: "Group Booking" },
+  // #3029: booking administrators only, and filtered out server-side for
+  // everybody else like "Bed Allocation" below — see `guestDietary`. Declared
+  // here because the card renders straight after the linked-party sections
+  // (which hold "non-member-guests" and "group") and before stay preferences.
+  { id: "dietary", label: "Dietary/Allergy" },
+  { id: "arrival", label: "Arrival Time" },
+  { id: "room-request", label: "Room Request" },
+  /*
+   * Admin-only (#2252). Unlike every other candidate here, this one is NOT left
+   * to SectionNav's post-mount pruning: pruning happens after hydration, so a
+   * member's server-rendered rail really did contain a "Bed Allocation" link
+   * that then vanished (#2252 review). The page knows both halves of the gate
+   * server-side, so it filters this entry out before render — see
+   * `showBedAllocationPanel` below. Pruning stays as the backstop for the
+   * genuinely client-unknowable cases.
+   */
+  { id: "bed-allocation", label: "Bed Allocation" },
+  { id: "directions", label: "Getting There" },
+  { id: "payment", label: "Payment" },
+  { id: "cancellation", label: "Cancellation" },
+  { id: "notes", label: "Notes" },
+  { id: "transaction-history", label: "Transaction History" },
+];
+
+/**
+ * The page's one level-1 heading, shared by the full detail and the removed
+ * booking notice, so the page file keeps exactly one `<h1>` (#5372).
+ */
+function BookingDetailHeading() {
+  return <h1 className="text-3xl font-bold">Booking Details</h1>;
+}
+
+/**
+ * #5266 (`INV-ADDPAY-034`): what the booking's owner, or a member guest on it,
+ * sees once the club has removed it. Everybody else gets the plain `notFound()`
+ * — `resolveBookingDetailEntry` decides which — and a Full Admin still gets the
+ * record, through the deleted-booking guard below.
+ */
+function RemovedBookingDetail() {
+  return (
+    <div className="mx-auto max-w-2xl space-y-6">
+      <BookingDetailHeading />
+      <RemovedBookingNotice
+        links={[
+          { href: "/bookings", label: "My bookings" },
+          { href: "/dashboard", label: "Back to the dashboard" },
+        ]}
+      />
+    </div>
+  );
+}
+
+export default async function BookingDetailPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams?: Promise<{ returnTo?: string | string[] }>;
+}) {
+  const { id } = await params;
+  const query = searchParams ? await searchParams : {};
+  const session = await auth();
+  if (!session) redirect("/login");
+  /*
+    THE CLUB'S OWN CLOCK, once, for the whole page (CT-4, #2870; INV-CONFIG-002).
+
+    Everything below that renders a real INSTANT — an audit stamp, a draft
+    expiry, an internet-banking hold, a deletion time — goes through this
+    binding, and so does the "today" the consent card is told. Both used to come
+    from `APP_TIME_ZONE`, so on a deployment whose container disagrees with the
+    club's recorded setting this page answered with the machine's day.
+
+    The stay dates DO NOT: `checkIn` and `checkOut` are `@db.Date` lodge nights,
+    which are calendar days and take no zone at all (INV-DATE-010).
+  */
+  const club = await clubTime();
+  const money = await clubFormat();
+  // #3123 — the club's today, as the UTC-midnight instant a `@db.Date` bound
+  // round-trips through, derived from the SAME binding this page already holds.
+  // THE ONLY RESOLUTION OF THE CLUB'S DAY ON THIS PAGE: it is threaded into
+  // every question below — the started-stay test, the edit policy, the
+  // admin-override policy, the self-removal card and the consent card — so none
+  // of them can answer on a different day. Two of those cards used to take a
+  // second `club.today()` of their own, which across club midnight would have
+  // offered a member a self-removal control the very next check refused.
+  const clubTodayDateOnly = dateOnlyInstantOf(club.today());
+
+  const entry = await resolveBookingDetailEntry({ id, session });
+  if (entry.kind === "REMOVED_FOR_VIEWER") return <RemovedBookingDetail />;
+  const booking = entry.kind === "FOUND" ? entry.booking : notFound();
+  const viewer = resolveBookingDetailViewer({ session, booking });
+  const {
+    isAdmin,
+    isBookingOwner,
+    viewerGuestRow,
+    isLinkedGuestViewer,
+    canManageBooking,
+    canViewAsAdmin,
+  } = viewer;
+  if (booking.deletedAt && !isAdmin) notFound();
+  if (!canManageBooking && !isLinkedGuestViewer && !canViewAsAdmin) {
+    redirect("/bookings");
+  }
+  // THIS booking's lodge identity, not the club default's. The ask card, the
+  // arrival instructions and the booking-message merge data (#2919) all want it
+  // and the last is unconditional, so it is loaded once rather than twice.
+  const bookingLodgeEmailSettings = await loadEmailMessageSettingsForLodge(
+    booking.lodgeId,
+  );
+  const consent = await resolveBookingDetailConsent({
+    session,
+    booking,
+    viewer,
+    clubTodayDateOnly,
+    bookingLodgeEmailSettings,
+  });
+
+  const history = await loadBookingDetailHistory({
+    booking,
+    club,
+    viewer,
+    format: money.format,
+  });
+
+  // Nights are CALENDAR arithmetic over the half-open `[checkIn, checkOut)`
+  // night range, never elapsed milliseconds divided by 24 hours: across a DST
+  // transition a night is 23 or 25 hours and that division is wrong (the kernel
+  // has a case where it returns 0 for a stay the calendar says is 1). Exact for
+  // the UTC-midnight encoding this replaces, so the value is unchanged here —
+  // what changes is that the wrong idiom is gone (INV-DATE-002, INV-DATE-003).
+  const nights = countClubNights(
+    calendarDateOfDateOnlyInstant(booking.checkIn),
+    calendarDateOfDateOnlyInstant(booking.checkOut),
+  );
+
+  const modules = await loadEffectiveModuleFlags();
+  const bookingMessages = await loadPublicBookingMessages();
+  const access = await resolveBookingDetailEditAccess({
+    booking,
+    modules,
+    clubTodayDateOnly,
+    viewer,
+  });
+  const {
+    isDraft,
+    isDeleted,
+    canModify,
+    canAdminOverride,
+    showBedAllocationPanel,
+  } = access;
+  const editorData = await buildBookingDetailEditorData({
+    session,
+    booking,
+    club,
+    nights,
+    viewer,
+    consent,
+    access,
+    // #3991: the amount owed and ledger credit the history loader already read for this page.
+    amountOwed: history.amountOwed,
+  });
+  const backHref = resolveInternalReturnPath(
+    query.returnTo,
+    isAdmin ? adminHref("bookings") : "/bookings"
+  );
+  const canDeleteDraft =
+    !isDeleted &&
+    isDraft &&
+    (isAdmin || bookingOwner(booking).memberId === session.user.id);
+  const canSoftDeleteCancelled =
+    !isDeleted &&
+    booking.status === "CANCELLED" &&
+    isAdmin;
+  // #2307 (domain invariant D-12): a member guest whose consent is still
+  // PENDING — or who said no, or let the request lapse — is NOT operationally
+  // present. D-11 lets them open this page so they can answer the question, and
+  // that is all it lets them do. The arrival instructions are the club's
+  // operational detail for people who are actually coming, and they carry the
+  // LODGE DOOR CODE, which the repo classifies as sensitive opt-in data. So the
+  // same predicate that keeps an unconsented row off the kiosk, the chore
+  // roster and the arrival emails gates it here too. The booking OWNER is
+  // unaffected: it is their booking, and they have no consent row of their own.
+  const showMemberArrivalInstructions =
+    !isDeleted &&
+    (isBookingOwner ||
+      (isLinkedGuestViewer &&
+        isOperationallyPresentConsent(viewerGuestRow?.consentStatus))) &&
+    ["CONFIRMED", "PAID"].includes(booking.status);
+  // Arrival instructions must carry THIS booking's lodge identity (door
+  // code, travel note), not the default lodge's — and stay null, so the door
+  // code never reaches the page at all, whenever the gate above says no.
+  const memberArrivalInstructions = showMemberArrivalInstructions
+    ? bookingLodgeEmailSettings
+    : null;
+
+  const party = resolveBookingDetailLinkedParty({
+    booking,
+    modules,
+    viewer,
+    access,
+  });
+  const resolvedPayment = resolveBookingDetailPayment({
+    booking,
+    modules,
+    viewer,
+    access,
+    party,
+    // #3991: the same read the narrative quoted, so the two cannot disagree.
+    amountOwed: history.amountOwed,
+    supersededHeldBackCents: await loadSupersededHeldBackCents(booking),
+  });
+  // #3956 (`INV-PAY-123`): an appeal on a booking the organiser paid for by card
+  // is capped at what the organiser's combined payment can still return.
+  const organiserCardAppeal = await loadOrganiserCardAppealCeiling(booking);
+  const payment =
+    organiserCardAppeal === null
+      ? resolvedPayment
+      : // #4124: its cap nets this child's card refunds in its own headroom, so no "still being refunded" line.
+        { ...resolvedPayment, maxRefundableCents: organiserCardAppeal.ceilingCents, appealCardRefundOwedCents: 0 };
+  const messages = renderBookingDetailMessages({
+    booking,
+    club,
+    money,
+    modules,
+    bookingMessages,
+    bookingLodgeEmailSettings,
+    payment,
+  });
+
+  const guestDietary = await loadBookingDetailGuestDietary({
+    sessionUserId: session.user.id,
+    booking,
+    viewer,
+  });
+
+  const adminTools = await loadBookingDetailAdminTools({
+    booking,
+    modules,
+    viewer,
+    access,
+    history,
+  });
+
+  const { cancellationSchedule, cancellationHasNoPayment } =
+    await loadBookingDetailCancellation({
+      booking,
+      access,
+      payment,
+      format: money.format,
+    });
+
+  return (
+    <div className="lg:flex lg:gap-8">
+      <SectionNav
+        sections={BOOKING_SECTIONS.filter(
+          (section) =>
+            (section.id !== "bed-allocation" || showBedAllocationPanel) &&
+            (section.id !== "dietary" || guestDietary !== null),
+        )}
+        className="mb-6 lg:mb-0"
+      />
+      {/* data-testid scopes content-only queries away from the SectionNav rail,
+          whose anchor labels (e.g. "Payment") would otherwise be matched by
+          loose getByText(...).first() locators. */}
+      <div
+        data-testid="booking-detail-content"
+        className="min-w-0 max-w-2xl flex-1 space-y-6"
+      >
+      <ScrollToHash />
+      {/* Render-null: feeds the four booking-help blocks into the global help
+          widget (epic #2094 C2), replacing the retired BookingHelpDialog. */}
+      <BookingHelpExtras
+        cancellationSchedule={cancellationSchedule}
+        cancellationHasNoPayment={cancellationHasNoPayment}
+      />
+      <div className="flex items-center justify-between">
+        <BookingDetailHeading />
+        <div className="flex items-center gap-2">
+          <Button asChild variant="outline">
+            <Link href={backHref}>Back to Bookings</Link>
+          </Button>
+        </div>
+      </div>
+
+      <BookingAdminToolsSection
+        booking={booking}
+        editorData={editorData}
+        modules={modules}
+        viewer={viewer}
+        access={access}
+        adminTools={adminTools}
+        payment={payment}
+      />
+
+      <Suspense fallback={<p className="text-sm text-muted-foreground" role="status">Checking additional-payment information…</p>}>
+        <BookingStatusSection
+          actorId={session.user.id}
+          modules={modules}
+          bookingMessages={bookingMessages}
+          bookingLodgeEmailSettings={bookingLodgeEmailSettings}
+          booking={booking}
+          club={club}
+          money={money}
+          viewer={viewer}
+          access={access}
+          party={party}
+          payment={payment}
+          history={history}
+          messages={messages}
+        />
+      </Suspense>
+
+      <section id="details" className="scroll-mt-20">
+        <BookingEditor
+          booking={editorData}
+          canModify={canModify}
+          canAdminOverride={canAdminOverride}
+        />
+      </section>
+
+      <BookingConsentCards
+        booking={booking}
+        club={club}
+        consent={consent}
+      />
+
+      <BookingLinkedPartySections
+        booking={booking}
+        money={money}
+        viewer={viewer}
+        party={party}
+        bookingLodgeEmailSettings={bookingLodgeEmailSettings}
+      />
+
+      {guestDietary && (
+        <BookingGuestDietaryCard
+          bookingId={booking.id}
+          guests={guestDietary.guests}
+          canEdit={guestDietary.canEdit}
+        />
+      )}
+
+      <BookingReviewNotices
+        booking={booking}
+        club={club}
+        viewer={viewer}
+        access={access}
+      />
+
+      <BookingStayPreferences
+        booking={booking}
+        viewer={viewer}
+        access={access}
+        memberArrivalInstructions={memberArrivalInstructions}
+      />
+
+      <BookingPaymentCards
+        booking={booking}
+        waitlistPosition={await loadBookingDetailWaitlistPosition(booking)}
+        club={club}
+        money={money}
+        viewer={viewer}
+        access={access}
+        party={party}
+        payment={payment}
+        messages={messages}
+      />
+
+      {/* #4946: a paid, cancellable booking shows its own lodge's schedule on
+          the page, beside the Cancel action, not only in the help widget. An
+          unpaid one keeps the widget's "no payment, no refund" line alone. */}
+      {cancellationSchedule && cancellationSchedule.length > 0 ? (
+        <CancellationScheduleBlock
+          rows={cancellationSchedule.map((row) => row.description)}
+          lead="If you cancel, the club's current cancellation schedule refunds what you have paid as follows:"
+        />
+      ) : null}
+
+      <BookingLifecycleActions
+        booking={booking}
+        viewer={viewer}
+        access={access}
+        payment={payment}
+        messages={messages}
+        canDeleteDraft={canDeleteDraft}
+        canSoftDeleteCancelled={canSoftDeleteCancelled}
+        backHref={backHref}
+        money={money}
+        organiserCardAppeal={organiserCardAppeal !== null}
+        organiserCardAppealPending={organiserCardAppeal?.combinedRefundPending === true}
+      />
+
+      <BookingCancellationOutcome
+        booking={booking}
+        money={money}
+        payment={payment}
+      />
+
+      <BookingNotesAndHistory
+        booking={booking}
+        club={club}
+        access={access}
+        history={history}
+      />
+
+      <p className="text-xs text-muted-foreground">
+        Waiting on a booking email? This page always shows the live status of
+        your booking — the confirmation, payment, and cancellation details
+        above are up to date even if an email hasn&apos;t arrived. Check your
+        spam folder, and contact the club if our emails keep going missing.
+      </p>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,3864 @@
+# Maintenance
+
+Audience: Developer, Agent
+
+This document describes the public maintenance baseline for AlpineClubBookingsNZ.
+
+## Required Gates
+
+Run the fast local gates before pushing application changes. `test:related` is
+mandatory because it follows the module graph to adjacent suites that a
+filename-only selection misses; add focused tests for the contracts you changed.
+
+```bash
+pnpm run db:generate
+pnpm run lint
+DATABASE_URL=postgresql://user:pass@localhost:5432/tacbookings pnpm run typecheck
+pnpm run test:related $(git diff --name-only main...HEAD)
+pnpm test path/to/focused.test.ts
+pnpm run knip                 # when files or exports change
+pnpm run docs:linkcheck       # when docs change
+pnpm run docs:indexcheck      # when docs change or INV-* ids are cited
+pnpm run quality:budget
+pnpm run ci:workflowcheck     # when .github/workflows/ changes
+git diff --check
+```
+
+The blocking `verify` job owns the full `pnpm test` and the production build; the
+dependency audit is its own blocking job beside it (`Dependency audit`, #2946)
+so an advisory cannot skip the gates behind it. Do not duplicate the full suite
+locally unless diagnosing CI or CI is unavailable. `pnpm test` includes property-based tests (fast-check) for the pure money math —
+pricing, promo discounts, refund tiers, change fees, member credit, and the
+Xero booking-edit settlement classifier — in
+`src/lib/policies/__tests__/*.property.test.ts` and
+`src/lib/__tests__/xero-settlement.property.test.ts`. They enforce the
+`DOMAIN_INVARIANTS.md` "Money" rules as universally-quantified properties
+(integer cents, refund + retained = paid, deterministic repricing, no negative
+charge or refund totals — booking-edit components stay signed and sum to the
+net, #1356).
+
+Migration/schema parity is enforced by a dedicated check. The committed
+migrations in `prisma/migrations` must reproduce `prisma/schema.prisma` exactly,
+or the blue/green deploy migration-safety gate aborts. Run it locally against a
+throwaway database (`SHADOW_DATABASE_URL` must point at an empty, existing DB
+that Prisma resets):
+
+```bash
+SHADOW_DATABASE_URL=postgresql://user:pass@localhost:5432/drift_shadow \
+  pnpm run db:check-drift   # exit 0 = in sync, 2 = drift
+```
+
+CI also runs independent static and container checks:
+
+- `pnpm run audit:deps` (`scripts/ci/audit-dependencies.mjs`) in its own blocking
+  `Dependency audit` job, on pull requests and on pushes to `main`. It runs
+  `pnpm audit --audit-level=high --json` and reports which of three things
+  happened — see "When the advisory service is down" below — plus a fourth
+  passing verdict, MITIGATED (never CLEAN), for a reviewed unfixed advisory
+  under an expiring owner-approved record (introduced in #3843; the live
+  records are listed in the mitigations README — see "Mitigated advisories"
+  below). It runs from a bare
+  checkout with no install: measured on npm 11.16.0 / Node 24 the audit built
+  its tree from `package-lock.json` and returned the same verdict with or without
+  `node_modules`, and `pnpm audit` likewise reads `pnpm-lock.yaml` alone (#3673).
+  Skipping the install keeps a required supply-chain gate
+  from reddening for anything except an advisory
+- the same wrapper again in the advisory, pull-request-only
+  `dependency-review` job (since #3843; it used to run the bare
+  `pnpm audit --audit-level=high`, which would stay red over a mitigation the
+  required job accepts). That one carries a job-level `if:`, which is exactly
+  why it can never be a required check
+- Semgrep with Next.js, TypeScript, JavaScript and React registry rules, **plus
+  the repository's own rules in `.semgrep/rules/`** for the two boundaries no
+  registry pack can know about — a `"use client"` module importing server-only
+  code, and interpolated SQL reaching `$queryRawUnsafe`/`$executeRawUnsafe`.
+  Each custom rule ships must-fail and must-pass fixtures in `.semgrep/tests/`,
+  which the same job runs before the scan (#2686)
+- gitleaks in one pinned container over **three** scopes — the pull request's own
+  commits, the history of `main`, and the checked-out tree — preceded by
+  `scripts/ci/gitleaks-selftest.sh`, which plants a credential and proves the
+  scanner still reports it. `Secret scan (gitleaks)` (#2686; **pending** as a
+  required check, see `AGENTS.md` for the rollout order)
+- the same pinned gitleaks over **every** branch's history, weekly and
+  non-blocking, as `Scheduled secret sweep` (#2852). It is advisory by
+  construction rather than by configuration — see "The repository-wide secret
+  sweep" below for which of the two is responsible for what
+- TypeScript, test, and Docker image build validation
+- Migration drift check (`migration-drift` job) running `db:check-drift` against
+  a throwaway Postgres, so schema-vs-migration drift fails the PR rather than the
+  deploy
+- Trivy critical vulnerability gate with high-severity warnings, as
+  `Image security gate (Trivy CRITICAL)` (#2686; **pending** as a required
+  check)
+- CodeQL, as **advisory** analysis via GitHub code scanning **default setup**
+  (repository settings, not a workflow file — languages `actions`, `javascript`,
+  `javascript-typescript`, `typescript`; default query suite; weekly schedule
+  plus every push and pull request on `main`). It is deliberately not a required
+  check, and it does not report on pull requests from forks
+
+## Dependency Policy
+
+- Keep `pnpm-lock.yaml` committed. It is the only lockfile; CI refuses a
+  `package-lock.json` (#3673).
+- Prefer small dependency update PRs with explicit validation results.
+- A package that runs an install script is approved in `pnpm-workspace.yaml`
+  `allowBuilds` at one exact version, and Dependabot bumps it in its own
+  `install-scripts` group. `verify` checks both before the install
+  (`scripts/ci/check-allow-builds.mjs`, #4364); a failure there is re-approved
+  as [`CONTRIBUTING.md` → "Package manager: pnpm"](../CONTRIBUTING.md#package-manager-pnpm)
+  describes.
+- Keep the `overrides` block in `pnpm-workspace.yaml` to the minimum that is still
+  load-bearing, and retire an entry as soon as the upstream dependency graph no
+  longer needs it. The register below — not the workspace file, whose comments
+  point here — is where an override records why it exists and when it retires.
+  Adding an override means adding a row.
+- Exact-pinning a **direct** dependency *below its newest release, because the
+  newer one is broken*, is a **hold**: it needs a row in the hold register below
+  and a written condition that lifts it. An exact pin at the version that is
+  already current is **not** a hold and needs no row — that covers the
+  version-coupling pins (`next` with `eslint-config-next`, `react` with
+  `react-dom`, `@prisma/client` with `@prisma/adapter-pg`) and every other exact
+  pin Dependabot steps forward each release. Thirteen direct dependencies are
+  exact-pinned today and none of them is a hold; the difference is whether
+  anything is being held back, not whether the range has a caret.
+- Use test or demo credentials for Stripe, Xero, SES, and Sentry in local and
+  CI environments.
+
+### When the advisory service is down
+
+**Audience: operator, developer.**
+
+`pnpm audit` asks npmjs.org for advisories over the network, so it can fail for
+two entirely different reasons. Until #3254 those two failures were
+indistinguishable at a glance: the same required check, the same red tick, and a
+`npm warn audit ...` line buried in the job log as the only way to tell them
+apart. On 4 September 2026 that cost a fully-green pull request several hours,
+and the check was re-run three times without the log being read - which is
+exactly how a genuine advisory eventually gets clicked past.
+
+The job now runs `scripts/ci/audit-dependencies.mjs`, and its **first line of
+output names the case**:
+
+| First line | What it means | What to do |
+| --- | --- | --- |
+| `Dependency audit: CLEAN - ...` | The advisory service answered and this branch has nothing at high or above. | Nothing. The job exits 0. |
+| `Dependency audit: MITIGATED — NOT CLEAN ...` | One reviewed, unfixed high advisory is still reported, and an owner-approved record in `dependency-mitigations.d/` says reviewed patches cover every copy the audit sees. The raw advisory, the record's scope (including copies it does **not** cover) and the unfiltered pnpm report are printed underneath. | Nothing until the record expires or a fixed release ships; then retire it ([`dependency-mitigations.d/README.md`](../dependency-mitigations.d/README.md) -> "Retiring a record"). The job exits 0 and raises a warning annotation. |
+| `Dependency audit: FAILED - VULNERABILITY FOUND ...` | A real finding. The service answered; the packages are listed underneath. When a mitigation record exists but does not apply, each reason is printed as `Mitigation record NOT applied: ...`. | Upgrade the dependency, or add a deliberate override with its reasoning to the register above. When a record was refused (expired, or its patch or dependency inputs changed), extend or retire it per [`dependency-mitigations.d/README.md`](../dependency-mitigations.d/README.md). **Re-running will not help.** |
+| `Dependency audit: FAILED - ADVISORY SERVICE UNREACHABLE ...` | npmjs.org did not answer, after four attempts. Nothing is known to be wrong with the branch - but it has not been cleared either. | Check <https://status.npmjs.org>, then re-run the job once the service has recovered. |
+| `Dependency audit: FAILED - THE AUDIT COULD NOT RUN ...` | pnpm answered with something that is not a readable audit report - usually a missing or malformed `pnpm-lock.yaml`, or a report whose severity counts are missing or non-numeric. | Read the pnpm output above the verdict. The verdict names which severities it could not read when that is the cause. |
+
+**The retry budget: four attempts, with 5s, 15s and 45s between them** - at most
+65 seconds added to a job whose own timeout is ten minutes. Generous enough to
+absorb the ordinary bad minute, which is what all three measured failures were;
+deliberately not generous enough to sit out a real outage, because a runner
+spending ten minutes discovering that npmjs.org is down helps nobody. Only an
+unreachable service is retried: a vulnerability is an answer, not a failure to
+answer.
+
+**Each attempt is also capped at 90 seconds** and killed if it exceeds that,
+which is what makes the budget a bound rather than an estimate. npm's own
+`fetch-timeout` default, which the gate ran under when the cap was chosen, is
+300 seconds, so an endpoint that swallows packets
+without answering could otherwise leave four attempts running past the job's
+ten-minute ceiling - and a cancelled runner prints no verdict line at all, which
+is the unexplained red this whole change exists to abolish. A killed attempt
+counts as unreachable, so it is retried and then named as an outage.
+
+**The accepted cost.** A sustained npmjs.org outage blocks every merge. That is
+the deliberate trade recorded on #3254: a required security gate that could not
+do its job does not get to report success, so green keeps meaning "the audit
+really ran and found nothing" - or, printed as MITIGATED and never as CLEAN,
+"the audit really ran and found only the one reviewed advisory an unexpired
+owner-approved record covers". Passing with a loud warning was considered and
+rejected - a green tick is what people read, not the summary underneath it.
+
+### Mitigated advisories
+
+**Audience: developer, operator.**
+
+Some advisories have no fixed release and cannot be overridden away. For those,
+and only with the owner's approval on the repository, the required audit can
+report **MITIGATED** instead of VULNERABILITY FOUND (#3843). It is never CLEAN:
+the advisory stays in the output with the unfiltered pnpm report, and the job
+goes red again the moment anything the approval relied on changes.
+
+The pieces, all in one reviewed pull request:
+
+- a reviewed patch under `patches/` for each affected installed copy,
+  registered for exactly that `package@version` in `patchedDependencies` in
+  `pnpm-workspace.yaml` (pnpm records its hash in `pnpm-lock.yaml`), and copied
+  into the Docker `deps` stage before its frozen install;
+- one record in [`dependency-mitigations.d/`](../dependency-mitigations.d/README.md)
+  binding the GHSA, each covered copy (exact version, dev flag, its patch's
+  SHA256, and the exact set of dependency paths the audit reports for it, since
+  #5252), the owner-decision comment URLs, an expiry, and the SHA256 of the
+  exact reviewed `pnpm-workspace.yaml` and `pnpm-lock.yaml`.
+
+Exactly when the wrapper accepts a record, who authorises one, the 14-day
+expiry cap, the warning annotation a MITIGATED pass raises, and the retirement
+checklist are all stated once, in
+[`dependency-mitigations.d/README.md`](../dependency-mitigations.d/README.md).
+Any dependency change at all - a Dependabot bump included - invalidates the
+acceptance until the advisory is re-reviewed against the new tree and the owner
+approves new digests. The live records, with their scope and their retirement
+issue, are listed in that README's "Current records" table, not here.
+
+### Why a stale override is not harmless
+
+A transitive dependency normally maintains itself: when a Dependabot group PR
+bumps a parent, pnpm re-resolves and every child floats up to the newest version
+its parent's range allows. An **exact** override switches that off for one
+package permanently, so the package silently stops being maintained by the
+system and becomes ours to carry. Prefer a `^` floor over an exact pin — the
+lockfile still pins one resolved version, so nothing about build or deploy
+determinism changes, but the package can drift upward within the range instead
+of freezing.
+
+This is not theoretical. #2863 found eleven of thirteen overrides had outlived
+the advisories that prompted them, two of them holding a package back a full
+minor version and two more pinning packages that had left the dependency tree
+altogether.
+
+### The override register
+
+Every row below was verified by removing that entry and re-resolving (#2863),
+and re-checked for #3673 against the ranges the installed parents declare. Five
+bind today: `postcss` (`next` pins 8.5.23 exactly), the `nodemailer` pair
+(`next-auth`'s optional peer stops at `^8`), and, since #5252, `qs` and
+`minimatch`, which hold development tooling outside its parents' declared
+ranges and say why in their rows, and, since #5293, `effect`, held above
+`@prisma/config`'s exact pin. The `mysql2` override retired in
+#4363, once `prisma` 7.10.1 pinned mysql2 3.24.4.
+`eslint-plugin-react-hooks` is a deliberate hold that is currently non-binding.
+`browserslist` is a security floor its parents' ranges do not guarantee
+(webpack accepts `^4.28.1`); it is non-binding under highest-version resolution
+but still required. Their rows say so. The `sharp` override was retired in #3673: `next@16.3.5` itself requires
+`^0.35.4`, which met its removal condition.
+
+Since #3673 the block lives in `pnpm-workspace.yaml`, translated one entry for
+one entry from npm's `overrides` in `package.json`. Two spellings changed.
+npm's `$sharp` and `$nodemailer` ("this repository's own range") became catalog
+references: `package.json` declares both dependencies as `catalog:`, the range
+is written once under the workspace file's `catalog:`, and the `nodemailer`
+override points at `catalog:` too, so a bump is one edit there. npm's nested
+`"next-auth": { "nodemailer" }` covered the whole subtree under `next-auth`;
+pnpm's `>` selector names a direct parent only, so that entry is written twice,
+`next-auth>nodemailer` and `@auth/core>nodemailer`, one for each package that
+declares the optional peer. Under pnpm, never override a package this
+repository also declares directly: the bare `sharp` override did, it rewrote
+the root's own `catalog:` specifier in the lockfile, and pnpm's pre-run check
+(`verifyDepsBeforeRun`), which compares `package.json` with the lockfile without
+applying overrides, then failed every `pnpm run` once `package.json` was newer
+than the last install. Scope an override to its parent (`parent>name`) instead.
+
+| override | why it exists | retires when |
+| --- | --- | --- |
+| `postcss` (`^8.5.26`) | **Security.** `next` requires postcss at an **exact** version: `8.4.31` when this was added, which carries four advisories including a high, and `8.5.23` in `next@16.3.5`, still below this floor. An exact upstream pin cannot be lifted by drift, so this override is the only thing keeping the nested copy safe. | `next` moves its own postcss pin to 8.5.26 or later. |
+| `next-auth>nodemailer` and `@auth/core>nodemailer` (`catalog:`) | **Resolution.** `next-auth@5.0.0-beta.32` declares `peerOptional nodemailer@"^7.0.7 \|\| ^8.0.5"`, which conflicts with this repository's own `nodemailer` range (the workspace `catalog:`); under npm the override was what stopped `npm install` failing with `ERESOLVE`, and under pnpm it keeps both packages' optional peer on that one copy instead of a peer-mismatch resolution. Added in `8f366a08c` (#1182). | `next-auth` widens its peer range to admit the catalog's nodemailer range (currently `^10.0.10`), on both `next-auth` and `@auth/core`. |
+| `eslint-plugin-react-hooks` | **Compatibility hold**, not security — `b1989558f` introduced it as "hold eslint-plugin-react-hooks at 7.0.1", and it has since been stepped forward to 7.1.1. Currently non-binding: natural resolution lands on 7.1.1 with or without it. | The hold is reviewed and lifted on purpose. |
+| `browserslist` (`^4.28.7`) | **Security.** Two high advisories against `browserslist <= 4.28.6` — unbounded memory growth with no cache eviction (GHSA-c83g-rgw3-j3cx), and an uncaught crash / prototype write via untrusted `browserslist-stats.json` (GHSA-73wf-gq98-2v4g). Transitive only; nothing declares it directly. A **range**, not a pin, so it keeps floating with future patches. | every package that depends on browserslist (today `webpack` `^4.28.1`, `@babel/helper-compilation-targets` `^4.24.0`, and `update-browserslist-db`'s peer `>= 4.21.0`) *requires* 4.28.7 or later, meaning the lowest version its range accepts is 4.28.7 or higher (e.g. `^4.28.7`). A range that only *includes* 4.28.7 does not count, and `pnpm audit` cannot show this because highest-version resolution clears the advisory with or without the override. |
+| `ajv>fast-uri` (`^3.1.9`) | **Security, in build tooling only.** `fast-uri < 3.1.9` carries four advisories (GHSA-w74x-v6f9-j3xg, GHSA-xhq7-xmqj-769h, GHSA-wjr9-j795-jxcr, GHSA-333x-w4r6-6crp). It arrives only through `ajv@8` under Prisma's dev tooling (`prisma > @prisma/dev > @prisma/streams-local`), which the running application never loads. `ajv@8.20.0` accepts any `fast-uri@^3.0.1`, so the pin does not conflict with its range; remove it when the resolved version is at least 3.1.9 without it (#4326). |
+| `typed-rest-client>qs` (`^6.16.1`) | **Security, in development tooling only.** `qs 6.15.1` carries four moderate advisories (GHSA-q8mj-m7cp-5q26, GHSA-x5fp-wj9c-mxmx, GHSA-4mjr-xmp4-gh2g, GHSA-6pq8-jhm2-2vcw; all fixed by 6.16.1). It arrives only through `@stryker-mutator/core > typed-rest-client@2.3.1`, which pins qs at **exactly** 6.15.1, so this override sits outside the parent's declared range. Checked for #5252: typed-rest-client calls qs only in `Util.getUrlWithParsedQueryParams` (`qs.stringify` with standard options), reached by Stryker's dashboard reporter (not configured here) and `stryker init`; qs's changelog from 6.15.1 to 6.17.1 lists fixes and one new opt-in format, no breaking change; the call returns the same query strings on 6.17.1; and typed-rest-client 3.1.x itself declares `^6.16.1`. Cleared with the overrides that let the #5252 mitigation record apply. | `@stryker-mutator/core` depends on a `typed-rest-client` whose own qs range requires 6.16.1 or later (3.1.x does; Stryker 10.1.1 asks for `~2.3.0`). |
+| `minimatch@>=7.0.0 <11.0.1` (`^11.0.5`) | **Security, in development tooling only.** GHSA-g3hv-75wg-m249 (moderate) covers minimatch `>=7.0.0 <11.0.1` with no 10.x fix. The selector is the advisory's own range, so `minimatch@3.1.5` (under `eslint-plugin-import`, `-jsx-a11y` and `-react`, outside the range and on a different API) is untouched. Today it moves two parents **outside their declared ranges** onto the 11.0.5 that `glob` already used: `@typescript-eslint/typescript-estree@8.62.1` (`^10.2.2`) and `@stryker-mutator/core@10.1.1` (`~10.2.4`). When it was added it also moved `eslint@10.14.0` (`^10.2.6`) and `@eslint/config-array@0.23.5` (`^10.2.4`); since #5414 `main` is on `eslint@10.15.0` and `@eslint/config-array@0.23.6`, which both declare `^11.0.5` themselves, so the override no longer changes what they resolve to (parents and ranges re-read from the lockfile and the installed packages on 22 Nov 2026). Checked for #5252, over the four parents it moved then: 11.0's breaking changes remove `makeRe`, `Minimatch#regexp`, `AST`, `debug` and `matchOne` and change what `Minimatch.set` holds; none of the four parents uses any of them (they call `minimatch()`, `new Minimatch()`, `.match(path[, partial])`, `.negate`, `.pattern` and `.hasMagic()`); a differential of 10.2.6 against 11.0.5 over every glob in the repository's tool configs and every tracked path, in each parent's call shape, found no difference; and eslint, knip, vitest and the production build ran. | Both remaining parents require 11.0.1 or later. typescript-eslint 8.73.0 does (`^11.0.1`), but `main` still resolves 8.62.1; Stryker 10.1.1 does not. |
+| `@prisma/config>effect` (`^3.22.1`) | **Security, in Prisma's configuration tooling.** GHSA-7589-6fvf-x4pw (high, CVE-2026-121707): `effect <=3.22.0` compiles `Schema.TemplateLiteral` templates with two or more string spans to a backtracking regular expression; fixed in 3.22.1. The installed `effect` arrives only through `prisma > @prisma/config`, and `@prisma/config@7.10.1`, the newest 7.x release, pins it at **exactly** 3.20.0, so this override takes `effect` **outside its parent's exact pin** (to 3.22.4). Checked for #5293: `@prisma/config` imports only `Schema.Struct`, `String`, `optional`, `Array`, `Boolean`, `NullOr`, `NonEmptyString`, `Any`, `mutable`, `decodeUnknownEither` and a schema's `make`, plus `Either` and `pipe` from `effect/Function`, never `Schema.TemplateLiteral`, and decodes only this repository's `prisma.config.ts`; Effect's changelog from 3.20.0 to 3.22.4 changes none of them (its one behaviour change, how a serialised `Cause.Fail` is named, is not used: `@prisma/config` throws the `ParseError` itself); the config still loads, an excess key is still refused with Effect's parse message, and Prisma generate, `migrate deploy`, the drift check, `prisma validate`, the data-migration verification suite and four real-database suites passed on PostgreSQL 16. **Not reached by this override:** the `prisma` command-line tool also bundles its own copy of `effect` 3.20.0 inside `build/cli.js`, which neither this override nor `pnpm audit` can reach. It loads `prisma.config.ts` through the installed `@prisma/config` (on 3.22.4), and the security review for #5293 found its bundled copy never builds a `Schema.TemplateLiteral` schema, so the weakness is not reachable through it. It is replaced when Prisma ships a release built on a fixed `effect`. | Prisma ships a release whose `@prisma/config` requires, and whose command-line tool bundles, `effect` 3.22.1 or later (keep `prisma`, `@prisma/client`, `@prisma/config` and `@prisma/adapter-pg` on one version). |
+
+### The direct-dependency hold register
+
+An override constrains what a *parent* is allowed to resolve. A hold is the other
+thing: a package this project declares itself, deliberately pinned to an exact
+version so a Dependabot group PR cannot carry it forward. It is recorded here and
+not in the table above, because the removal-and-re-resolve check described below
+does not apply — nothing transitive is being forced, so an inert hold looks
+identical to a load-bearing one.
+
+The word also appears in the override register above, in the older and looser
+sense: the `eslint-plugin-react-hooks` row calls itself a "compatibility hold"
+because it is kept for a compatibility reason rather than an advisory. That entry
+is an **override** on a transitive package and it stays where it is. Only a
+direct dependency this project declares belongs in the table below.
+
+Two rules, both learned the expensive way:
+
+- **A hold must be an exact version, never a `^` floor.** The preference for a
+  range stated above is about *overrides*, where the goal is to raise a floor. A
+  hold has the opposite goal, and `"^10.70.0"` does not hold anything back: the
+  range admits the broken release, so any re-resolve lands on it again. Measured
+  on #3313, where the caret was tried first and the lockfile came back on
+  **10.72.0 — the release being held back from.** The exact pin is also what
+  makes a future move show up as a visible `package.json` diff rather than as a
+  lockfile line nobody reads.
+- **A hold needs a written retirement condition, or it becomes permanent.** The
+  package stops being maintained by the system the moment it is pinned.
+
+| hold | why it exists | retires when |
+| --- | --- | --- |
+| _none_ | No package is held today. The `@sentry/nextjs` hold (`10.70.0`, #3313) retired in #3419, which moved to 10.74.0 after Sentry shipped a `@sentry/server-utils` that loads only what it declares. | — |
+
+### Checking whether an override still earns its place
+
+`pnpm audit` answers this directly, and it is worth running whenever the block is
+touched. Strip the candidate entries in a scratch copy — never in the worktree —
+regenerate, and audit:
+
+```bash
+mkdir -p /tmp/ovcheck && cp package.json pnpm-workspace.yaml pnpm-lock.yaml /tmp/ovcheck/
+cd /tmp/ovcheck && cp pnpm-lock.yaml lock-before.yaml
+
+# remove the override(s) under test from pnpm-workspace.yaml, then re-resolve
+# from scratch — deleting the lockfile is what forces pnpm to answer "where would
+# this land on its own?" rather than preserving what is already pinned.
+rm pnpm-lock.yaml
+pnpm install --lockfile-only --ignore-scripts
+pnpm audit --audit-level=high
+```
+
+Anything the audit reports is still load-bearing and stays. Anything it does not
+report has been fixed upstream and the override should go.
+
+Compare `lock-before.yaml` against the regenerated lockfile as well, because the
+audit alone does not distinguish an inert override from a harmful one. An entry
+that resolves to a **lower** version once removed is doing real work; one that
+resolves to the **same** version is inert; one that resolves **higher** was
+actively holding the package back.
+
+Two cautions. `pnpm audit` reflects today's advisory database, so this measures
+whether upstream has caught up as of now, not for all time. And an override may
+exist for a non-security reason that no audit can see — check `git log -S` for
+the entry before removing it, as a hold or a peer-conflict fix will look inert
+to this procedure while still being load-bearing. Nor can it see a
+security **floor** over parents whose ranges still accept a vulnerable version:
+highest-version resolution lands above the floor with or without the override,
+so the audit is clean either way. Read each parent's declared range instead;
+the floor is needed until the lowest version every parent accepts is itself
+safe (`browserslist` above is the standing example).
+
+## Supply-Chain And Deployment Security Policy
+
+- Keep GitHub Actions default permissions at `contents: read`. Grant elevated
+  permissions only on the job that needs them, such as `packages: write` for
+  GHCR publishing on `main`.
+- Do not reference GitHub Actions by default branches such as `master` or
+  `main`. Use released major tags for trusted first-party and widely used
+  actions that Dependabot can track, and use explicit release tags for scanner
+  actions or images where drift would change gate behavior.
+- Keep scanner container inputs isolated. Source checkouts mounted into scanner
+  containers should be read-only unless the scanner must write to the source
+  tree; write artifacts to `$RUNNER_TEMP` or another dedicated output mount.
+- Keep production image tags commit-SHA based. Operators should deploy the app
+  and migration images that match the resolved `origin/main` commit.
+- Keep GHCR host tokens read-only. Production hosts need `read:packages`; CI
+  publishing uses the workflow `GITHUB_TOKEN` in the publish job only. The one
+  exception is `--build-and-push-images`, the supported way to build on the host
+  when CI cannot (#3539): it pushes, so it needs `write:packages` for the
+  duration of that build. Log back in with the read-only token afterwards — a
+  host that is only ever deployed to has no standing need to publish.
+- Treat Docker image security as two gates: CRITICAL Trivy findings fail the PR,
+  while HIGH findings are warning-only until reviewed and promoted to a blocking
+  policy. Since #2686 the CRITICAL half is intended as a **required**
+  protected-branch check (`Image security gate (Trivy CRITICAL)`), so it blocks
+  the merge rather than only turning a job red; the HIGH step keeps
+  `continue-on-error: true` and the two steps are named "REQUIRED" and
+  "ADVISORY" so the distinction is readable from the checks list. Since #4425
+  (owner decision, 26 Oct 2026) a pull request builds and scans the image only
+  when it changes dependencies, `patches/`, the Dockerfile, a compose file,
+  `.dockerignore`, `.trivyignore` or the CI workflow; the check still reports,
+  and every push to `main` scans in full, so a newly published CVE surfaces
+  there rather than on an unrelated pull request.
+- Keep a scanner's configuration file honest about what it actually enables. A
+  `.gitleaks.toml` without `[extend] useDefault = true` REPLACES the built-in
+  rule set instead of adding to it, and this repository shipped exactly that for
+  months: both gitleaks jobs ran green over a rule set with nothing in it
+  (#2686). Whenever a scanner config changes, prove the scanner still fails on a
+  deliberate violation before trusting the green —
+  `bash scripts/ci/gitleaks-selftest.sh` is that proof, and it runs in CI ahead
+  of the scans it vouches for.
+- Keep gitleaks allowlists CONTENT-scoped **and pinned to exact literals**. A
+  global `[[allowlists]]` entry carrying `paths` suppresses everything under
+  those paths in gitleaks 8.28.0 whatever else the entry says, and
+  `matchCondition = "AND"` does not narrow it. A global allowlist also applies to
+  every RULE, not the one its description names, so a SHAPE — a UUID, a
+  `sk_test_` prefix — silences rules nobody considered: measured, the UUID shape
+  dropped `heroku-api-key` and a UUID `CRON_SECRET`. `targetRules` is not the fix
+  either; in 8.28.0 it silently voids the allowlist entirely.
+
+### Refreshing container image digests
+
+Third-party containers use tag plus digest (`INV-OPS-017`). Dependabot updates
+Dockerfile and Compose references, but does not update workflow environment
+values, workflow services or shell assignments. When it changes Compose's
+PostgreSQL pin, copy that exact reference to every PostgreSQL service in
+`.github/workflows/ci.yml`; `deployment-image-contracts.test.ts` rejects drift.
+The deploy's Caddy helpers read Compose directly, so they need no copied pin.
+
+For Semgrep (`SEMGREP_IMAGE` in `ci.yml`) and the backup drill (`PG_IMAGE` in
+`scripts/backup-restore-drill.sh`), resolve the existing tag's registry manifest
+index digest, preserving its version and platform coverage. Use the digest of
+the multi-architecture index, rather than one platform's manifest. Keep the
+backup drill on Debian `postgres:16`; its measured restore baseline uses that
+variant. Review intentional version upgrades separately.
+
+Run `node scripts/ci/check-image-pins.mjs` and
+`pnpm run test:named scripts/ci/check-image-pins.test.mjs src/lib/__tests__/deployment-image-contracts.test.ts src/lib/__tests__/deploy-caddy-image-script-contract.test.ts`.
+The image check shares the existing action-pin CI step; required check and
+scanner step names stay unchanged. A rejected unsupported shape needs an
+explicit parser extension and test, rather than bypassing the check.
+
+### Two Semgrep scans run per pull request, and only one of them blocks
+
+This trips up every reader of a `nosemgrep` annotation, so it is written down
+rather than inferred:
+
+- **`Static analysis gate`** (`ci.yml` → `static-analysis`) is the blocking one.
+  It runs `p/nextjs`, `p/typescript`, `p/javascript`, `p/react` and
+  `.semgrep/rules/`, and nothing else. **This is the policy**: the ruleset is
+  versioned in this repository and changes only through a reviewed diff.
+- **`semgrep-cloud-platform/scan`** is a Semgrep AppSec Platform GitHub App
+  check. It costs no GitHub Actions time and it is advisory. Its ruleset is
+  configured at semgrep.dev, so it is an **execution and reporting surface, not
+  a second policy** — the owner's decision on #2842.
+
+#### Keeping Semgrep Cloud aligned to this repository (owner UI checklist)
+
+Nothing in this repository can read what semgrep.dev is configured to run, so
+this alignment cannot be enforced by a check — it is a documented control, and
+saying so plainly is the honest version. Whenever `.semgrep/rules/` changes, or
+after any Semgrep Cloud policy edit, the owner re-walks this list at
+[semgrep.dev](https://semgrep.dev) → the `AlpineClubBookingsNZ` project:
+
+1. **Rules → Policies.** Turn OFF every managed policy the repository does not
+   run — in particular `p/default` and `p/security-audit`, which are the two
+   that produced the split-brain #2842 measured.
+2. **Turn ON exactly the four packs the blocking gate runs**: `p/nextjs`,
+   `p/typescript`, `p/javascript`, `p/react`.
+3. **Enable scanning of the repository's own rules** so `.semgrep/rules/` is
+   picked up from the checkout rather than from a Cloud-side copy.
+4. **Settings → confirm the scan excludes** `node_modules`, `.next` and
+   `.semgrep/tests`, matching the blocking invocation. Every file in
+   `.semgrep/tests` is a deliberate violation and will otherwise be reported.
+5. **Re-read the two counts below.** If Cloud reports findings the blocking gate
+   does not, the two have drifted again and step 1 is the usual cause.
+
+If the club ever decides the Cloud scan is not worth this recurring step, the
+supported answer is to remove the GitHub App outright rather than to let it
+drift — an advisory scanner running an unknown ruleset is worse than none,
+because its green is read as evidence.
+
+#### What the suppressions actually suppress (re-measured for #2842)
+
+Measured on the pinned CI image `semgrep/semgrep:1.161.0` by re-running the
+exact blocking invocation with `--disable-nosem`, **three** findings exist in
+the whole repository:
+
+| Rule | Site |
+| --- | --- |
+| `semgrep.rules.acb-unsafe-raw-sql` | `src/lib/audit-retention.ts` |
+| `semgrep.rules.acb-unsafe-raw-sql` | `src/lib/booking-envelope-invariants.ts` |
+| `typescript.react.security.audit.react-dangerouslysetinnerhtml` | `src/components/club-post-editor.tsx` |
+
+**This corrected the count #2686 recorded, and corrected it in a way that
+mattered.** That measurement found one finding and concluded that every
+annotation not naming an `acb-` rule served the cloud scan. It does not:
+`react-dangerouslysetinnerhtml` comes from `p/typescript`, which the blocking
+gate **does** run. One of the six annotations naming that rule was live; the
+other five sat on call sites the rule never flags.
+
+So the tree carried 120 id-bearing `nosemgrep` annotations and exactly 3 of them
+suppressed anything the blocking gate can emit. #2842 deleted the other 117
+— the evidence being that `--disable-nosem` reports no finding at any of those
+sites — and the scan is still findings-free with them gone. Each of the three
+retained annotations names its rule and carries the reason at the call site.
+
+Two things follow for anyone adding one:
+
+- **Measure before you write one.** Run the invocation below; if it reports
+  nothing at your line, a `nosemgrep` there suppresses nothing and is noise that
+  the next census has to re-disprove.
+- Semgrep matches `nosemgrep: <id>` by **exact suffix**, so a rule-id variant is
+  a different id. A `path-traversal.path-join-resolve-traversal` annotation does
+  not suppress an `express-path-join-resolve-traversal` finding, and a rename
+  upstream silently un-suppresses every annotation naming the old id.
+
+```bash
+# What the blocking gate would report with every suppression ignored.
+docker run --rm -v "$PWD:/src:ro" -w /src semgrep/semgrep:1.161.0 \
+  semgrep scan --config .semgrep/rules \
+    --config p/nextjs --config p/typescript --config p/javascript --config p/react \
+    --disable-nosem --metrics=off \
+    --exclude node_modules --exclude .next --exclude .semgrep/tests
+```
+
+### Semgrep parse coverage
+
+`semgrep scan --error` exits 0 on findings-free code **even when it could not
+parse some of that code**. Parse failures are reported at `warn` level in the
+JSON `errors` array and nowhere in the exit status, so a file the scanner cannot
+read has looked exactly like a file the scanner read and cleared.
+
+Measured for #2842 on the same pinned image: 177 of 4,219 scanned files carried
+a parse error behind a green gate, and **three were whole-file failures where no
+rule ran at all**. **Three families** of parser fault cause all of them, and
+every one fires on valid TypeScript that `tsc` and the build accept.
+
+Those three families are stated once, as the rule rather than as a spelling, in
+`KNOWN_CONSTRUCTS` in `scripts/ci/check-semgrep-coverage.mjs` — which is also
+the text the gate hands you when it fires, so it is the copy that has to be
+right. They are deliberately not restated here.
+
+**Two of the three are banned by lint, for the positions the rule reaches — and
+that qualifier is the whole point.** #3318 added
+`scan/no-semgrep-unparsable-import-type` to `eslint.config.mjs`, rewrote the 307
+call sites that carried the first, named the five types that carried the second,
+and took the allowlist from 169 entries to 3. **This paragraph is the one home
+for those four numbers.** They are measurements taken at that change rather than
+facts about the design, so a second copy goes stale silently and nobody notices
+which copy is wrong — `INV-SSOT-004`. The rule's own comments and its guard suite
+therefore describe the rewrite without counting it, and a later change
+re-measures here rather than stating a number of its own. It then said the two shapes
+"cannot come back", which #3345 measured as false: roughly a dozen further
+positions fail and the rule was silent on every one, including two members of
+the call family. The rule is now wider — the whole call family including the
+instantiation shapes, every **decorated** `import()` type wherever it appears,
+and an undecorated one in a parameter position — and the claim is narrower.
+**The gate remains the backstop for anything the rule does not reach**, which
+is the arrangement rather than a failure of it. So a partial parse of a shape
+the rule DOES reach means the rule was bypassed or the file is outside its
+globs; a partial parse of anything else is a real finding, and the response is
+to measure the construct and widen the rule rather than to add an entry.
+
+The description of those faults has now been wrong four times, each time by
+being narrower than the fault, and each correction cost somebody a wrong turn.
+Worth knowing before you reach for a remedy, all measured:
+
+- **the call fault is about the SHAPE, not the name.** 143 files spelled it
+  `importOriginal`, 22 spelled it `vi.importActual` or a destructured
+  `importActual`, and grepping for the first name finds nothing in those;
+- **and it is not only the empty argument list.** #2842 corrected the
+  description to "an EMPTY argument list", measured on a single-line repro:
+  `f<typeof import("x")>()` fails and `f<typeof import("x")>("x")` parses. That
+  correction is also incomplete — a **trailing comma** breaks it just as
+  reliably: the multi-line form, with a comma after the last argument, fails
+  with "`,` was unexpected". It appeared at 12 call sites, and for 10 of the
+  169 entries it was the only cause: a formatter split a long argument list
+  across lines and added the comma with the reflow. So which side of the line a
+  call sits on is decided by **print width**, which is why
+  #3318's rule reports the whole class: 23 files held the "parses today"
+  spelling and every one of them was one rename away from an entry of its own;
+- **a third fault exists that neither description reached**: a **decorated**
+  `import()` type — one carrying a type-argument list, an indexed access, a
+  `keyof` or a wrapping parenthesis. One allowlisted file carried this and no
+  call shape at all, so its entry read as unexplained for as long as the
+  description named only the call;
+- **and #3318 described that third fault as a PARAMETER fault, which was the
+  fourth time the description was too narrow.** It measured
+  `(i: import("x").A<null>)` and generalised from the position. Re-measured for
+  #3345, the position is nearly irrelevant: the same type fails in a type alias,
+  an interface property, a return annotation, a class property, a generic
+  constraint or default, a nested type argument and an `extends` or `implements`
+  clause. The boundary INSIDE the family is incoherent, which is why the rule
+  reports the decoration rather than a spelling —
+  `import("x").A<null>["k"]` parses in an alias and deleting the index makes it
+  fail, `keyof import("x")` fails while `keyof typeof import("x")` parses,
+  `(import("x").A)` fails while `(typeof import("x"))` parses, and `x as
+  import("x").A<null>` parses;
+- **the remedy for that third fault is a top-level `import type`, not a named
+  alias**, and getting this wrong is what #3345 was filed to fix. #3318's rule
+  printed "give the type a name and use the name", which produces
+  `type P = import("x").A<null>;` — measured to FAIL, with the rule silent on
+  it. A guard printing an instruction that creates the hole it exists to close
+  is the worst failure mode available to one. Use
+  `import type { A } from "@/lib/x";` and then `A<null>["k"]`, or root the type
+  at `typeof`: `typeof import("@/lib/x").k` and `(typeof import("@/lib/x"))["k"]`
+  parse everywhere outside a call. A type-only import is erased at compile time,
+  so a dynamically-loaded module stays dynamically loaded;
+- **two members of the CALL family were silent too** (#3345): a bare
+  instantiation expression `f<typeof import("x")>` with no call, and
+  `f<typeof import("x")>?.()`, where the type arguments hang off the callee
+  rather than the optional call. A second type argument also fails even with an
+  ordinary argument list. `new`, by contrast, is genuinely unaffected — every
+  argument-list variant of `new K<typeof import("x")>` parses, including the
+  trailing-comma reflow, which is why the rule leaves it alone;
+- **the `&amp;` remedy is for JSX text only.** The same fault fires on a `&`
+  inside a string literal — a URL query such as
+  `href="/admin/bookings?sortBy=member&sortDir=asc"` — where rewriting it
+  changes the value, and in one case the value a test asserts. The **three**
+  files left on the allowlist are there precisely because they have no safe
+  rewrite. It was reported here as four until #3318 re-measured it: the fourth
+  was unparsed for the call shape, and its own `&` never tripped anything.
+
+Each surviving entry carries its own `reason`, and the gate **refuses** an entry
+without one. The reasons used to sit in a composition summary beside the list,
+and both of that summary's clauses had gone false — a summary of a list is a
+second statement of the list (`INV-SSOT-001`).
+
+#### The coverage gate
+
+`scripts/ci/check-semgrep-coverage.mjs` runs in the same job and fails on four
+things:
+
+- a **whole-file** parse failure, always, with no way to allowlist it. Coverage
+  there is zero, and a file nothing scans must never be signed off as scanned;
+- a partially-unparsed file absent from `.semgrep/unparsed-allowlist.json`, so
+  coverage cannot quietly shrink;
+- an allowlist entry whose file now parses, or no longer exists. **An entry
+  cannot outlive its evidence** — whoever fixes a file deletes its entry in
+  the same change, so the list cannot rot into an exemption roster nobody
+  rechecks. Note which direction is mechanical: deletion is forced by the
+  gate, while an addition only has to survive review, so the guarantee is
+  that the list never grows *silently*, not that it never grows;
+- an `errors[].type` it does not recognise. Fail-closed: a scanner that starts
+  reporting a new kind of failure must not reduce coverage silently just because
+  the gate predates the name;
+- a scan that read nothing, or fewer files than `minimumScannedFiles`.
+
+**The allowlist doubles as the canary.** A report only passes if it names
+exactly those files as partially parsed *and* clears the file floor, and a
+broken, truncated or forged scan cannot satisfy both — too few files fails the
+floor, a missing entry reads as stale, an extra one as newly unparsed. #2842's
+security review attacked precisely this, forging reports that clear the floor
+with no failures, and could not construct one.
+
+The floor is a **tripwire, not a ratchet**, and worth stating as the limit it
+is: it sits at 4,000 against roughly 4,250 targets, so a change that excludes a
+directory *and* lowers the floor in the same commit passes everything. Review
+holds that direction, exactly as it holds an addition to the allowlist. The
+floor catches the accident, not the intent.
+
+Every entry in the allowlist is a **test file**: the production files and all
+three whole-file failures the measurement found were fixed rather than listed.
+The file itself is the count — the numbers above are dated facts about what
+#3318 removed, not a running total, because the gate exists to drive the list
+down and a copied total is wrong on the first success. Run it locally against a
+scan you produced yourself, and note that the scan reads the whole worktree:
+a stray `.ts` file under `.artifacts/` is scanned and will be reported as a new
+unparsed region, which is not something CI can see.
+
+```bash
+docker run --rm -v "$PWD:/src:ro" -v "$PWD/.semgrep-out:/out" -w /src \
+  semgrep/semgrep:1.161.0 \
+  semgrep scan --config .semgrep/rules \
+    --config p/nextjs --config p/typescript --config p/javascript --config p/react \
+    --metrics=off --exclude node_modules --exclude .next --exclude .semgrep/tests \
+    --json-output /out/semgrep-results.json
+node scripts/ci/check-semgrep-coverage.mjs .semgrep-out/semgrep-results.json
+```
+
+#### Both lists are living worklists, not a finished cleanup
+
+The unparsed allowlist and the suppression census are **populations that
+regrow**, and #2842 measured how fast — over three separate batches during one
+issue's delivery:
+
+| Merge | New unparsed files | New dead suppressions |
+| --- | --- | --- |
+| `main` sync into the epic | 4 | 1 |
+| one child merge (#3214) | — | 1 |
+| four children at once (#3307 et al) | 2 | — |
+
+**So it is not only a `main` sync that regrows these lists — it is anything
+landing at all**, including a sibling child on the same epic. Nobody did
+anything wrong in any of those: `importOriginal<typeof import("...")>()` is the
+idiomatic partial mock, and `path.resolve(process.cwd(), …)` in a test helper
+reads as exactly the thing that deserves an exemption comment.
+
+Two consequences worth holding on to.
+
+- **A one-time sweep cannot hold either population, so neither is "done".**
+  #2842 swept both, and both had regrown before the branch merged — the first
+  time with nobody noticing, which is why the count in this document was wrong
+  for a fortnight. The instruments are what hold the line now: the coverage
+  gate for the first list and `semgrep-suppression-census.test.ts` for the
+  second, and each caught its regrowth on the very first merge that produced
+  one, before any human read the diff.
+- **The first list's recurrence is closed, and the second's is not.**
+  [#3318](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/3318)
+  banned both call-site shapes with `scan/no-semgrep-unparsable-import-type`,
+  which removes that growth at the source rather than catching it after the
+  fact — the structural fix `INV-SSOT-001` prefers over a policed one. Write a
+  new partial mock as `(await importOriginal()) as typeof import("@/lib/x")` and
+  lint will tell you if you forget. The **suppression census** has no equivalent
+  and still regrows on merges, so expect to prune it after a sync.
+
+### Break-glass: a new CRITICAL image finding with no code change
+
+Trivy scans the built image against a vulnerability database that moves on its
+own. A newly published CRITICAL against the `node:24.15-alpine` base therefore
+turns `Image security gate (Trivy CRITICAL)` red on the next push to `main` and
+on **every** open pull request that rebuilds the image (#4425), including the one
+that would fix it, with nobody having changed a line. Branch
+protection has `enforce_admins` off, so the owner can force a merge through; an
+agent cannot, and must not try. Do this instead, in order:
+
+1. **Rebuild first.** If the base image has already been patched upstream, a
+   fresh `docker build` picks it up and the finding disappears. Check the
+   advisory for a fixed version before anything else.
+2. **If there is no fix yet, add a dated `.trivyignore` entry** at the
+   repository root, one CVE per line, each with a comment giving the CVE, the
+   date, why the application is not exposed, and the issue tracking removal:
+
+   ```
+   # CVE-2026-12345 — added 2026-08-14. openssl in node:24.15-alpine; no fixed
+   # version published yet. Reachable only from the TLS client path, which this
+   # image does not use at build time. Remove when 24.15.x ships the fix.
+   # Tracked by #NNNN.
+   CVE-2026-12345
+   ```
+
+3. **File the removal issue in the same pull request**, never as prose. An
+   undated, untracked `.trivyignore` entry is a permanently disabled gate.
+4. **Owner admin-merge is the last resort**, and it is an owner action: an agent
+   escalates by commenting, and waits.
+
+Review `.trivyignore` whenever the base image moves, and delete every entry whose
+advisory now has a fixed version.
+
+### The repository-wide secret sweep
+
+`Secret scan (gitleaks)` is deliberately scoped to `main`, not to every branch:
+`git log --all` walks every `refs/remotes/origin/*` that `fetch-depth: 0`
+materialised, so one leak on anybody's abandoned branch would turn a REQUIRED
+check red on every open pull request, unfixable from the author's own branch.
+A wider sweep is still worth running — a secret on an unmerged branch is public
+on a public repository — but it belongs in a scheduled, non-blocking job where a
+finding is a task rather than a merge freeze. That job is
+`Scheduled secret sweep` (#2852), in `.github/workflows/gitleaks-scheduled.yml`.
+
+**Which one is responsible for what.** The two are not alternatives and the
+difference is the scope, not the scanner:
+
+| | `Secret scan (gitleaks)` | `Scheduled secret sweep` |
+| --- | --- | --- |
+| Runs on | every pull request and push | weekly, plus `workflow_dispatch` |
+| Scope | this pull request's commits, the history of `main`, the checked-out tree | **every** branch's history (`--all`), plus the tree |
+| A finding | blocks the merge | opens a task; blocks nothing |
+| Branch protection | required context | no context at all — it has no `pull_request` or `push` trigger |
+
+What they share is deliberate and enforced. The pinned scanner version lives in
+`scripts/ci/gitleaks-image.sh` and nowhere else; the invocation lives in
+`scripts/ci/gitleaks-scan.sh`, which both workflows call; the rule set and the
+allowlists are `.gitleaks.toml` and `.gitleaksignore`, which gitleaks discovers
+from the scan root. `deployment-image-contracts.test.ts` fails if either
+workflow names a gitleaks container of its own. #2686 is why: the two jobs that
+used to sit in `ci.yml` ran 8.24.3 and 8.28.0 over the same commits for months,
+and nothing said so.
+
+**A scanner that failed is not a clean scan.** gitleaks exits 1 both when it
+finds a leak and when it cannot run at all, so `gitleaks-scan.sh` asks for
+`--exit-code=2` and treats every other non-zero as a scanner failure, saying so
+in the log. Both still fail the job — the discrimination is about the message,
+not about what blocks a merge.
+
+**And a successful exit is not a clean scan either, on its own.** When the git
+source itself fails — an unresolvable commit range, or a repository-ownership
+refusal — gitleaks logs the git error, concludes it finished, and exits **0**
+with `0 commits scanned … no leaks found`. `--exit-code` never applies, because
+from the scanner's point of view there was nothing to find. Measured on
+v8.28.0, and it lands on the REQUIRED gate rather than only on the sweep: the
+pull-request scope resolves `<base>..<head>`, which is unresolvable whenever
+the base commit is missing from the checkout. So a `git`-mode scan that walked
+zero commits is treated as the scanner failure it is. Zero commits is never a
+legitimate answer for any scope this repository scans.
+
+The same failure has a second, quieter shape: the git error need not happen at
+the START of the walk. gitleaks streams commits to its detector, and any
+unrecognised line on git's stderr both stops that stream and gets logged with a
+`[git] ` tag — so a bad object twenty percent into an `--all` sweep prints
+`1500 commits scanned … no leaks found` and exits 0, having silently skipped the
+other eighty percent. A tagged line therefore fails the scan on its own,
+whatever it says. Benign git messages are not tagged: gitleaks allowlists five
+of them and emits those as untagged `WRN` lines, which is what makes the tag a
+usable signal rather than noise.
+
+**Triaging a sweep finding.** The run summary lists the rule, the file, the line
+and the commit for each finding, and the run keeps a `gitleaks-sweep-reports`
+artifact for fourteen days with the same detail plus the fingerprint. Every
+value is `--redact`ed, so neither republishes the secret. A finding on a branch
+that was never merged is still a disclosure on a public repository: rotate the
+credential first, and only then decide what to do with the branch.
+
+Run the sweep yourself, exactly as the scheduled job does:
+
+```bash
+GITLEAKS_SCAN_LABEL="every branch's history" \
+GITLEAKS_LOG_OPTS="--diff-merges=first-parent --all" \
+  bash scripts/ci/gitleaks-scan.sh git
+```
+
+Accepted residual risk:
+
+- Most GitHub Actions remain pinned to released major tags rather than full
+  commit SHAs so Dependabot and upstream patch releases can keep routine
+  maintenance low-friction.
+- The project does not yet publish signed image attestations or SBOM artifacts;
+  image provenance is currently the commit-SHA tag, protected PR checks, and the
+  GHCR package publish job.
+- The `pnpm audit --audit-level=high` gate keeps high/critical npm advisories
+  blocking, while lower severity advisories remain review-driven. The one
+  exception is a MITIGATED record (#3843, "Mitigated advisories" above).
+- A sustained npmjs.org advisory outage blocks every merge, by deliberate
+  decision (#3254). See "When the advisory service is down" above.
+- Until `Dependency audit` is added to branch protection it is a red check
+  rather than a merge block (#2946). Adding the context before the job exists on
+  `main` would leave every open pull request waiting forever on a check that has
+  never reported, so the order in `AGENTS.md` -> "Completion and Merge" applies:
+  merge first, add the context second, rebase open pull requests third.
+
+## Image Uploads Storage
+
+Admin Image Manager uploads are written at runtime under `public/images` (served
+at `/images/...`). The deployed app runs with a read-only root filesystem and
+multiple replicas (blue/green), so this path must be a persistent, writable,
+shared volume:
+
+- `docker-compose.yml` mounts the `image_uploads` named volume at
+  `/app/public/images` for every app replica, so uploads survive redeploys and
+  are visible to all instances.
+- The app runs as uid 1001. The `Dockerfile` creates `public/images` owned by
+  uid 1001 so a freshly-initialised named volume inherits writable ownership.
+- Relocate storage at the deployment layer by bind-mounting your chosen path at
+  `/app/public/images`. The application path stays `public/images` (a trusted
+  constant), which keeps the upload path-traversal checks statically verifiable.
+- When the volume is missing or not writable, upload and create-directory
+  requests return a clear "image storage directory is not writable" message
+  (with the underlying error code) instead of a generic failure, and the cause
+  is logged server-side.
+
+## Maintainability Budgets
+
+The budgets below are the long-term target for every production source file:
+
+- Route handlers (`src/app/.../route.ts`) should stay under 250 LOC.
+- App Router page shells (`src/app/.../page.tsx`) should stay under 500 LOC.
+- New domain modules (`src/lib/...`, `src/components/...`) should stay under
+  700 LOC.
+- No new production `any`, type suppression (`@ts-ignore`,
+  `@ts-expect-error`, `@ts-nocheck`), or `eslint-disable` without a
+  short inline comment explaining the local justification.
+
+The first three are enforced, as a **regression ratchet** rather than a
+flag-day hard gate (#2687). When a file is already over budget, prefer
+extracting cohesive helpers into a focused module rather than adding more to
+the existing surface.
+
+### File-size budget ratchet
+
+The tree does not meet the budgets today and will not for some time. Measured
+on 21 Aug 2026: 283 of 2,036 production files are over budget, carrying 122,887
+lines of size debt. That is an anchored measurement, not an acceptance constant
+— run `pnpm run quality:budget --report` for the current tree, which is now
+the only place the figure lives. Failing all that debt at once would produce
+either a permanently red gate or a mass exception list, and both are worse than
+no gate, because they look like enforcement while providing none. So the rule CI
+enforces is:
+
+> Current size debt may stay. New debt and debt growth may not appear silently.
+
+**No per-file ceiling is written down.** For each file a change touches, the check reads
+how long that file was on `origin/main` and compares. From that:
+
+- a file that was **within** its budget may not go over it;
+- a file that was **already over** may not exceed the length it had on
+  `origin/main`;
+- shrinking is always allowed, and needs no follow-up: the smaller number is
+  what the next change is measured against, because that is what `origin/main`
+  will then carry;
+- a file the change did not touch is not judged at all — it cannot have grown;
+- an already-over-budget file **may** grow if the change says so out loud, in a
+  per-pull-request allowance that names the file, its new length and why
+  splitting is worse — see "When a file legitimately has to grow" below;
+- but never past its **hard ceiling** of three times its budget — 2,100 lines
+  for a domain module, 750 for a route handler, 1,500 for a page shell (owner
+  decision, 11 Nov 2026,
+  [#4926](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/4926)). No
+  allowance can take a file past it, and a file already past it may only stay
+  the same length or shrink. No file is exempt;
+- a file **renamed within** the budgeted scope keeps its predecessor's ceiling,
+  so moving an oversized module does not read as a pile of brand-new debt. A
+  file renamed **into** the scope from outside it — from `prisma/`, `scripts/`,
+  or a `__tests__/` path — has no ceiling to inherit and is judged as **new**,
+  so it must meet its budget outright. Otherwise "move it into `src/`" would be
+  a way to arrive over budget with the gate green, and moving it out and back
+  again would be a way to launder any amount of growth in two steps;
+- if the base cannot be read, the check **fails**. An enforcement tool that
+  cannot see what it is comparing against must say so rather than report a pass
+  it has not earned, which is the same rule `pnpm run pr:check` follows for an
+  unfetched `origin/main`. The same goes for a run that finds **no production
+  files at all**: "scanned and found nothing wrong" and "scanned nothing" are
+  the same empty result and must not be the same message.
+
+Every run on a change also prints `Size debt change from this PR: +N lines`
+(or a negative number), pass or fail: how far the change moves the tree-wide
+figure `--report` totals. A run of small declared increases is invisible one
+change at a time; the tree-wide total, from `--report`, is not. A file moved out
+of the budgeted scope counts as debt removed, exactly as `--report` would count
+it, so check the diff before reading a negative figure as a split.
+
+```bash
+pnpm run quality:budget                    # verify (also a step in CI's `verify` job)
+pnpm run quality:budget --base <ref>    # compare against something other than origin/main
+pnpm run quality:budget --report        # the whole tree's debt, on demand
+```
+
+All three read `git` and the working tree only: no network, no database, no
+build. A full run is well under a second.
+
+**"On `origin/main`" means at the point this branch was cut from it** — the
+merge base of `origin/main` and `HEAD`, not the tip. Otherwise a branch is
+measured against whatever has landed on `main` since, and `main`'s own edits
+read as the branch's. That was measured while building this: `origin/main` had
+moved ahead by one merged pull request and `git diff origin/main` reported seven
+`src/` files as changed that the branch had never touched. They happened to be
+shrinks, so nothing failed — but had that pull request *split* a file, the local
+run would have gone red for somebody else's edit.
+
+**In CI the two readings are the same commit**, so this choice costs and buys
+nothing there. A `pull_request` run checks out `refs/pull/N/merge`, a merge
+commit whose first parent is the base tip, so the merge base *is* the tip — and
+the merge tree already carries `main`'s version of every untouched file, so the
+seven files above could not have appeared under either reading. The difference
+is entirely about running the check locally on a branch that has not merged
+`main` in.
+
+**What it costs locally, stated plainly.** The merge base is not uniformly the
+stricter reading. If `main` *shrinks* a file after the branch point, the branch
+is still judged against the larger pre-split length: measured, a 1,200-line
+module that `main` splits to 300 can be re-inflated to 1,199 on a stale branch
+and the local run passes, where the tip reading would have failed it at 700. The
+gap closes as soon as `main` is merged in — the merge base then moves to the
+split — and it never opens in CI.
+
+**On a push to `main` the default base is not usable at all**, and the `verify`
+job passes an explicit one. There, `origin/main` *is* the commit being tested:
+the merge base is `HEAD`, the diff is empty, and the check would report "0
+production files changed" whatever the tree holds. Two branches that each add
+sixty lines to a six-hundred-line file both pass their own pull-request run,
+merge cleanly to 720 against a 700 budget, and nothing would ever say so — after
+which the next change to that file is measured against 720. The workflow
+therefore passes the last judged `main` commit as `--base` (`INV-OPS-021`: the
+push event's own pre-push commit, unless a newer merge replaced that commit's
+run or its run stopped before the ratchet), and keys that on the event name,
+because a `pull_request` payload carries a `before` field too and it means
+something else entirely.
+
+Most of the time that run says exactly what the pull-request run already said,
+against exactly the same base — for a branch that was up to date, the merge
+commit's tree is the tree CI already tested. It differs in two situations, and
+both are worth knowing. If `main` moved between a branch's last run and its
+merge, the push run is the first thing to see the combined result, which is the
+whole point. And if an accepted increase is ever landed by merging a red pull
+request, the push run goes red once as well; it clears on the next push, and
+while it is red it is reporting what `main` now holds rather than a fault in the
+merge.
+
+This is also why CI's `verify` job must keep `fetch-depth: 0` — for a quieter
+reason than "a shallow clone has no merge base", which is not true. A depth-1
+clone resolves `origin/main` perfectly well, returns `HEAD` as the merge base,
+and reports **OK** over a tree holding a 1,300-line module. Truncated history
+narrows the diff silently rather than failing, which is the worse of the two.
+
+#### Why there is no longer a baseline file (#2979)
+
+Until August 2026 the previous length came from a checked-in ledger,
+`scripts/quality/file-size-baseline.txt`, listing every over-budget file and its
+ceiling. The rule was right; the file was the problem.
+
+Every change that grew a listed file rewrote the same line, so the next change
+to merge re-conflicted it, forever. On the 21 Aug 2026 wave, **five of nine**
+parallel lanes touched it, and `.gitattributes` gives it no merge driver —
+`CHANGELOG.md` is the file's only `merge=` entry — so every collision was a real
+three-way conflict that somebody resolved by hand. Twice, that hand resolution
+shipped a wrong number:
+
+- two lanes both raised the ceiling for `src/proxy.ts`; their code changes
+  merged cleanly in different regions, and the merged file was 1,329 lines while
+  the recorded ceiling read either 1,320 or 1,208, whichever side won;
+- one recorded 1,101 for a file whose untouched length on `main` was already
+  1,104 — a ledger the tree violated the moment it landed.
+
+Two loopholes closed with it, both recorded against the old ratchet. A `.ts` to
+`.js` rename used to pass, because the ledger was keyed by path and the new path
+was simply unlisted; the previous length is now looked up under the old path git
+reports, so the allowance follows the file. And a stored ceiling could drift
+above the file's real size, letting removed lines come back unnoticed; the
+ceiling is now the base ref itself, so drift is not prevented so much as
+unrepresentable.
+
+**Scope.** Tracked source under `src/` only, tests excluded, in any of
+`.ts .tsx .mts .cts .js .jsx .mjs .cjs`. Everything outside `src/` —
+`scripts/`, `prisma/`, `e2e/`, `load/` — is outside the file-size policy by
+definition. That scope is stated once, in the tool, rather than as a
+per-issue exemption; adding or deleting a directory out there is a non-event
+for this gate, which is what the temporary `measurement/` tree (#2663) was:
+present, then removed whole by #3382, without ever moving this gate's
+baseline.
+
+An **untracked** new file under `src/` is judged too, even before `git add`.
+`git diff` cannot see one, so without that a brand-new 900-line module would be
+checked by nobody until somebody staged it — and whoever runs the check before
+staging is exactly the person who most needs the answer. A file git is
+**ignoring** stays ignored.
+
+The extension list is checked rather than trusted. A tracked file under `src/`
+whose extension is in neither the source set nor the tool's short list of
+declared non-source kinds (`.css`, `.md`, `.json`, images, fonts) **fails the
+check**, naming the file and asking for it to be classified. Without that, the
+scope silently narrows the first time a new file kind lands, and a narrowing
+scope in a ratchet looks exactly like progress: renaming `src/lib/audit.ts` to
+`audit.js` once removed it from the gate entirely and reported the removal as a
+45-line *reduction* in accepted debt. That is the shape this section teaches
+reviewers to read as a split going well.
+
+#### When a file legitimately has to grow
+
+**Splitting the file is the preferred answer, and stays the preferred answer.**
+Where a cohesive helper can come out into a focused module, take that — it is
+the outcome the budgets exist to produce, and it lowers the ceiling for everyone
+who comes next.
+
+Where the split is genuinely worse — the rule and its exception belong in one
+place, or the seam does not exist yet and inventing one for this change would
+make the code harder to follow — say so out loud, in a file of your own:
+
+```markdown
+size-allowances.d/2980-membership-type-policy.md
+
+file: src/lib/membership-type-policy.ts
+lines: 1509
+reason: the school-teacher discriminator has to sit beside the policy it
+  guards; splitting it would put the rule and its exception in different files.
+```
+
+That is **one new file per pull request**, at a path no other pull request
+touches, which is the same shape `changelog.d/` uses and for exactly the same
+reason: a shared list is what made this gate a treadmill in the first place.
+[`size-allowances.d/README.md`](../size-allowances.d/README.md) is the full
+format and the rules. In short:
+
+- it names the **file**, its **new length** and the **reason**, because a bare
+  "allow growth" marker is not something a reviewer can weigh;
+- the recorded length must be the file's **real** length. The check fails if it
+  is not, which is what stops an allowance drifting away from the tree the way
+  the old ledger did, and stops one being written once and reached for later;
+- it is **one-shot**. It only has effect on the change that introduces it, so
+  after merge it is inert — the grown length *is* the base ref by then. The
+  release compiler retires committed allowance fragments alongside compiled
+  changelog fragments; it leaves untracked or locally edited files alone;
+- an allowance the check **did not need** fails too, rather than passing
+  quietly. That is either a mistake or a file that shrank, and leaving one lying
+  around is how a per-change note turns back into a stored exceptions list;
+- it may **not** cover a new file, a file renamed into the budgeted scope, or a
+  file crossing its budget for the first time. Each is refused by name. An
+  allowance lets an already-over-budget file grow; it is not a way to arrive
+  over budget;
+- it may **not** take a file past its **hard ceiling** of three times its
+  budget (2,100 / 750 / 1,500 lines), refused as `allowance-over-hard-ceiling`.
+
+**The hard ceiling** (owner decision, 11 Nov 2026,
+[#4926](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/4926)) exists
+because an escape judged one change at a time needs a limit on the total. As
+measured in #4926 at 11 Nov 2026, `src/lib/payment-recovery.ts` went from 1,881
+lines on 21 Aug 2026 to 3,617 through 33 allowances, each step reasonable on its
+own. The multiple is
+`HARD_CEILING_MULTIPLE` in `scripts/lib/file-size-budget.ts`. A file at or past
+the ceiling can only stay or shrink, so the next change that needs it longer
+splits a cohesive part out first. There is no exemption mechanism — the owner
+chose that over naming `src/lib/bed-allocation.ts` as one.
+
+**`pnpm run quality:budget:update` is gone** (#2979) — if you remember typing it,
+or find it in an old branch or an old pull request comment, the allowance above
+is what replaced it. It regenerated the deleted baseline file; running it now
+prints an explanation rather than doing nothing quietly.
+
+What this arrangement buys, stated plainly: an accepted increase is still
+machine-checked and still visible in a diff, but **no other pull request pays
+for the decision**. The old escape hatch was a single shared file that every
+concurrent branch had to re-resolve, which is what made it a treadmill rather
+than a control.
+
+- **A split or a thinning** lowers the ceiling automatically on the next change,
+  because `origin/main` then carries the smaller file. Nothing to regenerate and
+  no way to leave the old number behind.
+- **A rebase or a merge from `main`** does not conflict on anything belonging to
+  this gate, because no two branches write the same path.
+- **A deliberate increase** is one disposable file, reviewed on its own terms.
+  There is still no exceptions list and no shared allow-list to hand-edit into a
+  laxer ceiling.
+
+If you want the aggregate figure for context — how many files are over budget
+and by how much in total — run `pnpm run quality:budget --report`, or read the
+`File-size budget ratchet` section of `pnpm run quality:report`. Both compute it
+from the tree through the same function, so neither can drift from the other or
+from the gate.
+
+A deployment fork syncing down from upstream judges upstream's own changes
+differently; see [Syncing a fork from upstream](#syncing-a-fork-from-upstream).
+
+### Function-length ratchet
+
+The file-size budget measures whole files, so a 2,000-line function inside a
+file that is already allowed to be long passes it. `performBookingCancellation`
+is exactly that: one function of more than two thousand lines in a file whose
+size debt the file-size ratchet accepts (#4927). So `pnpm run quality:budget`
+runs a second ratchet in the same run, over functions, with the same rule:
+
+> Current length debt may stay. New debt and debt growth may not appear silently.
+
+**The ceiling is 300 lines** (`FUNCTION_LENGTH_LIMIT` in
+`scripts/lib/function-length-ratchet.ts`), a function a reviewer can still hold
+in their head in one sitting. Measured on 13 Nov 2026, 323 of 13,565 production
+functions are over it, carrying 93,716 lines of length debt; run
+`pnpm run quality:budget --report` for the current figure and the longest ten.
+
+**What counts as a function** is what a reader opens and reads top to bottom: a
+top-level `function` declaration, a function or arrow assigned to a top-level
+`const`/`let` (including one passed to a wrapping call such as `forwardRef(…)`
+or `memo(…)`, measured as the whole declaration), and a method, constructor, accessor or arrow-valued field of a
+top-level class (named `Class.member`). A function nested inside one of those is
+part of its length, not a unit of its own, so keeping a long function's phases
+as inner closures does not shorten it. Known limit: methods and function-valued
+properties of an object literal (such as `export const config = { jwt() {…} }`,
+or `wrap({ handler: async () => {…} })`) and namespace members are not measured,
+so a long function written in one of those shapes is not judged. A span runs from the first token to the
+closing token; the leading doc comment does not count. `scripts/lib/function-length.ts`
+is the measurement.
+
+For each production file a change touches (the same scope and the same base ref
+as the file-size ratchet, so `--base` means the same thing to both):
+
+- a function that was **within** 300 lines may not go over;
+- a function **already over** may not exceed the length it had on the base ref;
+- a **new** function may not arrive over 300.
+
+A function is matched by name within its file. A git rename of the file keeps
+each function's base length, and so does a function moved to another file the
+change touches or out of a file it deletes, provided that name exists in only
+one of the change's files on each side. A function moved in from outside the
+budgeted scope is judged as new. A split is therefore recognised as progress: the
+moved function keeps its old length as its ceiling and the old file loses it. Renaming
+a long function is not followed: the ratchet cannot tell a rename from a
+deletion plus a new function, so keep the name or split it while you are there.
+
+**When a function legitimately has to grow**, splitting it stays the preferred
+answer. Where the split is genuinely worse, declare it in this change's
+`size-allowances.d/` fragment, exactly as for a file, with `function:` naming
+`<path>#<name>` (the figure below is illustrative):
+
+```markdown
+function: src/lib/booking-cancel.ts#performBookingCancellation
+lines: 2114
+reason: the guard belongs inside the claim it protects until #4516 splits the
+  cancellation into its phases.
+```
+
+The same rules apply as for a file allowance: the recorded length must be the
+function's real length, it is one-shot, an unneeded one fails, and it may not
+cover a new function or carry one over 300 for the first time. The hard ceiling
+is a file rule; a function allowance has no upper bound of its own.
+[`size-allowances.d/README.md`](../size-allowances.d/README.md) has the format.
+
+A deployment fork syncing down from upstream: see
+[Syncing a fork from upstream](#syncing-a-fork-from-upstream).
+
+### Syncing a fork from upstream
+
+Both ratchets judge one pull request at a time against its base. A deployment
+fork that syncs down from this repository's `main` moves its base across many
+upstream pull requests at once, so without help the gate refuses code upstream
+already reviewed: a function upstream took over 300 lines before the
+function ratchet existed reads as new, a file upstream moved under a heavy
+rewrite no longer reads as a rename, and every upstream `size-allowances.d/`
+fragment in the range arrives looking live (#5196).
+
+`pnpm run quality:budget --upstream-ref <ref>` names the upstream to trust.
+The rules, all in `scripts/lib/budget-upstream-ref.ts`:
+
+- **The trusted commit is the upstream `main` commit the checkout contains**:
+  the newest commit on `<ref>`'s first-parent history that `HEAD` contains,
+  not wherever upstream has got to since. An upstream tip the fork has not
+  merged adds no trust. First parent only, so a commit from the middle of a
+  merged upstream pull request's branch is never trusted: upstream's `main`
+  never carried it, and its gate never judged it on its own. That rests on
+  one assumption: first-parent history is what upstream's `main` carried only
+  while upstream lands every pull request with a merge commit, as `AGENTS.md`
+  -> "Completion and Merge" requires (step 4, merge with a merge commit). A
+  pull request that upstream fast-forwards or rebase-merges puts its
+  intermediate commits on `main`'s first-parent history, and a fork that
+  merged one of them would have it trusted. The module does not detect that,
+  so the rule is only as good as upstream's keeping to merge commits. If
+  `HEAD` contains no first-parent commit of `<ref>` at all, the run fails.
+- **Only the paths the sync brings in are trusted**: those upstream changed
+  between the fork's last meeting point with it and the trusted commit. Every
+  other path is judged against the fork's base as before.
+- **The longer of the two lengths is the previous length.** For a trusted
+  path, a file or function is judged against the longer of its length on the
+  fork's base and on the trusted commit, matched at the same path. So code
+  left as upstream wrote it passes with no allowance, while growth the fork
+  adds beyond upstream's length is judged as the fork's own and may need its
+  own allowance. A file past its hard ceiling upstream may stay as it is or
+  shrink, never grow.
+- **Upstream's fragments are spent.** A `size-allowances.d/` fragment whose
+  bytes equal the trusted commit's copy is not live, so it neither applies nor
+  fails as unused nor collides with the fork's own fragment for the same path.
+  A fragment the fork wrote or edited is judged as usual. Nothing upstream
+  merged has to be deleted or re-declared by hand.
+- The size-debt line still reports the change against the fork's base, so it
+  includes the debt the sync brings in.
+
+Every run with trust names the trusted commit, its subject, how many files or
+functions were judged against its length and how many fragments were ignored.
+When the trusted commit is `HEAD` itself (a fast-forward sync, or a push of
+one to the fork's `main`), there is no fork change to separate from upstream's,
+so the run prints `Trusted upstream ignored: resolves to HEAD` once and is
+otherwise exactly an ordinary run. An upstream ref that cannot be resolved
+fails the run, and so does `--upstream-ref` with no value.
+
+**In CI**, set the repository variable `QUALITY_BUDGET_UPSTREAM_REPO` to the
+upstream's `owner/repo` on the fork only; leave it unset here.
+`scripts/ci/run-budget-gate.mjs` then fetches that repository's `main`, without
+tags and needing no extra credentials, and passes it as `--upstream-ref`, on pull requests and on
+pushes. A malformed value or a failed fetch fails the step rather than falling
+back to an ordinary run. With the variable unset the step runs exactly
+`pnpm run quality:budget --base "$BUDGET_BASE"`. A private upstream cannot be
+fetched this way.
+
+A sync pull request merges upstream's `main` itself, and is merged with a merge
+commit, never a squash or rebase. The trusted commit has to be an upstream
+`main` commit among the fork's ancestors; a squash or rebase leaves none, so the
+push run on the fork's `main` judges upstream's code as the fork's own and goes
+red, and merging a single upstream pull request's commits trusts only the
+upstream `main` commit beneath them.
+
+### Quality report
+
+Run the local maintainability report before opening broad refactor PRs, after
+splitting a large surface, and when reviewing a PR that adds substantial
+production code:
+
+```bash
+pnpm run quality:report
+```
+
+The script scans tracked files via `git ls-files` and prints a markdown
+summary of:
+
+- largest production files
+- the whole tree's size debt, and any scope hole in the gate's classifier
+- largest oversized files, largest route handlers and App Router pages
+- largest test files
+- production `any` / type-suppression hotspots
+- production `eslint-disable` hotspots
+- test `as any` totals
+
+It uses only existing repo tooling, runs without external service
+credentials or network access, and is advisory: it warns and informs rather
+than failing the build. The `Over budget` column is a review prompt: `yes`
+means the file exceeds the route-handler, page-shell, or new-domain-module
+budget. The `File-size budget ratchet` section reports the population the
+blocking gate enforces its rule over, and both read it from the same function —
+so the report and the gate cannot disagree about which files are over budget.
+The report itself never fails; `pnpm run quality:budget` is the half that does.
+
+### Refactor history and split guidance
+
+There is no ledger of accepted size debt any more (#2979) — the current figure
+is whatever `pnpm run quality:budget --report` measures. This table is not a
+ledger and is not an allow-list: it is the standing guidance for a handful of
+surfaces whose split axis was decided once and should not be relitigated. It
+carries no line counts,
+because a hand-maintained count is exactly what went stale here before — the
+nine files this table used to list were presented as *the* over-budget
+population while the real figure was in the hundreds, and three of the counts
+were off by two orders of magnitude.
+
+| File | Disposition |
+| --- | --- |
+| `src/lib/xero-inbound-reconciliation.ts` | Split (#1270, #1208 item 1) into a re-export barrel over cohesive `src/lib/xero-inbound/` modules (`types`, `constants`, `amounts`, `object-links`, `audit`, `incremental-reconciliation`, `contact`, `payment`, `invoice-paid-effects`, `invoice`, `credit-note-repairs`, `credit-note`, `event-processing`). Behavior-preserving verbatim motion with an acyclic import graph (`types`/`constants` are leaves; the `event-processing` worker sits on top); the barrel re-exports the unchanged public surface (3 functions + 5 result types + `XeroInboundReplayError`). |
+| `src/lib/xero-booking-repair.ts` | Accepted as-is for now: operator repair tool, documented separately, not normal request-path code. |
+| `src/lib/xero-operation-outbox.ts` | Queued for future split when queue dispatch, release, or retry policy changes next land (PR-b of #1272 co-locates the replay stack). |
+| `src/lib/email-templates.ts` (deleted) | Split (#2689) into 19 cohesive family/content modules under `src/lib/email-templates/`, plus the shared `layout` shell and `escape` leaf (21 files altogether), with **no compatibility barrel** — callers import the family module directly. Fourteen modules mirror sender families in `src/lib/email/`; `communications` and `refunds` cover senders outside that tree; and `booking-reminders`, `booking-exceptions`, and `admin-xero-reports` keep large families within budget. The domain-only money rows and netting arithmetic live separately at `src/lib/booking-money-lines.ts`, shared by renderers, booking settlement reads, and the Xero drift checker. Largest rendering module 581 LOC, inside the 700 budget. The render-equivalence gate pins 219 complete outputs and discovers template modules from the directory, so a new renderer cannot arrive uncovered. Three former send-site bodies under two registry keys (`website-contact` and `admin-email-failure`) were brought under that gate, then deliberately moved onto the standard club shell; recipient, template, and booking values are escaped at the rendering edge. The old `adminXeroRepeatedFailureTemplate:minimal` pin was stale: the exact pre-split head renders 5,799 bytes with sha256 `f7a72f30fc8250c8ff75ca1417b9251541f5a06664e7d5c4fe3b8b171b9f6d4d`, byte-identical to the split head, rather than its recorded 5,802-byte hash. The split corrected that one pin row; it did not change that body. Mutation proofs cover byte-neutral body drift, module omissions, duplicate export names, duplicate case and pin IDs, and removed escaping. |
+| `src/lib/contextual-help.ts` (deleted) | Split (#2689) into 16 modules under `src/lib/contextual-help/`. `index.ts` **is** the registry (path matching, longest-prefix resolution, fallbacks, question attachment) rather than a barrel, and keeps the same three exported accessors; entry content sits in one module per **admin sidebar section** (`admin/*.ts`, matching `buildAdminNavSections` in `admin-sidebar.tsx`) — plus one `appearance-and-website` module split off Setup & Configuration, because `/admin/appearance` is an item in that section rather than a section of its own and folding its seven pages back would take that module to ~810 lines, over budget — with `finance.ts`, `questions-*.ts`, `fallbacks.ts`, and the two leaves `types.ts` and `booking-status-glossary.ts`. Content stayed TypeScript by owner decision — the typed shape is the schema check. Largest module 580 LOC. The structural move was proved value-for-value for every one of the 68 resolved paths: a JSON dump keyed by path — both scopes, both fallbacks, nested resolution and `normalisePath` — was byte-identical before and after (106,917 bytes, same sha256). The same PR then reconciled the shadowed second `/admin/notifications` entry against the live page and folded its accurate delivery-mode field into the surviving entry. The registry now has 68 entries with 68 unique paths (67 admin, one finance), and a permanent test rejects any future duplicate as unreachable text. |
+| `src/lib/admin-bed-allocation.ts` (deleted) | Split (#2688) into eighteen modules named for one responsibility each, all under the 700-LOC budget, with **no barrel** — every one of its 31 non-test importers names the module it depends on, because a re-export facade would have left the monolith in place under a new name and recreated the same dependency magnet. The two barrel rows in this table are precedents for a *published API*, not for hiding a split. It had grown to 55 exports over 80 functions covering room and bed inventory, board assembly, allocation writing, range assignment, audit recording and date arithmetic. The modules, by concern: leaves `-admin-contract` (shared error and db-client types), `-display-names` (how a member and a guest are named), `-admin-settings` (the settings read/write bound to `prisma`), `-date-range` (the board's lodge-night range and its parse); wire shapes `-board-payload` (types only) and `-range-report` (client-safe); pure `-warnings` (the board's warnings); reads `-board-records` (queries and DTO serialisers) and `-board` (payload assembly, officer-card counter); writers `-placement` (the shared write chokepoint all three manual paths pass through, carrying the D-12 consent refusal and the ADR-001 whole-lodge-hold refusal), `-manual-writes` (single night, bulk nights, same-date move, delete), `-range-assign` (#2251 range assignment) with `-range-audit` (its audit record, which stores counts, night runs and booking ids but never other bookings' guest or member names), `-auto-allocate` ("Run auto allocation"), `-approval` (approval plus the #776 booking row lock), `-bunk-pairing` (the #1675 bunk rule and its room-row lock), `-rooms` (room inventory, config import, delete guards) and `-beds` (bed inventory, retire/delete guards). Every function body moved verbatim; the live sizes are whatever the tree currently carries, not a number recorded here. |
+| `src/lib/payment-link.ts` | Split (#2956) by responsibility into the core record module — token resolution, the refusal vocabulary, the payable/paid status tests and the two revocation helpers — plus `payment-link-context` (what the public pay page shows), `payment-link-intent` (the Stripe intent a token may mint, and its recovery error), `payment-link-reissue` (the expired-link "email me a fresh one" mint) and `payment-link-split-guest` (the split non-member child's mint and on-demand issue). **No compatibility barrel**, on the `admin-bed-allocation` precedent above: the core imports none of the four, each flow module imports the core, and every caller names the module it depends on. Every function body moved verbatim; the one deliberate unification was the born-expired test, which two mint sites had written with different operators and which now lives once in `payment-link-expiry.ts`. Live sizes are whatever the tree carries. |
+| `src/lib/bed-allocation.ts` | **Accepted, oversized, and deliberately not split** (owner decision, 9 Aug 2026, #2688). It is 13 exports across 69 functions: a small public surface around one first-fit allocation algorithm whose function bodies are long because the algorithm is. That is cohesion, not sprawl, and the budget is a signal about sprawl. Splitting it would produce files that must be read together to follow one algorithm, which makes capacity code — money code — harder to reason about, not easier. The sibling that WAS split, `admin-bed-allocation.ts`, was the opposite shape: 55 exports over 80 functions of unrelated responsibilities. It is past the hard ceiling of 2,100 lines, which applies to it like any other file (owner decision, 11 Nov 2026, [#4926](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/4926), replacing #2688's "grow this file only with the algorithm"): it may stay or shrink, and the next change that needs it longer must first extract a cohesive part — a genuinely independent concern with its own API and tests is the natural candidate. |
+| `src/lib/email.ts` | Split (#1137) into a re-export facade over cohesive `src/lib/email/` modules (`core`, `admin-alerts`, `account`, `booking`, `membership`, `family`, `waitlist`, `groups`, `booking-requests`, `chores`, `ses-feedback`, plus non-re-exported `internal` plumbing). The `admin-alerts` surface was itself split (#1210) by **domain/source** — `admin-alerts.ts` is now a barrel re-exporting `admin-alerts-shared` (plumbing + `getAdminEmails`), `admin-alerts-booking`, `admin-alerts-membership`, `admin-alerts-finance`, and `admin-alerts-ops`. When an alerts/email module next exceeds the ~700 LOC soft cap, split it along the **domain axis** (booking/capacity, membership lifecycle, finance/Xero/payments, ops) — not by audience, which is fuzzy because most alerts fan out to all admins — and keep the facade barrel's exports byte-identical so `src/lib/email.ts` and every importer keep resolving. |
+| `src/lib/xero-hardening.ts` | Accepted as-is for now: central Xero hardening policy and diagnostics boundary. The `xero-hardening-canonical-links.ts` ↔ `xero-hardening-report.ts` clone pair (112 duplicated lines / 2 clones, jscpd 2026-07-07) is recorded as accepted under this same disposition (#1524 C4, owner-ticked 2026-07; same subsystem call as #1208 items 5/6). |
+| `src/lib/finance-sync-xero-datasets.ts` | Split (#1531, #1524 C3) into a re-export barrel over cohesive `src/lib/finance-sync-xero-datasets/` modules (`constants`, `types`, `date-format`, `report-snapshot`, `invoice-helpers`, `open-invoices`, `aged-invoices-snapshot`, `open-invoices-snapshot`, `report-sync`, `monthly-facts`, `chart-of-accounts`, `invoice-sync`). Behavior-preserving verbatim motion with an acyclic import graph (`constants`/`types`/`date-format` are leaves; the sync orchestrators sit on top); the barrel re-exports the unchanged public surface (29 functions/consts + the `FinanceMonthlyFactsWindowInput` type). The self-duplicated clone regions were deduped: the accounts-receivable and accounts-payable invoice builders now share one generic `buildFinanceOpenInvoicesSnapshot` (each snapshot's persisted invoice shape is supplied verbatim by the caller, keeping `expectedPaymentDate`/`plannedPaymentDate` divergent), and the aged + open-invoice builders share `updateContactDueDateRange`/`compareOpenInvoicePayloadsByDueDate`/`deriveSnapshotCurrency`. jscpd (min-tokens 70) dropped from 186 duplicated lines / 7 clones to 38 / 3 (2026-07-08); the 3 residual clones are the intentionally-separate AR-vs-AP payload literals plus two short prefix regions whose further extraction would over-abstract. |
+| `src/lib/finance-dashboard-page.ts` | Split (#2957) by **view**: the file keeps only the page-level loading (club zone, lodges, seasons, sync status), the selection labels and the `view` dispatch, and one module per dashboard view sits under `src/lib/finance-dashboard-page/` (`bookings-view`, `pnl-view` for revenue and costs, `ratios-view`, `pricing-sensitivity-view`, `balance-sheet-views` for cash, balance sheet and working capital, `sync-health-view`), with the shared view-model shapes and the projection helpers every view uses in `model.ts` and the derived chart palette in `series-colors.ts`. Every builder body moved verbatim, and there is **no barrel re-export**: the client, the route and the tests import the module that owns the symbol, so the old file cannot quietly become the dependency magnet again. A later view goes in its own module beside these; anything that two views need goes in `model.ts` (or a small named leaf, as the Xero reports source note does), never back into the facade. |
+| `src/app/(authenticated)/bookings/[id]/page.tsx` | Split (#2958) by **domain responsibility**, on the #2957/#2956 shape: the page keeps only the shell — auth, the club clock, the read, the viewer gate and redirect, the D-12 arrival-instructions gate, and the composition of sections — and everything else moved verbatim into two route-local directories. `_lib/` holds the server-side loading, projection and orchestration, one module per domain seam: `load-booking-detail` (the one `findUnique` and its `BookingDetailRecord`), `booking-detail-viewer` (who is looking), `booking-detail-consent` (the #2250 self-removal and #2307 consent cards), `booking-detail-history` (audit rows, events, the once-read #3033 review flag, narrative, timeline), `booking-detail-edit-access` (cancel/modify/override/room/name gates and the two panel gates), `booking-detail-linked-party` (split children and the organiser group), `booking-detail-payment` (the money projection and the pay-door gates), `booking-detail-editor-data` (the `BookingEditorData` payload with its admin-only spreads), `booking-detail-messages` (merge data and the rendered booking messages) and `booking-detail-admin-tools` (every admin-gated read the tools card is fed). `_components/` holds one server section per cohesive render block (`booking-status-banners`, `booking-admin-tools-section`, `booking-consent-cards`, `booking-linked-party-sections`, `booking-review-notices`, `booking-stay-preferences`, `booking-payment-cards`, `booking-lifecycle-actions`, `booking-cancellation-outcome`, `booking-notes-and-history`), each taking the projection groups it names and destructuring them at its top so the JSX moved byte-for-byte. **No barrel**; each module exports its result type and the page composes them in the order the section rail declares. Canonical booking lifecycle, settlement and authorization services stayed where they were and are called exactly as before. The thirteen source-contract suites that read the page were pointed at the module that now owns each pinned symbol, with no assertion changed in meaning. A new section goes in its own `_components/` module and a new server-side read in the `_lib/` module for its domain (or a new one), never back into the page. **Measured against the base at merge time: `page.tsx` went 2,792 -> 388 LOC** (route-page-shell budget 500), and the route directory's production files went 3 files / 2,915 LOC -> 23 files / 3,933 LOC. **This row is the one home for those numbers.** They are measurements rather than facts about the design, so a second copy goes stale silently: the branch first recorded 2,761, which was the page's length at the *branch point* and stopped being true once the branch merged the epic twice and took #3269's thirty-line addition into `load-booking-detail`. Nothing else states them — the changelog fragment and the split's own census docblock point here instead — and a later change re-measures here rather than adding a number of its own. |
+| `src/app/(admin)/admin/membership/members/[id]/page.tsx` | Queued for future route-shell thinning as member-detail sections continue to move local state out. |
+| `src/app/(admin)/admin/membership/family-groups/page.tsx` | Route-shell thinning completed (#1530, closes the #1524 C2 carry-over). The request-review duplication with `src/components/admin/family-group-editor.tsx` was extracted to a shared `FamilyGroupRequestReviewSection` (`src/components/admin/family-groups/request-review-section.tsx`) that both the admin page and the editor render; the per-request state and the approve/reject/search handlers now live there once (behaviour-preserving — the two prior copies differed only by a `member`/`adult` noun and their refresh callback, now props). jscpd (min-tokens 70) across the pair drops from the catalogued 225 duplicated lines / 7 clones to 29 lines / 3 clones — the residue is the unavoidable shared UI-import block plus the create/edit member-search combobox, left inline because its surrounding selected-member badges differ between the two forms. page.tsx thinned 786 → 565 LOC; editor 715 → 499 LOC. |
+
+## Operational Repair Tools
+
+### When a one-off tool leaves `main` (#5404)
+
+When a one-off upgrade tool leaves `main`, what it excludes and what replaces
+its documentation are set once, in principle 5 of
+[`docs/UPGRADING.md` → Principles](UPGRADING.md#principles). Removing such a tool takes
+everything that exists only for it: the script, its library module, tests,
+package script, lint exceptions and census entries.
+
+### Run these through `pnpm run`, never `pnpm exec tsx`
+
+Every repair tool below is published as a `pnpm run` command, and that is the
+spelling to copy unless a runbook explicitly gives you another one. (One does:
+`docs/INDUCTION_BASELINE_RUNBOOK.md` runs the baseline inside the Compose
+`migrate` service and calls the `tsx` binary directly, so it spells the
+command `./node_modules/.bin/tsx --conditions=react-server ...` in full. That is
+correct and supported — what is never correct is a bare `pnpm exec tsx`.) The reason
+is not tidiness.
+`@/lib/prisma`, `@/lib/audit`, `@/lib/email`, `@/lib/xero-api-client` and `@/lib/stripe`
+each carry `import "server-only"` (`INV-OPS-013`, #2850), which is what makes
+the production build refuse to ship any of them to a member's browser. Since
+#3204 the club-timezone seed and the two environment-role readers carry it too,
+taking the marked roots to nine — every command below already reached a module
+that carried the marker, so none of them needed a new flag. That
+marker throws the moment it is loaded under plain Node, with a message about
+React Server Components that names nothing you did — so a script started with a
+bare `pnpm exec tsx scripts/<name>.ts` would abort before it printed anything, which
+during a money-repair incident is the worst possible time to meet a confusing
+import error.
+
+The `pnpm run` wrappers pass Node's `--conditions=react-server` resolution flag,
+under which `server-only` resolves to an empty module and the script runs
+normally. Arguments go straight after the script name, for example
+`pnpm run xero:booking-repair --dry-run`. Environment variables go in front as
+usual: `DATABASE_URL=<non-prod copy> pnpm run payments:audit-ib-hold-clearing`.
+`src/lib/__tests__/cli-server-only-reach-census.test.ts` fails the build if a
+command that reaches ANY module carrying that marker is ever published without
+the flag —
+anywhere it is published, including inside a tool's own `--help` output, which
+is exactly where the bare form outlived every runbook (#2850).
+
+### Recover a stranded $0 waitlist confirm (#2623)
+
+Admin -> Audit log, filtered to action `waitlist.confirm_offer_release_failed`
+(category `booking`, severity `critical`), lists free bookings whose waitlist
+confirm got half-way and could not undo itself. It is rare by construction and
+needs no script, but it will not clear on its own — no cron sweeps
+`PAYMENT_PENDING`, and the member has no offer left to retry.
+
+What happened: the confirm's first phase committed the booking to
+`PAYMENT_PENDING` and consumed the waitlist offer; its second phase (the $0
+`PAYMENT_PENDING -> PAID` claim) then lost its locks, and the compensating
+release back to `WAITLISTED` lost its locks too. The booking therefore holds no
+bed, has no payment path (it costs nothing) and has no offer to replay. The
+member was told exactly this and told **not** to confirm again.
+
+The audit row's metadata carries the lodge, the stay dates, `finalPriceCents`
+and both underlying error codes (`claimErrorCode`, `releaseErrorCode`). Open the
+booking from Admin -> Bookings and pick the outcome:
+
+- **Put them back in the queue** — the repair the failed compensation would have
+  made, and the one that keeps the promise the member was given. Open the
+  booking from Admin -> Bookings and press **Return to waitlist** in the Admin
+  tools card (#2649). Correct whenever the bed that prompted the offer has since
+  gone. It needs `bookings: edit`, the same access Force Confirm needs.
+
+  In one locked transaction it sets the booking back to `WAITLISTED`, clears the
+  consumed offer (`waitlistOfferedAt`, `waitlistOfferExpiresAt`,
+  `waitlistOfferedLodgeId`, `waitlistOfferedPriceCents`) and the stale queue
+  position, releases any admin capacity hold or exclusive whole-lodge hold on the
+  booking, and reconciles the bed allocations. Afterwards it hands the freed
+  nights back to the ordinary offer worker and tells the member their waitlist
+  place is back at position N — unless the booking's **No emails** switch is on,
+  in which case the send is withheld and listed on the booking for you to relay.
+  The member's email says their place was restored and that their offer did
+  **not** run out; it is a separate message from the offer-expiry one, because
+  they confirmed in time and it was our system that failed.
+  It records a `waitlist.returned_to_waitlist` audit row whose metadata names
+  the `waitlist.confirm_offer_release_failed` row it resolves — closing the trail
+  at both ends — plus anything it released (`releasedAdminCapacityHold`,
+  `releasedWholeLodgeHold`), so freed nights are never a silent side effect.
+  If the booking carried a hold, the confirmation dialog says so before you
+  press: set the hold again afterwards if you still need it.
+
+  **The button appears only where the audit log proves a waitlist confirmation
+  stranded the booking** — an unresolved `waitlist.confirm_offer_release_failed`
+  report — on top of `PAYMENT_PENDING`, free, and no payment record. Those last
+  three are deliberately not enough: **six** ordinary paths leave a free booking
+  in Payment pending with no payment row — a date change that reprices to
+  nothing, an admin date shift or a guest being added that releases a free
+  booking's non-member hold, an admin approving a booking that was waiting on
+  review, the group settlement reaper reverting a never-billed group member, and
+  a free booking created between April and May 2026 that the May status backfill
+  moved. None of those members was ever in a queue, so returning one of them to
+  the waitlist would un-confirm a booking that was simply waiting to be paid.
+  The
+  route re-checks every condition under its locks, so a booking that someone else
+  confirms or cancels in the same moment is refused in plain words rather than
+  clobbered. If it reports that something else is holding the booking, nothing
+  was changed — wait a moment and press it again.
+
+  **Finding them.** There is no dashboard card for this state; it is rare enough
+  that the audit log is the queue. Filter Admin -> Audit log to action
+  `waitlist.confirm_offer_release_failed`, and treat any entry with no later
+  `waitlist.returned_to_waitlist` on the same booking as outstanding. A booking
+  stranded before #2648 shipped has no report and so no button — that one still
+  needs a database session, and is the only remaining case that does. (The report
+  is written and awaited inside the failing request, so a live strand cannot
+  lose it to process teardown; if the write itself fails, the server log carries
+  "the admin repair button will not appear for this booking".)
+- **Cancel and have them rejoin** — reachable entirely from the admin UI, and the
+  right choice when nobody can safely touch the database. Cancel the booking from
+  Admin -> Bookings and ask the member to rejoin the waitlist for those nights.
+
+Do **not** try Record payment: the dialog deliberately refuses a booking with
+nothing owing ("use Force confirm / Confirm pending guests instead"), and do not
+hand-write a `Payment` row — a $0 confirm mints its own and `Payment.bookingId`
+is unique, so a hand-written row permanently blocks the real one.
+
+Either way, tell the member. Their offer is gone, and their place in the queue is
+the outcome they were promised.
+
+### Record a trusted legacy induction baseline (#2361)
+
+`pnpm run induction:baseline` is a one-off, dry-run-first maintenance command
+for a committee-authorised legacy New Member induction baseline. It never
+belongs in normal setup or deployment flows. A dry run requires an active,
+login-enabled Full Admin actor member ID, one New Zealand date-only baseline
+date, and a stable provenance note:
+
+```bash
+IFS= read -r ACTOR_MEMBER_ID < /protected/path/actor-member-id
+IFS= read -r BASELINE_DATE < /protected/path/baseline-date
+IFS= read -r PROVENANCE_NOTE < /protected/path/provenance-note
+
+pnpm run induction:baseline \
+  --actor-member-id "$ACTOR_MEMBER_ID" \
+  --baseline-date "$BASELINE_DATE" \
+  --provenance-note "$PROVENANCE_NOTE"
+```
+
+The protected files must pass the runbook's exact one-line validation; embedded
+newlines are forbidden. Keep the variables unexported and quoted so club and
+provenance text remains literal data rather than executable shell syntax.
+Apply additionally requires `--apply` plus the exact `PLAN DIGEST`, club name,
+parsed database host, and parsed database name from the reviewed dry-run
+report. The digest binds the complete safe plan and is compared after apply
+takes the induction table lock and rebuilds that plan, but before the blocker,
+no-op, or write branches. A mismatch prints the refreshed safe report, writes
+nothing, and requires a fresh dry run. Apply preserves all existing induction
+rows, blocks on every eligible Draft or In Progress workflow, and commits the
+new rows plus a digest-bearing audit event atomically under a PostgreSQL lock
+against direct `MemberInduction` DML. The lock does not freeze the wider member
+population or the actor: from the final dry run through the post-apply
+verification dry run, pause membership approvals, member creation/import,
+group-booking join acceptance/token claims that can create an active `USER`,
+changes to the chosen actor's `canLogin`, access roles, or account lifecycle,
+induction writes, and member lifecycle writes. These writers are operationally
+frozen; the database lock still covers direct `MemberInduction` DML only. See
+the full
+[trusted legacy induction baseline runbook](INDUCTION_BASELINE_RUNBOOK.md)
+before using it. Do not expose `DATABASE_URL` or credentials in an operator
+report.
+
+### Reconcile booking and Xero records
+
+`scripts/xero-booking-repair.ts` is a targeted booking/Xero reconciliation
+helper. Keep it out of normal setup and deployment flows. Use it only when an
+operator needs to inspect or repair known booking-payment/Xero mismatches after
+reviewing the affected bookings.
+
+Always start with a dry run:
+
+```bash
+pnpm run xero:booking-repair --dry-run
+pnpm run xero:booking-repair --booking <bookingId> --dry-run
+pnpm run xero:booking-repair --from <YYYY-MM-DD> --to <YYYY-MM-DD> --dry-run
+```
+
+`--from`/`--to` are **inclusive club calendar days**, and a booking is swept if
+its check-in night, its creation, its last update, or any of its modifications
+falls inside them. The report header echoes back the two days you asked for, so
+check it against what you typed before reading the findings. Both dates must be
+real calendar days: `--to 2026-04-31` is refused rather than quietly read as
+1 May, which is what it used to do.
+
+**Reading an archived report from before #2868.** Only the CHECK-IN half of the
+window was wrong, and this matters because the error does not go the way the
+header suggests. The window was built as midnight in the server's own time zone
+and bound unchanged against both the date-only `checkIn` column and the three
+timestamp columns beside it. Under the `TZ=Pacific/Auckland` pin, that instant
+is the previous UTC day, so for a sweep asked to run 1-31 July the report
+actually covered:
+
+- `checkIn` between **30 June and 30 July** inclusive — one day early at both
+  ends, so it both missed 31 July check-ins and pulled in 30 June ones; and
+- created, last updated, or modified between **1 July 00:00 and 1 August 00:00
+  NZ** — that is, exactly the club days that were asked for. **This half was
+  correct**, because the server's local midnight IS the start of the club day
+  whenever the server is pinned to the club's zone.
+
+The header printed the shifted dates for both, so it understated the coverage of
+the second half. Do not read "the window started 30 June" as meaning a booking
+CREATED on 30 June was covered — it was not. Re-run any sweep whose check-in
+dates mattered; the created/updated/modified findings in an archived report can
+be taken at face value.
+
+**Bill historical increases to an organiser (#4299 B1).** A place paid through
+its organiser's combined internet-banking invoice has no primary invoice of its
+own. For these places the tool reports every recorded positive net change
+(price difference plus late-change fee), including places later reduced or
+cancelled. The JSON finding shows the combined invoice, organiser, amount to
+bill, later reductions, cancellation/refund/credit events, and the payment's
+recorded refunded total. The refunded total covers the whole booking; the dated
+events beside it identify later activity where recorded. Old financial-review
+tasks stay refused and are never turned into charges by this repair.
+
+Review that JSON before billing: **the whole recorded increase is billed even
+when a later reduction or cancellation means the organiser may be over-billed**
+(the owner's B1 decision). This repair does not net those historical cases.
+Copy each selected `queue:organiser-historical:…` action key from the dry run:
+
+```bash
+pnpm run xero:booking-repair --booking <bookingId> --dry-run
+pnpm run xero:booking-repair --booking <bookingId> --apply --apply-action '<exact-action-key>'
+```
+
+A plain `--apply` does not back-bill these changes. Repeat `--apply-action` for
+at most 50 reviewed changes per run. Each key includes a digest of the figures,
+payer, combined invoice and displayed history; stale keys match nothing, and
+apply reads the local evidence again before queueing. Re-run the dry run after
+any change. An edit with any earlier invoice link (including an inactive one)
+or invoice operation is skipped. Repair or retry a failed operation through
+**Admin → Xero → Operations**, rather than requesting another invoice. Missing
+combined invoices are reported for manual review, with no billing action. These
+findings sit beside the place's ordinary repair findings, which still apply.
+The place's missing primary invoice is not one of them: it reports
+`ORGANISER_SETTLED_ON_COMBINED_INVOICE` (info, no action), so a plain `--apply`
+never invoices the joiner, and the invoice queue and its handler refuse such a place.
+
+Each selected edit uses the ordinary supplementary-invoice queue and its
+per-change lock: one invoice on the joiner's change, addressed to the organiser,
+with no payment recorded and no card wait. The existing outbox worker sends it
+and the organiser notice; reconciliation records the organiser's transfer.
+Dry run makes only local reads and raises no invoice, email or contact.
+
+**A supplementary invoice is only offered when the main invoice went out
+FIRST (#3199).** When a booking edit adds money the club normally raises a small
+extra Xero invoice for the difference, and whether that is right depends on
+which came first. If the booking's main invoice had already gone out when the
+edit happened, it bills the old total and the difference is genuinely unbilled -
+the ordinary case, because the main invoice is raised at confirmation. If it had
+NOT gone out yet - a Xero outage, or the window between the card clearing and
+the queue running - the main invoice is raised later and bills the booking as it
+then stands, so it already includes the edit. An extra invoice on top of that
+bills the club's books for money nobody owes.
+
+The tool works the answer out from the Xero operation history: the successful
+invoice-create row carrying that invoice's Xero id, and when it completed. Three
+outcomes, and only the first is a click:
+
+- **the main invoice completed before the edit** - `MISSING_SUPPLEMENTARY_INVOICE`
+  at critical severity with its `QUEUE_SUPPLEMENTARY_INVOICE` action, exactly as
+  before;
+- **the main invoice completed at or after the edit** - reported at
+  `manual_review` severity with no queue action, carrying
+  `primaryInvoiceTiming: invoice-followed-edit` and the date it was raised.
+  Open the invoice in Xero and bill only what is genuinely still owed. It will
+  usually be nothing; a **change fee** is the exception, because a change fee is
+  not a line on the main invoice and so is still owed even when the price
+  difference is not;
+- **the history cannot answer** - reported the same way with
+  `primaryInvoiceTiming: unknown`. An invoice raised before this system kept an
+  operation history, or entered into Xero by hand, has no row to read. So does
+  one whose only remaining record is a **later re-run** that found the invoice
+  already there: retrying a failed or partial Xero operation re-uses the same
+  record and stamps it with the retry's own time, which erases the time the
+  invoice actually went out. Check the invoice in Xero before raising anything.
+
+`--apply` skips the second and third: they are reported, never applied and never
+silently dropped.
+
+**Which edits this asks the question about.** Any edit whose own recorded
+difference is a charge, and - less obviously - any edit that **added a guest**,
+even when its recorded difference is zero. A main invoice bills the booking's
+guests and their nights rather than its stored total, so a guest added by an
+edit whose amount was parked for a financial review is still on that invoice if
+it went out afterwards, at the real price they are being charged. Those two are
+the ways an edit can end up on a main invoice raised later. Everything else an
+edit priced by a financial review asks for is unaffected: that money lives on
+the review tasks and is never a line on a main invoice (see below), so the
+timing question does not arise for it and those findings keep their one-click
+repair.
+
+**Booking edits priced by a financial review (#3187).** Before #4317, when an
+edit's money could not be worked out from the booking's own history, the change
+was saved and the amount was parked for an officer to confirm; since #4317 every
+edit is priced, and only those older edits remain. The booking's stored totals do not
+move, so the change record itself says "nothing owed" and the tool used to skip
+those bookings entirely. It now reads the settled amount off the completed
+review tasks instead. Two things follow for an operator:
+
+- a `MISSING_SUPPLEMENTARY_INVOICE` finding on such a booking reports the total
+  the reviews settled to (its `editReviewChargeCents` detail), and its
+  `QUEUE_SUPPLEMENTARY_INVOICE` action queues an invoice for that total;
+- an invoice that already went out billing LESS than the settled total shows up
+  as `XERO_AMOUNT_MISMATCH`, which is manual-review only. That is the known
+  window where a second review share is settled after the invoice has been
+  picked up for sending; check the invoice, bill or correct the difference by
+  hand, and record what was done.
+
+A repaired invoice is raised with the payment state the member is actually in:
+unpaid where the club is asking through internet banking, held until the card
+clears where a card request is outstanding, and paid where the card has already
+taken at least the full amount. Do not assume a queued repair invoice records a
+payment.
+
+**Two review-priced cases are reported and never repaired**, because raising the
+invoice would state something untrue about money. Both arrive as a
+`MISSING_SUPPLEMENTARY_INVOICE` finding at `manual_review` severity — the report
+lists them, `--apply` skips them — and each carries an `editReviewPaymentReason`
+saying which it is:
+
+- `capture-short-of-ask` — the card took LESS than the officer settled on,
+  usually because a second review share settled after the member had already
+  paid the first. The invoice would be raised for the combined total and marked
+  paid in full, overstating the Stripe clearing account by the difference and
+  leaving money the member still owes with nothing chasing it. The finding
+  reports both figures (`netAmountCents` and `capturedAmountCents`); collect or
+  write off the difference by hand and record what was done.
+- `intent-mint-awaiting-recovery` — the card request could not be created at
+  Stripe and its retry is still queued. Nothing is wrong yet and nothing needs
+  doing: the retry raises the request, and the invoice follows it. Re-run the
+  sweep later. If the same booking keeps reporting this, the retry itself has
+  stopped making progress — that is the thing to investigate.
+
+  **Read this before you re-run the sweep, because the answer changes once the
+  retry gives up.** The retry is not infinite. When it exhausts its attempts it
+  is marked failed, an admin payment-failure alert is raised, and nothing will
+  replay it. At that point this tool stops deferring: the same booking now
+  reports `MISSING_SUPPLEMENTARY_INVOICE` at **critical** severity, safe to
+  auto-apply — and applying it queues an invoice for the settled total with **no
+  payment recorded and no card request behind it**. The member is left holding a
+  Xero receivable they were never asked for and cannot pay through this
+  application; someone has to collect it another way (internet banking, or a
+  fresh ask) and record the payment against that invoice by hand.
+
+  That is the deliberate choice, and it is the right way round: an unpaid
+  invoice can be collected, where an invoice falsely marked paid quietly
+  overstates the Stripe clearing account and stops anyone chasing the money. But
+  it is the operator's call to understand before running `--apply` on a booking
+  whose retry has failed, not a repair that finishes the job on its own.
+
+Only use `--apply` after the dry-run report has been reviewed. Do not run it
+with live Xero, Stripe, SES, Sentry, or production database credentials during
+exploratory work; use a staging database and Xero demo tenant where possible.
+`XERO_AMOUNT_MISMATCH` findings are manual-review only: the tool reports stored
+Xero operation/link amount evidence that disagrees with local cents, but it
+does not auto-adjust financial amounts. Since #1427,
+`MISSING_MODIFICATION_CREDIT_NOTE` and `MISSING_CREDIT_NOTE_ALLOCATION` are
+also manual-review (not auto-queued) when the payment captured money and no
+stored evidence records the policy-limited settlement — the report tells you
+to size the credit note (or confirm the note's total) by hand from the
+cancellation-policy history before acting; `--apply` will not touch these.
+Since #4757, an edit's note whose own operation went PARTIAL (the note made,
+its allocation refused) reports `MISSING_CREDIT_NOTE_ALLOCATION` with that
+operation's retry, never a fresh allocation; while a retry is running on it,
+or where the retry is refused, the report says the allocation is blocked and
+offers nothing, and you check again later or allocate it by hand in Xero.
+Since #3993 a paid-off allocation (Xero says the invoice has already been paid
+off, or the amount is greater than the amount outstanding) and a modification
+note the invoice cannot take are not retried and are not safe to apply: the
+report asks for manual review. For a card refund that already produced both
+notes, keep the refund note, which carries the Stripe refund payment. Void the
+modification note only after confirming it has no allocations or refunds. On
+the Xero operations screen, Resolve the partial operation and its failed
+requeue and allocate rows. Do not mark the row non-replayable, which warns
+forever. Do not void the refund note: inbound sync would retire its link and
+the next nightly run would raise another. A paid-off note recorded with any
+other method (or none) names no refund note: check how the money went back
+before allocating, refunding or voiding it. If the invoice cannot take the note
+on a re-run whose earlier attempt already sent the create to Xero (a worker
+that died before completing), the row says so and stays retryable: check Xero
+for an existing note for that edit before treating it as not created. This
+change does not perform that remedy, and it uses no production Xero, Stripe,
+or database.
+Since #4762 the same holds for an invoice-clearing note whose operation the
+retry refuses: reported blocked with the reason and the invoices left to
+allocate by hand, never a fresh allocation of the whole note against the
+primary invoice; where its recorded plan was redacted, the invoices left are
+not listed. For either note, whether its retry is offered or refused, an
+allocation operation still pending or running is reported instead (let it
+finish, then run the report again), and so is a failed one that is not the
+note's own attempt at a planned invoice and amount - such as an older,
+differently sized allocation the tool once queued: it is retried first, or
+reported if it cannot be, or reported as done if resolved in Xero and it
+names the same credit note (one resolved for another note is left to that
+note's own report). The report reads the edit's own operations, or for an
+invoice-clearing note the whole booking's. The note's own failed attempts
+are covered by its retry. Since #4767 that retry, and the report, also
+count an allocation an older version of this tool retried on its own
+(linked as `CREDIT_NOTE_ALLOCATION`) as done when it names the same credit
+note, invoice and amount, so the retry never sends it to Xero again; a
+note whose planned invoices are all covered that way is no longer reported.
+Its operation stays partial on the Xero operations screen until one retry
+closes it, which makes no Xero call. Invoices you allocated by hand through
+one of the note's own attempts are not listed: if none is left, the note is
+reported as done; otherwise the report asks you to allocate the planned
+invoices it lists as left by hand, and offers nothing.
+Since #4763, a note whose own operation was marked resolved in Xero is
+listed as an information-only "resolved in Xero by an officer" finding
+naming the note, with nothing offered. Any other allocation operation still
+failed or pending beside it is reported too, and not retried from this
+report: a retry of one of that note's own could allocate it a second time,
+since the allocation you made by hand is not linked in the app. Check such
+an operation in Xero, then retry or resolve it on the Xero operations panel.
+Since #1491, `LATE_CAPTURE_AFTER_CANCELLATION` is also never auto-applied:
+it now fires only when a cancelled booking retains captured value with NO
+recorded cancellation-refund decision (no cancellation credit, no
+booking-cancel refund recovery operation), which is either a genuine late
+capture or a deliberate 0%-tier policy retention. After verifying it is a
+genuine late capture, execute exactly that refund with
+`--apply --apply-action <actionKey>` (the key is printed next to the planned
+action in the human summary and in the JSON report; combine with
+`--booking <id>` to keep the rest of the apply run scoped, and note the run
+warns about forced keys that matched nothing); if it is a deliberate
+retention, leave it. If a multi-slice refund fails partway (one captured
+Stripe intent refunds and records, a later one declines), the action reports
+`failed`, but the Xero refund credit note is still queued for exactly the
+slices that actually refunded — sized from the recorded refund ledger, not the
+requested total — so Xero never understates the refund (#1495). Re-run
+`--apply-action` with the new, smaller remainder key the report now prints (it
+embeds the still-outstanding cents): it refunds only the remainder and queues a
+note for exactly that delta under a distinct cumulative-watermark correlation
+key, never re-noting the completed slices. Tiered cancels that
+deliberately retained a policy penalty produce no finding at all — their
+books are correct.
+
+A late capture a treasurer-approval task owns is never offered for refund
+(#3639). One the treasurer **kept** (the task was closed without refunding) is
+recorded in Xero by the app (#3635, `INV-PAY-110`; a change payment on a
+booking Xero invoiced is the next paragraph's): for the booking's own
+payment, and for a change payment on a booking Xero never invoiced,
+`KEPT_LATE_CAPTURE_WITHOUT_XERO_INVOICE` fires when no
+`KEPT_LATE_CAPTURE_INVOICE` row is queued or sent for its approval task. Its
+`QUEUE_KEPT_LATE_CAPTURE_INVOICE` action is always safe to auto-apply: the
+invoice bills the gross capture, dated the capture day, touches nothing of the
+booking's own, and the pass re-reads the task under its row lock before it
+queues. A failed or partial one is offered for retry instead, and a partial
+one (invoice raised, Stripe payment not recorded) is offered even after the
+task was reopened and approved. When an officer recorded the kept invoice by
+hand and resolved it in Xero, the app raises no refund note for it, so a refund
+of that capture raises the report-only
+`KEPT_LATE_CAPTURE_REFUND_RECORD_BY_HAND`: record the refund by hand as well,
+for the amount it names - the capture's card refunds less the refund notes in
+Xero naming it (#3924 round 13). A partial one the app had raised in Xero,
+whose invoice link stays active, is still the app's receipt: its refunds get
+the app's own note, and no finding asks for them by hand.
+A capture whose approved refund was closed as **Paid another way** never raises
+it (#3924 round 11): the close's findings below answer that capture. Like
+every record-by-hand finding, it keeps appearing after the refund is recorded
+by hand, and that is expected: the app cannot see what is recorded by hand in
+Xero, and the tool has no way to acknowledge a finding (#3924 round 12).
+
+**Card payment not recorded in Xero** (#3953, `INV-PAY-139`). A booking change
+whose extra the member paid by card after the booking's Xero invoice was raised,
+when no supplementary invoice waited on that payment, is recorded by its own
+receipt (`ADDITIONAL_CAPTURE_RECEIPT` in Xero Operations). A capture missed
+before that existed, or whose receipt never queued, raises
+`ADDITIONAL_CAPTURE_NOT_RECORDED_IN_XERO`. It never fires on a cancelled
+booking, on a booking with no Xero invoice, or where another document records
+the payment: the invoice's own payment, the change's own supplementary invoice
+where it records a payment, or one naming or paying it. Its `QUEUE_ADDITIONAL_CAPTURE_RECEIPT` action
+queues the receipt, which reads the invoice in Xero first and records the
+payment only against money still due, or refuses and emails the treasurer; it
+is auto-applied only where the invoice's stored figures say its own payment did
+not cover the capture. Where the invoice predates those figures the finding is
+`manual_review`: check Xero for the payment first, then apply the action by key
+if it is missing. A receipt that failed is offered for retry
+(`BLOCKED_BY_XERO_OPERATION`); one the worker refused (code
+`ADDITIONAL_CAPTURE_RECEIPT_REFUSED`) is reported for an officer - its
+operation says why; record the payment by hand and mark it resolved, or fix the
+cause and **Retry**. The tool's own missing-supplementary-invoice action raises
+that invoice unpaid where the change's capture is recorded, or may be being
+recorded, by its receipt (its Xero payment linked, the operation running, or its
+payment already decided); a receipt that has decided nothing yet then records the
+payment against that unpaid invoice. A **Retry** of a change's supplementary
+invoice whose card payment its own receipt records raises it unpaid, and says
+so. That holds for an officer's review charge
+too (its change is read from the charge), and for an older capture whose change
+the app never recorded, any of whose receipts makes an invoice on the booking
+that names no card payment go unpaid (one naming its own payment is left as
+it is). A receipt for such an older capture refuses, telling the treasurer,
+where a paid invoice on the booking names no card payment, or a change's
+invoice from before that record existed has a Stripe payment recorded in
+Xero: check in Xero whether that
+invoice already records it, then record by hand or resolve.
+
+**Kept card payment for a booking change not recorded in Xero** (#4324,
+`INV-PAY-144`). Before #4324, a late card payment for a booking change that a
+treasurer kept on a cancelled booking whose Xero invoice exists was recorded
+only where a supplementary invoice waited on it; otherwise Stripe held the money
+and Xero showed nothing. Since #4324 the keep records it, and the repair tool
+finds the ones kept before: `KEPT_LATE_CAPTURE_NOT_RECORDED_IN_XERO`. Its
+details say which document will record it (`recordedBy`): a payment on the
+booking's Xero invoice that bills the change, for no more than Xero shows still
+due (`ADDITIONAL_CAPTURE_RECEIPT`), or a kept-payment invoice where nothing in
+Xero bills the change (`KEPT_LATE_CAPTURE_INVOICE`), and how much: the
+payment (`capturedCents`), the part another Xero document already records
+(`alreadyRecordedCents`), and what the apply records (`recordsCents`, which a
+receipt caps at what Xero shows due when it is sent). The owner decided these are
+recorded automatically (25 Oct 2026), accepting that one a treasurer already
+entered by hand in Xero would then be recorded twice. So:
+
+1. **List them first.** Run the dry run, `pnpm run xero:booking-repair
+   --dry-run` (or with `--from`/`--to` for a window), and read every
+   `KEPT_LATE_CAPTURE_NOT_RECORDED_IN_XERO` finding with its booking, payment
+   intent, amounts and `recordedBy`. Ask the treasurer whether any of them
+   was already recorded by hand in Xero. Leaving such a booking out of an
+   apply only postpones it: the finding stays auto-apply, the tool cannot mark
+   it handled, and any later blanket `--apply`, run for any reason, records
+   it. The real ways out are to (a) delete the hand-entered payment in Xero
+   before applying, so the app's record is the only one, or (b) apply, then
+   check Xero and reverse whichever entry is the duplicate.
+2. **Then apply.** `pnpm run xero:booking-repair --apply` runs each finding's
+   `QUEUE_KEPT_LATE_CAPTURE_RECORD`. Each one runs the keep's own decision
+   again under the approval task's row lock and the change's lock, finds the
+   payment's receipt or kept-payment invoice first, and queues nothing a second
+   time, so applying twice records each payment once. The receipt reads the
+   invoice in Xero before it records anything, and refuses, telling the
+   treasurer, where nothing is left due.
+
+A payment whose ledger row names no booking change (even where an unpaid
+invoice names the payment), or one on a booking paid by internet banking, is
+reported `manual_review` and never applied: record it
+by hand in Xero. The tool cannot acknowledge a finding, so these come back on
+every run after you have recorded them; that is expected, not a sign the hand
+entry failed. A payment another writer already records (the credit-release
+sweep, say) raises no finding. One on a booking whose payment row lacks its
+Xero invoice id while the invoice link exists is reported `manual_review`,
+saying the tool cannot tell yet whether Xero records it, until that id is
+synced (`SYNC_PAYMENT_PRIMARY_INVOICE_FIELD`) - unless its receipt, a
+kept-payment invoice or the credit-release sweep already records it, when it
+raises nothing; a later pass then lists it as above. One whose change invoice already answers it is the late
+payment release's, and raises no finding here; a receipt that failed is offered
+for retry, and one the worker refused is reported for an officer, as above.
+Where the kept-payment invoice records a change's payment (one asked for, or
+one this pass raises), the tool raises no supplementary invoice for that
+change: the kept-payment invoice already bills it. Where no kept-payment
+invoice will be raised (another writer records the payment), the change's
+missing supplementary invoice is still reported.
+
+A late capture the treasurer **approved** refunding, whose card refund Stripe
+gave up on and which was then closed as **Paid another way** before Xero had
+its receipt, owes that receipt too, and the close's bank-transfer note waits
+for it (#3372, `INV-PAY-122`). When the receipt row failed before reaching
+Xero, or none was queued, `PAID_ANOTHER_WAY_LATE_CAPTURE_WITHOUT_XERO_RECEIPT`
+retries or queues it. Both are safe to auto-apply: the worker and the enqueue
+re-read the task and the close under the task's row lock before anything is
+sent, and the note follows once the receipt is in Xero. Its summary says which
+case it is: a receipt row that failed after its invoice was linked in Xero is
+retried automatically, since its retry sends nothing again; one that failed
+after it may have reached Xero - its Stripe payment linked, or the invoice call
+attempted - is **not** auto-applied (#3924 round 8): check Xero for the receipt
+first, then apply the retry with `--apply-action`. When the receipt is in Xero
+(the tool's own, or a change's supplementary invoice for the capture) and the
+close's note was never queued, `PAID_ANOTHER_WAY_REFUND_NOTE_NOT_QUEUED` queues
+it through the same note step the receipt's workers run, under the approval
+task's row; it is safe to auto-apply and queues a close's note at most once.
+While a change's invoice for the capture is still on its way to Xero, the tool
+queues no second receipt beside it: the note follows that invoice. If that
+invoice FAILED, retry it from the Xero operations list: since #3924 round 9 the
+retry sends it back through the outbox on its own row, and the note follows.
+Since round 10 the retry refuses (409) a change invoice whose booking change is
+already linked to its invoice in Xero. A failed change invoice that attempted
+the Xero call may already be in Xero: check Xero first, and retry it if it is
+not there. If it is there, it depends on whether the app linked it (#3924
+round 11). **Not linked** (its operation names no Xero invoice): mark it
+resolved as fixed in Xero and record the refund by hand. **Already linked**
+(its operation names its Xero invoice, or the retry refuses with the 409):
+mark it resolved as fixed in Xero first, before recording anything by hand
+(#3924 round 14). Do **not** record by hand what the close paid back: the
+receipt is read from that invoice, and the app raises the close's note through
+the nightly credit check or `PAID_ANOTHER_WAY_REFUND_NOTE_NOT_QUEUED` below.
+Do record by hand what Stripe refunded to the card: every card-refund path
+reads the resolved row as resolved by hand and raises no card note (round
+12). The 409 names both: the close's amount, and the capture's card refunds
+less the notes naming it (`readUnnotedLateCaptureCardRefunds`). Since round
+13 only a note in Xero counts. Since round 14 each card note is one of three:
+in Xero (its credit note's id recorded, its active refund-note link naming
+the capture, or resolved by hand), taken off; never sent (still queued, failed
+before it called Xero, or refused by Xero with a 4xx), so its amount is
+recorded by hand; or may be in Xero (it called Xero and the outcome is
+unknown), so the 409 names it apart: check Xero for that credit note and
+record it by hand only if it is not there. A queued note is not proof that
+nothing reached Xero: an officer's retry of a failed note sends it again on a
+new row, and round 15 counts that row and its link, once. While the capture
+still has another invoice in Xero, or another receipt on its way there, its
+card notes land there: nothing of them is recorded by hand, and the 409 says
+the app notes what no note covers yet the next time it notes the charge. With
+no close, or a $0 one, it says to record any card refund by hand. The nightly credit check also re-runs the note step for any payment
+whose closes' notes do not cover what they paid back; it queues a note that
+was never queued, but a FAILED note needs **Retry in background** in Xero
+Operations. If an officer resolved the capture's receipt
+by hand before the app sent it - the change invoice or the late charge's own
+receipt, before or after the close - the report-only
+`PAID_ANOTHER_WAY_REFUND_NOTE_RECORD_BY_HAND` names the close's record and
+what is left to record: the capture's own card refunds less the refund notes
+in Xero naming it, plus what the close paid back (rounds 12 and 13; never the
+capture row's refunded total, which can carry another hand-back). Record that
+by hand in Xero. A card note sent with no reply is named apart (round 14):
+check Xero for it before recording that amount. A receipt row resolved after
+the app sent it, or a change linked in Xero, is the app's receipt, so the
+close's note follows it and this finding is not raised. It is not raised once
+any note row of the close exists, one resolved by hand included. When every
+card-refund path reads the capture's receipt as resolved by hand, and no
+record-by-hand finding above names the capture, the report-only
+`LATE_CAPTURE_CARD_REFUND_RECORD_BY_HAND` names its card refunds that no note
+in Xero answers, whether or not a close exists (round 12). Since round 13 that
+covers the app's invoice in Xero whose row was resolved by hand, a change
+invoice resolved before the app sent it, and a close whose note row exists.
+Record those by hand in Xero, except a card note sent with no reply, which it
+names apart for you to check in Xero first (round 14), as the kept invoice's
+finding does. Each capture is named by one record-by-hand finding at most, and
+by none when the app raises its card note. One exception (#4383): where the
+app recorded only part of a late card payment in Xero (its invoice had less
+room than the payment, and the receipt's alert told you about the rest), its
+refund note stops at that part, and the same finding names the refund above it
+with its own sentence. Record that amount by hand only if you recorded the rest
+of the payment by hand; otherwise record nothing. A note raised before this
+change for the whole refund is left as it is: the finding does not name what it
+already credits, and the Xero reconciliation report may now list the payment as
+refund coverage above the refunded total. If you recorded the rest of the
+payment by hand, Xero is right and that line can be ignored; if not, reduce the
+note in Xero by the part above what the receipt recorded. One case is not
+right even when you recorded the rest by hand: the over-noted refund itself
+later failed in Stripe. A "Paid another way" close of it reverses only up to
+what the receipt recorded, so reverse the part above that by hand in Xero,
+unless a close made before this change already reversed the whole refund (its
+reversal invoice is for the whole amount). The app never reads
+that part as a card refund that failed later: closing a failed refund on the
+payment as "Paid another way" queues no Stripe reversal for it, and the inbound
+credit-note recount takes nothing off for it, so your correction in Xero is the
+only one. Each record-by-hand finding keeps
+appearing after the refund is recorded by hand, and that is expected: recording
+a refund by hand in Xero writes no row the app can read, and the tool has no
+way to acknowledge a finding.
+
+**A capped late-capture refund note and the journal's export manifest**
+(#4383, #5343). A refund note capped at what the receipt recorded is for less
+than the refund's debt in the member-money journal. Where the note names its
+card refund (a card refund's own note, `cardRefundId`) and that refund's
+journal entry pays one live refund debt, its `REFUND_NOTE` export manifest is
+recorded as a `CENTS` conflict (`coverRefundExportComponent` in
+`refund-note-plan.ts`), and the app logs "A refund document does not match the
+journal; its manifest records a conflict and the document still sent". The
+note is still sent, and the conflict is accurate: Xero holds less than the
+debt. Nothing needs doing for it. Expect it until M13 (#4525). Where the
+refund's entry pays no debt (none is posted, or it is posted and not yet
+answered to one), pays more than one, or pays one since reversed, the conflict
+is `COMPONENT_UNUSABLE` instead (`resolveRefundNoteObligation`). So is that of
+a capped note that names no card refund or other door, as for every note sized
+on the payment's refunded watermark, capped or not
+([`member-money-ledger.md`](design/member-money-ledger.md), section 7).
+
+**Credit-paid card bookings invoiced before #3836.** A card booking paid
+entirely with account credit was invoiced at its full price, but the credit was
+never allocated against the invoice, so Xero shows the whole booking owing and
+its reminders ask the member for money already paid. New bookings are allocated
+by the invoice operation itself. For bookings invoiced before the fix, the tool
+reports `UNALLOCATED_APPLIED_CREDIT` (critical) on a paid booking whose card
+payment captured nothing, whose invoice exists, and whose applied credit has no
+Xero note on record. Its `QUEUE_APPLIED_CREDIT_ALLOCATION` action is safe to
+auto-apply: it queues the same applied-credit allocation operation booking
+creation uses, which allocates the member's floating credit notes (minting one
+for credit that has none) up to what is still applied, and stamps it, so a
+re-run allocates nothing more. Where the booking's invoice or allocation
+operation is unfinished the tool offers that operation's retry instead, or
+waits, and never queues a second one. A cancelled booking is not reported here:
+the `CANCELLED_BOOKING_OPEN_INVOICE` finding clears its invoice with a note, and
+waits while the booking's invoice or allocation operation is unfinished, since
+that operation may still finish allocations the note must not repeat.
+
+If Xero refuses the allocation (a 4xx: typically the invoice was voided, or
+already settled by hand), the operation stays `FAILED` and the report offers its
+retry as a manual action only, never auto-applied, so a sweep does not re-run a
+refusal. An applied-credit operation cannot be marked "resolved in Xero": the
+local credit ledger's fences read only its status, so it is closed by a
+successful run. Read the operation's error, put the cause right in Xero (for
+example, remove a hand-made payment or allocation that already settles the
+invoice, so the member's credit note pays it as the app records), then apply the
+retry by its key: `--apply --apply-action <actionKey>`. Where the invoice was
+voided and must stay voided, leave the operation failed and take the booking to
+a developer: the member's credit note stays unallocated in Xero, and no tool
+here re-raises the invoice.
+
+### Refund credit notes with no settlement on record (#3548)
+
+Before #3548, a refund credit note whose first attempt died between raising the
+note in Xero and recording its settling payment could be closed by a later
+replay as SUCCEEDED carrying neither the payment nor the "no payment due" flag
+(`INV-PAY-111`). The note then reads as still owed in Xero, and nothing flagged
+it. New attempts can no longer end that way, but rows written before the fix
+remain.
+
+Two readers find them, both through the one predicate
+(`refundNoteSettlementOnRecord` in `src/lib/xero-refund-note-settlement.ts`),
+over the same evidence: refund notes only, never an account-credit note, and
+each note's payment links whether active or not:
+
+- the reconciliation report's **"Refund credit notes with no settlement on
+  record"** section (`unsettled-refund-credit-notes`), which also lists a note
+  Xero shows **part-settled**, with the amount still outstanding; and
+- the booking repair tool's `REFUND_CREDIT_NOTE_UNSETTLED` finding.
+
+**Nothing is settled automatically.** An officer may have left an old note open
+on purpose, and a settle would pay it from the Stripe account. For a note that
+should be paid, review it in Xero, then apply the finding's
+`SETTLE_REFUND_CREDIT_NOTE` action by its key from the dry-run report
+(`--apply --apply-action <actionKey>`). The action re-reads the row first, reads the note back
+from Xero, and pays it only if nothing settles it yet: under the note's one
+payment key, dated the note's own day, and never over a payment or allocation
+Xero already shows. For a part-settled note, settle its remainder in Xero by
+hand, then apply the same action: on that row it only reads the note back and
+records the payments Xero now shows, never paying, and the listing clears once
+the note is fully settled.
+
+### Backfill cancel-flattened payment statuses (retired, #5404)
+
+`payments:backfill-cancel-flattened` restored the stored status of payments a
+pre-`v0.10.0` cancellation flattened to `FAILED` (#1473 / #1506). It served
+only clubs that ran `v0.9.0` or earlier and has left `main` under the one-off
+retirement rule ([`UPGRADING.md` → Principles](UPGRADING.md#principles)). It
+remains in the `v0.14.0` tag, with its instructions in this file there under
+"Backfill cancel-flattened payment statuses (#1473 / #1506)"; it was not tested
+against any later schema.
+
+### Backfill orphaned applied credit (#1547)
+
+`scripts/backfill-orphaned-applied-credits.ts` is a one-off, idempotent,
+local-only heal for account credit a member applied to a booking that was never
+restored when the booking was cancelled. Before #1547, applying credit to a
+booking, abandoning payment, then cancelling left the negative `BOOKING_APPLIED`
+`MemberCredit` row on the ledger — the credit was permanently lost, and the
+delete guard then blocked deletion on that very row. #1547 fixed the cancel
+paths going forward (every branch now restores applied credit); this heals rows
+orphaned before the fix.
+
+It detects, per `CANCELLED` booking (including soft-deleted): a `BOOKING_APPLIED`
+row with NO matching `CANCELLATION_REFUND` row and (no payment, or a payment
+with no capture evidence per the shared discriminator AND an aggregate status
+other than `SUCCEEDED`). The absence-of-refund clause excludes healthy restores
+and held-as-credit cancels; the capture clause excludes the legitimately
+unrestored captured shapes (0%-tier paid cancels and held-credit refunds); the
+`SUCCEEDED` clause excludes settlement without cash (a fully-credit-covered $0
+payment settles the booking, and its 0%-tier cancel legitimately retains the
+credit). Known false negative, conservative by design: a pre-fix orphan whose
+cancelled booking later received late cash carries an inbound-minted
+`CANCELLATION_REFUND` row that compensates the cash, not the applied credit —
+the predicate skips it (a missed heal, never a double restore); such bookings
+need manual review. It restores 100% of
+the applied credit (ledger truth), writing a `CANCELLATION_REFUND` reversal row,
+a critical finance audit row, and a `CREDITED` booking event — each booking in
+its own transaction under the member's credit-ledger advisory lock, re-checking
+the predicate under that lock so a re-run heals nothing. It makes ZERO
+Xero/Stripe/SES calls. The daily credit-reconciliation cron also alerts
+(alert-only, no auto-heal) under the tag
+`credit-reconciliation:orphaned-applied-credits`; a post-fix hit means a NEW
+regression — diagnose before running this script.
+
+Always start with a dry run (the default) against a non-production copy:
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run payments:backfill-orphaned-credits
+```
+
+Only after reviewing the dry-run report, apply (each booking in its own
+transaction):
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run payments:backfill-orphaned-credits --apply
+```
+
+### Re-derive evenly-split night prices from the rate table (#3531)
+
+`scripts/backfill-night-prices-from-rates.ts` is an operator-run, idempotent,
+local-only rewrite of the per-night split of guest totals that two earlier
+backfills (#1098, #2739) divided evenly across the nights. Those rows reconcile
+to each guest's total but no night among them was ever sold at its own figure,
+so an edit that moved such a night used to go to a person. Since #4317 an edit
+values every night by [`INV-MOD-028`](invariants/booking-modifications.md)
+instead, which keeps a usable row's figure whatever its provenance; the backfill
+still makes those figures the ones the rate table actually sold.
+
+It runs the pricing engine once over each booking's party **as it was sold** —
+every guest's stored rate-type snapshot, age tier and membership, over the
+nights their rows hold, against the lodge's rate table and the club's
+booking-time group-discount setting — and rewrites a strand's rows **only when
+the engine's per-night vector reproduces that strand's stored total to the
+cent**. The rewritten rows carry the provenance `RATE_DERIVED`, distinct from a
+night somebody sold (`SOLD`) or an officer valued (`OFFICER_PRICED`). Every
+other candidate strand is LISTED in the report with one reason —
+`NO_RATE_SNAPSHOT`, `UNVALUED_NIGHT`, `NO_SEASON_RATE`,
+`RATE_TABLE_DOES_NOT_REPRODUCE_TOTAL` — and never priced. No guest total,
+booking total or figure a member sees changes; only the split and its
+provenance. Each booking is written in its own transaction, every row a
+compare-and-set on the price and provenance it was planned from, with one
+`booking-payment.stored-night-price.rate-derived` audit row carrying every
+strand's before and after. Zero live-provider calls.
+
+**When it may run — this is the load-bearing rule.** Only after a deploy has
+FULLY cut over to code that knows `RATE_DERIVED`, never during a blue/green
+window: a colour whose generated client predates the value cannot read a row
+that carries it, so a row rewritten while both colours serve would fail the old
+colour's reads of that booking. The script refuses if the database enum lacks
+the value (migration `20261005020000`); it cannot see which colours are
+serving, so the runbook is the second fence. Run it from the new image, after
+the cutover, and start with a dry run (the default) against a non-production
+copy:
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run bookings:backfill-night-prices-from-rates
+```
+
+Only after reviewing the dry-run report — the strands it would rewrite and the
+residue it lists — apply:
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run bookings:backfill-night-prices-from-rates --apply
+```
+
+`--booking <id>` scopes a run to one booking, `--limit <n>` to the n oldest
+candidate bookings, `--json` adds a machine-readable copy of the report. A
+booking whose row changed between the plan and the write is rolled back and
+named as raced; re-run to plan it again from what it then holds.
+
+**Rolling the deploy back after `--apply` has run is not safe.** A colour
+whose client predates `RATE_DERIVED` errors on every read that selects a
+night's provenance — the booking detail, every edit door, the money build-up,
+the finance exports — for each rewritten booking. Run the script only once the
+release is one you will not roll back. If a rollback becomes unavoidable
+afterwards, first reset the rewritten rows from their audit rows (each
+`booking-payment.stored-night-price.rate-derived` strand entry carries
+`fromPriceCents` and `fromSource` per night), then route back.
+
+### Settle open edit reviews and re-base frozen headlines (#4343)
+
+`pnpm run bookings:edit-review-cleanup` is the owner's one-off for edit reviews
+left from before every edit was priced automatically. It does nothing until it
+is run. Census (the default) and `--dry-run` keep nothing. `--apply` needs
+`--actor <memberId>` and is the only mode that writes.
+
+Census reports open edit reviews, frozen headlines (a booking that has a review,
+none of them still open, and a total that is not the sum of its guests),
+dismissed shortenings whose money stayed inside the guest's stored total, and
+the existing ledger night-line census. Dry-run prints the decision for each
+open review and, for each frozen headline, the four money columns before and
+after. That preview runs inside a transaction it rolls back.
+
+Apply settles each open review through the ordinary refund, credit or charge
+path, and charges the change fee when the edit moved check-in and had not
+already charged one. That fee is priced on the club day the edit was saved,
+through the normal late-notice fee rule, so an unpaid booking carries none. A
+review it cannot price, and one whose guest was removed after the review was
+raised, is closed with a note and no money moved; a removal that lands during
+the run is caught under the settlement lock and the review is dismissed
+instead. A resolver refusal stays open and is listed. The headline pass then re-bases each
+frozen booking through the same writer a review closure uses. It moves no cash,
+card charge, account credit or Xero document. A second apply changes nothing.
+
+Run it only from the image that contains this change, after that colour is the
+only one serving, and never during a mixed-colour window. The census and the
+dry-run write nothing (the dry-run's preview is rolled back), so either can be
+pointed at a non-production copy or at the live database. The apply writes, and
+it settles only the database `DATABASE_URL` names, so it is run against the live
+database. Name the database yourself:
+
+```bash
+DATABASE_URL=<database> pnpm run bookings:edit-review-cleanup
+DATABASE_URL=<database> pnpm run bookings:edit-review-cleanup -- --dry-run
+DATABASE_URL=<live database> pnpm run bookings:edit-review-cleanup -- --apply --actor <memberId>
+```
+
+The before-values are on the booking's `PRICE_REBASE` history row and the audit
+entry, which is how a headline can be put back by hand. Do not roll production
+back below `5bab5c49`.
+
+### Census the booking money verdicts, night-price provenance and edit reviews (#3278, #3531)
+
+`pnpm run booking-money:census` is a READ-ONLY, repeatable-read census. It
+writes nothing, repairs nothing and calls no provider. From one ordered
+snapshot it reports:
+
+- every booking's `INV-MONEY-031` verdict — `RECONCILED` or `UNRECONCILED`
+  with every applicable reason — as counts;
+- what the stored night prices are made of (#3531 3c): night rows by
+  provenance (`SOLD`, `OFFICER_PRICED`, `EVEN_SPLIT`, `UNKNOWN`, `RATE_DERIVED`)
+  and strands by class — the evidence classifier's verdict on the strand at
+  individual-night grain, so `EXACT` or the cause an edit moving one of its
+  nights parked with before #4317 (`INEXACT_STORED_NIGHT_PRICES`,
+  `STORED_TOTAL_MISMATCH`, `PARTIAL_STORED_NIGHT_PRICES`,
+  `NO_STORED_NIGHT_PRICES`) — overall and per booking-creation month. Since
+  #4317 no edit parks, and the class decides nothing an edit does
+  (`INV-MOD-028` values every strand);
+- every `EDIT_FINANCIAL_REVIEW` task by status and by the cause the raise
+  recorded, overall and per task-creation month. The two summaries share one
+  cause vocabulary on purpose: strands by cause is what the gate would have
+  parked; tasks by cause is what it did park before #4317;
+- `ledgerNightValues` (#4317 review M3): of the bookings an edit can still
+  reach (not cancelled or deleted) that are confirmed on the ledger, how many have a live single-night guest-night line whose figure is
+  not what an edit now values that night at, or a valued night with no live
+  line at all, with up to 100 of their ids. An edit to one of them posts no
+  ledger lines and leaves an `UNPOSTED_EDIT` gap that closes the booking
+  ledger's cut-over gate until wave B's re-base re-posts the lines. **Run it
+  before the auto-pricing release ships** and keep the figure with the release
+  notes, so the gaps that follow are expected rather than found.
+
+The per-month lines are the point: run it before a deploy and again after, and
+the effect of the parking gate's grain (#3531 3a) and the rate-derived backfill
+(3b) reads off as one line against another — no figure is asserted.
+
+```bash
+DATABASE_URL=<non-prod copy or, read-only, production> pnpm run booking-money:census
+```
+
+### Catch up and census member-money receipts (M4b)
+
+Before enabling card-refund journal posting (M4c), account for every receipt on
+a booking whose R01 charge is already in the journal. This fills the gap between
+M3 and M4b without guessing which charge historical cash paid.
+
+```bash
+pnpm run member-money:receipt-catch-up --dry-run
+pnpm run member-money:receipt-catch-up --execute
+pnpm run member-money:receipt-catch-up --dry-run
+```
+
+Only the owner runs `--execute`, using the application database role. It posts
+missing receipts and their exact reversals, one Payment-row transaction at a
+time. It never calls a provider or creates collection applications. A repeated
+run posts nothing. It includes archived bookings with R01; older bookings and
+organiser-share mirrors stay outside this population. Catch-up dates are the
+legacy settlement line's recorded instant and are labelled `app-record`.
+
+The default and `--dry-run` perform read-only checks. JSON findings distinguish
+`RECEIPT_WITHOUT_EVENT`, `UNBRIDGED_SETTLEMENT_LINE`, `RECEIPT_AMOUNT_DRIFT`,
+`OVER_COLLECTED`, `UNAPPLIED_RECEIPT_ON_OPEN_CHARGE`, `MERGED_DEBTOR_BALANCE` and
+`COLLECTION_ON_REVERSED_RECEIPT` (a reversed receipt whose collection still applies cash).
+Missing receipts give exit status 2 and hold M4c's deployment. Unapplied cash is
+expected after catch-up; it remains available without inferring collection, and
+no later receipt hook collects a receipt the catch-up posted.
+`OVER_COLLECTED` is also expected until M4c records refunds. A booking whose
+price fell after it was paid, or that was cancelled and not yet refunded, still
+holds its full collection against the lower charge.
+A drift finding needs investigation; the command never rewrites an existing
+journal or silently resizes cash. Failure rolls back the current payment's
+transaction; earlier committed payments remain safe to replay.
+
+### Reconcile and census card refund reservations (M4c)
+
+Before a card refund slice is sent, the journal reserves its debt (#4516). A
+rollback across M4c, or a sender that died between its reservation and Stripe's
+answer, can leave a reservation open. The census lists each one, and the owner
+reconciles them on redeploy:
+
+```bash
+pnpm run member-money:refund-reservations --dry-run
+pnpm run member-money:refund-reservations --reconcile
+pnpm run member-money:refund-reservations --release <reservationId> --note "<why>"
+```
+
+The default and `--dry-run` only read. `ANSWERABLE_RESERVATION` is one a
+recovery row's plan marks made (`madeRefundId`) by a refund on record;
+`--reconcile` answers it, or releases it as REFUSED when that refund failed,
+through the one cash writer, one Payment-row transaction per payment.
+`STRANDED_RESERVATION` is one nothing names: in flight while its sender runs,
+otherwise stranded. Only the owner releases one, with `--release` and a note;
+the release is audited and reverses its funding, and a refund Stripe later
+records against it posts unapplied. `UNAPPLIED_CARD_REFUND` and
+`RESERVATION_SKIPPED_NO_RECEIPT` are refunds answered to no debt (a dashboard
+refund, a capture with no receipt, a merged debtor); `CARD_REFUND_WITHOUT_EVENT`
+is a counted refund the next cash-writer run on its payment posts.
+`PAID_ANOTHER_WAY_WITHOUT_EVENT` is a "Paid another way" close with no R14: one
+made before M4c (M9 back-posts history) or while the journal was inactive.
+`KEPT_REST_WITHOUT_CLOSE_OUT` is a part close whose record says the club kept
+the rest, whose R14 paid its debt in the journal, and whose rest has no
+close-out. A close whose debt was never in the journal posts its bank cash
+unapplied and has no debt to close out, so it is not listed. Open reservations give exit status 2.
+No provider call; nothing is matched by amount or time.
+
+Since Ledger M4d (#5185) it also lists each booking's bank and cash hand-back
+classes, which `booking-ledger:census` reports too (below), excluding history
+from before the journal's first M4d event: `HAND_BACK_WITHOUT_EVENT`, a
+hand-back raised with no refund debt in the journal; `HAND_BACK_PAID_WITHOUT_EVENT`,
+one marked paid with no hand-back payment (R14); `UNAPPLIED_HAND_BACK`, an R14
+that paid no debt although the task's debt is the journal's;
+`HAND_BACK_OBLIGATION_DRIFT`, a debt whose open cents differ from what its task
+still owes (open while the task is closed, closed while it is open, or open
+with no task row behind it); and `KEEP_WITHOUT_EVENT`, a late capture the
+treasurer kept with no keep in the journal. Each is a journal that no longer
+says what the task says: a door that skipped the journal, a row changed outside
+one, or a door that does not yet post its step (two are known: a hand-back paid
+onto a group organiser's settlement mirror posts no R14, and putting a dismissed
+hand-back back on the queue posts no fresh R05). Report each as a defect;
+nothing here repairs it. During the blue/green switch that deploys M4d, the old
+colour can still raise or pay a hand-back after the new one's first event, and
+such a task is listed too: acknowledge those once the old colour has drained.
+
+Expected until the milestone that answers unapplied refunds: a refund that
+posted unapplied (a debt raised before M4c, a Stripe dashboard refund, a merged
+debtor's) pays no refund obligation, so the receipt census keeps listing its
+booking as `OVER_COLLECTED`. Both censuses list it; nothing to repair by hand.
+
+### Census the booking ledger against its money columns (#3583)
+
+`pnpm run booking-ledger:census` is the booking ledger's cut-over gate
+([`INV-MONEY-037`](invariants/money.md#inv-money-037), design
+[`booking-ledger.md`](design/booking-ledger.md) §6). It is READ-ONLY: one
+repeatable-read snapshot opened `READ ONLY`, so PostgreSQL itself refuses a
+write inside it; it repairs nothing and calls no provider. For every booking it
+checks seven identities — the price, the captured amount, applied credit, the
+refunded total, change fees, the uncollected ask, and a live booking's balance
+owed — against the ledger lines that project them. Since Ledger M3b (#4627,
+[`INV-MONEY-044`](invariants/money.md#inv-money-044)) an eighth, `JOURNAL`,
+compares, for each booking whose confirmation is in the member-money journal,
+the total of the journal's live charge components with the ledger lines it links; a booking
+confirmed earlier is not compared (M9 back-posts it). The comparison is of each
+booking's total, not component by component (a give-back may legitimately be
+taken from a change fee), so money posted to the wrong component of the right
+booking is not caught here; the mapping is pinned by its tests. Since Ledger
+M3c (#4628, [`INV-MONEY-045`](invariants/money.md#inv-money-045)) a
+bank-transfer booking charged at its binding moment and not yet confirmed on
+the ledger is judged by `JOURNAL_PENDING` instead: the journal's live charge
+against the booking's final price plus the change fees recorded on its payment,
+or, once cancelled, the kept figure its CANCELLED snapshot froze (none: zero).
+A disagreement there means a writer moved the price before payment without a
+journal event; the confirmation will re-state it once (logged as "confirmation
+lines differ from the charge posted before settlement"), so acknowledge it to
+the cent or let the booking settle. A charge line on such a booking is
+`UNBRIDGED_CHARGE_LINE`: a confirmation that skipped the bridge. Since Ledger
+M4d (#5185, [`INV-MONEY-049`](invariants/money.md#inv-money-049)) report v3
+adds `JOURNAL_REFUND_PAYABLE` for every booking whose confirmation is in the
+journal: its open refund payable against what the legacy records still owe back
+on the debts the journal holds (each hand-back task whose debt posted, at what
+it still owes; each open card refund row whose debt is still live, at its
+slices not yet made, so a row left on a debt since reversed, such as a kept
+late capture's, counts nothing; each late capture held open for the treasurer
+whose capture-return debt posted and no such row pays, at its task's amount).
+A card refund that went back without paying its debt (listed by the
+refund reservations command as `UNAPPLIED_CARD_REFUND` or
+`RESERVATION_SKIPPED_NO_RECEIPT`) disagrees here until the milestone that
+answers unapplied refunds; acknowledge it to the cent. So, for a while, does a
+card refund row whose slice Stripe made without answering the attempt: the row
+marks the slice made only on its next run, or on "Paid another way" once dead.
+So does a late capture kept while its capture-return debt is already partly
+paid or reserved: the keep leaves that debt open on purpose (logged as "A
+kept late capture's refund debt is paid or reserved, so the keep leaves it
+open"), the dismissed task owes nothing and the refused refund left no card
+refund row, so v3 disagrees by the debt's open cents. Today's automatic refund
+sends one slice and a refusal releases its reservation, so this is not expected;
+check the capture in Stripe, then acknowledge it to the cent.
+It prints:
+
+- per identity, how many bookings it applies to, agree, disagree, are
+  classified, or are a coverage gap;
+- **coverage**: bookings with money and no lines (`NO_LINES`), paid bookings not
+  confirmed on the ledger, edits, change fees or account-credit rows no line
+  records, captured transactions and recorded card refunds with no live line
+  of their own (`UNPOSTED_SETTLEMENT`), and money handed back before the
+  posters existed — a legacy seed's refund, a V3 hand-back — that the balance
+  owed cannot yet see (`UNPOSTED_LEGACY_REFUND`), and a group-settled child
+  with no lines whose planned lines would not agree outright
+  (`GROUP_SETTLEMENT_UNPOSTABLE`, below);
+- **integrity**: reversals that name no line or are not its exact opposite, a
+  second live line for one guest-night, an unknown posting-key namespace or one
+  on an anchor it never posts under, and a live line its source row (or a
+  cancellation's frozen kept figure) no longer bears out, and (`UNBRIDGED_CHARGE_LINE`)
+  a charge line on a journal-confirmed booking that no journal batch links,
+  (`CONFIRMED_WITHOUT_R01`) a booking created after the journal's first
+  confirmation and confirmed on the ledger with none, (`JOURNAL_INACTIVE`,
+  once) a club whose currency no card can be charged in, for which the journal
+  posts nothing, and the five M4d hand-back classes (#5185,
+  [card refund reservations](#reconcile-and-census-card-refund-reservations-m4c)
+  explains each).
+  PostgreSQL's update and delete counts for the table are printed as
+  information only;
+- **named classes** — expected differences, each matched to the cent from the
+  booking's own rows (in-flight refunds and hand-backs, a review share kept by
+  the club, the refunded total's credit and hand-back allocations, and so on).
+  Each instance holds the gate until the owner acknowledges it to the cent,
+  except `GROUP_SETTLEMENT_OFF_LEDGER` and `REFUND_APPEAL_PAID`, which are
+  listed only. One class is the
+  census failing closed rather than an expected difference:
+  `AMBIGUOUS_REVIEW_GIVE_BACK`, a booking whose #3791 review give-back
+  rows it cannot attribute to their reviews (a sibling review's price drop, a
+  dismissed one's included, or two rows beside a give-back line; once
+  cancelled, rows that could make its reviews' lines another way). It prints
+  three figures — the give-back lines, the rows and the unmatched drops; on a
+  cancelled booking the stand-ins, their own refunds and the shared rows — so
+  check the booking's reviews by hand before signing off all three. The
+  summary prints how many are still unacknowledged, per class and beside the
+  verdict;
+- every unclassified disagreement: booking, identity, column figure, ledger
+  figure and delta;
+- under the credit identity, #1620's internet-banking applied credit no Xero
+  note allocates, realized (settlement evidence proves the invoice paid) and
+  unverified (never asserted unpaid, #3632), with example bookings (`--json`
+  lists every booking, its amount and its evidence);
+- what the owner's acknowledgement file released, and any entry in it that is
+  stale or matches nothing;
+- the verdict, `GATE_OPEN` or `GATE_CLOSED`, with every reason it is closed.
+
+```bash
+DATABASE_URL=<non-prod copy, or production under a SELECT-only role> pnpm run booking-ledger:census
+DATABASE_URL=<...> pnpm run booking-ledger:census --json          # every list in full
+DATABASE_URL=<...> pnpm run booking-ledger:census --fail-on-gap   # exit 2 unless GATE_OPEN
+DATABASE_URL=<...> pnpm run booking-ledger:census --acknowledged <owner-file.json>
+DATABASE_URL=<...> pnpm run booking-ledger:census --write-acknowledgement-draft <new-file.json>
+```
+
+**The owner's workflow for the class lists.** Every class instance needs its own
+entry, so on a real history the file is long; the census drafts it rather than
+anyone typing it:
+
+1. Run the census and read the summary.
+2. Write the draft: `--write-acknowledgement-draft <new-file.json>`. It writes
+   one entry, to the cent, per class instance not yet acknowledged, in exactly
+   the format `--acknowledged` reads, each with a reference beginning `DRAFT`.
+   It refuses to overwrite an existing file, and the database is only read —
+   the file is the one thing written, locally.
+3. Review the draft line by line: delete any entry that is not an expected
+   state, and replace each `DRAFT` reference with your own.
+4. Deal with each `KNOWN_DEFECT_HISTORY` booking on #3583. The draft never
+   contains them — it says how many it left out and why — because owner
+   decision 1 requires each to be corrected by an officer or written off
+   deliberately; a write-off is an entry you add by hand. Nor does it ever
+   contain a disagreement, a coverage gap or an integrity finding: those hold
+   the gate until fixed.
+5. Re-run with `--acknowledged <the reviewed file>`. A figure that moved since
+   the draft is reported stale and holds the gate again.
+
+**Releasing a finding: the acknowledgement file.** The owner keeps it, outside
+the repository (it names real bookings). It is a JSON array, one entry per
+finding, each naming exactly one of `identity` or `class`:
+
+```json
+[
+  { "bookingId": "<id>", "class": "KNOWN_DEFECT_HISTORY", "cents": -5000, "reference": "written off, decision on #3583" },
+  { "bookingId": "<id>", "identity": "CAPTURED", "cents": 1, "reference": "corrected by the treasurer, see the booking history" }
+]
+```
+
+`cents` is the figure the census prints for that finding: a disagreement's
+delta, or a class instance's cents. An entry that matches to the cent moves the
+finding to the acknowledged list, where it no longer holds the gate. A booking
+can carry one finding on two identities (a #1641 double pay shows on
+`CREDIT_APPLIED` and on `OWED`), and each needs its own entry. An entry whose
+booking and identity or class match but whose cents do not is **stale**: the
+figure moved after it was signed off, so it is listed, the finding still holds,
+and the gate stays closed until somebody looks again. An entry matching nothing
+is listed as unmatched. If the database predates the ledger table, the command
+says so and stops.
+
+**Before the back-post (#3583's second pull request) expect `GATE_CLOSED` on
+coverage alone**: bookings made before the ledger existed have no lines, and
+a booking confirmed before it can carry settlement lines with no confirmation.
+That is the gap the back-post fills; any other finding is a poster bug to
+report with the figures the census prints. The gate opens on zero
+unclassified disagreements, zero coverage gaps, zero integrity findings and no
+unacknowledged class instance (design §6: every class is acknowledged by the
+owner on #3583, save the one the owner decided is listed only). Two classes follow the owner's
+decisions on #3583 and are one-line switches in
+`BOOKING_LEDGER_CENSUS_GATE_POLICY`
+(`src/lib/booking-ledger-projection-census-classes.ts`):
+`KNOWN_DEFECT_HISTORY` (bookings #3791, #3792 or #1641's double-pay shape
+damaged — named by shape, since that path may still be live) holds the gate
+until each is corrected, or written off in the acknowledgement file, and
+`GROUP_SETTLEMENT_OFF_LEDGER` (children whose money moved only through the
+organiser's group settlement — no transaction, refund or credit row of their
+own, no credit, refund or change-fee figure — and that hold no line: since
+#3854 the settle posts them, and the back-post below posts the history) is
+listed only. The census names a child in that class only when the lines the
+back-post would post — which it plans in memory, from the same snapshot,
+through the back-post's own planners — would make it agree outright. Any
+other such child (shares that do not add up to what the settlement collected,
+a #3653 refund still owed whose retry is exhausted or still running, night
+rows that do not make the price) is the coverage gap
+`GROUP_SETTLEMENT_UNPOSTABLE`, which holds the gate and cannot itself be
+acknowledged (#3854). The summary splits it by what to do: **refused** by the
+back-post, or posted but still not agreeing — correct the history, then re-run;
+**posts with a class** (a refund still in flight, say) — run the back-post,
+then acknowledge the class the census then shows. A refund counts as in flight while the recovery runner will still
+make it — pending, processing, or failed with a retry scheduled and attempts
+left; once its retries are exhausted it is not, and the money it owes back
+holds the gate. Every other class is an expected state, an in-flight refund among them:
+acknowledge each instance with its reference, and a figure that moves after
+sign-off goes stale and holds the gate again, so nothing stays "in flight"
+unseen. The census takes no lock, so run it off-peak against
+production; a whole history is read in one transaction, 500 bookings a page.
+
+### Back-post the booking ledger and open the cut-over gate (#3583)
+
+`pnpm run booking-ledger:back-post` (`scripts/backfill-booking-ledger.ts`) posts
+the ledger lines every booking made before #3580–#3582 is missing, so the census
+above can be run over the club's whole history — the cut-over gate (design
+[`booking-ledger.md`](design/booking-ledger.md) §6, §7; owner decision
+D-3532-1). It runs the live posters over each booking, never a second copy of
+how a line is shaped, one transaction per booking, under the locks those posters
+take. It calls no provider (no Stripe, Xero or email) and never edits or deletes
+a line: it only appends, through the one write door.
+
+- **Dry run by default.** Each booking is posted and judged inside a transaction
+  that is then rolled back, so the report is exactly what `--apply` would post
+  and nothing is committed. `--apply` commits each booking on its own.
+- **Never guessed.** After posting, each booking is judged by the census's own
+  evaluation in the same transaction. One that would disagree, keep a coverage
+  gap or show an integrity finding is rolled back — nothing at all is posted
+  for it, not even its payments — and listed `CANNOT POST` with the reason and,
+  for a disagreement, the identity with the column figure, the ledger figure and
+  the delta. A named class (an in-flight hand-back, `KNOWN_DEFECT_HISTORY`, …)
+  is not a refusal: the booking posts and the census lists the class.
+- **Idempotent.** A second `--apply` posts nothing; the summary says
+  `posted: 0 (0 line(s))`.
+- **Safe on a live database**, but run it off-peak: each booking takes the global
+  booking lock briefly, so a settle, cancel or edit on the same booking either
+  finishes first or waits for it; a booking whose rows another writer holds for
+  more than five seconds is rolled back and listed `LOCK_TIMEOUT`, for a re-run.
+  One booking's unexpected error rolls back only that booking and is listed
+  `UNEXPECTED_ERROR` with the message; the run goes on. Each booking is printed
+  as it finishes. Exit status 2 means at least one booking was listed
+  `CANNOT POST`.
+- **It names its target.** It prints the host and database first, and `--apply`
+  refuses unless `--confirm-database <name>` names the database `DATABASE_URL`
+  points at.
+- **Every run can be found again.** `--json` prints the run's id, its start and
+  finish, and per booking the id of every line it inserted. Keep that output
+  with the run.
+
+```bash
+DATABASE_URL=<...> pnpm run booking-ledger:back-post                  # dry run, every booking
+DATABASE_URL=<...> pnpm run booking-ledger:back-post --apply --confirm-database <name>   # post
+DATABASE_URL=<...> pnpm run booking-ledger:back-post --booking <id>   # one booking; repeat for several
+DATABASE_URL=<...> pnpm run booking-ledger:back-post --limit <n>      # the first n bookings by id
+DATABASE_URL=<...> pnpm run booking-ledger:back-post --json           # the report, then the run id, window and line ids as JSON
+```
+
+**Reading the report.** One summary line — bookings, how many it posted (or
+would) and how many lines, how many were journal only and how many
+member-money journal batches it posted, how many had nothing to post, how many
+it cannot post — then one line per booking that posts or cannot:
+
+- `POSTED` / `WOULD POST <id>  <n> line(s): …` names the steps: the
+  confirmation (one line per guest-night, an evenly split strand included), an
+  old edit's change fee or the nights it moved, the cancellation with the kept
+  figure, and in brackets any census class the booking now shows. A child a
+  group organiser settled (#3854) also names `group share (<cents>)` and, where
+  the organiser cancelled under a frozen refund plan whose refund was made,
+  `group plan refund (<cents>)`; its kept figure is the organiser cancel's own
+  (the share less every refund made or still owed). A plan refund still being
+  retried is not posted: the census names it `IN_FLIGHT_REFUND`, and the retry
+  posts it when it goes through. Since #4627 the line also counts the
+  member-money journal batches posted beside the lines (`, <n> journal batch(es)`).
+- `POSTED` / `WOULD POST <id>  journal only, <n> batch(es)` (#4627,
+  `JOURNAL_ONLY`): no legacy line to fill, but the journal had work — a
+  booking created after the journal's first confirmation that is missing its
+  R01, or lines no journal batch had picked up. A dry run reports these exactly
+  as `--apply` commits them.
+- `CANNOT POST <id>  <reason>: …`. `UNPRICED_NIGHT` — a strand has a night with
+  no price, which is an open review: close the review, then re-run.
+  `CONFIRMATION_DOES_NOT_RECONCILE` — the night rows and promotion do not make
+  the booking's final price; an officer looks at the booking. `LOCK_TIMEOUT` —
+  another writer held the booking; re-run. `UNEXPECTED_ERROR` — anything else
+  (a legacy negative night price, for one), with its message. `EDIT_NOT_DERIVABLE`,
+  `PRICE_LINES_DISAGREE`, `REBASE_MOVEMENT_UNREADABLE`, `LIVE_LINE_NOT_ONE_NIGHT`
+  — an old edit cannot be re-derived from what the rows hold.
+  `GROUP_SHARES_DO_NOT_RECONCILE` — the payments of the children a group
+  settlement paid do not add up to what it collected, so no share is guessed;
+  an officer looks at the group. A group-settled child (#3854) it refuses,
+  for this or any reason, holds the census's gate as
+  `GROUP_SETTLEMENT_UNPOSTABLE` (refused), or `NO_LINES` if it holds money of
+  its own: correct the history, then re-run. One it posts with a class — a
+  refund still in flight — also held as `GROUP_SETTLEMENT_UNPOSTABLE` (posts
+  with a class) until posted: run the back-post, then acknowledge the class
+  the census shows. `CENSUS_WOULD_NOT_PASS`
+  — the lines it could post would leave the census disagreeing, gapped or
+  finding a line wrong; the figures follow. What the back-post does not
+  reconstruct, and so lists here: a review give-back or stand-in a closure made
+  before #3582, a review refund an officer handed back by hand before #3599,
+  and a legacy refund with no refund row. Each is for an officer to look at;
+  report it on #3583 with the figures printed.
+
+Run the back-post only once the blue/green colour switch to the #3854 release
+is finished, and finish that switch before processing any organiser
+cancellation (the release's deploy note).
+
+**The owner's run.** Agents never touch production. Run it twice: first as a
+rehearsal on a restored backup, then for real.
+
+1. **Rehearse on a restored backup**, never on the live installation (restoring
+   a dump into a live site carries its environment override with it — see the
+   warning under [Quarterly Backup Restore Drill](#quarterly-backup-restore-drill)).
+   Fetch a backup as that section describes, then restore it into a throwaway
+   PostgreSQL bound to loopback, on a port that is not 5432, and bring its schema
+   up to the release you are about to cut over:
+
+   ```bash
+   docker run -d --name ledger-rehearsal -e POSTGRES_PASSWORD=password -p 127.0.0.1:55443:5432 postgres:16
+   gunzip -c /tmp/restore-check.sql.gz | docker exec -i ledger-rehearsal psql -U postgres -v ON_ERROR_STOP=1
+   export DATABASE_URL=postgresql://postgres:password@127.0.0.1:55443/postgres
+   pnpm exec prisma migrate deploy
+
+   pnpm run booking-ledger:census                         # expect GATE_CLOSED, on coverage
+   pnpm run booking-ledger:back-post                      # dry run: read every CANNOT POST
+   pnpm run booking-ledger:back-post --apply --confirm-database postgres --json > ~/ledger-backpost-rehearsal.txt
+   pnpm run booking-ledger:back-post --apply --confirm-database postgres   # must say "posted: 0 (0 line(s))"
+   pnpm run booking-ledger:census
+   pnpm run booking-ledger:census --write-acknowledgement-draft ~/ledger-ack-rehearsal.json
+   #   review the draft line by line (the class-list workflow above)
+   pnpm run booking-ledger:census --acknowledged ~/ledger-ack-rehearsal.json --fail-on-gap
+   ```
+
+   Every `CANNOT POST`, disagreement, coverage gap and integrity finding is a
+   question for #3583, answered before production. Remove the container when
+   done (`docker rm -f ledger-rehearsal`) and delete the dump.
+
+2. **Then production, off-peak**, from the release being cut over. The back-post
+   needs a role that may insert ledger lines (the application's own); the census
+   runs under a SELECT-only role, so the gate's evidence comes from a session
+   that cannot have written anything. Create that role once, as the database
+   owner:
+
+   ```sql
+   CREATE ROLE ledger_census LOGIN PASSWORD '<a strong password from your secret store>';
+   GRANT CONNECT ON DATABASE <database> TO ledger_census;
+   GRANT USAGE ON SCHEMA public TO ledger_census;
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO ledger_census;
+   -- Every session it opens is read-only, whatever the client asks for.
+   ALTER ROLE ledger_census SET default_transaction_read_only = on;
+   ```
+
+   Keep its password out of the shell history and the URL: put it in a
+   `PGPASSFILE` readable only by you (`host:port:database:ledger_census:password`,
+   `chmod 600`), which the database client reads when the URL carries no
+   password.
+
+   **Take a backup immediately before `--apply`** (Admin → Backups, or the
+   backup job run by hand), and keep the `--json` output of the run beside it.
+
+   ```bash
+   export PGPASSFILE=~/.ledger-census.pgpass         # chmod 600; written with an editor, not echo
+   CENSUS_URL=postgresql://ledger_census@<host>:5432/<database>
+   APP_URL=<the application's DATABASE_URL>
+
+   DATABASE_URL="$CENSUS_URL" pnpm run booking-ledger:census
+   DATABASE_URL="$APP_URL"    pnpm run booking-ledger:back-post             # dry run; compare with the rehearsal
+   #   take the backup now
+   DATABASE_URL="$APP_URL"    pnpm run booking-ledger:back-post --apply --confirm-database <database> --json > ~/ledger-backpost-run.txt
+   DATABASE_URL="$APP_URL"    pnpm run booking-ledger:back-post --apply --confirm-database <database>   # must post nothing
+   DATABASE_URL="$CENSUS_URL" pnpm run booking-ledger:census --write-acknowledgement-draft ~/ledger-ack.json
+   #   review it as in the rehearsal; carry over the reviewed rehearsal entries that still apply
+   DATABASE_URL="$CENSUS_URL" pnpm run booking-ledger:census --acknowledged ~/ledger-ack.json --fail-on-gap
+   ```
+
+   A booking that changed between the rehearsal and production is expected to
+   differ; anything listed on production and not in the rehearsal is read the
+   same way before going on.
+
+**If a run posted something wrong.** Nothing reads a line until #3584, so a
+wrong line costs nothing but holding the gate: the census names the booking.
+Lines are never edited or deleted (`INV-MONEY-032`); a correction is a reversal
+(`reversal:<lineId>`) through the one write door, anchored on the event that
+takes the line back. There is deliberately no command that reverses a whole
+back-post yet: the census accepts a reversal only on an edit, cancellation,
+review, transaction or refund anchor, so reversing a confirmation or a credit
+line would itself be an integrity finding, and a booking whose confirmation is
+reversed cannot be back-posted again under the same keys (its confirmation is
+fenced, design §4.1a). So report the booking on #3583 with the run's `--json`
+(its line ids) and the census figures, and it is corrected by a reviewed change.
+Undoing a whole run is the backup taken just before `--apply`, restored in a
+maintenance window — an owner's decision on #3583, because it also loses every
+write made since.
+
+**What holds the gate**, and so keeps every reader off the ledger (#3584): any
+unclassified disagreement, any coverage gap (a booking the back-post listed
+`CANNOT POST` still has one), any integrity finding, every
+`KNOWN_DEFECT_HISTORY` booking until an officer corrects it or you write it off
+in the acknowledgement file on #3583 (owner decision 1), and every other class
+instance until you acknowledge it to the cent. `REFUND_APPEAL_PAID` (an appeal
+paid back exactly as recorded, #4075) is listed only. `GROUP_SETTLEMENT_OFF_LEDGER` is
+listed only; a group-settled child whose planned lines would not agree
+outright — refused by the back-post (correct the history), or posted with a
+class to acknowledge (run the back-post, then acknowledge) — is never in it,
+but the gap `GROUP_SETTLEMENT_UNPOSTABLE`, which holds. The gate is open when `--fail-on-gap` exits 0 and the census prints
+`VERDICT: GATE_OPEN`. CI runs this same sequence on every pull request over a
+seeded history (`scripts/booking-ledger-seed-gate.sh`).
+
+### Census the booking ledger identity (#3340)
+
+`scripts/audit-booking-ledger-residual.ts` is a READ-ONLY census of
+[`INV-PAY-047`](invariants/payment-and-settlement.md). It never writes, never
+repairs and never calls a live provider — that is the owner's decision of 8 Sep
+2026, taken for a population of two rows that had already been handled by hand.
+It reports; a person decides.
+
+For every live booking with a captured payment it asks whether the money adds up:
+
+```
+finalPrice + changeFees - (captured - refunded) - credit - uncollected ask
+```
+
+- **Zero** — the books balance.
+- **Positive** — money the price says is owed that nothing is asking for. This is
+  the #3340 class, and it is what a delta-sized ask produced when it superseded
+  an unpaid one: minting the replacement retired the first extra, so its unpaid
+  balance simply stopped being owed. Investigate each one and invoice by hand —
+  **but read the Internet Banking caveat below first.**
+- **Negative** — the club holds more than the price. Normal after a policy-tiered
+  reduction (the retained slice is a charge, not a prepayment) or a reduction
+  settled as account credit. Worth a glance, rarely worth an action.
+
+**AN INTERNET BANKING BOOKING'S PRICE INCREASE IS AN EXPECTED POSITIVE, AND
+INVOICING IT BY HAND WOULD BILL THE MEMBER TWICE.** The identity's "uncollected
+ask" term reads the Stripe ask columns. An Internet Banking edit does not raise
+one: it bills through a SUPPLEMENTARY XERO INVOICE, which lives in the Xero
+outbox and leaves no ADDITIONAL `PaymentTransaction` behind. So an IB booking
+with a paid primary that takes a +$70 edit gains $70 of price, no captured cash
+and no ask — and the census reports +7000 as `unasked`, when the club is already
+asking for it on an invoice. **Before acting on any positive residual, check the
+booking's payment source and its Xero supplementary invoices.** A card booking's
+positive residual is the real thing; an IB one almost never is.
+
+**A CREDIT-PAID ($0) BOOKING THAT GREW BEFORE #3502 IS USUALLY A REAL POSITIVE.**
+A booking paid wholly with account credit has a $0 captured payment and no card
+intent. Until #3502, three of the four edit doors sent its price increase to a
+Xero supplementary invoice, which exists only when Xero is connected and the
+primary invoice had already been raised — otherwise nobody was asked for the
+money. Every door now asks the member's card instead, so new rows should not
+appear. For rows that grew earlier: at a club without Xero the residual is
+genuinely unbilled; at a Xero club, check the booking's supplementary invoices
+first, because one may already be asking for it. The owner's decision for these
+is report only — list them for the owner and do not back-bill from the census.
+
+The fix asks the card only where the $0 payment is a card-source row. A booking
+that was paid by Internet Banking and later re-priced to $0 keeps its Internet
+Banking source, so its increases still go to the Xero arm as before. To see how
+many such rows exist, run this read-only count on a copy (never production):
+
+```sql
+SELECT count(*) FROM "Payment"
+WHERE "amountCents" = 0 AND "status" = 'SUCCEEDED' AND "source" <> 'STRIPE';
+```
+
+A non-zero count is for the owner to weigh; it does not mean anything is wrong
+by itself.
+
+**A `retained` ROW CAN BE AN UP-THEN-DOWN EDIT FROM BEFORE #3954.** Until #3954 a
+reduction made while an earlier increase's card request was still unpaid left
+that request live, so a member who later paid it left the club holding more
+than the price; the census reads that as `retained`, like a policy retention.
+A reduction now cancels or shrinks the unpaid request first (`INV-PAY-120`), so
+new rows of this kind should not appear. To tell an old one from a policy
+retention, look at the booking's changes: an increase, then a reduction, with an
+ADDITIONAL card payment captured after the reduction. Report them to the owner;
+the census never repairs.
+
+That gap is not closed in the arithmetic on purpose. A term reading the Xero
+outbox would make the identity depend on an external system's queue state, and a
+queued-but-unsent invoice, a failed one and a sent one are three different
+answers to "is the club asking for this?" that only a person can weigh. The
+census is a report; this is one of the things the person reading it has to know.
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-booking-ledger
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-booking-ledger --sql
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-booking-ledger --json
+```
+
+The script itself reads TYPED, through Prisma, and does the arithmetic with the
+same function the CI census guard calls — so the operator's answer and the
+guard's answer are one implementation rather than two, and no raw statement of
+its own ships (`INV-OPS-001`, "lock raw, read typed"). `--sql` prints the
+EQUIVALENT `SELECT` for an operator who would rather run it against a read-only
+replica; that statement is not written by hand either, but folded from
+`BOOKING_LEDGER_IDENTITY_TERMS` in `src/lib/additional-payment-ask.ts`.
+
+**Be precise about what that shared term table does and does not guarantee**
+(`INV-SSOT-001`). Both forms are folded from the SAME LIST, so a term cannot be
+added to one and forgotten in the other — that part is structural and is pinned
+by `src/lib/__tests__/booking-ledger-census.test.ts`. Each term's BODY is still
+two expressions: a TypeScript closure and a SQL string. Five of the six read one
+column each and cannot meaningfully diverge; the sixth is a real translation —
+`isAdditionalAmountUncollected` against `CASE WHEN … IS DISTINCT FROM
+'SUCCEEDED'` — and its SQL is pinned character for character by that same file,
+which also asserts the TypeScript half still answers the four cases the pin
+claims for it. What no offline test can check is that PostgreSQL EVALUATES the
+statement to the same numbers. Nothing an operator relies on depends on that:
+the run above reads typed through Prisma, and `--sql` is a convenience for
+somebody who would rather query a replica by hand.
+
+### A card refund held after a Stripe check (#4359)
+
+An ordinary charge-backed recovery stops automatic retries when Stripe already
+holds a counted dashboard refund on its charge made since the debt arose
+(`INV-PAY-145`). A superseded payment's refund with no stored plan also stops
+when another door's refund on its charge since the row was raised would size
+what it sends (#4858): were that refund to fail later, the member could be paid
+twice. The officer alert and the payment audit entry say which, and why the
+member may be paid twice. The row is exhausted in the existing recovery queue,
+with no new refund sent; it is not automatically closed or matched to that
+refund. Its owed figure keeps the existing attribution rule.
+
+Check the booking, the recorded refunds and Stripe before moving more money.
+If money remains owed, settle it with **Paid another way** in
+[Stuck States](guides/stuck-states.md), rather than another Stripe dashboard
+refund. If nothing remains owed, ask a developer to reconcile the held row. A
+row held under #4858 whose named refund has since failed stays on that list
+without **Paid another way** until the failed refund has gone back to the card.
+The row says why (#4492).
+A preflight read or recording failure uses normal backoff and sends nothing;
+an intent with more than 100 refunds requires investigation because the single
+page cannot establish complete evidence. No production repair runs automatically.
+
+### Audit refunded totals left short by the old refund arithmetic (#3640)
+
+Before #3640 a card refund made after an account-credit settlement was lost from
+the payment's refunded total (`INV-PAY-103` now stops new cases). A payment left
+that way offers refundable headroom that is not there, so a later cancel or
+refund could pay the same money out twice.
+`scripts/audit-refunded-total-shortfall.ts` lists each captured payment whose
+stored refunded total is below its counted card refunds plus its account-credit
+settlements plus (`INV-PAY-141`) the bank cash its card refunds' bank records
+hold - "Paid another way" closes (#4280) and completed card refund shortfalls, a
+cancel's or a capacity race's (#4488) - with the shortfall; each line shows that
+cash as `paid another way` and `card refund shortfall paid back`, and `--json`
+carries them as `paidAnotherWayCents` and `shortfallPaybackCents`. It is READ-ONLY and repairs nothing: whether and how to repair is the
+owner's decision, taken on this report.
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-refunded-total
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-refunded-total --json
+```
+
+The expected figure is a floor, not an identity: a stored total above it is
+normal (pre-ledger card refunds and folded modification credit notes have no
+row), and only a shortfall is reported. The report keeps two sections apart:
+the part the old arithmetic can explain (at most the smaller of a payment's card
+refunds and its credit, and only with a card refund), and a shortfall with
+another cause - typically a credit that was never folded into the total, such as
+internet-banking cash that became credit on an already-cancelled booking, or
+a late card refund that failed after a "Paid another way" close (#4280) or a
+paid-back card refund shortfall (#4488) and took that bank cash out of the total.
+Attribution to #3640 is measured against the floor without either kind of bank
+cash, so a payment whose shortfall only that cash explains shows 0 attributable
+to #3640. Only the first section is the #3640
+repair question. The arithmetic and its caveats are in
+`src/lib/refunded-total-shortfall-audit.ts`.
+
+Rolling the application back past #4280 or #4488 restores the old subtraction:
+a late card refund failing after a close, or after a shortfall was paid back,
+could again take the total below that cash. The same holds for a failure the old
+version handles during a deploy. This audit still lists any such payment.
+
+Do not run it while a migration runs. It reads every captured payment in ONE
+read-only `RepeatableRead` snapshot, held for up to 120 seconds, and on a very
+large database it may reach that timeout and fail; run it again in a quiet
+window rather than raising the bound.
+
+### Retire links to payments deleted in Xero (#4531)
+
+Before #4531 a payment deleted in Xero kept its link here active, because Xero
+leaves a deleted payment out of its invoice and the inbound sync never saw it
+again. The sync now retires such a link when it next reads the invoice or credit
+note (`INV-INT-031`), and re-checks on a schedule any it could not confirm at
+the time. A payment deleted before that, on an invoice nobody has touched
+since, stays active until this backfill retires it. So does a booking change's
+card payment, whose link the inbound sync never reaches.
+
+```bash
+pnpm run xero:deleted-payment-link-backfill                   # dry run: lists, changes no link
+pnpm run xero:deleted-payment-link-backfill --apply           # retire every confirmed one
+pnpm run xero:deleted-payment-link-backfill --apply --payment <xero payment id>
+pnpm run xero:deleted-payment-link-backfill --json            # machine-readable report too
+```
+
+- **Dry run (the default).** It pages Xero's list of DELETED payments, oldest
+  change first (100 a call, at most 50 calls), checks each row's status itself,
+  and prints every ACTIVE local payment link that points at one: the link, its
+  local record, its role and the invoice or credit note it names. It changes
+  no link; its Xero calls are still recorded on the usage panel, like any
+  other.
+- **`--payment <id>`.** Instead of listing, it asks Xero about each named
+  payment directly (one call each) and keeps only those Xero reports DELETED.
+- **`--apply`.** It retires only the links of a payment Xero confirms DELETED:
+  inactive, with its recorded status `DELETED` and its other fields kept. A
+  listed payment is asked about once more first, so `--apply` costs one extra
+  call per candidate payment it checks, retired or not; a `--payment` id's
+  direct answer is already that confirmation. A payment Xero reports live, or
+  does not answer for, is left active and named. So is one with a Xero
+  operation that may run again and reads the link: a replayable failed card
+  receipt or PARTIAL booking invoice on its record, or an open receipt or
+  supplementary invoice on the same booking. Retiring it then would let that
+  retry pay again. It is marked, and the scheduled re-check retires it once
+  that operation is done, so retry or resolve the operation first. Keep the
+  dry-run output with the change record.
+- **A link the scheduled re-check gave up on.** After five checks Xero did not
+  answer, the re-check stops asking about a link on its own and logs an error;
+  its metadata records `deletionCheckGaveUpAt`. This backfill asks about it
+  again.
+- **Xero calls.** Every call is read-only and a single attempt. A run stops
+  once the day's recorded usage reaches 85% of the usage panel's budget, on a
+  Xero rate limit or outage, or while Xero's own daily limit is in force, and
+  then says it stopped early. A later run lists again from the beginning,
+  re-spending those list calls; it acts only on links still active. An
+  organisation with more than 5,000 deleted payments is never listed in full:
+  name the payments with `--payment` instead.
+
+It changes nothing in Xero and nothing else locally: no booking, payment or
+ledger row. Readers that judge recorded payments skip a `DELETED` status
+(`isRecordedBookingInvoicePayment`), so they stop counting the retired payment
+as money held. Before, they reached the right answer only because a
+replacement payment usually existed. It also removes the double count from the
+"recorded in Xero" totals. A booking change's card payment it retires gets no
+audit row (the audit writer resolves no subject for it), so keep this run's
+output. Design and call budget: [`xero/ARCHITECTURE.md` -> "A payment deleted
+in Xero (#4531)"](xero/ARCHITECTURE.md#a-payment-deleted-in-xero-4531).
+
+### Retire account-credit note links written on bookings a credit was applied to (#4712)
+
+Before #4712 the inbound credit-note reconcile, when it could place a note only
+through #1925's local provenance, linked the note as an account-credit note to
+every payment on the bookings the credit was spent on. That link stops the
+booking's own cancellation note being queued ("already linked"), and the
+payment's refunded total counted the note as money paid back. The reconcile no
+longer writes it; this repair retires the ones it left.
+
+```bash
+pnpm run xero:applied-credit-account-note-link-repair                    # dry run: lists, changes nothing
+pnpm run xero:applied-credit-account-note-link-repair --json             # machine-readable report too
+pnpm run xero:applied-credit-account-note-link-repair --apply --payment <payment id> [--payment <payment id> ...]
+```
+
+- **Dry run (the default).** Lists every active account-credit note link on a
+  payment as *stale* - a slice or applied-credit ledger row shows the note was
+  spent on the payment's booking, and neither an outbound create of the note
+  for that payment nor a cancellation credit of that booking shows it was
+  raised there - *conflicting*, when both show, or *unexplained*, when
+  neither does. Links the note was raised for are counted, not listed.
+- **`--apply`.** Needs the reviewed payment ids, and works one payment at a
+  time. Each is classified again; a stale link is retired (inactive, guarded
+  on still active) with an audit row, and the payment's refunded total and
+  status are recounted from the links left (the #4095 recount). It prints each
+  payment's refunded total before and after, and names any it could not
+  settle: a failed recount, or a link an inbound sync running at the same time
+  made active again (run the repair again for that one). The recount never
+  lowers a Stripe payment's recorded refund, nor a bank-transfer payment's
+  below its own refund detail: it raises an admin alert instead, so settle
+  that one by hand. Keep the dry-run output with the change record.
+- **Then raise the missing cancellation notes.** Retiring a link raises
+  nothing by itself. For each booking `--apply` names, run
+  `pnpm run xero:booking-repair --booking <bookingId> --dry-run`, review its
+  missing account-credit note, and apply it.
+- **Conflicting and unexplained links** are never retired. A conflicting link
+  may mean the booking's own cancellation note was completed with the note
+  spent there, so the member's cancellation credit names the wrong note.
+  Check both kinds in Xero by hand.
+
+It makes no Xero call. Design: [`xero/ARCHITECTURE.md`](xero/ARCHITECTURE.md),
+the `xero-applied-credit-account-note-link-repair` module row; concurrency:
+[`CONCURRENCY_AND_LOCKING.md`](CONCURRENCY_AND_LOCKING.md#applied-credit-account-note-link-repair-lock-free-4712).
+
+### Count voided bank-transfer refund notes before the follow-up writes (#4162)
+
+`scripts/bank-refund-void-count.ts` sorts every voided bank-transfer refund
+credit note with the nightly follow-up's own classifier, so the count is what
+the first writing run will do, and counts bank-transfer payments whose refunded
+total is below their own transaction detail with no void. It is READ-ONLY - no
+transaction, no lock, no write, no provider call - and is meant to be run on the
+live database before `XERO_ENABLE_BANK_REFUND_VOID_WRITES=true` is set.
+
+```bash
+pnpm run xero:bank-refund-void-count          # counts and amounts per bucket
+pnpm run xero:bank-refund-void-count --list   # also each link / payment id
+pnpm run xero:bank-refund-void-count --json
+```
+
+The buckets and what each one leads to are in
+[`xero/ARCHITECTURE.md` -> "Voided bank-transfer refund notes (#4162)"](xero/ARCHITECTURE.md#voided-bank-transfer-refund-notes-4162).
+
+### Find refund notes Xero voided that the app still counts (#4336)
+
+Before #4288 (PR #4341), an older "live" reading of a refund credit note could
+be written after the treasurer voided the note in Xero, and the write erased
+the app's record of the void. The app then counts the refund as documented
+while Xero credits nothing. No local data can find these, so
+`scripts/xero-revived-refund-note-report.ts` asks Xero again.
+
+**When to run it:** once, on the live deployment, after upgrading from any
+version before #4341 (v0.13.2 or earlier). Run it from the app's own
+environment: it needs the app's `AUTH_SECRET` and `DATABASE_URL` to read the
+stored Xero login, and refuses before reading anything if it cannot.
+
+```bash
+pnpm run xero:revived-refund-note-report                      # counts, and cents per payment source
+pnpm run xero:revived-refund-note-report --list               # also each payment, booking and note
+pnpm run xero:revived-refund-note-report --json               # JSON on stdout; logs go to stderr
+pnpm run xero:revived-refund-note-report --resume-from <id>   # carry on a run that stopped early
+```
+
+**What it reads.** Every active refund-note link (both the payment's own role
+and a refund request's), outside any transaction, then each distinct note once
+from Xero, one call every 1.5 seconds, in note-id order. Each listed line shows:
+
+- the payment, booking and payment source;
+- the link role, and the refund request for a request's own note;
+- the note's number and id;
+- Xero's status and `UpdatedDateUTC`, and the status the app records;
+- for the payment's own note, the cents the app counts toward its refunded
+  total; for a refund request's own note, the note's value instead, shown
+  apart because the refunded total never counts it;
+- whether `Payment.xeroRefundCreditNoteId` names the note.
+
+The list comes first; the run ends with the count and the cents per payment
+source. A note Xero reports live is not listed. A link the app already records
+as VOIDED or DELETED is counted in its own line, outside the list and its
+totals. It needs no action: the app already treats the note as cancelled, and
+for the payment's own refund note the nightly link cleanup (#4161) also
+retires the link. A note Xero cannot find, or that could not be read, goes on
+a separate "could not read" list.
+
+**What it writes.** It changes no booking, payment, credit, link or Xero
+record. It can write API-usage rows and, if the Xero token needs refreshing,
+the new token, its refresh lease and a credential audit row; a failed refresh
+alerts the admins, as it would for the app.
+
+**Limits, and carrying on.** A minute rate limit waits and retries. The run
+stops, printing what it read so far, on Xero's daily limit or once the app's
+own share of it is used (85% of the app's 1,000-call daily budget, counting
+everything else the app called that day, which leaves the rest to the outbox
+and the inbound sync), if Xero needs reconnecting, or after three failed reads
+in a row. Its reads never arm the outage pause; that pause lives in memory in
+each process, so the report and the running app never see each other's.
+
+Whenever a run leaves a note unread (a failed read, or a stop before the note
+was reached), the output says **THE LIST IS INCOMPLETE** and prints
+`To carry on, run again with --resume-from <id>` (`resumeFrom` in the JSON).
+That id is the earliest note the run did not read, so the next run retries
+every failed read before it moves on; a note after it that was already read
+can be read and listed again, and the later run's line is the one to act on.
+A note Xero answers for, even "no such note", counts as read and is not
+retried. A club with more distinct refund notes than one day's share, roughly
+600 to 800 on a quiet day, takes several days.
+
+How to finish a multi-day walk:
+
+1. Run the report. If it says **THE LIST IS INCOMPLETE**, keep its output and
+   run it again the next day with the `--resume-from` id it printed.
+2. A resumed run says its output, totals included, is **this run only**: keep
+   every day's output together. Do not add the parts' totals together: a note
+   read again after an earlier failure appears in two parts. For a grand
+   total, count each note id once across the parts, using the latest part's
+   line.
+3. The walk is finished when a resumed run prints "This was the last part:
+   every note from <id> to the end was read; the notes before it were covered
+   by earlier runs", with no **THE LIST IS INCOMPLETE** line (exit code 0,
+   `walkFinished: true` in the JSON). A run from the beginning that reads
+   everything says neither and has `complete: true`.
+4. If a run prints **NO PROGRESS**, check its "Read from Xero" count. If it is
+   0 and the run stopped on the daily limit, wait until tomorrow and run the
+   same command. Otherwise the note it resumed from is stuck: do not re-run
+   with the same id. Ask a maintainer, giving the note id privately. A
+   maintainer can move past it by resuming from the next note id in the
+   `--list` output; the stuck note is then checked by hand.
+
+If the note a resume id names has since left the active set (handled with
+**Sync from Xero now**, say), the run starts at the next note after it and
+says so; every note before the id was covered by earlier runs. An id that was
+never a refund note on any link is refused. Exit code 0 means nothing in this
+run's scope is left to read; 2 means a note is; 1 is an error or a refused
+argument.
+
+**Could not read.** A read that failed is retried by the next run (above). A
+note Xero sent without a status is reported and not retried: ask a
+maintainer. A note **Xero says does not exist** will never be readable, so do
+not wait for it. First check that Xero is connected to the organisation the
+note was raised in (**Admin → Finance → Xero Sync**). If it is, the app's link
+points at nothing: **Sync from Xero now** on that booking fails, reporting
+the note was not found, and no tool in the app retires such a link yet
+(#5233, which needs an owner decision on the rule). Ask a maintainer to look
+at it, giving the payment and note ids privately.
+
+**Privacy.** The output names members' payments and refunds by id and amount.
+It goes to your terminal only. Never post it in an issue, a pull request or
+any public place.
+
+**What to do with each line.** Open the booking and use **Sync from Xero now**
+([guide](guides/xero.md#pick-up-a-change-made-in-xero-now)). It re-reads every
+credit note on an active link of the booking's payment, in both roles, and a
+VOIDED or DELETED reading always applies (#4288). Then:
+
+- the link goes inactive, and if `Payment.xeroRefundCreditNoteId` named the
+  note it is moved to another live refund note or cleared;
+- **bank transfer:** the recount never takes the refunded total below the
+  payment's own refund history. The nightly voided-note follow-up (#4162) picks
+  the void up the night after and, with `XERO_ENABLE_BANK_REFUND_VOID_WRITES`
+  set, puts the refund back on the treasurer's list
+  ([runbook](xero/ARCHITECTURE.md#voided-bank-transfer-refund-notes-4162));
+- **card:** the refunded total is raise-only, so it stays. Where the remaining
+  notes no longer cover it, the refund-ledger-divergence alert fires, and the
+  nightly credit reconciliation can then raise a fresh refund note for the
+  uncovered amount, subject to its usual checks;
+- **a refund request's own note:** no total is recounted and nothing re-raises
+  it. An officer decides whether to raise a fresh note (#4214).
+
+The sync may answer **Already in step** even when it changed a link, because it
+compares money records, not links. Run the report again afterwards: a handled
+line no longer appears. **Sync everything from Xero now** does not revisit
+these notes.
+
+### Release Xero outbox rows stuck without a queued request (#5228)
+
+Before #5228, a Xero outbox row that a pre-HTTP cooldown (the "Xero is down"
+pause, the daily limit, the environment gate) refused after its handler had
+saved its execution request went back to PENDING without its queued request.
+The outbox then skipped it on every pass: the refund note, invoice or credit
+note never reached Xero, and nothing failed or alerted. Fixed builds never
+leave a row so. Any an older build left are kept out of the outbox's scan, so
+they never hold up other work, and counted (`unclaimableRequest` in the outbox
+run's result, shown as an amber warning on the Xero cron run).
+
+**When to run it:** once, on the live deployment, after upgrading to a build
+with #5228; and whenever the outbox's `unclaimableRequest` count is not zero.
+Running the report is safe at any time. **`--release` on a live site is the
+owner's to run.**
+
+```bash
+pnpm run xero:stuck-queued-report             # read-only: lists the rows, changes nothing
+pnpm run xero:stuck-queued-report --release   # fails exactly the rows it has just listed
+```
+
+1. **Inspect.** Run the report. Each line names the row, its queue type, the
+   record it belongs to (`Payment:<id>`, `GroupBookingSettlement:<id>`, ...),
+   and when it was queued; every row listed holds a request that names no
+   queue type. Look the records up before going on. The output
+   names members' payments, so never post it publicly.
+2. **Release.** Run it again with `--release`. It lists the rows again and
+   moves exactly those from PENDING to FAILED with
+   `QUEUED_REQUEST_RELEASED`, each only while it is still an unclaimed,
+   unresolved PENDING row with the same queue type and stored request; any
+   other is skipped and named. It keeps each row's request, response, Xero ids
+   and keys, makes no Xero call and rewrites nothing already posted.
+3. **Check the counts.** "Released N; skipped M." A second run lists nothing
+   and releases nothing.
+4. **Retry.** The rows are now in Xero Operations as Failed. For each, an
+   officer checks Xero for the document, then uses Retry (or resolves it by
+   hand if it is there). A refund note's Retry bills only what the payment
+   still shows uncovered, so cover added since the row was queued is not billed
+   twice.
+
+### Audit bank-transfer receipts settled at a stale figure (#3979)
+
+Before #3979 the inbound Xero settle kept the figure an Internet Banking payment
+was born with, so a booking re-priced (or charged a recorded fee) before its
+invoice was raised was settled at its old price: its ledger bank receipt and
+`Payment.amountCents`, which refund and credit caps read, were wrong
+(`INV-PAY-125` stops new cases). And while the old and new code are both live in
+a deploy, they can count an invoice correction differently (`INV-PAY-126`).
+`scripts/audit-ib-settled-cash.ts` lists:
+
+- each captured bank-transfer receipt whose figure differs from the payments Xero
+  recorded against its invoice, as the inbound invoice sync stored them;
+- each payment whose refunded total exceeds what its rows record (a credit note
+  folded in), which catches both directions of the deploy window.
+
+It is READ-ONLY and repairs nothing. **Run it after every cutover that carries
+#3979**, on a non-production copy:
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-ib-settled-cash
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-ib-settled-cash --json
+```
+
+A receipt whose invoice was paid by an applied overpayment or prepayment (Xero
+records an allocation, not a payment; the inbound sync marks the primary-invoice
+link), one with no recorded payment, or one whose amount cannot be read is
+listed apart as not judged: check its invoice in Xero. An invoice last synced
+before the sync recorded allocations carries no mark, so the report says when a
+difference, or a missing payment, may hide one (#4095). Officer-settled payments
+(`INV-PAY-001`) are left out. **Correcting a row is a database change**: the
+owner or a developer makes it under the raw-SQL rules (`INV-OPS`), and corrects
+the receipt and the payment's refunded total TOGETHER - either alone moves the
+payment's net. The rules are in `src/lib/ib-settled-cash-audit.ts`.
+
+### Audit organiser-settled children's refunded mirrors (#3653)
+
+Before #3653 a joiner's reduction of a booking the group organiser paid for could
+hand the joiner account credit, or leave recovery that refunded nothing, and the
+joiner's `Payment` mirror then read as partly refunded with no Stripe refund
+behind it (`INV-PAY-114` stops new cases). A later group cancellation sizes from
+that mirror, so the organiser can be under-refunded.
+`scripts/audit-organiser-child-refunds.ts` lists each organiser-settled child
+whose mirror Stripe does not fully back, classed `legacy-group-cancel` (a
+pre-#3653 one-refund cancellation; legitimate), `joiner-account-credit` (value
+went to the joiner; an officer decides) or `unbacked` (nothing explains it). It
+is READ-ONLY and repairs nothing: a cash mirror moves only on Stripe evidence.
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-organiser-child-refunds
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-organiser-child-refunds --json
+```
+
+### Audit IB hold-expiry invoice under-clears (#1597)
+
+`scripts/audit-ib-hold-clearing.ts` is a READ-ONLY audit — it never writes and
+never calls a live provider, and it has no `--apply` by design (owner decision,
+2026-07-08). Before #1597, the Internet-Banking hold-expiry release
+(`internet-banking-payment-cron.ts`) sized its invoice-clearing credit note at
+`payment.amountCents` — the credit-REDUCED effectivePriceCents — while the
+booking invoice is raised at the FULL finalPriceCents. Where a released hold
+carried an issued invoice AND applied credit, the invoice was left open by
+exactly the applied-credit slice. #1597 fixed the sizing going forward (it now
+clears `max(0, finalPrice + changeFee − Xero-allocated applied credit)` and skips
+entirely when the payment has no issued invoice).
+
+The script scans every released IB hold, sizes what its invoicing should have
+been cleared by with the one INV-PAY-017 helper (`unpaidInvoiceClearingAmountCents`,
+reading applied credit from the same allocation ledger the release reads), and
+lists each booking whose notes ALLOCATED less than that: booking id, invoice
+ref, the notes raised, expected clearing, what was allocated, and the open
+delta. It reads only local rows (no Xero calls). Only allocations count — the
+allocation links the builder and the inbound reconcile write, with the note's
+own role or `CREDIT_NOTE_ALLOCATION` (since #4786 a link with any other role
+counts nothing), one per note and invoice: the newest with the note's role and
+an amount, else the newest role-less one, since the inbound reconcile's link
+carries the note's applications to that invoice summed — so a FAILED
+clearing operation (nothing created), a PARTIAL one, and a pre-#3535 refund note
+(never allocated by the system) all show as not clearing. A refund note someone
+allocated by hand in Xero counts as far as it was allocated; every clearing
+note on the booking counts, including one a retry created after the release's
+own operation FAILED. Each note's line says which shape it is and whether it
+was created and allocated.
+
+A hold whose invoice received the member's cash after the release is **not** an
+under-clear and is listed apart as "paid in cash after release, note retired".
+The late payment retired the pending note and credited the member, so a credit
+note now would credit an invoice the member paid: take no action on those rows
+(a part payment is kept, not released — see below).
+
+Its applied-credit strand section reports an already-realized loss only when the
+current Internet-Banking `PRIMARY` transaction is captured and linked to the
+payment's current Xero invoice, or when the payment has its manual-settlement
+stamp. The aggregate payment status is a mutable mirror and any historical Stripe
+or `ADDITIONAL` capture is not evidence that this IB invoice was paid. Rows without
+that evidence are reported as **UNVERIFIED**, never as definitely unpaid: check the
+current Xero invoice or the manual settlement record before changing credit.
+
+```bash
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-ib-hold-clearing
+DATABASE_URL=<non-prod copy> pnpm run payments:audit-ib-hold-clearing --json
+```
+
+**Holds released before #3535 are not the repair CLI's to fix yet.** Its
+`CANCELLED_BOOKING_OPEN_INVOICE` arm sizes a clearing note with the same
+INV-PAY-017 helper (#3535), but it recognizes only a booking-anchored
+`MODIFICATION_CREDIT_NOTE`, not the `REFUND_CREDIT_NOTE` an older release
+issued — so `--apply` would raise a second clearing note beside that refund
+note. Since #3639 the arm skips any cancelled booking whose payment already
+carries a refund or account-credit note (`INV-PAY-106`), so these bookings get
+no finding from it and it will not point at the open delta. Repair those findings by hand instead:
+allocate the existing refund note to the invoice where it is unallocated, or
+issue a credit note for exactly the reported open delta, then confirm the
+invoice reaches a zero balance in Xero. A FAILED or PARTIAL clearing note on a
+hold released since #3535 is retried from the Xero operations screen (or by the
+repair CLI). A FAILED note replays its recorded amount and wording and plans
+its allocations again from what the invoices owe now; only a PARTIAL note
+replays its recorded allocation plan. A note that failed because the invoices
+owe less than it (part of the booking was paid) is never retried
+automatically: resolve it by hand, then mark the failed operation **resolved**
+on the Xero operations panel and the finding stops.
+
+**"Resolved" on the Xero operations panel means done (#3635,
+`INV-INT-025`).** Mark a failed or partial operation resolved only once you have
+made the fix in Xero yourself. From then on nothing re-runs it automatically:
+
+- the Retry and Requeue buttons are gone, and the server refuses a stale tab's
+  retry with a 409; a retry already queued is skipped, not run;
+- the repair tool neither retries it nor queues a new document beside it, and
+  shows it as an information-only "resolved in Xero by an officer" finding;
+- a refund credit note you raised by hand counts for the amount its operation
+  recorded: the nightly credit reconciliation stops asking for it, and a later
+  refund on the same payment still gets its own note for the rest. If the
+  resolved operation's amount cannot be read, no further note is queued for
+  that payment and the log says so: raise any later refund's note by hand;
+- **Queue all** on the missing-invoices list leaves that booking out, and a
+  copy queued before your resolve is cancelled before it reaches Xero;
+- it stops blocking the Stripe refund-note link repair.
+
+Two limits. You cannot resolve an operation while a retry of it is running, or
+while a new copy of the same document is queued; wait for it to finish, then
+check Xero. A retry that looks stuck has to be cleared with **Reset stale
+running operations** first. And an applied-credit allocation
+or deallocation cannot be resolved at all, because a hand fix in Xero does not
+bring the club's own credit ledger back in line; retry it instead. One marked
+resolved before this release can still be retried.
+
+A Xero call already under way can still succeed after you resolve (#4374,
+`INV-INT-029`): two attempts can share one operation, and one may answer late.
+The operation then shows as succeeded and, if the app recorded a document in
+Xero, the finance contacts get one **Xero Sync Error** email for it
+(`XERO_SUCCESS_AFTER_RESOLUTION`) naming that document. If you also made the
+document by hand, Xero may now hold it twice. The app may instead have found
+and used yours, by its reference, leaving only one: check Xero before voiding
+a duplicate. If that email cannot reach anyone, it is not sent again; the
+operation's succeeded status on the panel is then the only sign.
+
+A payment refund credit note is the exception (#4426): a refund-note job that
+stalled in Xero, was marked failed and was then resolved by hand with the
+number of the note you made keeps your note when its own call comes back with
+a second one. The app does not record or link the late note, or record a
+refund payment against it in Xero, and the operation stays as you resolved it.
+The audit log gets one Xero entry naming the late note (its number, Xero id,
+amount and booking), and the same **Xero Sync Error** email names it and the
+note the operation keeps: check the late note in Xero, and that it is not
+recorded on the payment, before voiding it. If the late note is the very note
+you recorded (Xero made it but its answer to the app was lost, and you found
+it), nothing is wrong and nothing is sent; recording its refund payment in
+Xero, if one is due, stays with you, as for any note you resolve by hand. A
+job resolved without a note number (a refund request's note) records the late
+note as before and sends the email above.
+
+Limit: if the app stops between deciding not to record the late note and
+writing its audit entry, the app's log is the only record of it; if the email
+cannot reach anyone, the audit entry and the log remain. In the rare case of
+two copies of one job both getting the late note back, each writes an audit
+entry; the email still goes once.
+
+An organiser adjustment's credit note (the waiver of a group organiser's unpaid
+extra, or an organiser's bank-transfer refund note) has its own rule (#4655).
+If its job stalls in Xero and you press **Reset stale running**, the stalled
+call may still come back with a note:
+
+- If you did nothing else, the app records the note on the job, takes the job
+  back as running, and finishes it (allocates the waiver, or records the
+  refund payment); the job shows as succeeded. One note, nothing to do. While
+  it shows as running, **Resolve** and **Retry** are refused: wait for it to
+  finish or fail. If it fails, it fails with the note kept, and **Retry**
+  finishes from that note.
+- If you pressed **Retry** after the reset, the app records the note on the
+  queued job, and the retry finishes from it instead of raising a second note.
+- If you resolved the job by hand, or a retry was already running its own
+  create, or the job has since finished with a different note, the app leaves
+  the job exactly as it is and records nothing. The audit log gets one Xero
+  entry naming the late note (its number, Xero id, amount and booking), and the
+  finance contacts get one **Xero Sync Error** email naming it. Check the late
+  note in Xero, and that nothing is allocated from it or paid against it,
+  before voiding it. If a retry was running, wait for it to finish first: it
+  may have recorded that very note, in which case nothing needs voiding.
+
+Limit: if the app stops between deciding not to record the note and writing
+its audit entry, the app's log is the only record of it. If the email cannot
+reach anyone, or its send fails, the payments cron re-sends it every 15
+minutes (daily while nobody can receive it) until it is out, for up to seven
+days (#5255); after that the audit entry and the log remain.
+
+The job can also stall after it has recorded its note, while it allocates the
+waiver or records the refund payment (#4680). After **Reset stale running**,
+the stalled job no longer allocates or pays out when it comes back: it checks
+first that the job is still its own, and stops if not. It records nothing on
+the job and leaves it as it stands, and the audit log gets one Xero entry. If
+you did nothing else, the job stays failed with its note: **Retry** finishes
+from that note. If you pressed **Retry**, the retry finishes from it. If you
+resolved the job by hand, the finance contacts also get one **Xero Sync
+Error** email naming the note: it is in Xero, but the app did not allocate it
+or pay against it. Check it in Xero before voiding it, in case the adjustment
+was also made by hand.
+
+Limit: a Xero call already under way when you reset can still finish. If it
+does, the job shows as succeeded, and if you had resolved it, the **Xero Sync
+Error** email says a success landed after the resolve.
+
+There is no undo on the panel. If you marked one by mistake, fix the Xero side
+by hand, or use **Targeted force sync** for that one booking's invoice: it
+raises the invoice anyway, and its audit entry records that it overrode the
+officer's mark. Check Xero for the invoice raised by hand before you do.
+
+**A part-paid hold is kept, not released (#3643, `INV-PAY-107`).** Before
+releasing a hold the job reads the booking's primary and supplementary invoices
+from Xero, outside the release transaction. Any cash keeps the hold: no cancel,
+no clearing note, no member email, and one **Internet banking hold needs
+attention** admin email per hold (booking reference, invoice link, amount paid
+and owing) with a `booking.internet_banking_hold_kept` audit entry. A clean read
+wins over the inbound sync's `PAYMENT` links (roles `INVOICE_PAYMENT` /
+`SUPPLEMENTARY_INVOICE_PAYMENT`); they count only when Xero cannot answer. The
+release transaction re-checks only links recorded after the read started, which
+narrows the window but cannot close it (the inbound link write takes no booking
+lock); a payment slipping through leaves the clearing note refused as a
+shortfall and the repair CLI's manual-review item.
+
+An invoice the job cannot read (Xero disconnected, down, a 404, or a payload
+without payment fields) keeps the hold with one email, for up to seven days past
+the deadline (`UNREADABLE_INVOICE_HOLD_BOUND_MS`, the group settlement reaper's
+bound too). Then the hold is released with a second email and a
+`booking.internet_banking_hold_released_unreadable` audit entry; the clearing
+note it queues is created only once the builder can read the invoices and they
+owe it. A hold whose stay has started is never released and is answered before
+any Xero read or read budget is spent (`INV-PAY-016`, #3635), so such holds
+cannot starve the others. An email that threw before reaching anyone is retried
+on the next run; one that ran and reached nobody (every address suppressed, a
+non-production withhold) waits a day. For a kept hold its claim is given back or
+held a day; for a released one it is marked owed (an `AlertCooldown` row keyed
+`internet-banking-hold-alert-owed:`), which a later run tries at most once a
+day until it is delivered, and the release's audit entry is written either way. A copy that
+failed but that the email retry cron will re-send counts as reached, so it is
+not sent twice (`adminAlertSendOutcome`, #3672). At most 20
+holds are read per run, rotating, and 400 a day club-wide (the
+`ib-hold-xero-reads` limiter); the result counts `kept` and `deferred`.
+
+To resolve a kept hold: wait for the member to pay the rest (the inbound sync
+then settles the booking), or cancel it in the app. The cancel path reads Xero
+first and, when the cash can be sized exactly, records it as the payment's
+captured internet banking money (a ledger row with reason
+`xero_part_payment_recognised_at_cancel`), tiers the cancellation policy on it
+as account credit, and queues, in the same transaction, a clearing note for what
+the invoices still owe, worded "Unpaid balance cleared - booking cancelled"
+rather than #3535's "booking not paid". Under its lock the claim refuses (409;
+cancel again) if a payment was recorded after its read. The cancel preview
+(`/api/bookings/[id]/cancel-preview`) makes the same read, rate-limited per user
+and cached for a minute per booking, so the dialog quotes the same credit.
+
+Money the app cannot credit — an organisation's booking, or a payment Xero
+cannot size (only a recorded link while Xero is down, a figure that did not add
+up, a supplementary invoice that could not be read) — follows DECISION 2 on
+#3643: the hold stays kept; an officer may cancel, which takes the unpaid path
+with no clearing note and sends the treasurer a "cancelled as unpaid" email
+(audit `booking.internet_banking_cancelled_payment_recorded`); a member is told
+to contact the club. The same cancel raises one item in the hand-back queue
+(**Money to settle** on the admin payments page) with no amount — a
+`CANCELLED_BOOKING_HAND_BACK` task marked by `partPaymentReviewPaymentId`
+(migration `20261014010000`). Settle the payment in Xero, clear what the invoice
+still owes, then close the item with a note; it cannot be marked paid back,
+because nothing in the app moves money for it. Once it is closed the repair CLI
+stops reporting the booking; putting the item back on the queue re-arms the
+finding. The repair CLI never queues or retries a full clearing note
+over a recorded or recognised part payment, including a recognised booking whose
+unpaid-rest note failed; it reports `MANUAL_REVIEW_REQUIRED`, naming the
+recorded payment, until the hand-back item above is closed. A recognised booking is only reported while that rest note is
+outstanding: once you have cleared the rest by hand in Xero, mark the failed
+operation **resolved** on the Xero operations panel and the finding stops. A
+booking paid in full before its cancel has no rest note and is never reported.
+A rest note that was created but not allocated is allocated for its own amount,
+never the booking's full clearing amount.
+
+Note: because Internet-Banking bed-holding is off by default
+(`DOMAIN_INVARIANTS.md`), and the two hold-slots paths that reach release either
+carry no invoice (create-time, skipped by the fix) or already clear the full
+finalPrice (switch-to-IB, where `amountCents` equals finalPrice), this audit is
+expected to report zero on most tenants. A non-empty result means a hold-slots
+booking reached release with both an issued invoice and a credit-reduced
+`amountCents` (e.g. an operator-created invoice on a credit-carrying hold).
+
+The **#1620 applied-credit strand count** this script used to print moved to
+the booking-ledger census (#3583; see "Census the booking ledger against its
+money columns" above), where it is an information line under the credit
+identity: every non-cancelled Internet-Banking payment whose booking still
+carries UN-allocated applied credit (a `BOOKING_APPLIED` row not yet stamped
+with an allocated Xero note), split into REALIZED (a current IB receipt or
+manual settlement proves the member already double-paid the full invoice) and
+UNVERIFIED (local history cannot prove whether the current invoice was paid).
+Since #3632 that split is read from settlement evidence
+(`internet-banking-settlement-evidence.ts`), never from the payment's status
+mirror, and an unverified row is never asserted unpaid; the census's JSON lists
+each booking with its evidence (`xero-primary-receipt`, `manual-settlement` or
+`unverified`) under `realized` and `unverified` (the audit's old `pending`
+keys are gone with it). Repair guidance under the #1620 allocate-existing
+mechanism, for what the census lists:
+
+- **UNVERIFIED** rows need an operator to check the current Xero invoice or the
+  manual settlement record before choosing a remedy. Do not restore credit or
+  allocate a note solely from the audit row.
+- **REALIZED** rows already paid the full invoice in cash, so allocating a credit
+  note now would over-pay the invoice. The repair is a LOCAL credit restore for
+  the strand amount (a Xero credit note does not refund cash already sent);
+  handle by hand per the reported per-row figures.
+
+The same script also prints a second, separate **#1641 card applied-credit
+double-pay enumeration** (read-only): every captured (SUCCEEDED) non-Internet-
+Banking card payment whose booking still carries UN-allocated applied credit AND
+whose mirror shows the pre-fix full-price shape — `creditAppliedCents = 0` and
+`amountCents = booking.finalPriceCents`. Before #1641 the card intent was minted at
+the full price while the applied credit was consumed at booking-create, so these
+members were double-charged by the applied slice. A #1641-fixed card booking is
+charged the EFFECTIVE amount with a positive `creditAppliedCents` mirror and its
+`BOOKING_APPLIED` rows stamped, so it fails every discriminating clause and never
+appears. CANCELLED bookings are excluded (the #1547 restore domain). Every finding
+is REALIZED (a card capture already moved cash), so the repair is an operator-
+reviewed LOCAL credit restore for the reported per-row amount (a Xero credit note
+does not refund cash already captured). Not-yet-captured legacy card intents need no
+repair here: the next `create-payment-intent` call supersedes the stale full-price
+intent and re-mints at the effective amount.
+
+## Quarterly Backup Restore Drill
+
+A backup you have never restored is a hope, not a backup. `scripts/backup-restore-drill.sh`
+is a self-contained fire drill that proves a `pg_dump` artifact can actually be
+restored, that Prisma migrations still run forward on the restored data, and
+that the restored rows still satisfy the money-in-integer-cents invariants.
+
+The drill produces the same artifact shape as the automated backup pipeline
+(`src/lib/backup.ts`): a plain `pg_dump` piped through `gzip` (a `.sql.gz`
+file). All work happens in a throwaway Postgres 16 container bound to
+`127.0.0.1:55441`. **The drill never connects to production Postgres on port
+5432, never fetches from S3, and never reads live provider credentials.**
+
+### When to run it
+
+- Every quarter, as a standing operations task.
+- After any change to the backup pipeline (`src/lib/backup.ts`, the backup cron,
+  the in-app backup configuration at `/admin/backups`, the database schema, or
+  the Postgres major version).
+- Any time you need confidence that a specific backup file is restorable.
+
+> **Restoring a dump into a REAL installation carries its environment-safety
+> override with it.** The drill above is safe — it restores into a throwaway
+> container. But a restore into a live installation is different: the
+> "treat this as a copy" switch lives in the database, so restoring a staging or
+> rehearsal dump into the club's live site makes the live site behave as a copy
+> — member email held back, and a replaced address on every Xero contact it
+> touches. Nothing stops the restore, and the deployment's own setting cannot
+> overrule it in the unsafe direction. Read
+> [Environment Safety → Restoring a database dump carries the override with it](guides/environment-role.md#restoring-a-database-dump-carries-the-override-with-it)
+> before restoring anything into an installation that matters, and check
+> **Admin → Environment** afterwards.
+
+### Local self-contained mode (default)
+
+No arguments, no production data. The script starts the container, seeds a
+source database, dumps it, restores the dump into a second database, runs
+`prisma migrate deploy` forward on the restore, and checks every assertion:
+
+```bash
+bash scripts/backup-restore-drill.sh
+```
+
+Requirements: Docker with the `postgres:16` image available, plus the repo
+dependencies installed (`pnpm install --frozen-lockfile`). The container is removed on exit even if the
+drill fails. The script prints a PASS/FAIL summary suitable for pasting into an
+operations log.
+
+### Operator mode with a real backup (`--from-dump`)
+
+Use this to prove that an actual production backup restores. **You** obtain the
+dump file first; the script never touches S3 itself.
+
+To fetch a backup safely, use read-only S3 credentials from a workstation (never
+the production host) to copy one object out of the backup bucket. The backups
+live under the `tacbookings_s3backup/` prefix of the configured bucket. Read the
+destination **bucket** and **region** from **Admin → Monitoring & Support → Database
+Backups** (`/admin/backups`) — since #2095 the backup configuration lives in the
+encrypted in-app store, not in `BACKUP_S3_*` environment variables. Use your OWN
+read-only S3 credentials (from your operator secret store) rather than the app's
+stored write credentials. Set the values as local shell variables and copy a
+single `.sql.gz` object to a local scratch path — do not print or paste
+credential values, and do not run this on a production host:
+
+```bash
+# BUCKET/REGION are read from Admin -> Backups; the AWS creds are your own
+# read-only workstation credentials from your operator secret store. Never echo.
+aws s3 cp "s3://$BUCKET/tacbookings_s3backup/<backup-file>.sql.gz" \
+  /tmp/restore-check.sql.gz --region "$REGION"
+
+bash scripts/backup-restore-drill.sh --from-dump /tmp/restore-check.sql.gz
+```
+
+In `--from-dump` mode the source-fidelity comparisons are reported as `SKIP`
+(there is no local source to compare against); the sentinel and migration
+assertions still run against the restored database. Delete the downloaded dump
+when you are done.
+
+The drill leaves the supplied dump unchanged and omits ownership and privilege
+statements during restore, so deployment roles need not exist in the throwaway
+cluster. Plain and gzipped SQL use the backup validator's streaming filter;
+custom archives use `pg_restore --no-owner --no-acl --exit-on-error`. This proves
+schema and data restoration, not deployment role permissions. A disaster-recovery
+restore must provision the deployment roles and retain the original owners and
+grants.
+
+### What the assertions prove
+
+- **Restore fidelity** (local mode only): row counts for `Member`, `Booking`,
+  `Payment`, `BookingGuest`, and `BookingGuestNight` match the source exactly,
+  and `SUM("finalPriceCents")` over `Booking` and `SUM("amountCents")` over
+  `Payment` match the source exactly as integers. This proves the dump/restore
+  round-trip loses no rows and no cents.
+- **Sentinel invariants** (both modes): the restored database has zero `Booking`
+  rows with a `NULL` or negative `finalPriceCents` and zero `Payment` rows with a
+  `NULL` or negative `amountCents`. This proves the money-in-integer-cents
+  invariant survives the round-trip.
+- **Migration health** (both modes): after `prisma migrate deploy`, the
+  `_prisma_migrations` table has zero rows still in progress (`finished_at IS
+  NULL AND rolled_back_at IS NULL`). This proves migrations run forward cleanly
+  on top of the restored data.
+
+### On failure
+
+A failing drill is a **backup-pipeline incident**, not a routine test flake:
+
+1. Do **not** overwrite, prune, or re-run the backup job — preserve every
+   existing backup artifact as evidence.
+2. Capture the full drill summary output.
+3. Escalate to the owner before taking any corrective action on the backup
+   pipeline. Restoring or repairing production data is an owner-approved,
+   high-risk operation.
+
+## Public Reference Release Checklist
+
+Every production deploy ships a tagged release (#4465), cut with
+[`scripts/release/cut-release.mjs`](../scripts/release/cut-release.mjs). `main`
+only moves through pull requests, so the release is cut in two phases with the
+release-prep pull request between them — the order v0.13.2 was cut in. Both
+phases print their whole plan and change nothing without `--execute`. The
+deploy script enforces the rule (#4978, `INV-OPS-019`): it refuses a commit no
+annotated `vX.Y.Z` tag on `origin` points at, unless
+`ALLOW_UNTAGGED_DEPLOY_COMMIT=1` and a written `UNTAGGED_DEPLOY_COMMIT_REASON`
+are set — see [`DEPLOYMENT.md`](../DEPLOYMENT.md#the-deploy-refuses-a-commit-that-is-not-a-release-4978).
+
+1. From a clean checkout of `origin/main`, prepare the release-prep commit:
+
+   ```bash
+   git switch --detach origin/main
+   pnpm run release:cut prepare             # dry run: version, fragments, steps
+   pnpm run release:cut prepare --execute   # make the local commit
+   ```
+
+   It fetches `origin/main`, refuses a dirty tree (an untracked `changelog.d/`
+   draft would be released), a checkout that is not exactly `origin/main`, a
+   `release/v<version>` branch that already exists here or on `origin`, a
+   local tag for the version that `origin` does not have, and a release that
+   is prepared but not yet tagged (`package.json` ahead of `origin`'s latest
+   tag, with that version's section in `CHANGELOG.md`) — publish that one, or
+   fold late fragments into it, rather than planning a lower version. It also
+   refuses, dry run included, while the upgrade documents are not ready
+   (`scripts/release/upgrade-docs.mjs`, #4979): `docs/UPGRADING.md` must have
+   exactly one `## Unreleased`, with only its fixed guide sections above it and
+   no release-specific `(#NNNN)` section there, and
+   `docs/PRODUCTION_UPGRADE_RUNBOOK.md`'s opening paragraph must either say
+   "This runbook is release-agnostic" or name a release no older than the
+   version being cut (the census in step 3 holds the release-prep pull request
+   to the same threshold, through `package.json`). Fix them in a pull request
+   to `main`, then re-run. The version is the
+   latest `vX.Y.Z` tag **on `origin`** (never this clone's tags) plus a minor
+   bump when any fragment
+   is named `*.feature.md`, or a patch bump otherwise
+   (`changelog.d/README.md`, "Patch or minor"); `--bump patch|minor|major`
+   overrides it and `--date YYYY-MM-DD` overrides the release date. With
+   `--execute` it creates `release/v<version>`, sets `package.json`'s
+   `"version"` (`pnpm-lock.yaml` does not record it), compiles the changelog
+   (step 2), files the release documents (step 3) and commits. It never
+   pushes. If it stops part way it prints how to inspect the branch or abandon
+   it.
+2. The compile step runs `scripts/release/compile-changelog.mjs` — on its own:
+
+   ```bash
+   node scripts/release/compile-changelog.mjs 0.14.0 --dry-run   # show the plan
+   node scripts/release/compile-changelog.mjs 0.14.0             # write it
+   ```
+
+   That adds `## <version> - <date>` to `CHANGELOG.md` from the per-PR fragments
+   in `changelog.d/` (plus any entry still written directly under
+   `## Unreleased`), deletes the fragments it consumed and the committed,
+   clean `size-allowances.d/*.md` fragments made inert by their merge to main,
+   and leaves the `## Unreleased` heading and its sentinel-marked pointer note
+   in place. The compiled `CHANGELOG.md` and both sets of fragment deletions
+   are committed together (`release:cut` does it; by hand, do the same), then
+   read the new section end to end and edit it for order and duplication
+   before pushing —
+   `changelog.d/README.md` documents the convention. If the run prints
+   `WARNING: unrecognised content left under "## Unreleased"`, resolve that
+   first: the text it echoes was neither released nor deleted. A release-prep
+   checkout with locally edited allowance files must resolve those edits before
+   compiling; untracked drafts and `size-allowances.d/README.md` are preserved.
+   Refresh `origin/main` before this step: the compiler checks that it is an
+   ancestor of the release-prep checkout and retires only allowance fragments
+   present on that ref, never a branch-only draft. It cannot detect an unfetched
+   remote update while offline; the printed reminder is not proof of freshness.
+   If a file removal fails during apply, the compiler restores the original
+   changelog and fragments so you can fix the I/O cause and retry. If that
+   restoration itself fails, stop and inspect the named files before retrying.
+3. The same commit brings the release documents up to date (#4979, #4983).
+   **A release's upgrade steps are filed under that release**: the tool
+   records the release boundary in the upgrade guide and the release notes as
+   well as the changelog, so nobody rolls them by hand.
+
+   - **The upgrade guide is folded.** `release:cut prepare` renames
+     `docs/UPGRADING.md`'s `## Unreleased` block to
+     `## v<previous> → v<version>`, `<previous>` being the same latest tag on
+     `origin`, and leaves a fresh, empty `## Unreleased` above it. When
+     nothing was waiting, the new section says the release has no manual
+     upgrade steps, so every tag has a section. Text above `## Unreleased`
+     and every released section are left untouched. It refuses a guide that
+     already has the version's section, one with a step added since the
+     previous tag to a released section that tag already had, or any tracked
+     document (bar `CHANGELOG.md` and `changelog.d/`) that links the guide's
+     `#unreleased` anchor: the link would be left on the empty section, so
+     link the step's own heading instead. Prose that says "see Unreleased"
+     with no link is not found: name the step instead. A release section that
+     arrives whole between two tags, such as a fork merging an upstream
+     release, is not a late step. It reads the previous tag's guide from that
+     tag's commit and refuses when the commit is not in the clone (a shallow
+     clone), rather than skip the check. Read the folded section: it should
+     open with `### Upgrade checklist for this release`, the ordered
+     before / during / after list, and the plan says so when it does not.
+     `--amend` moves steps added under the fresh `## Unreleased` to the end
+     of the untagged release's section.
+   - **After-deploy steps are filed (#5379).** Every
+     `changelog.d/*.deploy.md` fragment
+     ([format](../changelog.d/README.md#after-deploy-steps-the-deploymd-suffix))
+     becomes one checkbox under "After deploying this release" at the end of
+     the release's upgrade-guide section and in its notes page, naming who
+     does it, what to do, how to check it worked and the pull request it came
+     from, and the fragment is deleted with the others. `prepare` refuses,
+     dry run included and before it switches branch, while any of them is
+     malformed. `--amend` adds late steps to both lists.
+   - **A notes stub is written.** `docs/releases/v<version>.md` links the
+     version's changelog and upgrade-guide sections. It carries an unfinished
+     marker (`<!-- release-notes:unfinished -->`), a note saying it is a stub
+     and a placeholder paragraph, and `publish` refuses while any of the three
+     is still in the page. `docs/releases/README.md` lists the page first under
+     "Published release notes". The documentation hub links the index, not a
+     version, so it needs no edit.
+   - **The runbook stays release-agnostic.**
+     `docs/PRODUCTION_UPGRADE_RUNBOOK.md` names no release pair and keeps
+     reusable operator templates. If it has been re-scoped to one release,
+     re-scope it to the new tag, templates included.
+     It may record example rehearsal transcripts, including their dates and
+     results. Record nothing that the public-writing rule bars
+     ([writing in the open](agents/ISSUE_WORKFLOW.md#writing-in-the-open)):
+     in particular secrets, credentials, production data, personal data, IP
+     addresses, hostnames, and anything else identifying a club's production
+     environment. An example does not attest any operator's upgrade, so it
+     carries no "Confirmed by" owner confirmation. Operators fill in their own
+     §7 and §8 records offline.
+   - **Every windowed migration is reached.** A census
+     (`src/lib/__tests__/upgrade-docs-scope.test.ts`) fails a pull request when
+     a windowed ledger row is not named in the runbook's
+     [§2.4](PRODUCTION_UPGRADE_RUNBOOK.md#24-windowed-migration-deploy-sequence).
+     It cannot judge the checklist. List the ledger's windowed rows with
+     `awk -F'\t' '$4 == "windowed" { print $1 }' docs/BLUE_GREEN_MIGRATION_SAFETY.tsv`
+     and confirm that each one added since the previous tag is reached from the
+     checklist's "During the window" part. The checklist links; it never copies
+     a migration's text.
+
+   The dry run lists each of these. The fold files only what sits under
+   `## Unreleased`: an upgrade step written anywhere else is left where it is,
+   so move any such step under `## Unreleased` in a pull request before you
+   prepare. Then, before merging the release-prep pull request, read the new
+   upgrade section and drop any step that no longer applies, and write the
+   notes page, deleting the marker, the stub note and the placeholder.
+4. Check `README.md`, `DEPLOYMENT.md`, `CONFIGURATION.md`, this maintenance
+   guide, `docs/ARCHITECTURE.md`, `docs/UPGRADING.md` and
+   `docs/PRODUCTION_UPGRADE_RUNBOOK.md` for dependency, release, GHCR, migration,
+   validation, and public/private workflow drift.
+5. Confirm any new or changed migrations that touch hot tables or potentially
+   breaking SQL are represented in `docs/BLUE_GREEN_MIGRATION_SAFETY.tsv`, or
+   document why no ledger entry is needed.
+6. Run local release validation without live provider credentials, then rely on
+   GitHub Actions for Docker image build, static analysis, secret scanning,
+   dependency review, and GHCR publication.
+7. Push `release/v<version>` and open the release-prep pull request from the
+   template (`pnpm run pr:check <body-file>` first), with the notes page
+   written. It merges like any other.
+8. After it merges, tag the merged commit and publish the GitHub release:
+
+   ```bash
+   git fetch origin main
+   pnpm run release:cut publish             # dry run: commit, body, steps
+   pnpm run release:cut publish --execute
+   ```
+
+   It reads the version from `package.json` on the merged commit (default
+   `origin/main`; `--commit <sha>` names another) and publishes to the
+   repository `origin`'s push URL names (its URL when no push URL is set),
+   passing it to every `gh` call; push and fetch URLs that name different
+   repositories are refused. It refuses when:
+
+   - the commit is not on `origin/main`'s **first-parent** chain — only a
+     commit pushed to `main` gets a CI run that publishes GHCR images (a
+     release-prep branch commit inside a merge never was);
+   - its `ci.yml` push run on `main` has not published its images: GitHub
+     reports no run whose `Publish GHCR images` job succeeded, because the run
+     is still going, failed, was cancelled by hand, never started, or was
+     replaced while queued by a newer merge (`INV-OPS-021`, #5356; normally
+     only an intermediate commit given with `--commit`, since the default
+     `origin/main` loses its pending run only to a manual re-run). The refusal
+     names the commit and the run. Wait for the run, or re-run it with
+     `gh run rerun <run-id>` and publish once that job succeeds. A re-run joins
+     `main`'s queue and replaces whatever is pending there, so start it only
+     when nothing is pending on `main`
+     (`gh run list --workflow ci.yml --branch main --status pending`). The
+     check runs in the dry run too, on the commit that would be tagged (on a
+     resume, the tagged commit), and refuses when GitHub's answer cannot be
+     read — a fine-grained token needs **Actions: Read**;
+   - `origin` already has the version's tag on another commit, or the version
+     is not newer than `origin`'s latest tag — nothing new was prepared;
+   - `CHANGELOG.md` has no section for the version, or still has entries
+     written directly under `## Unreleased`;
+   - the commit still holds `changelog.d/` fragments, `.deploy.md` steps
+     included. Required checks are not
+     strict, so a pull request can merge while the release-prep one is open
+     and leave its fragment in the merge commit. Two supported ways out:
+     **fold** them — from a fresh `origin/main`,
+     `pnpm run release:cut prepare --amend --execute` appends them to the
+     untagged `## <version>` section on `release/v<version>-late`; merge that
+     pull request and publish its merge commit. A late `*.feature.md` cannot
+     be folded into a patch release: carry it, or revert the release-prep
+     merge and prepare again as minor. Or **carry** them:
+     `pnpm run release:cut publish --carry-late-fragments --execute` publishes
+     anyway and lists them as carried into the next release;
+   - `docs/UPGRADING.md` has no `## v<previous> → v<version>` section, or still
+     has upgrade steps under `## Unreleased` — a pull request with its own
+     upgrade step merged while the release-prep one was open. They would ship
+     in this tag but read as the next release's. Fold them:
+     `pnpm run release:cut prepare --amend --execute` moves them into the
+     untagged version's section (and rolls the guide if prep never did).
+     `--carry-late-fragments` does **not** carry upgrade steps, because a
+     step a club never sees under its release is the harm this check stops;
+   - `docs/UPGRADING.md` has more `### ` steps in an already-released section
+     than the previous tag's copy of that section — a late pull request merged
+     its step into the wrong section. Rewording a released step's title adds no
+     step, so it is not refused. `prepare` refuses this too, before it has
+     written anything: move the step under `## Unreleased` in a pull request,
+     then run `prepare` again. After a refused `publish`, move it the same way,
+     then fold it with `--amend`;
+   - `docs/releases/v<version>.md` is missing, or still carries the unfinished
+     marker, the stub note or the placeholder paragraph. Write the page through
+     a pull request, then publish.
+
+   The dry run also checks `gh auth status` and that `gh` can reach the
+   repository, prints the CI run that published the commit's images, and
+   says which release body it will use: the section itself, or — over
+   120,000 characters, below GitHub's 125,000 limit — a short body with the
+   entry count and a link to the section in `CHANGELOG.md` at the tag. With
+   `--execute` it writes the body to a file, creates the annotated
+   `v<version>` tag, and only then pushes the tag and runs
+   `gh release create`. A failure prints the re-run, always with
+   `--commit <sha>` of the commit being tagged, and the re-run resumes: a
+   local (annotated) tag on the commit resumes at the push, still re-running
+   the content checks; a pushed tag resumes at `gh release create`; an
+   existing release is reported as done. Once `main` has moved on, a pushed
+   tag whose release is missing is resumed on its own commit even without
+   `--commit`, and a local-only tag on another commit is named with the
+   `--commit` that resumes it. A failed push keeps the local tag; a failed
+   publish never deletes the pushed tag. `compile-changelog.mjs --append`
+   only adds to the newest section, so a fold can never rewrite a released
+   version's notes.
+   Before `gh release create` it opens the **post-deploy checklist**
+   (#5379): a "v<version> post-deploy checklist" issue with the notes page's
+   after-deploy steps, one checkbox each linking its pull request, labelled
+   `post-deploy-checklist` and assigned to the repository's owner (owner
+   decision D2 on #5379); the release body links it under "After deploying
+   this release". `--checklist-assignee <login>` names someone else. When an
+   organisation owns the repository, or GitHub cannot say who does, it is
+   assigned to whoever publishes (`@me`) and the plan says why. A re-run
+   finds the issue by its label and exact title and reuses it. A release with
+   no steps opens none. If the issue cannot be opened, the release is still
+   published, linking the notes page instead, and the script writes the body
+   to a file and prints the `gh label create` and `gh issue create` commands
+   to run. The dry run prints the issue's title, assignee and body.
+   Add validation evidence, migration notes, image names and non-blocking
+   maintainability follow-ups to the published release by hand.
+9. Deploy the tag (`DEPLOYMENT.md`, "Cut the release first").
+
+## GitHub Actions Availability
+
+If Actions jobs fail before starting, check repository or account billing and
+spending limits before treating the failures as code failures.

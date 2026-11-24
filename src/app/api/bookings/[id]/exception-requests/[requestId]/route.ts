@@ -1,0 +1,89 @@
+import { NextRequest, NextResponse } from "next/server";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { auth } from "@/lib/auth";
+import { logAudit } from "@/lib/audit";
+import { getClientIp } from "@/lib/rate-limit";
+import { requireActiveSessionUser } from "@/lib/session-guards";
+import { cancelModificationExceptionRequest } from "@/lib/booking-exception-request-service";
+import { transactionContendedResponse } from "@/lib/transaction-contended-response";
+import { exceptionRequestWithdrawSchema } from "@/lib/booking-exception-request-schemas";
+import { WITHDRAWN_EXCEPTION_REQUEST_CONNECTION_SHAPE } from "@/lib/connection-shapes-bookings";
+import { connectionJson } from "@/lib/mcp-connection-request";
+
+/**
+ * Withdraw the member's own exception request on a booking. Also the AI app
+ * action `withdraw_booking_change_exception_request` (ALP-794): scoped to the
+ * signed-in member's own request, with no officer branch.
+ */
+export async function PATCH(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string; requestId: string }> },
+) {
+  const session = await auth();
+  if (!session?.user) {
+    return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+  }
+  const inactiveResponse = await requireActiveSessionUser(session.user.id);
+  if (inactiveResponse) return inactiveResponse;
+
+  const jsonBody = await parseJsonRequestBody(req, { error: "Invalid JSON" });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+  const parsed = exceptionRequestWithdrawSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Only { action: \"cancel\" } is supported here" },
+      { status: 400 },
+    );
+  }
+
+  const { id: bookingId, requestId } = await params;
+
+  // Guarded single transition REQUESTED -> CANCELLED, scoped to the member's own
+  // POLICY_EXCEPTION request. A lost claim runs NO side effect: plain 409, no
+  // audit-success, no notification. Scoped to POLICY_EXCEPTION so it can never
+  // touch a locked-period change request sharing the table, and to `bookingId`
+  // so the request must actually belong to the booking in the URL — otherwise
+  // the success-path audit below (which records the URL's bookingId verbatim)
+  // could mislabel a cancel of a request that belongs to a different booking.
+  let cancelled: Awaited<ReturnType<typeof cancelModificationExceptionRequest>>;
+  try {
+    cancelled = await cancelModificationExceptionRequest({
+      id: requestId,
+      bookingId,
+      requestedByMemberId: session.user.id,
+    });
+  } catch (err) {
+    // The claim is one lock(1) transaction (INV-LOCK-006).
+    const contended = transactionContendedResponse(
+      err,
+      "Exception request cancel contended for the lock(1) budget",
+      { context: { bookingId, requestId } },
+    );
+    if (contended) return contended;
+    throw err;
+  }
+
+  if (!cancelled) {
+    return NextResponse.json(
+      { error: "This request is no longer open and cannot be cancelled" },
+      { status: 409 },
+    );
+  }
+
+  logAudit({
+    action: "booking-policy-exception-request.cancel",
+    memberId: session.user.id,
+    targetId: bookingId,
+    subjectMemberId: session.user.id,
+    entityType: "BookingChangeRequest",
+    entityId: requestId,
+    category: "booking",
+    outcome: "success",
+    summary: "Modification policy exception request cancelled by member",
+    metadata: { source: "MODIFICATION", bookingId, requestId },
+    ipAddress: getClientIp(req),
+  });
+
+  return connectionJson(req, { id: requestId, status: "CANCELLED" }, WITHDRAWN_EXCEPTION_REQUEST_CONNECTION_SHAPE);
+}

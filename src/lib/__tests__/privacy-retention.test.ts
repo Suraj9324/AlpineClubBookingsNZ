@@ -1,0 +1,449 @@
+import type { PrismaClient } from "@prisma/client";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { matchesWhere, type WhereInput } from "./support/prisma-where";
+
+vi.mock("@/lib/logger", () => ({ default: { error: vi.fn() } }));
+vi.mock("server-only", () => ({}));
+vi.mock("@/lib/prisma", () => ({ prisma: {} }));
+vi.mock("@/lib/audit", () => ({ createAuditLog: vi.fn() }));
+vi.mock("@/lib/club-time/server", () => ({ clubTime: async () => ({ calendarDateOf: () => "2026-07-01" }) }));
+vi.mock("@/lib/member-lifecycle-lock", () => ({ acquireMemberLifecycleLocks: vi.fn() }));
+vi.mock("@/lib/member-credit", () => ({ getMemberCreditBalance: vi.fn(async () => 0), lockMemberCreditLedger: vi.fn() }));
+vi.mock("@/lib/xero-contact-create-recovery", () => ({
+  hasMemberContactChangeMergeBlocker: vi.fn(async () => false),
+  lockMemberForAccountDeletionXeroFence: vi.fn(), DELETED_ACCOUNT_PASSWORD_HASH: "disabled-password",
+}));
+vi.mock("@/lib/member-dietary", () => ({ DIETARY_ERASURE_PATCH: { dietaryRequirements: null } }));
+vi.mock("@/lib/member-photo", () => ({ deleteOwnedMemberPhotoBlobs: vi.fn() }));
+vi.mock("@/lib/member-email-inheritance", () => ({ retireInheritedEmailCopies: vi.fn(), reconcileEmailInheritanceForMemberChange: vi.fn() }));
+
+import logger from "@/lib/logger";
+import { getPrivacyRetentionPreview } from "@/lib/privacy-retention";
+import {
+  privacyRetentionFailureMessage, privacyRetentionRunStatus, runBookingDietaryClearJob, runFormerMemberAnonymisationJob,
+  runPersonalDataPruneJob, runRecordedPrivacyRetentionJob,
+} from "@/lib/privacy-retention-jobs";
+import {
+  BOOKING_DIETARY_CLEAR_JOB_NAME, DEFAULT_PRIVACY_RETENTION_SETTINGS, FORMER_MEMBER_ANONYMISATION_JOB_NAME,
+  privacyRetentionSettingsSchema,
+} from "@/lib/privacy-retention-shared";
+import { createAuditLog } from "@/lib/audit";
+import { deleteOwnedMemberPhotoBlobs } from "@/lib/member-photo";
+import { getMemberCreditBalance } from "@/lib/member-credit";
+import { addUtcYears } from "@/lib/retention-calendar";
+import { reconcileEmailInheritanceForMemberChange } from "@/lib/member-email-inheritance";
+
+type Row = Record<string, unknown> & { id: string };
+type Args = { where?: WhereInput; data?: Record<string, unknown>; take?: number; skip?: number; select?: Record<string, boolean> };
+const NOW = new Date("2026-07-01T00:00:00.000Z");
+const BEFORE = new Date("2019-06-30T00:00:00.000Z");
+const EMAIL_BOUNDARY = new Date("2024-07-01T00:00:00.000Z");
+const APPLICATION_BOUNDARY = new Date("2025-07-01T00:00:00.000Z");
+
+/** Apply the real predicates through the shared evaluator, rather than returning canned candidates. */
+function store() {
+  const data: Record<string, Row[]> = {
+    privacyRetentionSettings: [{ id: "default", ...DEFAULT_PRIVACY_RETENTION_SETTINGS, pruneStartedAt: null, anonymiseStartedAt: null, bookingDietaryClearStartedAt: null }],
+    member: [], emailLog: [], memberApplication: [], familyGroupMember: [], booking: [], memberSubscription: [],
+    membershipSubscriptionCharge: [], refundRequest: [], xeroObjectLink: [], bookingGuest: [], xeroContactCache: [],
+    magicLinkToken: [], passwordResetToken: [], emailVerificationToken: [], emailChangeToken: [],
+    twoFactorEmailCode: [], twoFactorRecoveryCode: [], twoFactorSessionChallenge: [], sessionReauthChallenge: [],
+    webAuthnCredential: [], webAuthnChallenge: [], mcpGrant: [],
+  };
+  const hooks: { beforeApplicationDelete?: () => void; beforeMemberUpdate?: () => void } = {};
+  const delegates = Object.fromEntries(Object.keys(data).map(name => {
+    const selected = (args: Args = {}) => data[name].filter(row => matchesWhere(row, args.where));
+    const project = (row: Row | undefined, args: Args) => row && args.select
+      ? Object.fromEntries(Object.keys(args.select).filter(key => args.select![key]).map(key => [key, row[key]]))
+      : row ?? null;
+    return [name, {
+      upsert: vi.fn(async () => data[name][0]),
+      findUnique: vi.fn(async (args: Args) => project(selected(args)[0], args)),
+      findFirst: vi.fn(async (args: Args) => project(selected(args)[0], args)),
+      findMany: vi.fn(async (args: Args = {}) => selected(args).sort((a, b) => a.id.localeCompare(b.id)).slice(args.skip ?? 0, (args.skip ?? 0) + (args.take ?? Infinity)).map(row => project(row, args))),
+      count: vi.fn(async (args: Args) => selected(args).length),
+      updateMany: vi.fn(async (args: Args) => {
+        if (name === "member") hooks.beforeMemberUpdate?.();
+        const rows = selected(args);
+        rows.forEach(row => Object.assign(row, args.data));
+        return { count: rows.length };
+      }),
+      deleteMany: vi.fn(async (args: Args) => {
+        if (name === "memberApplication") hooks.beforeApplicationDelete?.();
+        const removed = selected(args);
+        data[name] = data[name].filter(row => !removed.includes(row));
+        return { count: removed.length };
+      }),
+    }];
+  }));
+  const db = {
+    ...delegates, $executeRaw: vi.fn(async () => 1),
+    $transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+  } as unknown as PrismaClient;
+  return { db, data, hooks, settings: data.privacyRetentionSettings[0] };
+}
+
+function member(id: string, overrides: Record<string, unknown> = {}): Row {
+  return {
+    id, firstName: "Former", lastName: "Person", email: `${id}@example.invalid`,
+    active: false, deletedAt: null, leavingDate: BEFORE, familyGroupId: null, billingFamilyGroupId: null,
+    photoImageId: null, xeroContactId: `contact-${id}`, canLogin: true, dietaryRequirements: "Sensitive",
+    inheritEmailFromId: null, inheritEmailChoiceId: null, ...overrides,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(getMemberCreditBalance).mockResolvedValue(0);
+});
+
+describe("privacy retention selection and execution", () => {
+  it("returns the same settings snapshot that selected the preview", async () => {
+    const s = store();
+    s.settings.emailLogRetentionYears = 5;
+    s.data.emailLog.push({ id: "three-years", createdAt: new Date("2023-06-30Z") });
+    const preview = await getPrivacyRetentionPreview({ db: s.db, now: NOW });
+    expect(preview.settings.emailLogRetentionYears).toBe(5);
+    expect(preview.emailLogs.count).toBe(0);
+    expect(s.db.privacyRetentionSettings.findUnique).toHaveBeenCalledOnce();
+  });
+
+  it("bounds blocker reads to one candidate page and traverses the same job population", async () => {
+    const s = store();
+    s.data.member.push(...Array.from({ length: 120 }, (_, i) => member(`member-${String(i).padStart(3, "0")}`)));
+    s.data.familyGroupMember.push({ id: "family", memberId: "member-001" });
+    const first = await getPrivacyRetentionPreview({ db: s.db, now: NOW, pageSize: 25 });
+    expect(first.formerMemberCandidateCount).toBe(120);
+    expect(first.formerMembers.count).toBe(24);
+    expect(first.blockedMembers.count).toBe(1);
+    expect(first.memberHasMore).toBe(true);
+    expect(first.memberNextCursor).toBe("member-024");
+    expect(getMemberCreditBalance).toHaveBeenCalledTimes(26);
+    const ids = [...first.formerMembers.rows, ...first.blockedMembers.rows].map(row => row.id);
+    let cursor = first.memberNextCursor;
+    for (let page = 2; page <= 5; page++) {
+      const next = await getPrivacyRetentionPreview({ db: s.db, now: NOW, pageSize: 25, page, memberAfter: cursor ?? undefined });
+      ids.push(...next.formerMembers.rows.map(row => row.id), ...next.blockedMembers.rows.map(row => row.id));
+      cursor = next.memberNextCursor;
+      expect(next.memberHasMore).toBe(page < 5);
+    }
+    expect(new Set(ids).size).toBe(120);
+    expect(ids).toHaveLength(120);
+    s.settings.anonymiseMembersEnabled = true;
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 119, blocked: 1 });
+  });
+
+  it("logs a failed member, continues later members and releases the lease", async () => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("a-fails"), member("b-succeeds"));
+    const failure = new Error("transaction failed");
+    vi.mocked(s.db.$transaction).mockRejectedValueOnce(failure);
+    const result = await runFormerMemberAnonymisationJob({ db: s.db, now: NOW });
+    expect(result).toMatchObject({ anonymised: 1, blocked: 1, failed: 1 });
+    // A thrown member fails the run (cron health and one Sentry report), unlike an ordinary blocker.
+    expect(privacyRetentionRunStatus(result)).toBe("FAILURE");
+    expect(privacyRetentionFailureMessage(result)).toMatch(/^1 former member\(s\) could not be anonymised/);
+    expect(privacyRetentionFailureMessage(result)).not.toContain("a-fails");
+    expect(s.data.member[0].deletedAt).toBeNull();
+    expect(s.data.member[1].deletedAt).toEqual(NOW);
+    expect(s.db.$transaction).toHaveBeenCalledTimes(2);
+    expect(logger.error).toHaveBeenCalledWith({ err: failure, memberId: "a-fails", job: FORMER_MEMBER_ANONYMISATION_JOB_NAME }, expect.any(String));
+    expect(s.settings.anonymiseStartedAt).toBeNull();
+  });
+
+  it("records a run with failed members as FAILURE and throws once for the cron step's report", async () => {
+    const recordCronRun = vi.fn();
+    const failedRun = { deletedEmailLogs: 0, deletedApplications: 0, anonymised: 3, blocked: 2, clearedBookingDietary: 0, failed: 2 };
+    await expect(runRecordedPrivacyRetentionJob(FORMER_MEMBER_ANONYMISATION_JOB_NAME, async () => failedRun, recordCronRun))
+      .rejects.toThrow(/^2 former member\(s\) could not be anonymised/);
+    expect(recordCronRun).toHaveBeenCalledWith(expect.objectContaining({
+      jobName: FORMER_MEMBER_ANONYMISATION_JOB_NAME, status: "FAILURE", resultSummary: failedRun,
+      error: expect.stringMatching(/^2 former member\(s\)/),
+    }));
+    recordCronRun.mockClear();
+    const heldBack = { ...failedRun, failed: 0 };
+    await expect(runRecordedPrivacyRetentionJob(FORMER_MEMBER_ANONYMISATION_JOB_NAME, async () => heldBack, recordCronRun)).resolves.toBeUndefined();
+    expect(recordCronRun).toHaveBeenCalledWith(expect.objectContaining({ status: "SUCCESS", error: null }));
+    const crash = new Error("database unavailable");
+    await expect(runRecordedPrivacyRetentionJob(FORMER_MEMBER_ANONYMISATION_JOB_NAME, async () => { throw crash; }, recordCronRun)).rejects.toBe(crash);
+    // The dietary clear (#4916) records through the same helper: a clean run is SUCCESS.
+    recordCronRun.mockClear();
+    const dietaryRun = { ...heldBack, anonymised: 0, blocked: 0, clearedBookingDietary: 4 };
+    await expect(runRecordedPrivacyRetentionJob(BOOKING_DIETARY_CLEAR_JOB_NAME, async () => dietaryRun, recordCronRun)).resolves.toBeUndefined();
+    expect(recordCronRun).toHaveBeenCalledWith(expect.objectContaining({
+      jobName: BOOKING_DIETARY_CLEAR_JOB_NAME, status: "SUCCESS", resultSummary: dietaryRun, error: null,
+    }));
+  });
+
+  it("ships both jobs off and performs no transaction or destructive side effect", async () => {
+    const s = store();
+    s.data.member.push(member("off"));
+    s.data.emailLog.push({ id: "old", createdAt: new Date("2020-01-01Z") });
+    const pruneOff = await runPersonalDataPruneJob({ db: s.db, now: NOW });
+    expect(pruneOff).toMatchObject({ skipped: "disabled", deletedEmailLogs: 0 });
+    expect(privacyRetentionRunStatus(pruneOff)).toBe("SKIPPED");
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ skipped: "disabled", anonymised: 0 });
+    expect(s.db.$transaction).not.toHaveBeenCalled();
+    expect(s.data.emailLog).toHaveLength(1);
+    expect(s.data.member[0].deletedAt).toBeNull();
+    expect(createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("previews exactly what pruning deletes, preserving anniversary and unreviewed rows", async () => {
+    const s = store();
+    s.data.emailLog.push(...Array.from({ length: 101 }, (_, i) => ({ id: `old-${i}`, createdAt: new Date(EMAIL_BOUNDARY.getTime() - 1) })), { id: "boundary", createdAt: EMAIL_BOUNDARY });
+    s.data.memberApplication.push(
+      { id: "rejected", status: "REJECTED", reviewedAt: new Date(APPLICATION_BOUNDARY.getTime() - 1) },
+      { id: "boundary", status: "REJECTED", reviewedAt: APPLICATION_BOUNDARY },
+      { id: "approved", status: "APPROVED", reviewedAt: new Date("2020-01-01Z") },
+      { id: "unreviewed", status: "REJECTED", reviewedAt: null },
+    );
+    const preview = await getPrivacyRetentionPreview({ db: s.db, now: NOW, page: 2, pageSize: 100 });
+    expect(preview.emailLogs.count).toBe(101);
+    expect(preview.emailLogs.rows).toHaveLength(1);
+    expect(preview.rejectedApplications.count).toBe(1);
+    s.settings.pruneLogsAndApplicationsEnabled = true;
+    const result = await runPersonalDataPruneJob({ db: s.db, now: NOW });
+    expect(result).toMatchObject({ deletedEmailLogs: preview.emailLogs.count, deletedApplications: preview.rejectedApplications.count });
+    expect(s.data.emailLog.map(row => row.id)).toEqual(["boundary"]);
+    expect(s.data.memberApplication.map(row => row.id)).toEqual(["boundary", "approved", "unreviewed"]);
+    expect(await runPersonalDataPruneJob({ db: s.db, now: NOW })).toMatchObject({ deletedEmailLogs: 0, deletedApplications: 0 });
+    expect(s.settings.pruneStartedAt).toBeNull();
+  });
+
+  it("honours club-specific retention periods and clamps leap-year anniversaries", async () => {
+    const s = store();
+    s.settings.emailLogRetentionYears = 3;
+    s.data.emailLog.push({ id: "two-years", createdAt: new Date("2024-01-01Z") }, { id: "four-years", createdAt: new Date("2022-01-01Z") });
+    expect((await getPrivacyRetentionPreview({ db: s.db, now: NOW })).emailLogs.rows.map(row => row.id)).toEqual(["four-years"]);
+    expect(addUtcYears(new Date("2024-02-29T12:00:00Z"), -1).toISOString()).toBe("2023-02-28T12:00:00.000Z");
+  });
+
+  it("separates undated, boundary, active, erased and blocked members from eligible profiles", async () => {
+    const s = store();
+    s.data.member.push(member("eligible"), member("undated", { leavingDate: null }), member("boundary", { leavingDate: new Date("2019-07-01Z") }), member("active", { active: true }), member("erased", { deletedAt: NOW }), member("family"));
+    s.data.familyGroupMember.push({ id: "family-link", memberId: "family" });
+    const preview = await getPrivacyRetentionPreview({ db: s.db, now: NOW });
+    expect(preview.formerMembers.rows.map(row => row.id)).toEqual(["eligible"]);
+    expect(preview.undatedMembers.rows).toEqual([{ id: "undated", date: null }]);
+    expect(preview.blockedMembers.rows[0]).toMatchObject({ id: "family", reasons: ["active family group"] });
+    s.settings.anonymiseMembersEnabled = true;
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 1, blocked: 1 });
+    expect(s.data.member.filter(row => row.deletedAt === NOW).map(row => row.id).sort()).toEqual(["eligible", "erased"]);
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 0, blocked: 1 });
+  });
+
+  it("keeps completed paid booking identities and invoice references while erasing profile and guest details", async () => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("former"));
+    const payment = { id: "payment", status: "SUCCEEDED", additionalAmountCents: 0, additionalPaymentStatus: null, recoveryOperations: [], manualRefundTasks: [], stripePaymentIntentId: "pi-kept", xeroInvoiceId: "invoice-kept" };
+    s.data.booking.push({ id: "booking", memberId: "former", status: "COMPLETED", guests: [], payment });
+    s.data.bookingGuest.push({ id: "guest", memberId: "former", firstName: "Former", lastName: "Person", dietaryRequirements: "Sensitive", stayEnd: NOW });
+    s.data.passwordResetToken.push({ id: "reset", memberId: "former" });
+    // An AI app connection signs in as the member (INV-MCP-005): it goes with
+    // them, and another member's is left alone.
+    s.data.mcpGrant.push({ id: "grant", memberId: "former" }, { id: "kept-grant", memberId: "someone-else" });
+    expect((await getPrivacyRetentionPreview({ db: s.db, now: NOW })).formerMembers.count).toBe(1);
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 1 });
+    expect(s.data.member[0]).toMatchObject({ id: "former", xeroContactId: "contact-former", firstName: "Deleted", canLogin: false, dietaryRequirements: null });
+    expect(s.data.booking[0]).toMatchObject({ id: "booking", memberId: "former", payment });
+    expect(s.data.bookingGuest[0]).toMatchObject({ id: "guest", memberId: "former", firstName: "Deleted", dietaryRequirements: null });
+    expect(s.data.passwordResetToken).toEqual([]);
+    expect(s.data.mcpGrant).toEqual([{ id: "kept-grant", memberId: "someone-else" }]);
+    expect(createAuditLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("records the second factor's clear under the named job, in the anonymising transaction (INV-PRIV-020)", async () => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("enrolled", { twoFactorEnabled: true, twoFactorMethod: "TOTP", totpSecret: "ciphertext" }));
+    s.data.twoFactorRecoveryCode.push({ id: "code", memberId: "enrolled" });
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 1 });
+    expect(s.data.member[0]).toMatchObject({ twoFactorEnabled: false, twoFactorMethod: null, totpSecret: null });
+    expect(s.data.twoFactorRecoveryCode).toEqual([]);
+    const actions = vi.mocked(createAuditLog).mock.calls.map(([event]) => event.action);
+    expect(actions).toEqual(["security.two_factor.cleared", "privacy.retention.member_anonymised"]);
+    const [clear, client] = vi.mocked(createAuditLog).mock.calls[0]!;
+    expect(client).toBe(s.db);
+    expect(clear).toMatchObject({
+      memberId: null, actorMemberId: null, subjectMemberId: "enrolled",
+      metadata: { actorKind: "system", systemActor: "former-member-anonymisation", method: "TOTP", authenticatorApp: true },
+    });
+    expect(JSON.stringify(clear)).not.toContain("ciphertext");
+  });
+
+  it("blocks open money and open booking obligations", async () => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("credit"), member("booking"));
+    vi.mocked(getMemberCreditBalance).mockImplementation(async id => id === "credit" ? 100 : 0);
+    s.data.booking.push({ id: "open", memberId: "booking", guests: [], status: "CONFIRMED", payment: null });
+    const preview = await getPrivacyRetentionPreview({ db: s.db, now: NOW });
+    expect(preview.formerMembers.count).toBe(0);
+    expect(preview.blockedMembers.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "credit", reasons: ["open money"] }),
+      expect.objectContaining({ id: "booking", reasons: ["open booking or booking money"] }),
+    ]));
+    const result = await runFormerMemberAnonymisationJob({ db: s.db, now: NOW });
+    expect(result).toMatchObject({ anonymised: 0, blocked: 2, failed: 0 });
+    // Members held back by open money or links are expected, not a failed run.
+    expect(privacyRetentionRunStatus(result)).toBe("SUCCESS");
+    expect(privacyRetentionFailureMessage(result)).toBeNull();
+    expect(createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("allows ended bumped stays but still blocks their pending money", async () => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("bumped-settled"), member("bumped-pending"));
+    s.data.booking.push(
+      { id: "settled", memberId: "bumped-settled", guests: [], status: "BUMPED", payment: null },
+      { id: "pending", memberId: "bumped-pending", guests: [], status: "BUMPED", payment: { status: "PENDING", recoveryOperations: [], manualRefundTasks: [] } },
+    );
+    const preview = await getPrivacyRetentionPreview({ db: s.db, now: NOW });
+    expect(preview.formerMembers.rows.map(row => row.id)).toEqual(["bumped-settled"]);
+    expect(preview.blockedMembers.rows.map(row => row.id)).toEqual(["bumped-pending"]);
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 1, blocked: 1 });
+  });
+
+  it("clears the inherited mailbox choice and flag before reconciling descendants", async () => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("departing"), member("child", {
+      active: true, inheritEmailFromId: "departing", inheritEmailChoiceId: "departing", inheritParentEmail: true,
+    }));
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 1 });
+    expect(s.data.member[1]).toMatchObject({ inheritEmailFromId: null, inheritEmailChoiceId: null, inheritParentEmail: false });
+    expect(reconcileEmailInheritanceForMemberChange).toHaveBeenCalledWith(s.db, ["departing"], { trigger: "lifecycle-eligibility-change" });
+  });
+
+  it("rechecks a changed application status inside the delete predicate", async () => {
+    const s = store();
+    s.settings.pruneLogsAndApplicationsEnabled = true;
+    s.data.memberApplication.push({ id: "reviewed-again", status: "REJECTED", reviewedAt: new Date("2020-01-01Z") });
+    s.hooks.beforeApplicationDelete = () => { s.data.memberApplication[0].status = "APPROVED"; };
+    expect(await runPersonalDataPruneJob({ db: s.db, now: NOW })).toMatchObject({ deletedApplications: 0 });
+    expect(s.data.memberApplication[0].status).toBe("APPROVED");
+  });
+
+  it.each([null, "FAILED"])("blocks a completed stay with an unpaid addition (%s)", async (additionalPaymentStatus) => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("still-owes"));
+    s.data.booking.push({
+      id: "completed", memberId: "still-owes", guests: [], status: "COMPLETED",
+      payment: { status: "SUCCEEDED", additionalAmountCents: 1000, additionalPaymentStatus, recoveryOperations: [], manualRefundTasks: [] },
+    });
+    const preview = await getPrivacyRetentionPreview({ db: s.db, now: NOW });
+    expect(preview.formerMembers.count).toBe(0);
+    expect(preview.blockedMembers.rows).toEqual([
+      { id: "still-owes", date: BEFORE, reasons: ["open booking or booking money"] },
+    ]);
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 0, blocked: 1 });
+    expect(s.data.member[0].deletedAt).toBeNull();
+    expect(createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("a lost anonymisation claim runs no token, photo or audit side effects", async () => {
+    const s = store();
+    s.settings.anonymiseMembersEnabled = true;
+    s.data.member.push(member("rejoined"));
+    s.data.passwordResetToken.push({ id: "keep-token", memberId: "rejoined" });
+    s.hooks.beforeMemberUpdate = () => { s.data.member[0].active = true; };
+    expect(await runFormerMemberAnonymisationJob({ db: s.db, now: NOW })).toMatchObject({ anonymised: 0, blocked: 1 });
+    expect(s.data.passwordResetToken).toHaveLength(1);
+    expect(deleteOwnedMemberPhotoBlobs).not.toHaveBeenCalled();
+    expect(createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("a held lease skips work; a crashed worker's expired lease can be reclaimed", async () => {
+    const s = store();
+    s.settings.pruneLogsAndApplicationsEnabled = true;
+    s.settings.pruneStartedAt = NOW;
+    expect(await runPersonalDataPruneJob({ db: s.db, now: NOW })).toMatchObject({ skipped: "busy" });
+    expect(s.db.$transaction).not.toHaveBeenCalled();
+    s.settings.pruneStartedAt = new Date(NOW.getTime() - 3_600_001);
+    expect(await runPersonalDataPruneJob({ db: s.db, now: NOW })).not.toHaveProperty("skipped");
+    expect(s.settings.pruneStartedAt).toBeNull();
+  });
+
+  it("a support-only preview never reads applications or member records", async () => {
+    const s = store();
+    const preview = await getPrivacyRetentionPreview({ db: s.db, now: NOW, includeMembers: false });
+    expect(preview.rejectedApplications).toEqual({ count: 0, rows: [] });
+    expect(preview.formerMembers).toEqual({ count: 0, rows: [] });
+    expect(s.db.memberApplication.findMany).not.toHaveBeenCalled();
+    expect(s.db.memberApplication.count).not.toHaveBeenCalled();
+    expect(s.db.member.findMany).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("after-stay dietary retention", () => {
+  it.each([0, 366, 1.5])("rejects an invalid day period %s", days => {
+    expect(privacyRetentionSettingsSchema.safeParse({ ...DEFAULT_PRIVACY_RETENTION_SETTINGS, bookingDietaryRetentionDays: days }).success).toBe(false);
+  });
+  it.each([1, 365])("accepts the day boundary %s", days => {
+    expect(privacyRetentionSettingsSchema.safeParse({ ...DEFAULT_PRIVACY_RETENTION_SETTINGS, bookingDietaryRetentionDays: days }).success).toBe(true);
+  });
+  it("clears only expired notes in bounded batches and audits each batch's count without values", async () => {
+    const s = store();
+    for (let n = 0; n < 205; n++) s.data.bookingGuest.push({ id: String(n).padStart(3, "0"), stayEnd: new Date("2026-05-31"), dietaryRequirements: "Private fixture" });
+    s.data.bookingGuest.push(
+      { id: "boundary", stayEnd: new Date("2026-06-01"), dietaryRequirements: "Keep" },
+      { id: "today", stayEnd: NOW, dietaryRequirements: "Keep" },
+      { id: "future", stayEnd: new Date("2026-08-01"), dietaryRequirements: "Keep" },
+      { id: "empty", stayEnd: new Date("2020-01-01"), dietaryRequirements: null },
+    );
+    expect((await getPrivacyRetentionPreview({ db: s.db, now: NOW, includeMembers: false })).clearedBookingDietary).toBe(205);
+    expect(await runBookingDietaryClearJob({ db: s.db, now: NOW })).toMatchObject({ clearedBookingDietary: 205 });
+    expect(s.data.bookingGuest.filter(row => row.dietaryRequirements === "Keep")).toHaveLength(3);
+    expect(s.db.$transaction).toHaveBeenCalledTimes(3);
+    // One count row per clearing batch, written through the batch's own transaction client.
+    expect(vi.mocked(createAuditLog).mock.calls.map(([event]) => event.metadata)).toEqual([{ count: 100 }, { count: 100 }, { count: 5 }]);
+    for (const [event, client] of vi.mocked(createAuditLog).mock.calls) {
+      expect(event).toMatchObject({ category: "privacy", action: "privacy.retention.booking_dietary_cleared" });
+      expect(client).toBe(s.db);
+    }
+    expect(JSON.stringify(vi.mocked(createAuditLog).mock.calls)).not.toContain("Private fixture");
+    expect(s.db.$executeRaw).not.toHaveBeenCalled();
+    vi.mocked(createAuditLog).mockClear();
+    expect(await runBookingDietaryClearJob({ db: s.db, now: NOW })).toMatchObject({ clearedBookingDietary: 0 });
+    expect(createAuditLog).not.toHaveBeenCalled();
+  });
+  it("keeps the audit row of a committed batch when a later batch fails", async () => {
+    const s = store();
+    for (let n = 0; n < 150; n++) s.data.bookingGuest.push({ id: String(n).padStart(3, "0"), stayEnd: new Date("2026-05-31"), dietaryRequirements: "Private fixture" });
+    const failure = new Error("lock timeout");
+    vi.mocked(s.db.$transaction)
+      .mockImplementationOnce(async callback => (callback as (tx: PrismaClient) => Promise<unknown>)(s.db))
+      .mockRejectedValueOnce(failure);
+    await expect(runBookingDietaryClearJob({ db: s.db, now: NOW })).rejects.toBe(failure);
+    expect(createAuditLog).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ category: "privacy", metadata: { count: 100 } }), s.db);
+    // The lease is still released after the failure.
+    expect(s.settings.bookingDietaryClearStartedAt).toBeNull();
+  });
+  it("does not claim or write when disabled or already busy", async () => {
+    const s = store();
+    s.settings.bookingDietaryClearEnabled = false;
+    expect(await runBookingDietaryClearJob({ db: s.db, now: NOW })).toMatchObject({ skipped: "disabled", clearedBookingDietary: 0 });
+    expect(s.db.privacyRetentionSettings.updateMany).not.toHaveBeenCalled();
+    s.settings.bookingDietaryClearEnabled = true;
+    s.settings.bookingDietaryClearStartedAt = NOW;
+    expect(await runBookingDietaryClearJob({ db: s.db, now: NOW })).toMatchObject({ skipped: "busy" });
+    expect(s.db.$transaction).not.toHaveBeenCalled();
+    expect(createAuditLog).not.toHaveBeenCalled();
+  });
+  it("rechecks the switch inside each batch", async () => {
+    const s = store();
+    s.data.bookingGuest.push({ id: "old", stayEnd: new Date("2020-01-01"), dietaryRequirements: "Keep" });
+    vi.mocked(s.db.$transaction).mockImplementationOnce(async callback => {
+      s.settings.bookingDietaryClearEnabled = false;
+      return (callback as (tx: PrismaClient) => Promise<unknown>)(s.db);
+    });
+    expect(await runBookingDietaryClearJob({ db: s.db, now: NOW })).toMatchObject({ clearedBookingDietary: 0 });
+    expect(s.db.bookingGuest.updateMany).not.toHaveBeenCalled();
+  });
+});

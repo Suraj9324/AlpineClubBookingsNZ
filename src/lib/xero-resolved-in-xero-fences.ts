@@ -1,0 +1,396 @@
+// #3635 (`INV-INT-025`): the enqueue-side fences for an operation an officer
+// resolved in Xero. The retry machinery refuses a resolved ROW; these stop a
+// fresh enqueue minting a new document beside the one the officer made by
+// hand, because a new row does not carry the old row's mark.
+import type { Prisma } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
+import {
+  CARD_REFUND_REVERSAL_INVOICE_ROLE,
+  liveCardRefundReversalCents,
+  NOT_CARD_REFUND_REVERSAL_INVOICE,
+  raisedCardRefundReversalCents,
+} from "@/lib/xero-card-refund-reversal-outbox";
+import { XERO_OUTBOX_REFUND_CREDIT_NOTE_TYPE } from "@/lib/xero-operation-outbox-payload";
+import { parsePaymentCreditNoteRetryInput } from "@/lib/xero-payment-credit-note-payload";
+import { countsTowardRefundNoteCoverage, refundNoteIdSets } from "@/lib/xero-refund-note-status";
+import { sumCoveredRefundCreditNoteCents } from "@/lib/xero-sync";
+
+type OperationReader = Pick<Prisma.TransactionClient, "xeroSyncOperation">;
+type CoverageReader = Pick<Prisma.TransactionClient, "xeroSyncOperation" | "xeroObjectLink">;
+
+export interface ResolvedInXeroOperation {
+  id: string;
+  manuallyResolvedAt: Date;
+}
+
+function toResolved(
+  row: { id: string; manuallyResolvedAt: Date | null } | null,
+): ResolvedInXeroOperation | null {
+  return row?.manuallyResolvedAt
+    ? { id: row.id, manuallyResolvedAt: row.manuallyResolvedAt }
+    : null;
+}
+
+/**
+ * What the refund credit notes an officer raised by hand in Xero cover on this
+ * payment (#3635 round 4, `INV-INT-025`). AMOUNT-based, never a per-payment
+ * block: each resolved refund-note create counts its RECORDED amount as
+ * covered - the note the officer made stands in for exactly that - so a later,
+ * different refund on the same payment still gets its own note, and the
+ * hand-made one is never covered twice. The amount is read by the one reader
+ * the retry replays with (`parsePaymentCreditNoteRetryInput`).
+ *
+ * A resolved row whose own note has an active `REFUND_CREDIT_NOTE` link adds
+ * nothing to `coveredCents` (#3548 round 3): the link already counts that note
+ * in `sumRefundCreditNoteCoverageCents`. That is a crashed row (the note is
+ * linked the moment Xero returns it) or a PARTIAL one, resolved by hand. Its
+ * keys and id are still reported, so the fences still see it.
+ *
+ * #4250 (`INV-INT-025`): nor does a resolved row whose note a link records
+ * VOIDED or DELETED in Xero (`refundNoteIdSets(...).cancelled`). Xero no longer
+ * holds that note, so it covers nothing - as a cancelled link counts nothing
+ * in `sumCoveredRefundCreditNoteCents` - and its amount is never read, so an
+ * unreadable one refuses nothing. Its id is still reported, but never its key:
+ * the voided refund is raised again (owner decision, 21 Oct 2026), and the
+ * re-raise's key can equal it when the note's executed watermark differs from
+ * its queued one, so a key fence would refuse the re-raise every night.
+ *
+ * #4265 (owner decision 26 Oct 2026, `INV-INT-025`): nor does a row that is
+ * no coverage of its own (`countsTowardRefundNoteCoverage`): a refund
+ * request's note (`INV-PAY-118`), live or voided, or a row closed as covered
+ * by another note. Its key and id are still reported, so the request's own
+ * fence holds; its amount is never read, so an unreadable one refuses nothing.
+ *
+ * A resolved row whose amount cannot be read is reported in
+ * `unreadableOperationIds`; callers must refuse loudly on it rather than guess.
+ */
+/**
+ * #4421 (`INV-SSOT`, `INV-INT-028`): THE refund-note create rows the resolved
+ * coverage reader reads - an outbound credit-note create on a payment, queued
+ * as a refund note or with no recorded queue type (a legacy row, whose payload
+ * says whether it was a refund or an account-credit note). One spelling for
+ * this module's queries and for the "Resolve by hand" shape
+ * (`refundNoteResolveShape`), so the rows a resolve asks a note number of are
+ * exactly the rows whose resolve counts toward coverage.
+ */
+export const REFUND_NOTE_CREATE_ROW = {
+  direction: "OUTBOUND",
+  entityType: "CREDIT_NOTE",
+  operationType: "CREATE",
+  localModel: "Payment",
+} as const;
+export const REFUND_NOTE_CREATE_QUEUE_TYPES = [XERO_OUTBOX_REFUND_CREDIT_NOTE_TYPE, null] as const;
+
+/** The same population, asked of a row already read. */
+export function isRefundNoteCreateRow(row: {
+  direction: string;
+  entityType: string;
+  operationType: string;
+  localModel: string | null;
+  queueType: string | null;
+}): boolean {
+  return (
+    (Object.keys(REFUND_NOTE_CREATE_ROW) as Array<keyof typeof REFUND_NOTE_CREATE_ROW>).every((key) => row[key] === REFUND_NOTE_CREATE_ROW[key]) &&
+    (REFUND_NOTE_CREATE_QUEUE_TYPES as readonly (string | null)[]).includes(row.queueType)
+  );
+}
+
+/**
+ * #4692 review (`INV-SSOT`): the same population on one payment, as a query -
+ * the base the resolved coverage reader and the unrecorded-note fence
+ * (`xero-refund-note-in-flight.ts`) each narrow. A legacy row with no recorded
+ * queue type is read too; its payload says whether it was a refund or an
+ * account-credit note.
+ */
+export function paymentRefundNoteCreateRowsWhere(paymentId: string) {
+  return {
+    ...REFUND_NOTE_CREATE_ROW,
+    localId: paymentId,
+    OR: REFUND_NOTE_CREATE_QUEUE_TYPES.map((queueType) => ({ queueType })),
+  } as const satisfies Prisma.XeroSyncOperationWhereInput;
+}
+
+export interface ResolvedRefundCreditNoteCoverage {
+  coveredCents: number;
+  correlationKeys: string[];
+  operationIds: string[];
+  unreadableOperationIds: string[];
+}
+
+export async function readResolvedRefundCreditNoteCoverage(
+  paymentId: string,
+  db: CoverageReader = prisma,
+  /** #3924 round 8: only these rows - one refund's own (`sumRefundCreditNoteCoverageOfRowsCents`). */
+  rowsWhere?: Prisma.XeroSyncOperationWhereInput,
+): Promise<ResolvedRefundCreditNoteCoverage> {
+  const rows = await db.xeroSyncOperation.findMany({
+    where: {
+      ...paymentRefundNoteCreateRowsWhere(paymentId),
+      manuallyResolvedAt: { not: null },
+      ...(rowsWhere ? { AND: [rowsWhere] } : {}),
+    },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, correlationKey: true, idempotencyKey: true, requestPayload: true, responsePayload: true, xeroObjectId: true },
+  });
+  const noteIds = [...new Set((rows ?? []).flatMap((row) => (row.xeroObjectId ? [row.xeroObjectId] : [])))];
+  // #4250 review (concurrency F1): which notes are live and which Xero voided,
+  // from ONE read of the payment's refund-note links.
+  const links = noteIds.length > 0 ? await refundNoteIdSets(paymentId, db) : null;
+  const coverage: ResolvedRefundCreditNoteCoverage = {
+    coveredCents: 0,
+    correlationKeys: [],
+    operationIds: [],
+    unreadableOperationIds: [],
+  };
+  // `operationIds[i]` is the row of `correlationKeys[i]`; rows with no key reported follow.
+  const unkeyedOperationIds: string[] = [];
+  const report = (row: { id: string; correlationKey: string | null }) => {
+    if (row.correlationKey) {
+      coverage.operationIds.push(row.id);
+      coverage.correlationKeys.push(row.correlationKey);
+    } else {
+      unkeyedOperationIds.push(row.id);
+    }
+  };
+  for (const row of rows ?? []) {
+    const recorded = parsePaymentCreditNoteRetryInput(row);
+    if (row.xeroObjectId && links?.cancelled.has(row.xeroObjectId)) {
+      if (recorded && recorded.kind !== "refund") continue;
+      // #4250 review (money P2): no key - a re-raise's key can equal it.
+      unkeyedOperationIds.push(row.id);
+      continue;
+    }
+    // #4265: a refund request's note, or a row closed as covered by another
+    // note, covers nothing here; the fences still see its key.
+    if (!countsTowardRefundNoteCoverage(row)) {
+      if (!recorded || recorded.kind === "refund") report(row);
+      continue;
+    }
+    if (!recorded) {
+      coverage.unreadableOperationIds.push(row.id);
+      continue;
+    }
+    if (recorded.kind !== "refund") continue;
+    if (!row.xeroObjectId || !links?.active.has(row.xeroObjectId)) {
+      coverage.coveredCents += recorded.amountCents;
+    }
+    report(row);
+  }
+  coverage.operationIds.push(...unkeyedOperationIds);
+  return coverage;
+}
+
+/**
+ * The one answer to "how much of this payment's cash refund do refund credit
+ * notes already cover" (#3635, `INV-INT-025`): the active refund-note links
+ * plus the recorded amounts of notes an officer resolved by hand in Xero. The
+ * enqueue's cap, the credit note's execution-time cap and the refund-gap reader
+ * all read it, so the note a kept late capture's refund queues
+ * (`creditBackLateCaptureRefunds`) and the gap the self-heal list reports agree.
+ * The resolved coverage is a REQUIRED argument, read first by the caller, which
+ * must refuse on its `unreadableOperationIds` before trusting this sum.
+ */
+export async function sumRefundCreditNoteCoverageCents(
+  paymentId: string,
+  resolved: ResolvedRefundCreditNoteCoverage,
+  db: Prisma.TransactionClient = prisma,
+): Promise<number> {
+  const gross = (await sumCoveredRefundCreditNoteCents(paymentId, db)) + resolved.coveredCents;
+  // #4369 (`INV-PAY-151`): a reversal invoice that has reached Xero and is not
+  // voided or deleted undoes that much of the card note. One still queued, or
+  // one with no amount on the link, changes nothing.
+  const reversals = await db.xeroObjectLink.findMany({
+    where: activeCardRefundReversalLinksWhere(paymentId),
+    select: { role: true, metadata: true },
+  });
+  return Math.max(0, gross - reversals.reduce((sum, link) => sum + reversalLinkCents(link), 0));
+}
+
+/**
+ * #4383 delta review (money): the same live reversals
+ * `sumRefundCreditNoteCoverageCents` subtracts, by the close that queued each
+ * (`closeTaskId`), so a reader can tell which refunds a reversal answered. A
+ * link naming no close is left out; it still counts in that sum.
+ */
+export async function readLiveCardRefundReversalCentsByClose(
+  paymentId: string,
+  db: Pick<Prisma.TransactionClient, "xeroObjectLink"> = prisma,
+): Promise<Map<string, number>> {
+  const links = await db.xeroObjectLink.findMany({
+    where: activeCardRefundReversalLinksWhere(paymentId),
+    select: { role: true, metadata: true },
+  });
+  const centsByClose = new Map<string, number>();
+  for (const link of links ?? []) {
+    const closeTaskId = (link.metadata as { closeTaskId?: unknown } | null)?.closeTaskId;
+    const cents = reversalLinkCents(link);
+    if (typeof closeTaskId === "string" && closeTaskId.length > 0 && cents > 0) {
+      centsByClose.set(closeTaskId, (centsByClose.get(closeTaskId) ?? 0) + cents);
+    }
+  }
+  return centsByClose;
+}
+
+/**
+ * The active reversal-invoice links of one payment, or of many (#4936). The one
+ * filter `sumRefundCreditNoteCoverageCents`, its bulk counterpart
+ * `readCardRefundReversalCentsByPayment` and its per-close counterpart
+ * `readLiveCardRefundReversalCentsByClose` select by (`INV-SSOT`). #4370: with
+ * `retired`, also the links a voided or deleted invoice retired.
+ */
+function activeCardRefundReversalLinksWhere(
+  localId: string | { in: string[] },
+  { retired = false }: { retired?: boolean } = {},
+): Prisma.XeroObjectLinkWhereInput {
+  return {
+    localModel: "Payment",
+    localId,
+    xeroObjectType: "INVOICE",
+    role: CARD_REFUND_REVERSAL_INVOICE_ROLE,
+    ...(retired ? {} : { active: true }),
+  };
+}
+
+/**
+ * The cents one reversal link takes off coverage. The role is checked on the
+ * row as well as in the query: a credit note also stores amountCents, and only
+ * this role undoes coverage (`INV-PAY-151`).
+ */
+function reversalLinkCents(link: { role: string | null; metadata: unknown }, cents = liveCardRefundReversalCents): number {
+  return link.role === CARD_REFUND_REVERSAL_INVOICE_ROLE ? cents(link.metadata) : 0;
+}
+
+/**
+ * #4936 after #4369: what live reversal invoices take off each payment's
+ * coverage, in one query for many payments - exactly the `reversed` figure
+ * `sumRefundCreditNoteCoverageCents` subtracts for the same payment. The
+ * health check's link pre-filter subtracts it too, so its bound stays at or
+ * below that sum. A payment with no live reversal is absent from the map.
+ */
+export async function readCardRefundReversalCentsByPayment(
+  paymentIds: readonly string[],
+  db: Pick<Prisma.TransactionClient, "xeroObjectLink"> = prisma,
+  /**
+   * #4370: "raised" sums every reversal that reached Xero at the cents it was
+   * raised for, voided or deleted since included - the failed refunds a
+   * reversal answered. The default is the live figure above.
+   */
+  which: "live" | "raised" = "live",
+): Promise<Map<string, number>> {
+  const centsByPayment = new Map<string, number>();
+  if (paymentIds.length === 0) return centsByPayment;
+  const links = await db.xeroObjectLink.findMany({
+    where: activeCardRefundReversalLinksWhere({ in: [...paymentIds] }, { retired: which === "raised" }),
+    select: { localId: true, role: true, metadata: true },
+  });
+  for (const link of links) {
+    const cents = reversalLinkCents(link, which === "raised" ? raisedCardRefundReversalCents : liveCardRefundReversalCents);
+    if (cents > 0) centsByPayment.set(link.localId, (centsByPayment.get(link.localId) ?? 0) + cents);
+  }
+  return centsByPayment;
+}
+
+/**
+ * #3924 round 8 (money review, `INV-PAY-122`): THE SAME COVERAGE, ASKED OF ONE
+ * REFUND'S OWN NOTE ROWS - the refund-note creates `rowsWhere` selects on this
+ * payment (a "Paid another way" close's, `paidAnotherWayCloseNoteRowsWhere`).
+ * Counted exactly as `sumRefundCreditNoteCoverageCents` counts the payment: the
+ * active link of each note those rows raised, plus the recorded amount of a row
+ * resolved by hand whose note has no link and was not voided in Xero (#4250).
+ * #4265: only rows that count (`countsTowardRefundNoteCoverage`) - a row closed
+ * as covered by another refund's note counts nothing of that note (#4258), nor
+ * does a refund request's. So what those notes cover here is exactly their
+ * share of the payment's coverage, never more and never less. A resolved row
+ * whose amount cannot be read covers nothing, as there.
+ */
+export async function sumRefundCreditNoteCoverageOfRowsCents(
+  paymentId: string,
+  rowsWhere: Prisma.XeroSyncOperationWhereInput,
+  db: CoverageReader = prisma,
+): Promise<number> {
+  const rows = await db.xeroSyncOperation.findMany({
+    where: {
+      ...REFUND_NOTE_CREATE_ROW,
+      localId: paymentId,
+      AND: [rowsWhere],
+    },
+    select: { xeroObjectId: true, correlationKey: true, idempotencyKey: true, requestPayload: true, responsePayload: true },
+  });
+  const noteIds = [
+    ...new Set((rows ?? []).flatMap((row) => (row.xeroObjectId && countsTowardRefundNoteCoverage(row) ? [row.xeroObjectId] : []))),
+  ];
+  const linkedCents = await sumCoveredRefundCreditNoteCents(paymentId, db, noteIds);
+  const resolved = await readResolvedRefundCreditNoteCoverage(paymentId, db, rowsWhere);
+  return linkedCents + resolved.coveredCents;
+}
+
+/**
+ * The payment's LATEST booking-invoice create, when an officer resolved it in
+ * Xero; null otherwise. The latest, not any: a newer create means someone chose
+ * to raise the invoice again (the force-sync override), and a resolved row never
+ * outranks a live one.
+ */
+export async function findResolvedBookingInvoiceCreate(
+  paymentId: string,
+  db: OperationReader = prisma,
+): Promise<ResolvedInXeroOperation | null> {
+  const row = await db.xeroSyncOperation.findFirst({
+    where: {
+      direction: "OUTBOUND",
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModel: "Payment",
+      localId: paymentId,
+      ...NOT_CARD_REFUND_REVERSAL_INVOICE,
+    },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    select: { id: true, manuallyResolvedAt: true },
+  });
+  return toResolved(row);
+}
+
+/**
+ * #3635 round 4 (`INV-INT-025`): the response of a copy closed CANCELLED
+ * because an officer resolved a sibling for the same document after it was
+ * queued - by the outbox at its claim, or by a refund-note create once the
+ * fence its sibling held reads lifted (#4692 review).
+ */
+export function resolvedSiblingCopySkippedPayload(resolvedOperationId: string) {
+  return {
+    skipped: "resolved-in-xero",
+    resolvedOperationId,
+    reason: "An officer resolved this document by hand in Xero after this copy was queued, so it was not sent.",
+  } as const;
+}
+
+/**
+ * #3635 round 4 (review N3): a queued copy of a document is stale when an
+ * officer resolved a sibling for the SAME document (same correlation key)
+ * after this copy was queued - the sibling's hand-made document now stands for
+ * it. The outbox checks this after it claims a row and before any Xero call. A
+ * copy queued AFTER the resolve (a force-sync override, or a later delta with
+ * its own key) is not stale.
+ */
+export async function findResolvedSiblingSince(
+  operation: {
+    id: string;
+    correlationKey: string | null;
+    entityType: string;
+    operationType: string;
+    createdAt: Date;
+  },
+  db: OperationReader = prisma,
+): Promise<ResolvedInXeroOperation | null> {
+  if (!operation.correlationKey) return null;
+  const row = await db.xeroSyncOperation.findFirst({
+    where: {
+      id: { not: operation.id },
+      correlationKey: operation.correlationKey,
+      entityType: operation.entityType,
+      operationType: operation.operationType,
+      manuallyResolvedAt: { gt: operation.createdAt },
+    },
+    select: { id: true, manuallyResolvedAt: true },
+  });
+  return toResolved(row);
+}

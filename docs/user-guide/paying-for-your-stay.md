@@ -1,0 +1,274 @@
+# Paying for your stay
+
+Audience: Member, Guest
+
+## What it is
+
+How you settle what a booking costs — by **card** (Stripe) or by **internet
+banking** against a Xero invoice, where your club offers it — plus how **account
+credit** and **split charges** for non-member guests work. You pay either inside
+the booking wizard's **Pay** step or later from the booking's **Complete
+Payment** card (`/bookings/<id>`). The payment states are in
+[`STATE_MACHINES.md`](../STATE_MACHINES.md#payment-lifecycle).
+
+## When you'd use it
+
+- You have just finished the booking wizard and money is due.
+- You closed the wizard before paying and need to finish from your booking page.
+- Your club uses internet banking and you want to pay a Xero invoice by bank
+  transfer instead of by card.
+- You have **account credit** from an earlier cancellation and want it applied.
+
+## Step-by-step
+
+![My Bookings showing stay statuses and amounts before opening a booking to pay](../images/public/member-bookings.png)
+
+### Check which lodge before you pay
+
+The booking page's **Stay Details** card starts with the **Lodge** the booking
+is at, and a payment link the club emails a guest shows **Lodge:** above the
+dates. If your club has more than one lodge, check it before paying: a booking
+at the wrong lodge has to be moved or cancelled later, and that can mean a
+refund. If the lodge is wrong, contact the club instead of paying.
+
+### Pay by card (Stripe)
+
+1. On the **Pay** step of the wizard, or the **Complete Payment** card on your
+   booking page, choose the card option and enter your card details.
+2. The headline shows exactly what you are being charged now:
+   - A normal booking shows **Total: $X** — the card charge after any credit applied.
+   - A **split** booking (a Members First hold, see below) shows **Charged today:
+     $X** — only your **member** portion — with a second line naming the
+     non-member guest portion that is "charged closer to your stay".
+3. Read any saved-credit message above the form, then confirm the payment. The
+   success message quotes the same card charge. The booking moves to a paid state and you get
+   a booking-confirmation email. The booking page is always the live source of
+   truth if a confirmation, payment, or cancellation email goes missing.
+
+The card headline and success amount come from the server payment intent, not
+from arithmetic in your browser. This applies to both normal and split bookings.
+
+If the dates fill up while your card payment is going through, the booking is
+cancelled. The payment panel tells you how much was confirmed refunded to your
+card. If only part was refunded, it names the remaining amount the club will be
+in touch about. If no refund was confirmed, it says the club will be in touch
+about your refund. **Do not try another payment**; reload the booking to check
+its current status.
+
+### Pay by internet banking (Xero invoice)
+
+If your club has internet banking enabled and your stay is far enough ahead of
+the club's lead-time cutoff, you can choose **Internet Banking** instead of card:
+
+1. Choose the internet-banking option. The club raises a **Xero invoice** and
+   emails you the payment instructions. That invoice email is your instruction to
+   pay, so it is sent whatever your other notification settings say. (Very
+   occasionally the club arranges a booking's details with you directly instead
+   of by email — if you are expecting an invoice and nothing arrives, get in
+   touch and we will sort it out.)
+2. Pay the invoice by bank transfer using the reference on it. Your bed is held
+   under the club's internet-banking lead-time rules while the transfer clears.
+
+An unpaid card booking can also be switched later: tap **Pay by internet
+banking instead** under the card form on your booking page. A dialog asks you
+to confirm first, because once switched you cannot go back to paying by card
+from the booking page. Choose **Keep paying by card** if you tapped it by
+mistake; nothing changes.
+
+Operators manage the bed-hold and lead-time settings with the
+[Internet Banking](../guides/internet-banking.md) guide.
+
+### Use account credit
+
+If you hold **account credit** (for example from a cancelled paid booking), your
+current balance shows on your profile under **Account Credit** (`/profile`, the
+Account Credit section). Credit is applied toward what you owe the club; your
+dashboard's **Account Credit** card links straight to it. How a cancellation
+produces credit rather than a card refund is covered in
+[Changing or cancelling a booking](changing-or-cancelling-a-booking.md).
+
+If you tick **use my credit** and then **Save as draft**, your credit is *not*
+taken there and then — your balance stays free while the booking is only a
+draft, so nothing is tied up in a booking you might never make. What you asked
+for is remembered, and it is applied when you come back and pay.
+
+You can also make or change that choice while **editing** a booking that has
+not been paid yet — the edit screen's **Account credit** card shows your
+balance and remembers your tick exactly the same way (see
+[Changing or cancelling a booking](changing-or-cancelling-a-booking.md)). The
+booking page then reminds you: *"Your $X credit choice is saved and will be
+applied when you confirm."*
+
+Because time passes in between, what you asked for is not always still
+available. Your balance may have gone on another booking, or the booking itself
+may have been repriced. The club applies **as much of your election as it still
+can** rather than refusing your payment, and the pay step tells you what it did:
+
+| At the pay step | What it means |
+| --- | --- |
+| "Your credit of $X was applied." | Your full election was applied |
+| "You asked to use $X credit. $Y was applied because you no longer hold that much credit." | Your current balance capped the application |
+| "You asked to use $X credit. $Y was applied because the booking no longer costs that much." | The booking's remaining price capped the application |
+| "You asked to use $X credit. $Y was applied because you no longer hold that much credit and the booking no longer costs that much." | Both limits were equal and below your choice |
+| "Your credit covered it all. No card payment is needed." | Read the message and press **Continue** to finish; no card is charged |
+
+Shortfall messages add: "Any unused credit stays on your account." If a card
+form is ready, the message also says "Your card will be charged $X today."
+If payment is paused because a payment is already processing, is being
+refunded, or is below the card minimum, the message still names the credit
+applied, without promising a card charge. If the card payment could not start at
+all, check the **Account Credit** section on your [profile](your-account.md)
+before trying again.
+
+The same applies if you switch that booking to internet banking: your credit is
+applied first and the invoice asks only for the difference. If your credit
+covers the whole thing there is no invoice to send, so finish the booking on the
+pay step instead and it settles for $0.
+
+Very occasionally a booking gets paid in full before the credit can be applied —
+an invoice that had already gone out at the full price, say. If that happens
+your credit is **not** used and stays on your account down to the cent, and your
+booking's History shows a line saying so ("Saved account credit was not
+applied"). The club is told at the same time, so if you would rather have the
+difference back than keep the credit for next time, just ask.
+
+## Download your invoice
+
+When your club uses Xero for its accounts, your booking page has a **Download
+invoice** button beside **Edit Booking** once the club has raised the invoice.
+It saves Xero's own PDF of that invoice, so it is the same invoice the club's
+accounts hold, with the same invoice number. The file name starts with the
+club's short name.
+
+Under the booking's **Payment** card, an **Invoice and credits** card shows:
+
+- a short summary from the booking itself: the booking total (the same as
+  the Payment card's Total), any change fee, any account credit applied, what
+  you have paid less refunds and credits returned, anything kept under the
+  booking's change terms when a change was refunded only in part, and what is
+  still to pay (or what will be due once the booking is reviewed or
+  confirmed);
+- each Xero credit note raised against the booking (for example when a change
+  lowered the price, a refund, or account credit used on it), each with its
+  own **Download credit note** button;
+- a line in plain words when the club's accounts do not show your latest
+  change: the invoice could not be changed, a credit for the change has not
+  been made yet, or the invoice stays as it was issued because it can no
+  longer be changed, for example once it has been paid. The summary is then
+  the booking's own figures.
+
+Some things to know:
+
+- If Xero can't be reached just then, you'll see a message; try again later.
+  If the page says the invoice or credit note is no longer available, refresh
+  it.
+- If the booking may have more than one invoice (for example a change that
+  added to the price), the page says so and asks you to contact the club for
+  copies instead.
+- A cancelled booking has no invoice to download, and a place your group
+  organiser paid for by internet banking is on the organiser's invoice.
+- A guest on someone else's booking does not see the button or the card.
+- Downloads are limited to 10 an hour per person (and 20 an hour per booking),
+  because each one reads the club's accounts.
+
+### When your club doesn't use Xero
+
+Your booking page still has a **Download invoice** button, and it saves an
+invoice the app makes from your booking:
+
+- titled **Invoice**, from the club's legal name and postal address (set by
+  the club under Club identity), with the lodge named as the place of stay;
+- the date you downloaded it and your booking reference (there is no invoice
+  number);
+- one line per guest for each run of nights at one price, one line per promo
+  code, and any change fee;
+- the total, then the same figures as the **Invoice and credits** card on the
+  booking page: account credit applied, what you have paid less refunds and
+  credits returned, anything kept under the booking's change terms, and what
+  is still to pay (or due once the booking is reviewed or confirmed).
+
+It has no bank details or payment instructions; pay the way your booking page
+shows. A booking the club has not approved yet (for example a school group
+awaiting review) gets an invoice marked **Not yet approved**: nothing is
+payable until the club approves it.
+
+There is no invoice for a cancelled, draft or waitlisted booking, a place your
+group organiser pays for, or a booking with a night whose price the club is
+still reviewing; the button does not show for those. A group organiser's own
+booking gets one for its own guests. Instead of the button, the page asks you
+to contact the club for a copy of the invoice when:
+
+- the booking already has an invoice in the club's accounts (from before the
+  club stopped using Xero);
+- an extra charge has been raised on the booking, even one later withdrawn; or
+- the club has recorded that it was GST-registered when the booking was made
+  (for a place in a group, when the organiser's booking was made). The app
+  does not make the invoice for those bookings yet.
+
+Downloads count towards the same limits as above.
+
+A single statement PDF for a Xero club's booking (invoice, credits, payments
+and balance in one document) is planned for a later release.
+
+## Split charges for non-member guests
+
+When a **Members First** hold splits a mixed party (your members are booked now,
+your non-member guests are held provisionally), the money is split too:
+
+- **Today** you are charged only your **member** portion — the pay screen reads
+  "Charged today: $X".
+- The **non-member guest portion** is **auto-charged to the same card around the
+  hold deadline**, if beds still remain. If no bed remains, those guests are
+  bumped and you are not charged for them.
+- If you paid your own place by **internet banking** (so there is no card on
+  file for the later guest charge), the club warns you and can email you a secure
+  **pay link** (`/pay/<token>`) to settle the guest portion yourself. If a guest
+  portion reaches its deadline still unpaid, the club emails you a payment link
+  and extends the hold; if it is still unpaid at the end of check-in day, that
+  provisional guest booking is automatically cancelled — **your own place is
+  untouched**.
+
+The booking side of this split is described in
+[Booking a stay](booking-a-stay.md#3-review-confirm-and-the-hold-policies).
+
+## What it costs / what to expect
+
+| Payment path | What to expect |
+| --- | --- |
+| Card (Stripe) | Charged immediately; booking confirmed on success |
+| Card, split booking | "Charged today" is your member portion; guest portion charged near the hold deadline |
+| Internet banking | Xero invoice emailed; pay by transfer; bed held per lead-time rules |
+| Account credit | Applied toward what you owe; balance shown on your profile |
+| Account credit chosen on a draft | Not taken while it is a draft; applied when you pay, clamped to what you still hold and still owe |
+| Account credit covers it all | Nothing to pay: the booking is confirmed at $0 and no card is charged |
+| Payment failed | Booking stays unpaid with a **Complete Payment** card — retry from there |
+
+All amounts are shown in dollars, formatted from the integer cents the club
+stores. Settlement rules are in
+[`payment-and-settlement.md`](../invariants/payment-and-settlement.md).
+
+## Troubleshooting
+
+| Symptom | Why it happens | What to do |
+| --- | --- | --- |
+| Booking still says "Payment required" after you paid | The card step was interrupted, or payment did not complete | Open the booking and retry from the **Complete Payment** card |
+| You do not see an internet-banking option | Your club has not enabled it, or your stay is inside the lead-time cutoff | Pay by card instead |
+| Your card was declined | A normal card failure | Try another card from the **Complete Payment** card |
+| The invoice email never arrived | It may be in spam | Check spam; the booking page always shows what is owed even without the email |
+| You expected credit to be applied | Credit shows but was not used | Check the **Account Credit** section on your [profile](your-account.md); contact the club office if it looks wrong |
+| Less credit was applied than you chose | Your balance was spent elsewhere, or the booking was repriced below what you asked to apply, between saving the draft and paying | The pay step says which; any unused credit stays on your account. Check the displayed card remainder before paying |
+| Internet banking says there is nothing to pay by transfer | Your account credit covers the whole booking, so there is no invoice to raise | Go back to the booking page and complete it there — it settles for $0 |
+| Switching to internet banking says your card payment has already gone through | The card payment you started was completed, so switching would charge you twice | Refresh the booking page; it shows as paid once the card payment is recorded. If the switch says it could not confirm the card payment was cancelled, try again in a few minutes |
+| The card payment page says the booking is being paid by Internet Banking | The booking was switched to Internet Banking, here or in another tab, and an invoice was emailed | Reload the booking page and pay the invoice by bank transfer; the card option is closed so you cannot pay twice |
+| Your non-member guests were bumped | No bed remained at the hold deadline | Their provisional hold lapsed; your own place stands — re-add them if beds free up |
+
+## Related links
+
+- Back to the [Member & Guest Guide](README.md) and the
+  [documentation hub](../README.md).
+- Sibling guides: [Booking a stay](booking-a-stay.md),
+  [Changing or cancelling a booking](changing-or-cancelling-a-booking.md).
+- Reference: the [payment lifecycle](../STATE_MACHINES.md#payment-lifecycle) and
+  [payment & settlement invariants](../invariants/payment-and-settlement.md).
+  Operators use the [Payments](../guides/payments.md) and
+  [Internet Banking](../guides/internet-banking.md) guides.

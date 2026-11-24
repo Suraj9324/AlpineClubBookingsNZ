@@ -1,0 +1,2182 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  memberFindMany: vi.fn(),
+  paymentFindMany: vi.fn(),
+  subscriptionFindMany: vi.fn(),
+  linkFindMany: vi.fn(),
+  linkFindFirst: vi.fn(),
+  linkCreateMany: vi.fn(),
+  linkUpdateMany: vi.fn(),
+  transaction: vi.fn(),
+  lockMemberForXeroContactLink: vi.fn(),
+  upsertXeroObjectLink: vi.fn(),
+  operationCount: vi.fn(),
+  operationFindMany: vi.fn(),
+  operationFindFirst: vi.fn(),
+  operationCreate: vi.fn(),
+  operationCreateMany: vi.fn(),
+  inboundEventCount: vi.fn(),
+  inboundEventFindMany: vi.fn(),
+  emailFindFirst: vi.fn(),
+  notificationDeliveryPolicyFindUnique: vi.fn(),
+  sendRepeatedFailureAlert: vi.fn(),
+  sendReconciliationReportAlert: vi.fn(),
+  resolveStripeCashRefundEvidence: vi.fn(),
+  paymentRefundFindMany: vi.fn(),
+  healExecuteRaw: vi.fn(),
+  healOperationFindFirst: vi.fn(),
+  // #5407 item 29: an in-memory `AlertCooldown` table, so the real claim and
+  // release in `alert-cooldown.ts` run against it.
+  cooldowns: new Map<string, Date>(),
+  cooldownUpdateMany: vi.fn(),
+}));
+
+// #2902: the over-coverage drift class compares coverage against the
+// provider-backed cash refund target, never the refundedAmountCents mirror.
+// Resolution rules are unit-tested in stripe-cash-refund-evidence.test.ts;
+// the default here (cash === mirror) keeps the pre-#2902 scenarios intact.
+vi.mock("@/lib/stripe-cash-refund-evidence", () => ({
+  resolveStripeCashRefundEvidence: mocks.resolveStripeCashRefundEvidence,
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    $transaction: mocks.transaction,
+    member: {
+      findMany: mocks.memberFindMany,
+    },
+    payment: {
+      findMany: mocks.paymentFindMany,
+    },
+    paymentRefund: {
+      findMany: mocks.paymentRefundFindMany,
+    },
+    memberSubscription: {
+      findMany: mocks.subscriptionFindMany,
+    },
+    xeroObjectLink: {
+      findMany: mocks.linkFindMany,
+      findFirst: mocks.linkFindFirst,
+      createMany: mocks.linkCreateMany,
+      updateMany: mocks.linkUpdateMany,
+    },
+    xeroSyncOperation: {
+      count: mocks.operationCount,
+      findMany: mocks.operationFindMany,
+      findFirst: mocks.operationFindFirst,
+      create: mocks.operationCreate,
+      createMany: mocks.operationCreateMany,
+    },
+    xeroInboundEvent: {
+      count: mocks.inboundEventCount,
+      findMany: mocks.inboundEventFindMany,
+    },
+    emailLog: {
+      findFirst: mocks.emailFindFirst,
+    },
+    alertCooldown: {
+      updateMany: mocks.cooldownUpdateMany,
+      create: async ({ data }: { data: { key: string; lastAlertedAt: Date } }) => {
+        if (mocks.cooldowns.has(data.key)) {
+          throw Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
+        }
+        mocks.cooldowns.set(data.key, data.lastAlertedAt);
+        return data;
+      },
+      deleteMany: async ({ where }: { where: { key: string; lastAlertedAt: Date } }) => {
+        const held = mocks.cooldowns.get(where.key);
+        if (!held || held.getTime() !== where.lastAlertedAt.getTime()) return { count: 0 };
+        mocks.cooldowns.delete(where.key);
+        return { count: 1 };
+      },
+    },
+    notificationDeliveryPolicy: {
+      findUnique: mocks.notificationDeliveryPolicyFindUnique,
+    },
+  },
+}));
+
+vi.mock("@/lib/xero-contact-create-recovery", () => ({
+  XeroMemberUnavailableError: class XeroMemberUnavailableError extends Error {},
+  lockMemberForXeroContactLink: mocks.lockMemberForXeroContactLink,
+}));
+
+vi.mock("@/lib/xero-sync", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/xero-sync")),
+  upsertXeroObjectLink: mocks.upsertXeroObjectLink,
+}));
+
+vi.mock("@/lib/email", () => ({
+  sendAdminXeroRepeatedFailureAlert: mocks.sendRepeatedFailureAlert,
+  sendAdminXeroReconciliationReportAlert: mocks.sendReconciliationReportAlert,
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: {
+    error: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+import {
+  backfillHistoricalXeroObjectLinks,
+  buildXeroReconciliationReport,
+  cleanupStaleCanonicalXeroObjectLinks,
+  maybeNotifyXeroRepeatedFailure,
+  sendXeroReconciliationReport,
+} from "@/lib/xero-hardening";
+import { canonicalLinkCleanupFailureMessage } from "@/lib/xero-hardening-shared";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+
+describe("maybeNotifyXeroRepeatedFailure", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.operationCount.mockResolvedValue(3);
+    mocks.emailFindFirst.mockResolvedValue(null);
+    mocks.sendRepeatedFailureAlert.mockResolvedValue({
+      deliveryAllowed: true,
+      recipients: 1,
+      sent: 1,
+      queuedForRetry: 0,
+      notDelivered: 0,
+      failedBeforeLogged: 0,
+    });
+    mocks.cooldowns.clear();
+    mocks.cooldownUpdateMany.mockImplementation(
+      async ({
+        where,
+        data,
+      }: {
+        where: { key: string; lastAlertedAt: { lt: Date } | Date };
+        data: { lastAlertedAt: Date };
+      }) => {
+        const held = mocks.cooldowns.get(where.key);
+        // A claim matches an older stamp (`lt`); a defer matches its own stamp.
+        const matches =
+          where.lastAlertedAt instanceof Date
+            ? held?.getTime() === where.lastAlertedAt.getTime()
+            : held !== undefined && held.getTime() < where.lastAlertedAt.lt.getTime();
+        if (!matches) return { count: 0 };
+        mocks.cooldowns.set(where.key, data.lastAlertedAt);
+        return { count: 1 };
+      }
+    );
+  });
+
+  it("sends an alert once a correlation key has repeated failures", async () => {
+    const result = await maybeNotifyXeroRepeatedFailure({
+      id: "op_1",
+      correlationKey: "payment:pay_1:invoice:v1",
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModel: "Payment",
+      localId: "pay_1",
+      lastErrorMessage: "Rate limit exceeded",
+      xeroObjectType: "INVOICE",
+      xeroObjectId: "inv_1",
+      xeroObjectUrl: null,
+    });
+
+    expect(result).toEqual({
+      triggered: true,
+      failureCount: 3,
+    });
+    expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subject: "Repeated Xero Failure: payment:pay_1:invoice:v1",
+        correlationKey: "payment:pay_1:invoice:v1",
+        failureCount: 3,
+        localUrl: "/admin/xero/records/Payment/pay_1",
+      })
+    );
+  });
+
+  it("does not count failures an officer resolved in Xero toward the alert (#3635)", async () => {
+    // Three failures on the key, two of them resolved: an evaluator of the
+    // count's where clause, so the test reads what the query would match.
+    const rows = [
+      { manuallyResolvedAt: null },
+      { manuallyResolvedAt: new Date("2026-06-20T00:00:00.000Z") },
+      { manuallyResolvedAt: new Date("2026-06-21T00:00:00.000Z") },
+    ];
+    mocks.operationCount.mockImplementation(
+      async (args: { where: { manuallyResolvedAt?: null } }) =>
+        rows.filter((row) => !("manuallyResolvedAt" in args.where) || row.manuallyResolvedAt === null)
+          .length
+    );
+
+    const result = await maybeNotifyXeroRepeatedFailure({
+      id: "op_1",
+      correlationKey: "payment:pay_1:invoice:v1",
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModel: "Payment",
+      localId: "pay_1",
+      lastErrorMessage: "Rate limit exceeded",
+      xeroObjectType: "INVOICE",
+      xeroObjectId: "inv_1",
+      xeroObjectUrl: null,
+    });
+
+    expect(result).toEqual({ triggered: false, failureCount: 1 });
+    expect(mocks.sendRepeatedFailureAlert).not.toHaveBeenCalled();
+  });
+
+  describe("one alert per correlation key per window (#5407 item 29)", () => {
+    const KEY = "payment:pay_1:invoice:v1";
+    const COOLDOWN_KEY = `xero-repeated-failure:${KEY}`;
+    const WINDOW_MS = 24 * 60 * 60 * 1000;
+    const failing = (correlationKey = KEY) => ({
+      id: "op_1",
+      correlationKey,
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModel: "Payment",
+      localId: "pay_1",
+      lastErrorMessage: "Rate limit exceeded",
+      xeroObjectType: "INVOICE",
+      xeroObjectId: "inv_1",
+      xeroObjectUrl: null,
+    });
+    const sendResult = (overrides: Record<string, unknown> = {}) => ({
+      deliveryAllowed: true,
+      recipients: 1,
+      sent: 1,
+      queuedForRetry: 0,
+      notDelivered: 0,
+      failedBeforeLogged: 0,
+      ...overrides,
+    });
+
+    it("sends once per key in the window, holding the claim on the correlation key", async () => {
+      expect(await maybeNotifyXeroRepeatedFailure(failing())).toEqual({ triggered: true, failureCount: 3 });
+      expect(await maybeNotifyXeroRepeatedFailure(failing())).toEqual({ triggered: false, failureCount: 3 });
+
+      expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledTimes(1);
+      expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledWith(
+        expect.objectContaining({ subject: `Repeated Xero Failure: ${KEY}` })
+      );
+      expect([...mocks.cooldowns.keys()]).toEqual([COOLDOWN_KEY]);
+    });
+
+    it("holds the limit when the club saved its own subject, which the mail log then stores", async () => {
+      // The old limit looked the earlier alert up in EmailLog by the built-in
+      // subject. With a saved subject the stored row never matched, which this
+      // lookup models by always finding nothing; the limit must still hold.
+      mocks.emailFindFirst.mockResolvedValue(null);
+
+      await maybeNotifyXeroRepeatedFailure(failing());
+      await maybeNotifyXeroRepeatedFailure(failing());
+      await maybeNotifyXeroRepeatedFailure(failing());
+
+      expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledTimes(1);
+      expect(mocks.emailFindFirst).not.toHaveBeenCalled();
+    });
+
+    it("alerts separately for two different correlation keys", async () => {
+      await maybeNotifyXeroRepeatedFailure(failing("payment:pay_1:invoice:v1"));
+      await maybeNotifyXeroRepeatedFailure(failing("payment:pay_2:invoice:v1"));
+
+      expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledTimes(2);
+    });
+
+    it("alerts again once the earlier alert is older than the window", async () => {
+      mocks.cooldowns.set(COOLDOWN_KEY, new Date(Date.now() - WINDOW_MS - 1));
+
+      expect(await maybeNotifyXeroRepeatedFailure(failing())).toEqual({ triggered: true, failureCount: 3 });
+    });
+
+    it("does not alert while an alert raised at the window's start still holds the key", async () => {
+      mocks.cooldowns.set(COOLDOWN_KEY, new Date(Date.now() - WINDOW_MS));
+
+      expect(await maybeNotifyXeroRepeatedFailure(failing())).toEqual({ triggered: false, failureCount: 3 });
+      expect(mocks.sendRepeatedFailureAlert).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["sent", sendResult()],
+      ["queued for the retry cron (FAILED with its body kept)", sendResult({ sent: 0, queuedForRetry: 1 })],
+      ["withheld on a copy or bounced (SKIPPED_NON_PRODUCTION, BOUNCED)", sendResult({ sent: 0, notDelivered: 1 })],
+    ])("keeps the claim when the alert was RAISED, not just delivered: %s (#3035)", async (_label, result) => {
+      mocks.sendRepeatedFailureAlert.mockResolvedValue(result);
+
+      await maybeNotifyXeroRepeatedFailure(failing());
+      await maybeNotifyXeroRepeatedFailure(failing());
+
+      expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledTimes(1);
+      expect(mocks.cooldowns.has(COOLDOWN_KEY)).toBe(true);
+    });
+
+    const NOBODY_ELIGIBLE = [
+      ["the delivery policy skipped it", sendResult({ deliveryAllowed: false, recipients: 0, sent: 0 })],
+      ["no admin is opted in", sendResult({ recipients: 0, sent: 0 })],
+    ] as const;
+
+    it.each(NOBODY_ELIGIBLE)(
+      "holds the claim for a day, never giving it back, when nobody could receive it: %s (#3635 F1)",
+      async (_label, result) => {
+        mocks.sendRepeatedFailureAlert.mockResolvedValue(result);
+
+        await maybeNotifyXeroRepeatedFailure(failing());
+        await maybeNotifyXeroRepeatedFailure(failing());
+        await maybeNotifyXeroRepeatedFailure(failing());
+
+        // One attempt (and so at most one Xero read) per day, not one per failure.
+        expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledTimes(1);
+        expect(mocks.cooldowns.get(COOLDOWN_KEY)?.getTime()).toBe(Date.now());
+      },
+    );
+
+    it.each(NOBODY_ELIGIBLE)(
+      "holds it for a day, not the whole window, under a longer window: %s",
+      async (_label, result) => {
+        mocks.sendRepeatedFailureAlert.mockResolvedValue(result);
+
+        await maybeNotifyXeroRepeatedFailure(failing(), { windowHours: 48 });
+
+        // Moved back so a 48-hour claim succeeds again exactly one day on.
+        expect(mocks.cooldowns.get(COOLDOWN_KEY)?.getTime()).toBe(Date.now() - WINDOW_MS);
+      },
+    );
+
+    it("holds the claim for a day when the alert reached nobody and nothing will replay it (#5448)", async () => {
+      // Every copy failed before its mail log row existed: no retry row, so
+      // only sending again reaches anyone (`adminAlertNeedsResend`).
+      mocks.sendRepeatedFailureAlert.mockResolvedValue(
+        sendResult({ sent: 0, notDelivered: 1, failedBeforeLogged: 1 }),
+      );
+
+      await maybeNotifyXeroRepeatedFailure(failing(), { windowHours: 48 });
+      await maybeNotifyXeroRepeatedFailure(failing(), { windowHours: 48 });
+
+      expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledTimes(1);
+      // Deferred: due again one day on, not after the 48-hour window.
+      expect(mocks.cooldowns.get(COOLDOWN_KEY)?.getTime()).toBe(Date.now() - WINDOW_MS);
+    });
+
+    it("keeps the whole window for copies withheld or refused on purpose", async () => {
+      mocks.sendRepeatedFailureAlert.mockResolvedValue(sendResult({ sent: 0, notDelivered: 1 }));
+
+      await maybeNotifyXeroRepeatedFailure(failing(), { windowHours: 48 });
+
+      expect(mocks.cooldowns.get(COOLDOWN_KEY)?.getTime()).toBe(Date.now());
+    });
+
+    it("gives the claim back when the send throws, so the next failure alerts", async () => {
+      mocks.sendRepeatedFailureAlert.mockRejectedValueOnce(new Error("render failed"));
+
+      expect(await maybeNotifyXeroRepeatedFailure(failing())).toEqual({ triggered: false, failureCount: 3 });
+      expect(await maybeNotifyXeroRepeatedFailure(failing())).toEqual({ triggered: true, failureCount: 3 });
+      expect(mocks.sendRepeatedFailureAlert).toHaveBeenCalledTimes(2);
+    });
+
+    it("sends nothing and fails when the claim throws, giving back a stamp that may have landed", async () => {
+      mocks.cooldownUpdateMany.mockImplementationOnce(async ({ data }: { data: { lastAlertedAt: Date } }) => {
+        // The write committed, then the connection dropped before the reply.
+        mocks.cooldowns.set(COOLDOWN_KEY, data.lastAlertedAt);
+        throw new Error("database unavailable");
+      });
+
+      await expect(maybeNotifyXeroRepeatedFailure(failing())).rejects.toThrow("database unavailable");
+      expect(mocks.sendRepeatedFailureAlert).not.toHaveBeenCalled();
+      expect(mocks.cooldowns.has(COOLDOWN_KEY)).toBe(false);
+    });
+  });
+});
+
+describe("buildXeroReconciliationReport", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.inboundEventCount.mockResolvedValue(0);
+    mocks.inboundEventFindMany.mockResolvedValue([]);
+    // #3635: no resolved refund note, and no refund row naming a late capture,
+    // unless a test says so.
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.paymentRefundFindMany.mockResolvedValue([]);
+    mocks.resolveStripeCashRefundEvidence.mockImplementation(
+      async (payment: { refundedAmountCents: number }) => ({
+        cashRefundCents: payment.refundedAmountCents,
+        countedRefundCents: payment.refundedAmountCents,
+        refundLedgerRowCount: 1,
+        accountCreditCents: 0,
+        source: "provider-ledger",
+      })
+    );
+  });
+
+  it("summarises canonical drift, repeated failures, and unsupported partials", async () => {
+    mocks.memberFindMany.mockResolvedValue([
+      { id: "mem_1", xeroContactId: "contact_1" },
+    ]);
+    // First call: the canonical-field payment scan. Second call (#2901): the
+    // source resolution for refund-note link owners — pay_1 is NOT Stripe
+    // here, so the pre-#2901 single-canonical expectations stay in force.
+    mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+      args?.where?.source === "STRIPE"
+        ? []
+        : [{ id: "pay_1", xeroInvoiceId: "inv_1", xeroRefundCreditNoteId: "cn_1" }]
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([
+      { id: "sub_1", xeroInvoiceId: "subinv_1" },
+    ]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Member",
+        localId: "mem_1",
+        xeroObjectType: "CONTACT",
+        xeroObjectId: "contact_1",
+        role: "CONTACT",
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_1",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_old",
+        role: "PRIMARY_INVOICE",
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_1",
+        xeroObjectId: "cn_1",
+        xeroObjectType: "CREDIT_NOTE",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        localModel: "MemberSubscription",
+        localId: "sub_1",
+        xeroObjectType: "SUBSCRIPTION",
+        xeroObjectId: "subinv_1",
+        role: "SUBSCRIPTION_INVOICE",
+      },
+      {
+        localModel: "MemberSubscription",
+        localId: "sub_1",
+        xeroObjectType: "SUBSCRIPTION",
+        xeroObjectId: "subinv_old",
+        role: "SUBSCRIPTION_INVOICE",
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValueOnce([
+      {
+        id: "op_4",
+        direction: "OUTBOUND",
+        correlationKey: "contact:mem_1:repair-gap:v1",
+        entityType: "CONTACT",
+        operationType: "CREATE",
+        localModel: "Member",
+        localId: "mem_1",
+        lastErrorMessage: "Manual repair needed",
+        replayable: true,
+        requestPayload: null,
+        responsePayload: null,
+        status: "PARTIAL",
+        xeroObjectType: "CONTACT",
+        xeroObjectId: "contact_1",
+        createdAt: new Date("2026-04-13T10:15:00Z"),
+        startedAt: null,
+        xeroObjectNumber: null,
+        xeroObjectUrl: null,
+      },
+      {
+        id: "op_3",
+        direction: "OUTBOUND",
+        correlationKey: "payment:pay_1:invoice:v1",
+        entityType: "INVOICE",
+        operationType: "CREATE",
+        localModel: "Payment",
+        localId: "pay_1",
+        lastErrorMessage: "Timeout",
+        replayable: true,
+        requestPayload: null,
+        responsePayload: null,
+        status: "FAILED",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+        createdAt: new Date("2026-04-13T10:10:00Z"),
+        startedAt: null,
+        xeroObjectNumber: "INV-001",
+        xeroObjectUrl: null,
+      },
+      {
+        id: "op_2",
+        direction: "OUTBOUND",
+        correlationKey: "payment:pay_1:invoice:v1",
+        entityType: "INVOICE",
+        operationType: "CREATE",
+        localModel: "Payment",
+        localId: "pay_1",
+        lastErrorMessage: "Timeout",
+        replayable: true,
+        requestPayload: null,
+        responsePayload: {
+          invoice: {
+            invoices: [{ total: 45.67 }],
+          },
+        },
+        status: "PARTIAL",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+        createdAt: new Date("2026-04-13T10:00:00Z"),
+        startedAt: null,
+        xeroObjectNumber: "INV-001",
+        xeroObjectUrl: null,
+      },
+      {
+        id: "op_1",
+        direction: "OUTBOUND",
+        correlationKey: "payment:pay_1:invoice:v1",
+        entityType: "INVOICE",
+        operationType: "CREATE",
+        localModel: "Payment",
+        localId: "pay_1",
+        lastErrorMessage: "Timeout",
+        replayable: true,
+        requestPayload: null,
+        responsePayload: null,
+        status: "FAILED",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+        createdAt: new Date("2026-04-13T09:55:00Z"),
+        startedAt: null,
+        xeroObjectNumber: "INV-001",
+        xeroObjectUrl: null,
+      },
+    ]);
+    mocks.operationCount.mockResolvedValue(2);
+    mocks.operationFindMany.mockResolvedValueOnce([
+      {
+        id: "op_pending_1",
+        direction: "OUTBOUND",
+        correlationKey: "payment:pay_1:invoice:v1",
+        entityType: "INVOICE",
+        operationType: "CREATE",
+        localModel: "Payment",
+        localId: "pay_1",
+        status: "PENDING",
+        lastErrorMessage: null,
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+        xeroObjectNumber: "INV-001",
+        xeroObjectUrl: null,
+        startedAt: null,
+        createdAt: new Date("2026-04-13T11:00:00Z"),
+      },
+    ]);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary).toEqual({
+      missingMemberContactLinks: 0,
+      missingPaymentInvoiceLinks: 1,
+      missingPaymentRefundCreditNoteLinks: 0,
+      missingSubscriptionInvoiceLinks: 0,
+      mismatchedCanonicalLinks: 1,
+      staleCanonicalLinks: 2,
+      duplicateActiveCanonicalLinks: 1,
+      overCoveredStripeRefundPayments: 0,
+      unsettledRefundCreditNotes: 0,
+      stalePendingOperations: 2,
+      recentFailedOperations: 2,
+      recentPartialOperations: 2,
+      unsupportedPartialOperations: 1,
+      repeatedFailureCorrelations: 1,
+      failedInboundEvents: 0,
+      resolvedInXeroOperations: 0,
+      issueCategoryCount: 9,
+      issueTotalCount: 13,
+    });
+    expect(report.repeatedFailures).toEqual([
+      expect.objectContaining({
+        correlationKey: "payment:pay_1:invoice:v1",
+        failureCount: 3,
+        localUrl: "/admin/xero/records/Payment/pay_1",
+        latestOperationId: "op_3",
+        xeroObjectUrl: "https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID=inv_1",
+      }),
+    ]);
+    expect(report.unsupportedPartials).toEqual([
+      expect.objectContaining({
+        operationId: "op_4",
+        localUrl: "/admin/members/mem_1",
+        xeroObjectUrl: "https://go.xero.com/Contacts/View/contact_1",
+        reason: "This partial Xero operation does not have a repair handler yet.",
+      }),
+    ]);
+    expect(report.issueSections).toEqual([
+      expect.objectContaining({
+        id: "unsupported-partials",
+        severity: "critical",
+        count: 1,
+        items: [
+          expect.objectContaining({
+            operationId: "op_4",
+            localUrl: "/admin/members/mem_1",
+          }),
+        ],
+      }),
+      expect.objectContaining({
+        id: "repeated-failures",
+        severity: "critical",
+        count: 1,
+        items: [
+          expect.objectContaining({
+            operationId: "op_3",
+            latestErrorMessage: "Timeout",
+          }),
+        ],
+      }),
+      expect.objectContaining({
+        id: "stale-pending-operations",
+        severity: "warning",
+        count: 2,
+        items: [
+          expect.objectContaining({
+            operationId: "op_pending_1",
+            operationStatus: "PENDING",
+          }),
+        ],
+      }),
+      expect.objectContaining({
+        id: "canonical-link-drift",
+        severity: "warning",
+        count: 5,
+      }),
+      expect.objectContaining({
+        id: "recent-failed-partial-operations",
+        severity: "info",
+        count: 4,
+      }),
+    ]);
+  });
+
+  it.each([
+    ["unresolved (control)", null, 1, 2, 1],
+    ["resolved in Xero", new Date("2026-04-13T11:30:00Z"), 0, 0, 0],
+  ])(
+    "counts repeated, failed and partial operations only while not %s (#3635)",
+    async (_label, manuallyResolvedAt, repeated, failed, partial) => {
+      // `INV-INT-025`: an operation an officer resolved in Xero is done, so it
+      // is not a failure the digest reports.
+      mocks.memberFindMany.mockResolvedValue([]);
+      mocks.operationFindFirst.mockResolvedValue(null);
+      mocks.paymentFindMany.mockResolvedValue([]);
+      mocks.subscriptionFindMany.mockResolvedValue([]);
+      mocks.linkFindMany.mockResolvedValue([]);
+      mocks.operationCount.mockResolvedValue(0);
+      const failure = (id: string, status: string, minute: number) => ({
+        id,
+        direction: "OUTBOUND",
+        correlationKey: "payment:pay_1:invoice:v1",
+        entityType: "INVOICE",
+        operationType: "CREATE",
+        localModel: "Payment",
+        localId: "pay_1",
+        lastErrorMessage: "Timeout",
+        replayable: true,
+        requestPayload: null,
+        responsePayload: null,
+        status,
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+        createdAt: new Date(`2026-04-13T10:${String(minute).padStart(2, "0")}:00Z`),
+        startedAt: null,
+        xeroObjectNumber: "INV-001",
+        xeroObjectUrl: null,
+        manuallyResolvedAt,
+      });
+      mocks.operationFindMany.mockResolvedValueOnce([
+        failure("op_c", "FAILED", 10),
+        failure("op_b", "PARTIAL", 5),
+        failure("op_a", "FAILED", 0),
+      ]);
+      mocks.operationFindMany.mockResolvedValue([]);
+
+      const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+        now: new Date("2026-04-13T12:00:00Z"),
+      });
+
+      expect(report.summary).toEqual(
+        expect.objectContaining({
+          repeatedFailureCorrelations: repeated,
+          recentFailedOperations: failed,
+          recentPartialOperations: partial,
+          // Kept visible, not counted as a failure.
+          resolvedInXeroOperations: manuallyResolvedAt ? 3 : 0,
+        })
+      );
+      expect(report.repeatedFailures).toHaveLength(repeated);
+    }
+  );
+
+  it("does not report Stripe per-delta refund notes as stale, mismatched, or duplicate drift (#2901)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: {
+        where?: { source?: string; id?: { in?: string[] } };
+        select?: { refundedAmountCents?: boolean };
+      }) => {
+        if (args?.select?.refundedAmountCents) {
+          // #2901 fix round: the over-coverage detector's amounts query.
+          return [{ id: "pay_stripe", refundedAmountCents: 100 }];
+        }
+        if (args?.where?.source === "STRIPE") {
+          expect(args.where.id?.in).toEqual(["pay_stripe"]);
+          return [{ id: "pay_stripe" }];
+        }
+        return [
+          {
+            id: "pay_stripe",
+            xeroInvoiceId: "inv_1",
+            // The scalar names the LATEST per-delta note, not the only one.
+            xeroRefundCreditNoteId: "cn_10",
+          },
+        ];
+      }
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_1",
+        role: "PRIMARY_INVOICE",
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_90",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_10",
+        role: "REFUND_CREDIT_NOTE",
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary).toEqual(
+      expect.objectContaining({
+        missingPaymentRefundCreditNoteLinks: 0,
+        mismatchedCanonicalLinks: 0,
+        staleCanonicalLinks: 0,
+        duplicateActiveCanonicalLinks: 0,
+        overCoveredStripeRefundPayments: 0,
+        issueTotalCount: 0,
+      })
+    );
+    expect(
+      report.issueSections.some((section) => section.id === "canonical-link-drift")
+    ).toBe(false);
+  });
+
+  it("reports the still-active mirror of a VOIDED Stripe refund note as stale drift (#2901 fix round)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: {
+        where?: { source?: string };
+        select?: { refundedAmountCents?: boolean };
+      }) => {
+        if (args?.select?.refundedAmountCents) {
+          return [{ id: "pay_stripe", refundedAmountCents: 100 }];
+        }
+        if (args?.where?.source === "STRIPE") {
+          return [{ id: "pay_stripe" }];
+        }
+        return [
+          {
+            id: "pay_stripe",
+            xeroInvoiceId: null,
+            xeroRefundCreditNoteId: "cn_10",
+          },
+        ];
+      }
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_90",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 90, status: "VOIDED" },
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_10",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 10, status: "AUTHORISED" },
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    // The voided mirror is stale drift (the nightly cleanup deactivates it);
+    // the live sibling stays exempt, and the voided note contributes NOTHING
+    // to coverage so the payment is not over-covered.
+    expect(report.summary).toEqual(
+      expect.objectContaining({
+        staleCanonicalLinks: 1,
+        duplicateActiveCanonicalLinks: 0,
+        overCoveredStripeRefundPayments: 0,
+      })
+    );
+    const drift = report.issueSections.find(
+      (section) => section.id === "canonical-link-drift"
+    );
+    expect(drift?.items?.[0]?.detail).toContain("VOIDED/DELETED");
+  });
+
+  it("reports a bank-transfer payment's canonical note voided before #4091 as stale drift, though its pointer names it (#4161)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+      args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: null, xeroRefundCreditNoteId: "cn_voided" }]
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Payment",
+        localId: "pay_ib",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_voided",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 5_000, status: "VOIDED" },
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary).toEqual(
+      expect.objectContaining({
+        staleCanonicalLinks: 1,
+        missingPaymentRefundCreditNoteLinks: 0,
+        mismatchedCanonicalLinks: 0,
+      })
+    );
+    const drift = report.issueSections.find((section) => section.id === "canonical-link-drift");
+    expect(drift?.items?.[0]?.detail).toContain("releases the payment's refund-note pointer");
+  });
+
+  /**
+   * #3635 round-3 R6: a hand-made refund note an officer resolved in Xero
+   * covers its recorded amount everywhere a note is sized, so over-coverage
+   * reads it too - alone, or on top of links - against the note-eligible cash,
+   * and an unreadable one is reported rather than skipped.
+   */
+  describe("over-coverage with refund notes resolved by hand in Xero (round-3 R6)", () => {
+    function armResolved(options: {
+      links: Array<{ amountCents: number }>;
+      resolved: Array<{ refundAmountCents: number } | null>;
+    }) {
+      mocks.memberFindMany.mockResolvedValue([]);
+      mocks.operationFindFirst.mockResolvedValue(null);
+      mocks.subscriptionFindMany.mockResolvedValue([]);
+      mocks.operationCount.mockResolvedValue(0);
+      mocks.paymentFindMany.mockImplementation(
+        async (args?: { where?: { source?: string }; select?: { refundedAmountCents?: boolean } }) => {
+          if (args?.select?.refundedAmountCents) {
+            return [{ id: "pay_stripe", bookingId: "booking_1", refundedAmountCents: 100 }];
+          }
+          if (args?.where?.source === "STRIPE") return [{ id: "pay_stripe" }];
+          return [{ id: "pay_stripe", xeroInvoiceId: null, xeroRefundCreditNoteId: null }];
+        }
+      );
+      mocks.linkFindMany.mockResolvedValue(
+        options.links.map((link, index) => ({
+          localModel: "Payment",
+          localId: "pay_stripe",
+          xeroObjectType: "CREDIT_NOTE",
+          xeroObjectId: `cn_${index}`,
+          role: "REFUND_CREDIT_NOTE",
+          metadata: { amountCents: link.amountCents, status: "AUTHORISED" },
+        }))
+      );
+      mocks.operationFindMany.mockImplementation(
+        async (args?: { where?: { entityType?: string; manuallyResolvedAt?: { not: null } } }) =>
+          args?.where?.entityType === "CREDIT_NOTE" && args.where.manuallyResolvedAt
+            ? options.resolved.map((row, index) => ({
+                id: `op_resolved_${index}`,
+                localId: "pay_stripe",
+                correlationKey: `payment:pay_stripe:refund-credit-note:${index}:v2`,
+                requestPayload: row ? { queueType: "REFUND_CREDIT_NOTE", ...row, watermarkCents: 0 } : null,
+              }))
+            : []
+      );
+    }
+    const overCoverage = async () => {
+      const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+        now: new Date("2026-04-13T12:00:00Z"),
+      });
+      return {
+        count: report.summary.overCoveredStripeRefundPayments,
+        items:
+          report.issueSections.find((section) => section.id === "stripe-refund-over-coverage")?.items ?? [],
+      };
+    };
+
+    it("reports over-coverage from resolved notes alone", async () => {
+      armResolved({ links: [], resolved: [{ refundAmountCents: 150 }] });
+      const { count, items } = await overCoverage();
+      expect(count).toBe(1);
+      expect(items[0]?.detail).toContain("$0.00 from active notes less Stripe reversals, $1.50 from notes resolved by hand in Xero");
+    });
+
+    it("reports over-coverage from links and resolved notes together", async () => {
+      armResolved({ links: [{ amountCents: 90 }], resolved: [{ refundAmountCents: 50 }] });
+      const { count, items } = await overCoverage();
+      expect(count).toBe(1);
+      expect(items[0]?.detail).toContain("$0.90 from active notes less Stripe reversals, $0.50 from notes resolved by hand in Xero");
+    });
+
+    it("reports a resolved note whose amount cannot be read, never skipping it", async () => {
+      armResolved({ links: [], resolved: [null] });
+      const { count, items } = await overCoverage();
+      expect(count).toBe(1);
+      expect(items[0]?.detail).toContain("has no readable amount");
+    });
+
+    it("does not report a payment a resolved note covers exactly", async () => {
+      armResolved({ links: [], resolved: [{ refundAmountCents: 100 }] });
+      await expect(overCoverage()).resolves.toMatchObject({ count: 0 });
+    });
+  });
+
+  it("flags a Stripe payment whose active refund-note coverage exceeds the refunded total (#2901 fix round)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: {
+        where?: { source?: string };
+        select?: { refundedAmountCents?: boolean };
+      }) => {
+        if (args?.select?.refundedAmountCents) {
+          return [{ id: "pay_stripe", refundedAmountCents: 100 }];
+        }
+        if (args?.where?.source === "STRIPE") {
+          return [{ id: "pay_stripe" }];
+        }
+        return [
+          {
+            id: "pay_stripe",
+            xeroInvoiceId: null,
+            xeroRefundCreditNoteId: "cn_10",
+          },
+        ];
+      }
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    // 90 + 90 + 10 = 190 active cents against a 100c refund: every link is
+    // legitimately per-delta SHAPED (so stale/duplicate stay 0), which is
+    // exactly why over-coverage needs its own drift class.
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_90",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 90, status: "AUTHORISED" },
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_90_dup",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 90, status: "AUTHORISED" },
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_10",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 10 },
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary).toEqual(
+      expect.objectContaining({
+        staleCanonicalLinks: 0,
+        duplicateActiveCanonicalLinks: 0,
+        overCoveredStripeRefundPayments: 1,
+      })
+    );
+    const section = report.issueSections.find(
+      (issueSection) => issueSection.id === "stripe-refund-over-coverage"
+    );
+    expect(section?.severity).toBe("critical");
+    // #3533: coverage details state amounts.
+    expect(section?.items?.[0]?.detail).toContain("$1.90");
+    expect(section?.items?.[0]?.detail).toContain("$1.00");
+  });
+
+  it("lists a refund note whose row completed with neither its payment nor a skip, and never an account-credit note (#3548)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockResolvedValue([]);
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+    const bareRow = {
+      id: "op_bare",
+      entityType: "CREDIT_NOTE",
+      operationType: "CREATE",
+      status: "SUCCEEDED",
+      localModel: "Payment",
+      localId: "pay_1",
+      xeroObjectId: "cn_9",
+      xeroObjectNumber: "CN-9",
+      requestPayload: { allocation: { invoiceId: "inv_1", amount: 50 }, refundMethod: "card" },
+      responsePayload: { existingCreditNoteId: "cn_9" },
+      manuallyResolvedAt: null,
+      createdAt: new Date("2026-04-01T00:00:00Z"),
+    };
+    // A cancellation taken as account credit: the same entity, operation and
+    // model, no settling payment ever due, so never listed (round 3 R2-1).
+    const accountCreditRow = {
+      ...bareRow,
+      id: "op_account_credit",
+      xeroObjectId: "cn_acct",
+      xeroObjectNumber: "CN-ACCT",
+      requestPayload: { creditNotes: [{ lineItems: [{ unitAmount: 50 }] }] },
+      responsePayload: { creditNotes: [{ creditNoteID: "cn_acct" }] },
+    };
+    mocks.operationFindMany.mockImplementation(async (args?: { where?: { xeroObjectId?: unknown } }) =>
+      args?.where?.xeroObjectId ? [bareRow, accountCreditRow] : []
+    );
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary.unsettledRefundCreditNotes).toBe(1);
+    const section = report.issueSections.find((issueSection) => issueSection.id === "unsettled-refund-credit-notes");
+    expect(section?.severity).toBe("warning");
+    expect(section?.items?.[0]?.detail).toContain("CN-9");
+    expect(section?.items).toHaveLength(1);
+    expect(section?.howToFix).toContain("MAINTENANCE.md");
+  });
+
+  it("flags an account-credit-only cancellation's fictitious note as over-coverage against a ZERO cash target (#2902)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: {
+        where?: { source?: string };
+        select?: { refundedAmountCents?: boolean };
+      }) => {
+        if (args?.select?.refundedAmountCents) {
+          return [
+            { id: "pay_credit", bookingId: "book_1", refundedAmountCents: 100 },
+          ];
+        }
+        if (args?.where?.source === "STRIPE") {
+          return [{ id: "pay_credit" }];
+        }
+        return [
+          {
+            id: "pay_credit",
+            xeroInvoiceId: null,
+            xeroRefundCreditNoteId: "cn_fict",
+          },
+        ];
+      }
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    // Coverage exactly EQUALS the mirror — the pre-#2902 comparison saw no
+    // over-coverage at all, which is precisely how the fictitious note hid.
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Payment",
+        localId: "pay_credit",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_fict",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 100, status: "AUTHORISED" },
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+    mocks.resolveStripeCashRefundEvidence.mockResolvedValue({
+      cashRefundCents: 0,
+      countedRefundCents: 0,
+      refundLedgerRowCount: 0,
+      accountCreditCents: 100,
+      source: "legacy-mirror",
+    });
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary).toEqual(
+      expect.objectContaining({ overCoveredStripeRefundPayments: 1 })
+    );
+    const section = report.issueSections.find(
+      (issueSection) => issueSection.id === "stripe-refund-over-coverage"
+    );
+    expect(section?.items?.[0]?.detail).toContain(
+      "cash target of $0.00"
+    );
+    expect(section?.items?.[0]?.detail).toContain("legacy-mirror");
+  });
+
+  it("still counts duplicate drift for malformed rows sharing a Stripe refund-note scope (#2901 fix round)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: {
+        where?: { source?: string };
+        select?: { refundedAmountCents?: boolean };
+      }) => {
+        if (args?.select?.refundedAmountCents) {
+          return [{ id: "pay_stripe", refundedAmountCents: 100 }];
+        }
+        if (args?.where?.source === "STRIPE") {
+          return [{ id: "pay_stripe" }];
+        }
+        return [
+          {
+            id: "pay_stripe",
+            xeroInvoiceId: null,
+            xeroRefundCreditNoteId: "cn_100",
+          },
+        ];
+      }
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    // The group key is localModel:localId:role, so the two malformed
+    // INVOICE-typed rows share a scope with the legitimate per-delta link.
+    // The exemption is per LINK: the legit link is exempt, the two malformed
+    // rows still form a duplicate group — the same rows the cleanup
+    // deactivates, so report and cleanup agree.
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_100",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 100 },
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_bad_1",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_bad_2",
+        role: "REFUND_CREDIT_NOTE",
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary).toEqual(
+      expect.objectContaining({
+        duplicateActiveCanonicalLinks: 1,
+        // Both malformed rows are also stale, exactly as cleanup treats them.
+        staleCanonicalLinks: 2,
+      })
+    );
+  });
+
+  it("still reports a missing active link for the scalar-pointed Stripe refund note (#2901)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: {
+        where?: { source?: string };
+        select?: { refundedAmountCents?: boolean };
+      }) => {
+        if (args?.select?.refundedAmountCents) {
+          return [{ id: "pay_stripe", refundedAmountCents: 100 }];
+        }
+        return args?.where?.source === "STRIPE"
+          ? [{ id: "pay_stripe" }]
+          : [
+              {
+                id: "pay_stripe",
+                xeroInvoiceId: null,
+                xeroRefundCreditNoteId: "cn_10",
+              },
+            ];
+      }
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    // Only the earlier delta's link is active; the scalar-pointed cn_10 link
+    // is absent, which stays reportable drift until someone REACTIVATES or
+    // recreates it: the nightly backfill deliberately skips any link row that
+    // already exists for the target — active or not — and never flips
+    // `active`, so an inactive cn_10 row is healed by the #2901 operator
+    // repair script (which also repoints the scalar off a deactivated note),
+    // not by the backfill.
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_90",
+        role: "REFUND_CREDIT_NOTE",
+      },
+    ]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary).toEqual(
+      expect.objectContaining({
+        missingPaymentRefundCreditNoteLinks: 1,
+        mismatchedCanonicalLinks: 0,
+        staleCanonicalLinks: 0,
+        duplicateActiveCanonicalLinks: 0,
+      })
+    );
+  });
+});
+
+describe("buildXeroReconciliationReport persistently failing inbound events", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.paymentFindMany.mockResolvedValue([]);
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+    mocks.inboundEventCount.mockResolvedValue(0);
+    mocks.inboundEventFindMany.mockResolvedValue([]);
+  });
+
+  it("surfaces FAILED inbound events older than the age threshold, with redacted errors", async () => {
+    mocks.inboundEventCount.mockResolvedValue(1);
+    mocks.inboundEventFindMany.mockResolvedValue([
+      {
+        id: "inbound_1",
+        correlationKey: "xero-webhook:INVOICE:inv_stuck_1:UPDATE",
+        eventCategory: "INVOICE",
+        eventType: "UPDATE",
+        resourceId: "inv_stuck_1",
+        errorMessage: "Payload rejected: access_token=abcSECRET123 could not be parsed",
+        createdAt: new Date("2026-04-13T09:00:00Z"),
+      },
+    ]);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary.failedInboundEvents).toBe(1);
+    // Only the inbound section contributes issues here, so the counters are 1/1.
+    expect(report.summary.issueCategoryCount).toBe(1);
+    expect(report.summary.issueTotalCount).toBe(1);
+
+    // Query is age-filtered at the DB layer: only events created before the
+    // now-minus-60-minute cutoff are counted / sampled.
+    expect(mocks.inboundEventCount).toHaveBeenCalledWith({
+      where: {
+        status: "FAILED",
+        createdAt: { lt: new Date("2026-04-13T11:00:00Z") },
+      },
+    });
+    expect(mocks.inboundEventFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          status: "FAILED",
+          createdAt: { lt: new Date("2026-04-13T11:00:00Z") },
+        },
+        orderBy: { createdAt: "asc" },
+        take: 5,
+      })
+    );
+
+    const inboundSection = report.issueSections.find(
+      (section) => section.id === "failed-inbound-events"
+    );
+    expect(inboundSection).toMatchObject({
+      id: "failed-inbound-events",
+      severity: "critical",
+      count: 1,
+    });
+    expect(inboundSection?.items).toHaveLength(1);
+
+    const item = inboundSection?.items[0];
+    expect(item).toMatchObject({
+      operationId: "inbound_1",
+      operationStatus: "FAILED",
+      correlationKey: "xero-webhook:INVOICE:inv_stuck_1:UPDATE",
+    });
+    expect(item?.detail).toContain("3 hours");
+    // errorMessage is redacted before it reaches the report/email.
+    expect(item?.latestErrorMessage).toBe(
+      "Payload rejected: access_token=[REDACTED] could not be parsed"
+    );
+    expect(item?.latestErrorMessage).not.toContain("abcSECRET123");
+  });
+
+  it("excludes inbound events newer than the default age threshold via the query cutoff", async () => {
+    // A fresh FAILED event (younger than the 60-minute threshold) is filtered
+    // out at the DB layer, so count is 0 and no section is emitted.
+    mocks.inboundEventCount.mockResolvedValue(0);
+    mocks.inboundEventFindMany.mockResolvedValue([]);
+
+    const report = await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(report.summary.failedInboundEvents).toBe(0);
+    expect(
+      report.issueSections.some((section) => section.id === "failed-inbound-events")
+    ).toBe(false);
+    expect(mocks.inboundEventCount).toHaveBeenCalledWith({
+      where: {
+        status: "FAILED",
+        createdAt: { lt: new Date("2026-04-13T11:00:00Z") },
+      },
+    });
+  });
+
+  it("honours a custom failedInboundMinAgeMinutes threshold", async () => {
+    await buildXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+      failedInboundMinAgeMinutes: 120,
+    });
+
+    expect(mocks.inboundEventCount).toHaveBeenCalledWith({
+      where: {
+        status: "FAILED",
+        createdAt: { lt: new Date("2026-04-13T10:00:00Z") },
+      },
+    });
+  });
+});
+
+describe("sendXeroReconciliationReport", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.paymentFindMany.mockResolvedValue([]);
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.operationCount.mockResolvedValue(0);
+    mocks.inboundEventCount.mockResolvedValue(0);
+    mocks.inboundEventFindMany.mockResolvedValue([]);
+    mocks.notificationDeliveryPolicyFindUnique.mockResolvedValue(null);
+    mocks.sendReconciliationReportAlert.mockResolvedValue(undefined);
+  });
+
+  it("does not email clean reports under the default content-only policy", async () => {
+    const result = await sendXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.deliveryMode).toBe("content_only");
+    expect(result.skippedReason).toBe("no_content");
+    expect(mocks.sendReconciliationReportAlert).not.toHaveBeenCalled();
+  });
+
+  it("emails reports with issues under the default content-only policy", async () => {
+    mocks.memberFindMany.mockResolvedValue([
+      { id: "mem_1", xeroContactId: "contact_1" },
+    ]);
+
+    const result = await sendXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.deliveryMode).toBe("content_only");
+    expect(result.report.summary.issueTotalCount).toBeGreaterThan(0);
+    expect(mocks.sendReconciliationReportAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summary: expect.objectContaining({
+          issueTotalCount: expect.any(Number),
+        }),
+      }),
+    );
+  });
+
+  it("emails clean reports when policy is always", async () => {
+    mocks.notificationDeliveryPolicyFindUnique.mockResolvedValue({
+      templateName: "admin-xero-reconciliation-report",
+      mode: "ALWAYS",
+    });
+
+    const result = await sendXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.deliveryMode).toBe("always");
+    expect(mocks.sendReconciliationReportAlert).toHaveBeenCalled();
+  });
+
+  it("does not email reports with issues when policy is disabled", async () => {
+    mocks.memberFindMany.mockResolvedValue([
+      { id: "mem_1", xeroContactId: "contact_1" },
+    ]);
+    mocks.notificationDeliveryPolicyFindUnique.mockResolvedValue({
+      templateName: "admin-xero-reconciliation-report",
+      mode: "DISABLED",
+    });
+
+    const result = await sendXeroReconciliationReport(CLUB_FORMAT_TEST, {
+      now: new Date("2026-04-13T12:00:00Z"),
+    });
+
+    expect(result.sent).toBe(false);
+    expect(result.deliveryMode).toBe("disabled");
+    expect(result.skippedReason).toBe("disabled");
+    expect(result.report.summary.issueTotalCount).toBeGreaterThan(0);
+    expect(mocks.sendReconciliationReportAlert).not.toHaveBeenCalled();
+  });
+});
+
+describe("backfillHistoricalXeroObjectLinks", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.transaction.mockImplementation(async (callback) =>
+      callback({
+        xeroObjectLink: { findFirst: mocks.linkFindFirst },
+        xeroSyncOperation: {
+          findFirst: mocks.operationFindFirst,
+          create: mocks.operationCreate,
+        },
+      }),
+    );
+    mocks.lockMemberForXeroContactLink.mockResolvedValue({
+      xeroContactId: "contact_1",
+    });
+    mocks.linkFindFirst.mockResolvedValue(null);
+    mocks.operationFindFirst.mockResolvedValue(null);
+    mocks.operationCreate.mockResolvedValue({ id: "operation-member" });
+    mocks.upsertXeroObjectLink.mockResolvedValue({ id: "link-member" });
+    mocks.linkFindMany.mockResolvedValue([]);
+    mocks.operationFindMany.mockResolvedValue([]);
+    mocks.linkCreateMany.mockResolvedValue({ count: 1 });
+    mocks.operationCreateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("creates missing canonical links and synthetic backfill ledger rows", async () => {
+    mocks.memberFindMany.mockResolvedValue([
+      { id: "mem_1", xeroContactId: "contact_1" },
+    ]);
+    mocks.paymentFindMany.mockResolvedValue([
+      {
+        id: "pay_1",
+        xeroInvoiceId: "inv_1",
+        xeroInvoiceNumber: "INV-001",
+        xeroRefundCreditNoteId: "cn_1",
+      },
+    ]);
+    mocks.subscriptionFindMany.mockResolvedValue([
+      {
+        id: "sub_1",
+        seasonYear: 2026,
+        xeroInvoiceId: "subinv_1",
+        xeroInvoiceNumber: "SUB-001",
+        xeroOnlineInvoiceUrl: "https://pay.xero.com/subinv_1",
+      },
+    ]);
+
+    const result = await backfillHistoricalXeroObjectLinks();
+
+    expect(result.totals).toEqual({
+      scanned: 4,
+      createdLinks: 4,
+      createdOperations: 4,
+    });
+    expect(mocks.upsertXeroObjectLink).toHaveBeenCalledWith(
+      expect.objectContaining({
+        localModel: "Member",
+        localId: "mem_1",
+        role: "CONTACT",
+      }),
+      expect.objectContaining({ store: expect.anything() }),
+    );
+    expect(mocks.linkCreateMany).toHaveBeenCalledTimes(3);
+    expect(mocks.operationCreateMany).toHaveBeenCalledTimes(3);
+    expect(mocks.operationCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          operationType: "BACKFILL_LINK",
+          localModel: "Member",
+          localId: "mem_1",
+          status: "SUCCEEDED",
+        }),
+      }),
+    );
+  });
+});
+
+describe("cleanupStaleCanonicalXeroObjectLinks", () => {
+  /** What a scan mock returns, read without recording a call: the heal's re-read sees the same rows. */
+  async function scanRows<T>(mock: typeof mocks.linkFindMany, args: unknown): Promise<T[]> {
+    const impl = mock.getMockImplementation();
+    return ((impl ? await impl(args) : []) ?? []) as T[];
+  }
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.linkUpdateMany.mockResolvedValue({ count: 2 });
+    mocks.healOperationFindFirst.mockResolvedValue(null);
+    // #4161: each heal's own transaction - the link row lock, the re-read
+    // under it, the pointer read and the still-minting refusal.
+    mocks.transaction.mockImplementation(async (callback) =>
+      callback({
+        $executeRaw: mocks.healExecuteRaw,
+        xeroObjectLink: {
+          findUnique: async ({ where }: { where: { id: string } }) => {
+            const row = (await scanRows<{ id: string; active?: boolean }>(mocks.linkFindMany, { where: {} })).find((link) => link.id === where.id);
+            return row ? { ...row, active: row.active ?? true } : null;
+          },
+        },
+        payment: {
+          findUnique: async ({ where }: { where: { id: string } }) =>
+            (await scanRows<{ id: string }>(mocks.paymentFindMany, {})).find((payment) => payment.id === where.id) ?? null,
+        },
+        xeroSyncOperation: { findFirst: mocks.healOperationFindFirst },
+      }),
+    );
+  });
+
+  it("deactivates active canonical links that no longer match the local canonical fields", async () => {
+    mocks.memberFindMany.mockResolvedValue([
+      { id: "mem_1", xeroContactId: "contact_new" },
+    ]);
+    mocks.paymentFindMany.mockResolvedValue([
+      {
+        id: "pay_1",
+        xeroInvoiceId: "inv_1",
+        xeroRefundCreditNoteId: null,
+      },
+    ]);
+    // No REFUND_CREDIT_NOTE links below, so the #2901 source resolution never
+    // issues its payment query — the scan mock above stays single-purpose.
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        id: "link_keep_contact",
+        localModel: "Member",
+        localId: "mem_1",
+        xeroObjectType: "CONTACT",
+        xeroObjectId: "contact_new",
+        role: "CONTACT",
+      },
+      {
+        id: "link_old_contact",
+        localModel: "Member",
+        localId: "mem_1",
+        xeroObjectType: "CONTACT",
+        xeroObjectId: "contact_old",
+        role: "CONTACT",
+      },
+      {
+        id: "link_old_invoice",
+        localModel: "Payment",
+        localId: "pay_1",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_old",
+        role: "PRIMARY_INVOICE",
+      },
+    ]);
+
+    const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+    expect(result).toEqual({
+      completedAt: expect.any(Date),
+      scannedActiveLinks: 3,
+      keptActiveLinks: 1,
+      deactivatedLinks: 2,
+      preservedStripeRefundCreditNoteLinks: 0,
+      cancelledRefundCreditNoteMirrors: 0,
+      healedCancelledRefundCreditNoteMirrors: 0,
+      pointedInactiveCancelledRefundNoteMirrors: 0,
+      releasedInactiveRefundNotePointers: 0,
+      deferredRefundNoteHealLinkIds: [],
+      failedRefundNoteHealLinkIds: [],
+      byCategory: {
+        memberContacts: 1,
+        paymentInvoices: 1,
+        paymentRefundCreditNotes: 0,
+        subscriptionInvoices: 0,
+        otherCanonicalLinks: 0,
+      },
+      deactivatedLinkIds: ["link_old_contact", "link_old_invoice"],
+    });
+    expect(mocks.linkUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: {
+          in: ["link_old_contact", "link_old_invoice"],
+        },
+        active: true,
+      },
+      data: {
+        active: false,
+      },
+    });
+  });
+
+  it("preserves every active Stripe per-delta refund note link, wherever the scalar points (#2901)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: { where?: { source?: string; id?: { in?: string[] } } }) => {
+        if (args?.where?.source === "STRIPE") {
+          // Source resolution is keyed on the LINKS' payment ids (#2901), so a
+          // Stripe payment with a null scalar still shields its notes.
+          expect([...(args.where.id?.in ?? [])].sort()).toEqual([
+            "pay_null_scalar",
+            "pay_stripe",
+          ]);
+          return [{ id: "pay_stripe" }, { id: "pay_null_scalar" }];
+        }
+        return [
+          {
+            id: "pay_stripe",
+            xeroInvoiceId: "inv_1",
+            xeroRefundCreditNoteId: "cn_10",
+          },
+        ];
+      }
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        id: "link_cn_90",
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_90",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        id: "link_cn_10",
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_10",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        // A Stripe payment whose scalar AND invoice pointers are null has no
+        // expectation row at all; pre-#2901 that deactivated its live coverage.
+        id: "link_no_expectation",
+        localModel: "Payment",
+        localId: "pay_null_scalar",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_other",
+        role: "REFUND_CREDIT_NOTE",
+      },
+    ]);
+
+    const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+    expect(result).toEqual({
+      completedAt: expect.any(Date),
+      scannedActiveLinks: 3,
+      keptActiveLinks: 3,
+      deactivatedLinks: 0,
+      preservedStripeRefundCreditNoteLinks: 3,
+      cancelledRefundCreditNoteMirrors: 0,
+      healedCancelledRefundCreditNoteMirrors: 0,
+      pointedInactiveCancelledRefundNoteMirrors: 0,
+      releasedInactiveRefundNotePointers: 0,
+      deferredRefundNoteHealLinkIds: [],
+      failedRefundNoteHealLinkIds: [],
+      byCategory: {
+        memberContacts: 0,
+        paymentInvoices: 0,
+        paymentRefundCreditNotes: 0,
+        subscriptionInvoices: 0,
+        otherCanonicalLinks: 0,
+      },
+      deactivatedLinkIds: [],
+    });
+    expect(mocks.linkUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("deactivates the still-active mirror of a Stripe refund note VOIDED in Xero (#2901 fix round)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE"
+          ? [{ id: "pay_stripe" }]
+          : [
+              {
+                id: "pay_stripe",
+                xeroInvoiceId: "inv_1",
+                xeroRefundCreditNoteId: "cn_10",
+              },
+            ]
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        id: "link_cn_90_live",
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_90",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 90, status: "AUTHORISED" },
+      },
+      {
+        // The operator voided this note in Xero and inbound merged the status,
+        // but the row is still active — phantom coverage that suppressed the
+        // self-heal. The exemption must not shield it.
+        id: "link_cn_10_voided",
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_10",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 10, status: "VOIDED" },
+      },
+      {
+        // No status ever recorded: outbound-created links look like this and
+        // must stay preserved — only an explicit VOIDED/DELETED is drift.
+        id: "link_cn_5_unknown",
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_5",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { amountCents: 5 },
+      },
+    ]);
+    mocks.upsertXeroObjectLink.mockResolvedValue({});
+
+    const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+    expect(result.deactivatedLinkIds).toEqual(["link_cn_10_voided"]);
+    expect(result.deactivatedLinks).toBe(1);
+    expect(result.cancelledRefundCreditNoteMirrors).toBe(1);
+    expect(result.preservedStripeRefundCreditNoteLinks).toBe(2);
+    expect(result.byCategory.paymentRefundCreditNotes).toBe(1);
+    // #4161: healed through the link write, which also releases a pointer
+    // naming the note (here `cn_10`); never flipped directly.
+    expect(mocks.linkUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.upsertXeroObjectLink).toHaveBeenCalledTimes(1);
+    expect(mocks.upsertXeroObjectLink).toHaveBeenCalledWith(
+      expect.objectContaining({
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_10",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { status: "VOIDED" },
+        mergeMetadata: true,
+      }),
+      { store: expect.any(Object) }
+    );
+    expect(mocks.upsertXeroObjectLink.mock.calls[0]?.[0]).not.toHaveProperty("active");
+    // On the heal's own transaction, after the link row lock and then the
+    // payment row, taken NOWAIT.
+    expect(mocks.upsertXeroObjectLink.mock.calls[0]?.[1]).toEqual({ store: expect.any(Object) });
+    expect(mocks.healExecuteRaw).toHaveBeenCalledTimes(2);
+    expect(mocks.healExecuteRaw.mock.calls.map((call) => (call[0] as string[]).join("?"))).toEqual([
+      'SELECT 1 FROM "XeroObjectLink" WHERE "id" = ? FOR UPDATE NOWAIT',
+      'SELECT 1 FROM "Payment" WHERE "id" = ? FOR NO KEY UPDATE NOWAIT',
+    ]);
+  });
+
+  it("keeps single-canonical enforcement for non-Stripe refund notes and malformed or foreign links (#2901)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.paymentFindMany.mockImplementation(
+      async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE"
+          ? [{ id: "pay_stripe" }]
+          : [
+              {
+                id: "pay_ib",
+                xeroInvoiceId: "inv_ib",
+                xeroRefundCreditNoteId: "cn_canonical",
+              },
+              {
+                id: "pay_stripe",
+                xeroInvoiceId: "inv_s",
+                xeroRefundCreditNoteId: "cn_s",
+              },
+            ]
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    mocks.linkFindMany.mockResolvedValue([
+      {
+        // Internet Banking source: the single-note contract still holds, so
+        // the non-canonical note is deactivated.
+        id: "link_ib_keep",
+        localModel: "Payment",
+        localId: "pay_ib",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_canonical",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        id: "link_ib_stale",
+        localModel: "Payment",
+        localId: "pay_ib",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_old",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        // Malformed: a REFUND_CREDIT_NOTE link must target a CREDIT_NOTE, so a
+        // wrong-typed row is stale even on a Stripe payment.
+        id: "link_wrong_type",
+        localModel: "Payment",
+        localId: "pay_stripe",
+        xeroObjectType: "INVOICE",
+        xeroObjectId: "inv_s",
+        role: "REFUND_CREDIT_NOTE",
+      },
+      {
+        // Foreign: no payment row exists for this id, so no source can vouch
+        // for it and it stays subject to cleanup.
+        id: "link_foreign",
+        localModel: "Payment",
+        localId: "pay_missing",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_x",
+        role: "REFUND_CREDIT_NOTE",
+      },
+    ]);
+    mocks.linkUpdateMany.mockResolvedValue({ count: 3 });
+
+    const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+    expect(result.deactivatedLinkIds).toEqual([
+      "link_ib_stale",
+      "link_wrong_type",
+      "link_foreign",
+    ]);
+    expect(result.preservedStripeRefundCreditNoteLinks).toBe(0);
+    expect(result.byCategory.paymentRefundCreditNotes).toBe(3);
+    expect(mocks.linkUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: {
+          in: ["link_ib_stale", "link_wrong_type", "link_foreign"],
+        },
+        active: true,
+      },
+      data: {
+        active: false,
+      },
+    });
+  });
+
+  it("keeps a bank payment's live per-refund notes beside its field's note, or with no field, and retires a VOIDED one (#3880)", async () => {
+    mocks.memberFindMany.mockResolvedValue([]);
+    mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+      args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_handback" }]
+    );
+    mocks.subscriptionFindMany.mockResolvedValue([]);
+    const link = (id: string, localId: string, xeroObjectId: string, metadata: Record<string, unknown> | null) => ({
+      id, localModel: "Payment", localId, xeroObjectType: "CREDIT_NOTE", xeroObjectId, role: "REFUND_CREDIT_NOTE", metadata,
+    });
+    mocks.linkFindMany.mockResolvedValue([
+      link("link_handback", "pay_ib", "cn_handback", { amountCents: 5_000 }),
+      link("link_review", "pay_ib", "cn_review", { amountCents: 3_000, perDelta: true }),
+      // A payment whose field is null: its per-refund note is still live coverage.
+      link("link_review_nofield", "pay_ib_nofield", "cn_review_2", { amountCents: 2_000, perDelta: true }),
+      link("link_review_voided", "pay_ib", "cn_review_voided", { amountCents: 1_000, perDelta: true, status: "VOIDED" }),
+      // Not stamped per-refund: the single-note contract still retires it.
+      link("link_old", "pay_ib", "cn_old", { amountCents: 1_000 }),
+    ]);
+    mocks.linkUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.upsertXeroObjectLink.mockResolvedValue({});
+
+    const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+    // Flipped links first, then the mirrors healed through the link write.
+    expect(result.deactivatedLinkIds).toEqual(["link_old", "link_review_voided"]);
+    expect(result.deactivatedLinks).toBe(2);
+    expect(result.preservedStripeRefundCreditNoteLinks).toBe(2);
+    expect(mocks.linkUpdateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["link_old"] }, active: true },
+      data: { active: false },
+    });
+    expect(mocks.upsertXeroObjectLink).toHaveBeenCalledWith(
+      expect.objectContaining({ localId: "pay_ib", xeroObjectId: "cn_review_voided", metadata: { status: "VOIDED" } }),
+      { store: expect.any(Object) }
+    );
+  });
+
+  describe("#4161: a bank-transfer payment's canonical note voided before #4091", () => {
+    const link = (id: string, xeroObjectId: string, metadata: Record<string, unknown> | null, extra: Record<string, unknown> = {}) => ({
+      id, localModel: "Payment", localId: "pay_ib", xeroObjectType: "CREDIT_NOTE", xeroObjectId, role: "REFUND_CREDIT_NOTE",
+      xeroObjectNumber: `CN-${xeroObjectId}`, xeroObjectUrl: `https://go.xero.com/x/${xeroObjectId}`, metadata, ...extra,
+    });
+    beforeEach(() => {
+      mocks.memberFindMany.mockResolvedValue([]);
+      mocks.subscriptionFindMany.mockResolvedValue([]);
+      mocks.upsertXeroObjectLink.mockResolvedValue({});
+    });
+
+    it("counts the active mirror its pointer still names and heals it through the link write, recorded fields passed back", async () => {
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_voided" }]
+      );
+      mocks.linkFindMany.mockResolvedValue([
+        // Matches the pointer, so the expectation check alone kept it active.
+        link("link_voided", "cn_voided", { amountCents: 5_000, status: " deleted " }),
+      ]);
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(result.cancelledRefundCreditNoteMirrors).toBe(1);
+      expect(result.deactivatedLinks).toBe(1);
+      expect(result.keptActiveLinks).toBe(0);
+      expect(result.deactivatedLinkIds).toEqual(["link_voided"]);
+      expect(result.byCategory.paymentRefundCreditNotes).toBe(1);
+      expect(mocks.linkUpdateMany).not.toHaveBeenCalled();
+      // Only the recorded status, as recorded, merged: no other metadata key moves.
+      expect(mocks.upsertXeroObjectLink).toHaveBeenCalledWith({
+        localModel: "Payment",
+        localId: "pay_ib",
+        xeroObjectType: "CREDIT_NOTE",
+        xeroObjectId: "cn_voided",
+        xeroObjectNumber: "CN-cn_voided",
+        xeroObjectUrl: "https://go.xero.com/x/cn_voided",
+        role: "REFUND_CREDIT_NOTE",
+        metadata: { status: " deleted " },
+        mergeMetadata: true,
+      }, { store: expect.any(Object) });
+      expect(result.healedCancelledRefundCreditNoteMirrors).toBe(1);
+    });
+
+    it("leaves a live canonical note, an unrecorded status and a malformed voided link to the ordinary rules", async () => {
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_live" }]
+      );
+      mocks.linkFindMany.mockResolvedValue([
+        link("link_live", "cn_live", { amountCents: 5_000, status: "AUTHORISED" }),
+        // A wrong-typed refund link is stale by the ordinary rule, not healed.
+        link("link_malformed", "inv_x", { status: "VOIDED" }, { xeroObjectType: "INVOICE" }),
+      ]);
+      mocks.linkUpdateMany.mockResolvedValue({ count: 1 });
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(result.cancelledRefundCreditNoteMirrors).toBe(0);
+      expect(result.deactivatedLinkIds).toEqual(["link_malformed"]);
+      expect(mocks.upsertXeroObjectLink).not.toHaveBeenCalled();
+    });
+
+    it("tries every mirror when one write fails, then fails the task naming the link left for the next run", async () => {
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_a" }]
+      );
+      mocks.linkFindMany.mockResolvedValue([
+        link("link_a", "cn_a", { status: "VOIDED" }),
+        link("link_b", "cn_b", { status: "VOIDED" }),
+      ]);
+      mocks.upsertXeroObjectLink.mockRejectedValueOnce(new Error("deadlock")).mockResolvedValueOnce({});
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(mocks.upsertXeroObjectLink).toHaveBeenCalledTimes(2);
+      // Returned, not thrown, and only the heal that landed is counted.
+      expect(result.failedRefundNoteHealLinkIds).toEqual(["link_a"]);
+      expect(result.healedCancelledRefundCreditNoteMirrors).toBe(1);
+      expect(result.deactivatedLinks).toBe(1);
+      expect(result.deactivatedLinkIds).toEqual(["link_b"]);
+      expect(canonicalLinkCleanupFailureMessage(result)).toMatch(/1 refund-note link.*link_a/);
+      expect(canonicalLinkCleanupFailureMessage({ failedRefundNoteHealLinkIds: [] })).toBeNull();
+    });
+
+    it("re-checks under the row lock: a mirror no longer active or no longer cancelled is skipped with no write and not counted", async () => {
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_a" }]
+      );
+      const scanned = [link("link_a", "cn_a", { status: "VOIDED" }), link("link_b", "cn_b", { status: "VOIDED" })];
+      mocks.linkFindMany.mockResolvedValue(scanned);
+      // Between the scan and the lock: link_a was deactivated, link_b's status changed.
+      mocks.transaction.mockImplementation(async (callback) =>
+        callback({
+          $executeRaw: mocks.healExecuteRaw,
+          xeroObjectLink: {
+            findUnique: async ({ where }: { where: { id: string } }) =>
+              where.id === "link_a" ? { ...scanned[0], active: false } : { ...scanned[1], active: true, metadata: { status: "AUTHORISED" } },
+          },
+          payment: { findUnique: async () => ({ xeroRefundCreditNoteId: "cn_a" }) },
+          xeroSyncOperation: { findFirst: mocks.healOperationFindFirst },
+        }),
+      );
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(mocks.upsertXeroObjectLink).not.toHaveBeenCalled();
+      expect(result.cancelledRefundCreditNoteMirrors).toBe(2);
+      expect(result.healedCancelledRefundCreditNoteMirrors).toBe(0);
+      expect(result.deactivatedLinks).toBe(0);
+      expect(result.deactivatedLinkIds).toEqual([]);
+    });
+
+    it("defers, with no write and no wait, when a payment-first writer holds the payment row (55P03 from NOWAIT)", async () => {
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_a" }]
+      );
+      mocks.linkFindMany.mockResolvedValue([link("link_a", "cn_a", { status: "VOIDED" })]);
+      // The link lock succeeds; the payment lock is refused at once.
+      mocks.healExecuteRaw.mockResolvedValueOnce(1).mockRejectedValueOnce({ code: "P2010", meta: { code: "55P03" } });
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(mocks.upsertXeroObjectLink).not.toHaveBeenCalled();
+      expect(result.deferredRefundNoteHealLinkIds).toEqual(["link_a"]);
+      expect(result.failedRefundNoteHealLinkIds).toEqual([]);
+      expect(result.deactivatedLinks).toBe(0);
+    });
+
+    it("counts any other database error as a failed heal, not a deferral", async () => {
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_a" }]
+      );
+      mocks.linkFindMany.mockResolvedValue([link("link_a", "cn_a", { status: "VOIDED" })]);
+      mocks.healExecuteRaw.mockResolvedValueOnce(1).mockRejectedValueOnce({ code: "P2010", meta: { code: "40P01" } });
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(result.failedRefundNoteHealLinkIds).toEqual(["link_a"]);
+      expect(result.deferredRefundNoteHealLinkIds).toEqual([]);
+    });
+
+    it("defers, with no write, a payment with a credit-note operation that could still mint (the create records payment-then-link)", async () => {
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE" ? [] : [{ id: "pay_ib", xeroInvoiceId: "inv_ib", xeroRefundCreditNoteId: "cn_a" }]
+      );
+      mocks.linkFindMany.mockResolvedValue([link("link_a", "cn_a", { status: "VOIDED" })]);
+      mocks.healOperationFindFirst.mockResolvedValue({ id: "op_running" });
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(mocks.upsertXeroObjectLink).not.toHaveBeenCalled();
+      expect(result.deferredRefundNoteHealLinkIds).toEqual(["link_a"]);
+      expect(result.failedRefundNoteHealLinkIds).toEqual([]);
+      expect(result.deactivatedLinks).toBe(0);
+      expect(canonicalLinkCleanupFailureMessage(result)).toBeNull();
+      // The refusal is the #2901 repair's own, scoped to this payment.
+      expect(mocks.healOperationFindFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ localId: "pay_ib", entityType: "CREDIT_NOTE" }) })
+      );
+    });
+  });
+
+  describe("#4192: a pointer that still names its own inactive cancelled mirror", () => {
+    const link = (id: string, localId: string, xeroObjectId: string, active: boolean, metadata: Record<string, unknown> | null) => ({
+      id, localModel: "Payment", localId, xeroObjectType: "CREDIT_NOTE", xeroObjectId, role: "REFUND_CREDIT_NOTE",
+      xeroObjectNumber: null, xeroObjectUrl: null, active, metadata,
+    });
+    const inactive = [
+      link("link_pointed", "pay_card", "cn_latest", false, { amountCents: 500, status: "VOIDED" }),
+      // Not named by its payment's pointer: left alone.
+      link("link_unpointed", "pay_card", "cn_old", false, { status: "VOIDED" }),
+      // Named, but its status is unknown or live: never touched (#2901 refuses those too).
+      link("link_unknown", "pay_other", "cn_unknown", false, { amountCents: 100 }),
+      // Another payment's mirror of the pointed note id: the pair must match.
+      link("link_decoy", "pay_other", "cn_latest", false, { status: "VOIDED" }),
+    ];
+    beforeEach(() => {
+      mocks.memberFindMany.mockResolvedValue([]);
+      mocks.subscriptionFindMany.mockResolvedValue([]);
+      mocks.upsertXeroObjectLink.mockResolvedValue({});
+      mocks.paymentFindMany.mockImplementation(async (args?: { where?: { source?: string } }) =>
+        args?.where?.source === "STRIPE"
+          ? [{ id: "pay_card" }]
+          : [
+              { id: "pay_card", xeroInvoiceId: "inv_card", xeroRefundCreditNoteId: "cn_latest" },
+              { id: "pay_other", xeroInvoiceId: null, xeroRefundCreditNoteId: "cn_unknown" },
+            ]
+      );
+      mocks.linkFindMany.mockImplementation(async (args?: { where?: { active?: boolean } }) =>
+        args?.where?.active === false ? inactive : args?.where?.active === true ? [] : inactive
+      );
+    });
+
+    it("counts it first and routes it through the link write's pointer release, apart from the active-link counts", async () => {
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(result.pointedInactiveCancelledRefundNoteMirrors).toBe(1);
+      expect(result.releasedInactiveRefundNotePointers).toBe(1);
+      expect(result.scannedActiveLinks).toBe(0);
+      expect(result.keptActiveLinks).toBe(0);
+      expect(result.deactivatedLinks).toBe(0);
+      expect(mocks.upsertXeroObjectLink).toHaveBeenCalledTimes(1);
+      expect(mocks.upsertXeroObjectLink).toHaveBeenCalledWith(
+        expect.objectContaining({ localId: "pay_card", xeroObjectId: "cn_latest", metadata: { status: "VOIDED" }, mergeMetadata: true }),
+        { store: expect.any(Object) }
+      );
+      // The candidate query is scoped to inactive refund-note mirrors of the scanned pointers.
+      expect(mocks.linkFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ active: false, localId: { in: ["pay_card", "pay_other"] }, xeroObjectId: { in: ["cn_latest", "cn_unknown"] } }),
+        })
+      );
+    });
+
+    it("skips it with no write when the pointer moved after the scan", async () => {
+      mocks.transaction.mockImplementation(async (callback) =>
+        callback({
+          $executeRaw: mocks.healExecuteRaw,
+          xeroObjectLink: { findUnique: async () => inactive[0] },
+          payment: { findUnique: async () => ({ xeroRefundCreditNoteId: "cn_other_live" }) },
+          xeroSyncOperation: { findFirst: mocks.healOperationFindFirst },
+        }),
+      );
+
+      const result = await cleanupStaleCanonicalXeroObjectLinks();
+
+      expect(result.pointedInactiveCancelledRefundNoteMirrors).toBe(1);
+      expect(result.releasedInactiveRefundNotePointers).toBe(0);
+      expect(mocks.upsertXeroObjectLink).not.toHaveBeenCalled();
+    });
+  });
+});

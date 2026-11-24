@@ -1,0 +1,143 @@
+import { revalidatePath } from "next/cache";
+import { revalidateAdminPage } from "@/lib/admin-page-revalidation";
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { createAuditLog, getAuditRequestContext } from "@/lib/audit";
+import {
+  getFinanceReportMappingsState,
+  saveFinanceReportMappings,
+} from "@/lib/finance-report-mappings";
+import { hasFinanceManagerAccess } from "@/lib/admin-permissions";
+import { clubFormatValues } from "@/lib/club-format-server";
+import { loadFinanceAccessMember } from "@/lib/finance-auth";
+import { requireAdmin } from "@/lib/session-guards";
+import { parseJsonRequestBody } from "@/lib/api-json";
+
+const mappingSchema = z.object({
+  id: z.string().optional(),
+  accountCode: z.string().min(1, "Account code is required"),
+});
+
+const categorySchema = z.object({
+  id: z.string().optional(),
+  kind: z.enum(["REVENUE", "EXPENSE"]),
+  name: z.string(),
+  subtype: z
+    .string()
+    .max(120)
+    .nullable()
+    .optional()
+    .transform((value) => value ?? null),
+  sortOrder: z.number().int().nonnegative().optional(),
+  archived: z.boolean().optional(),
+  mappings: z.array(mappingSchema).optional(),
+});
+
+const saveSchema = z.object({
+  categories: z.array(categorySchema).min(1),
+});
+
+async function requireFinanceSetupWriteAccess() {
+  const guard = await requireAdmin({
+    permission: { area: "finance", level: "edit" },
+  });
+  if (!guard.ok) {
+    return guard;
+  }
+
+  const member = await loadFinanceAccessMember(guard.session.user.id);
+  if (!member || !hasFinanceManagerAccess(member)) {
+    return {
+      ok: false as const,
+      response: NextResponse.json(
+        { error: "Admin finance manager access required" },
+        { status: 403 },
+      ),
+    };
+  }
+
+  return {
+    ok: true as const,
+    session: guard.session,
+    member,
+  };
+}
+
+export async function GET() {
+  const guard = await requireAdmin({
+    permission: { area: "finance", level: "view" },
+  });
+  if (!guard.ok) {
+    return guard.response;
+  }
+
+  // The club's format (#3565), resolved once per request and passed down.
+  const format = await clubFormatValues();
+  const state = await getFinanceReportMappingsState(format);
+  return NextResponse.json(state);
+}
+
+export async function PUT(request: NextRequest) {
+  const guard = await requireFinanceSetupWriteAccess();
+  if (!guard.ok) {
+    return guard.response;
+  }
+
+  const jsonBody = await parseJsonRequestBody(request, {
+    error: "Invalid JSON",
+  });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = saveSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid input", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  // The club's format (#3565), resolved once per request, before the save.
+  const format = await clubFormatValues();
+
+  try {
+    await saveFinanceReportMappings(parsed.data);
+  } catch (error) {
+    const validationErrors = (error as Error & { validationErrors?: string[] })
+      .validationErrors;
+    if (validationErrors) {
+      return NextResponse.json(
+        { error: "Invalid finance report mappings", details: validationErrors },
+        { status: 400 },
+      );
+    }
+    throw error;
+  }
+
+  const auditRequest = getAuditRequestContext(request) ?? {};
+  await createAuditLog({
+    action: "finance_report_mappings.save",
+    memberId: guard.member.id,
+    actorMemberId: guard.member.id,
+    category: "xero",
+    severity: "important",
+    outcome: "success",
+    summary: "Finance report category mappings saved",
+    metadata: {
+      categoryCount: parsed.data.categories.length,
+      mappingCount: parsed.data.categories.reduce(
+        (total, category) => total + (category.mappings?.length ?? 0),
+        0,
+      ),
+    },
+    requestId: auditRequest.id ?? null,
+    ipAddress: auditRequest.ipAddress ?? null,
+    userAgent: auditRequest.userAgent ?? null,
+  });
+
+  revalidatePath("/finance");
+  revalidateAdminPage("setup");
+  revalidateAdminPage("setup-finance");
+
+  return NextResponse.json(await getFinanceReportMappingsState(format));
+}

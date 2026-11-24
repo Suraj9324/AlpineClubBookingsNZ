@@ -1,0 +1,307 @@
+export const PAYMENT_RECEIVED_STATUS_UNCONFIRMED_CODE =
+  "PAYMENT_RECEIVED_STATUS_UNCONFIRMED" as const;
+
+export const PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE =
+  "Your card payment was received, but we could not confirm the booking status. Reload the booking and check its payment status before trying any payment again.";
+
+export const PAYMENT_RECEIVED_STATUS_UNCONFIRMED_BODY = Object.freeze({
+  code: PAYMENT_RECEIVED_STATUS_UNCONFIRMED_CODE,
+  error: PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE,
+  paymentReceived: true as const,
+  bookingStatusUnconfirmed: true as const,
+});
+
+export const EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_CODE =
+  "EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED" as const;
+
+export const EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE =
+  "An existing successful card transaction was found, but we could not confirm whether it is still paid or has been refunded. Reload the booking and verify its payment status before trying any payment again.";
+
+export const EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_BODY = Object.freeze({
+  code: EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_CODE,
+  error: EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE,
+  existingCardTransactionFound: true as const,
+  paymentStatusUnconfirmed: true as const,
+});
+
+// #4955: the pay link's payment-intent door refusing because the booking is
+// already paid (or completed). The client reads it as the server saying "paid";
+// the link's other used/expired 410s carry no code and stay unconfirmed.
+export const BOOKING_ALREADY_PAID_CODE = "BOOKING_ALREADY_PAID" as const;
+
+// #3567: an intent in the club's previous currency is still `processing` (a bank
+// debit, say), so it is neither handed back nor superseded; the member waits.
+export const PAYMENT_PROCESSING_CODE = "PAYMENT_PROCESSING" as const;
+
+export const PAYMENT_PROCESSING_MESSAGE =
+  "This payment is being processed. Refresh the page in a minute to see it confirmed.";
+
+/** ALP-569: the heading over `PAYMENT_PROCESSING_MESSAGE` on every card surface. */
+export const PAYMENT_PROCESSING_HEADING = "Payment being processed";
+
+/** #4955 / ALP-569: shown while a card surface asks the server what a payment did. */
+export const CHECKING_PAYMENT_MESSAGE = "Checking your payment...";
+
+export const PAYMENT_PROCESSING_BODY = Object.freeze({
+  code: PAYMENT_PROCESSING_CODE,
+  error: PAYMENT_PROCESSING_MESSAGE,
+});
+
+/**
+ * #4300 (`INV-PAY-138`): the same refusal as `PAYMENT_PROCESSING_BODY` (same
+ * code, so every page already handles it), for an intent an edit superseded:
+ * if it completes, it is going back, not confirming the booking.
+ */
+export const SUPERSEDED_PAYMENT_PROCESSING_MESSAGE =
+  "An earlier payment for an out-of-date amount is still processing; if it completes, it will be returned to your card.";
+
+export const SUPERSEDED_PAYMENT_PROCESSING_BODY = Object.freeze({
+  code: PAYMENT_PROCESSING_CODE,
+  error: SUPERSEDED_PAYMENT_PROCESSING_MESSAGE,
+});
+
+export function isPaymentProcessing(value: unknown): value is { code: typeof PAYMENT_PROCESSING_CODE; error: string } {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.code === PAYMENT_PROCESSING_CODE && typeof candidate.error === "string";
+}
+
+// #3864: the pay step left the member's stored credit election unspent because
+// an earlier card intent could not be confirmed dead. The booking is still
+// payable; the member retries. One code, two server-written reasons.
+export const CREDIT_ELECTION_NOT_APPLIED_CODE = "CREDIT_ELECTION_NOT_APPLIED" as const;
+
+export const CREDIT_ELECTION_NOT_APPLIED_BODIES = Object.freeze({
+  cancelUnconfirmed: Object.freeze({
+    code: CREDIT_ELECTION_NOT_APPLIED_CODE,
+    error:
+      "We couldn't confirm your earlier card payment was cancelled, so your account credit has not been applied yet. Please try again in a few minutes.",
+  }),
+  otherPaymentStarted: Object.freeze({
+    code: CREDIT_ELECTION_NOT_APPLIED_CODE,
+    error:
+      "Another card payment for this booking was started while this one was opening, so your account credit has not been applied yet. Reload the page and try again.",
+  }),
+});
+
+export function isCreditElectionNotApplied(value: unknown): value is { code: typeof CREDIT_ELECTION_NOT_APPLIED_CODE; error: string } {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.code === CREDIT_ELECTION_NOT_APPLIED_CODE && typeof candidate.error === "string";
+}
+
+/**
+ * #3641 / #3635: Stripe already holds an additional (modification) payment —
+ * `succeeded` or `requires_capture` — and our rows have not caught up yet. The
+ * additional-payment-secret route answers this instead of a second form, and
+ * the card shows it as paid. A `processing` intent is NOT this: it can still
+ * fail, so it answers {@link PAYMENT_PROCESSING_BODY} instead.
+ */
+export const ADDITIONAL_PAYMENT_ALREADY_MADE_CODE =
+  "ADDITIONAL_PAYMENT_ALREADY_MADE" as const;
+
+export const ADDITIONAL_PAYMENT_ALREADY_MADE_MESSAGE =
+  "This payment has already been made. Refresh the page to see it.";
+
+export const ADDITIONAL_PAYMENT_ALREADY_MADE_BODY = Object.freeze({
+  code: ADDITIONAL_PAYMENT_ALREADY_MADE_CODE,
+  error: ADDITIONAL_PAYMENT_ALREADY_MADE_MESSAGE,
+});
+
+/**
+ * #4442: the additional ask changed (paid from another tab, or replaced by a
+ * later change) while the pay page was re-issuing it in the club's currency.
+ * Nothing was written or offered; a reload reads the pay door afresh.
+ */
+export const ADDITIONAL_PAYMENT_CHANGED_CODE = "ADDITIONAL_PAYMENT_CHANGED" as const;
+
+export const ADDITIONAL_PAYMENT_CHANGED_MESSAGE =
+  "This payment changed while it was being prepared. Reload the page to see what is still owed.";
+
+export const ADDITIONAL_PAYMENT_CHANGED_BODY = Object.freeze({
+  code: ADDITIONAL_PAYMENT_CHANGED_CODE,
+  error: ADDITIONAL_PAYMENT_CHANGED_MESSAGE,
+});
+
+export function isAdditionalPaymentAlreadyMade(
+  value: unknown,
+): value is typeof ADDITIONAL_PAYMENT_ALREADY_MADE_BODY {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.code === ADDITIONAL_PAYMENT_ALREADY_MADE_CODE &&
+    typeof candidate.error === "string"
+  );
+}
+
+export const REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_CODE =
+  "REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED" as const;
+
+export const REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_MESSAGE =
+  "This card payment was already refunded. Reload the booking before starting a new payment.";
+
+export const REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_BODY = Object.freeze({
+  code: REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_CODE,
+  error: REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_MESSAGE,
+  paymentRefunded: true as const,
+  repaymentRequired: true as const,
+});
+
+/**
+ * #4300 (`INV-PAY-138`): the card payment the member just made was on an intent
+ * an edit had superseded, so the superseded-intent machinery is sending it back
+ * and the booking still waits for its money. Not a failure, and not "payment
+ * received" either: the member pays the amount the booking shows now. Worded
+ * so it never promises a refund the machinery might not complete by itself.
+ */
+export const SUPERSEDED_CARD_PAYMENT_REFUNDING_CODE =
+  "SUPERSEDED_CARD_PAYMENT_REFUNDING" as const;
+
+export const SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE =
+  "This card payment was for an earlier version of the booking, so it will be returned to your card; the club will contact you if it cannot be. Reload the booking and pay the amount it shows now.";
+
+/** #4300: the `/pay` link's wording of the same refusal, matching its "Reload payment status" button. */
+export const SUPERSEDED_CARD_PAYMENT_REFUNDING_LINK_MESSAGE =
+  "This card payment was for an earlier version of the booking, so it will be returned to your card; the club will contact you if it cannot be. Reload the payment status to pay the amount the booking shows now.";
+
+/**
+ * #4300: what a saved-card door (an admin's or the cron's charge) answers when
+ * the settle refused its capture as superseded: taken, going back, not paid.
+ */
+export const SUPERSEDED_CHARGE_NOT_SETTLED_CODE = "SUPERSEDED_CHARGE_NOT_SETTLED" as const;
+
+export const SUPERSEDED_CHARGE_NOT_SETTLED_MESSAGE =
+  "The charge was taken on a payment a later change had replaced, so it is being returned to the card and the booking is not paid: it still owes, and it is back to waiting for payment. Admins have been alerted.";
+
+/**
+ * Deliberately WITHOUT `paymentReceived`/`finalisationPending`: those say
+ * "money arrived, do not charge again", and this money is going back.
+ */
+export const SUPERSEDED_CHARGE_NOT_SETTLED_BODY = Object.freeze({
+  code: SUPERSEDED_CHARGE_NOT_SETTLED_CODE,
+  error: SUPERSEDED_CHARGE_NOT_SETTLED_MESSAGE,
+  chargeReturning: true as const,
+});
+
+export function isSupersededChargeNotSettled(value: unknown): value is typeof SUPERSEDED_CHARGE_NOT_SETTLED_BODY {
+  return !!value && typeof value === "object" && (value as Record<string, unknown>).code === SUPERSEDED_CHARGE_NOT_SETTLED_CODE;
+}
+
+/**
+ * #4300: the `/pay` link's notice beside a fresh payment, when the payer's
+ * earlier payment was superseded (`previousPaymentRefunding`).
+ */
+export const PREVIOUS_PAYMENT_REFUNDING_NOTICE =
+  "Your earlier card payment was for an out-of-date amount, so it will be returned to your card; the club will contact you if it cannot be. Pay the amount below to complete the booking.";
+
+export const SUPERSEDED_CARD_PAYMENT_REFUNDING_BODY = Object.freeze({
+  code: SUPERSEDED_CARD_PAYMENT_REFUNDING_CODE,
+  error: SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE,
+  paymentRefunding: true as const,
+  repaymentRequired: true as const,
+});
+
+export function isSupersededCardPaymentRefunding(
+  value: unknown,
+): value is typeof SUPERSEDED_CARD_PAYMENT_REFUNDING_BODY {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.code === SUPERSEDED_CARD_PAYMENT_REFUNDING_CODE &&
+    candidate.paymentRefunding === true &&
+    candidate.repaymentRequired === true
+  );
+}
+
+export type PaymentReceivedFinalisationPending = Readonly<{
+  paymentReceived: true;
+  finalisationPending: true;
+}>;
+
+/**
+ * Positive, provider-safe proof that money was received before a later local
+ * finalisation step failed. Consumers must suppress every payment action as
+ * soon as these two facts are present; the error code identifies the local
+ * cause, but is not what proves the captured-money phase.
+ */
+export function isPaymentReceivedFinalisationPending(
+  value: unknown,
+): value is PaymentReceivedFinalisationPending {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.paymentReceived === true &&
+    candidate.finalisationPending === true
+  );
+}
+
+export function isPaymentReceivedStatusUnconfirmed(
+  value: unknown,
+): value is typeof PAYMENT_RECEIVED_STATUS_UNCONFIRMED_BODY {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.code === PAYMENT_RECEIVED_STATUS_UNCONFIRMED_CODE &&
+    candidate.paymentReceived === true &&
+    candidate.bookingStatusUnconfirmed === true &&
+    candidate.finalisationPending !== true
+  );
+}
+
+export function isExistingCardTransactionStatusUnconfirmed(
+  value: unknown,
+): value is typeof EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_BODY {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.code === EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_CODE ||
+      candidate.code === "HOSTING_COVERAGE_PARTICIPANT_RETRY") &&
+    candidate.existingCardTransactionFound === true &&
+    candidate.paymentStatusUnconfirmed === true &&
+    candidate.paymentReceived !== true &&
+    candidate.finalisationPending !== true
+  );
+}
+
+export function isRefundedCardTransactionRepaymentRequired(
+  value: unknown,
+): value is typeof REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_BODY {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.code === REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_CODE &&
+    candidate.paymentRefunded === true &&
+    candidate.repaymentRequired === true &&
+    candidate.paymentReceived !== true
+  );
+}
+
+/**
+ * #3638 (`INV-PAY-102`): the booking is being paid by Internet Banking — it
+ * switched before this request, or while its card intent was being minted — so
+ * a card door refuses a card payment beside the emailed invoice. THE ONE body
+ * for that refusal, sent by both card doors (the session pay route and the
+ * `/pay/<token>` link), and worded for either reader: the member on their
+ * booking page or a payer holding only the link. A pure leaf, so a page can
+ * recognise it without importing the server module that sends it.
+ */
+export const SWITCHED_TO_INTERNET_BANKING_CODE =
+  "SWITCHED_TO_INTERNET_BANKING" as const;
+
+export const SWITCHED_TO_INTERNET_BANKING_MESSAGE =
+  "This booking is being paid by Internet Banking, so it can't be paid by card. Pay by bank transfer using the booking's Internet Banking details instead.";
+
+export const SWITCHED_TO_INTERNET_BANKING_BODY = Object.freeze({
+  code: SWITCHED_TO_INTERNET_BANKING_CODE,
+  error: SWITCHED_TO_INTERNET_BANKING_MESSAGE,
+});
+
+export function isSwitchedToInternetBanking(
+  value: unknown,
+): value is typeof SWITCHED_TO_INTERNET_BANKING_BODY {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    (value as Record<string, unknown>).code === SWITCHED_TO_INTERNET_BANKING_CODE
+  );
+}

@@ -1,0 +1,666 @@
+/**
+ * Encrypted integration credential store (guided provider setup — #2079).
+ *
+ * The database is the ONLY source of provider credentials. This module is the
+ * shared surface every guided-setup lane (Xero here; Stripe/Google/Backup
+ * later) reads and writes through: write-only setters, cache-aware async
+ * getters, the canonical per-provider STATE MODEL, and the unified re-entry
+ * aggregate.
+ *
+ * CROSS-PROCESS CACHE (binding contract — issue #2079):
+ * production runs three containers (blue/green web slots + cron-leader,
+ * docker-compose.yml). A wizard write lands in one web slot; the cron-leader
+ * (Xero sync, payment sync, backups) must observe it without a restart. So:
+ *   - entries carry a SHORT TTL (CACHE_TTL_MS, 30-60s) — a fresh write is
+ *     visible to a cold reader in another process within the TTL;
+ *   - the writing process invalidates its own cache immediately;
+ *   - NEGATIVE results ("provider not configured") are cached, but only for the
+ *     TTL — they expire, they are never remembered indefinitely;
+ *   - a DB ERROR is never converted into a remembered negative: the error
+ *     propagates and nothing is cached.
+ * The derived key + decrypt are synchronous (integration-crypto.ts); only the
+ * ciphertext fetch here is async.
+ */
+
+import type { IntegrationCredential, Prisma } from "@prisma/client";
+import type { IntegrationCredentialNamespace } from "@/lib/integration-credential-namespaces";
+import { prisma } from "@/lib/prisma";
+import {
+  applyCredentialWrite,
+  readRowForWrite,
+  type CredentialRowWrite,
+} from "@/lib/integration-credential-claim";
+import {
+  assertCredentialActor,
+  assertCredentialDeleteExpectation,
+  assertCredentialWriteExpectation,
+  credentialActorMemberId,
+  credentialVersionOf,
+  describeCredentialExpectation,
+  recordCredentialMutation,
+  CREDENTIAL_AUDIT_ACTIONS,
+  StaleCredentialWriteError,
+  type CredentialActor,
+  type CredentialMutationCause,
+  type CredentialDeleteExpectation,
+  type CredentialRequestContext,
+  type CredentialVersion,
+  type CredentialWriteExpectation,
+} from "@/lib/integration-credential-actor";
+import {
+  CredentialDecryptError,
+  DATA_KEY_SOURCE_PREFIX,
+  decryptCredential,
+  encryptCredential,
+  getAuthSecretWithSource,
+  type WrappingKeySource,
+} from "@/lib/integration-crypto";
+import { assertLegacyWriteAllowed } from "@/lib/data-encryption-legacy-write-guard";
+
+/** Cross-process cache TTL. Kept inside the binding 30-60s window. */
+export const CACHE_TTL_MS = 45_000;
+
+/**
+ * Longest credential VALUE any admin route may hand this store.
+ *
+ * It is a fact about what a credential is, not about one route, so it lives
+ * beside the store rather than being re-typed at each door. It was `4096` in the
+ * shared credentials route; #2940 opened a second door and copied the literal
+ * with a comment saying it was copying it, which is the moment a fact stops
+ * having one home. Nothing enforces it at the column — `ciphertext` is an
+ * unbounded Postgres text — so this is the only bound there is, and two doors
+ * disagreeing about it would mean a value one route stores and the other
+ * refuses.
+ *
+ * The figure itself is a sanity cap rather than a protocol limit: it clears an
+ * RSA-4096 PEM private key and every provider secret this application holds,
+ * while refusing a megabyte of request body that would be encrypted, stored and
+ * then read back on every cache miss.
+ */
+export const INTEGRATION_CREDENTIAL_VALUE_MAX_LENGTH = 4096;
+
+interface CachedProvider {
+  fetchedAt: number;
+  rows: Map<string, IntegrationCredential>;
+}
+
+// Module-scoped, per-process cache. Cleared on write in the writing process;
+// other processes re-read once their entry ages past the TTL.
+const providerCache = new Map<IntegrationCredentialNamespace, CachedProvider>();
+
+/** test seam — reset the in-process cache between tests. */
+export function resetIntegrationCredentialCacheForTests(): void {
+  providerCache.clear();
+}
+
+/** Drop a provider's cached rows immediately (called after any write). */
+export function invalidateProviderCredentialCache(provider: IntegrationCredentialNamespace): void {
+  providerCache.delete(provider);
+}
+
+/**
+ * Load a provider's credential rows, cache-aware. A DB error propagates and is
+ * NOT cached (never remembered as a negative). An empty result IS cached (a
+ * bounded negative that expires at the TTL).
+ */
+async function loadProviderRows(
+  provider: IntegrationCredentialNamespace,
+  now: number = Date.now(),
+): Promise<Map<string, IntegrationCredential>> {
+  const cached = providerCache.get(provider);
+  if (cached && now - cached.fetchedAt < CACHE_TTL_MS) {
+    return cached.rows;
+  }
+  // A throw here (DB unreachable) propagates without touching the cache.
+  const rows = await prisma.integrationCredential.findMany({
+    where: { provider },
+  });
+  const map = new Map(rows.map((row) => [row.key, row]));
+  providerCache.set(provider, { fetchedAt: now, rows: map });
+  return map;
+}
+
+// ---------------------------------------------------------------------------
+// Read
+// ---------------------------------------------------------------------------
+
+export type CredentialResolution =
+  | {
+      status: "configured";
+      value: string;
+      secretSource: WrappingKeySource;
+      /**
+       * A legacy row whose value is unchanged, but the auth-secret env var it
+       * was written under flipped. Always false for a ring row (#4456).
+       */
+      sourceFlipped: boolean;
+      labelVersion: string;
+      /**
+       * Optimistic-concurrency token for the row this value came from (#2723).
+       * Hand it back as `{ expect: "version", version }` to make a
+       * read-modify-write lose deterministically if anybody else got in first.
+       */
+      version: CredentialVersion;
+    }
+  | { status: "not_configured" }
+  | {
+      status: "needs_reentry";
+      reason: string;
+      /** Same token, for the dead row — a replacement can still CAS on it. */
+      version: CredentialVersion;
+    };
+
+/**
+ * Resolve one credential. Distinguishes:
+ *   - configured (decrypts; may flag a secret-source flip),
+ *   - not_configured (no row),
+ *   - needs_reentry (row present but unreadable — its key changed or is gone).
+ * A DB error propagates to the caller (it is neither "not configured" nor a
+ * decrypt failure).
+ */
+export async function resolveIntegrationCredential(
+  provider: IntegrationCredentialNamespace,
+  key: string,
+): Promise<CredentialResolution> {
+  const rows = await loadProviderRows(provider);
+  return resolveStoredRow(rows.get(key) ?? null);
+}
+
+/**
+ * Resolve one credential READ THROUGH THE DATABASE, on the given client, and
+ * without touching the cache in either direction (#3454).
+ *
+ * For a value that ROTATES. The provider cache is right for a client id that
+ * changes when an administrator says so; it is wrong for the Xero refresh
+ * token, which another container may have spent and replaced seconds ago — a
+ * cached copy up to `CACHE_TTL_MS` old would hand this process a refresh token
+ * Xero has already invalidated. Passing the claim transaction's client also
+ * makes the read part of that transaction, which is what a compare-and-set
+ * built on the returned `version` needs.
+ */
+export async function readIntegrationCredentialRow(
+  db: Pick<Prisma.TransactionClient, "integrationCredential">,
+  provider: IntegrationCredentialNamespace,
+  key: string,
+): Promise<CredentialResolution> {
+  const row = await db.integrationCredential.findUnique({
+    where: { provider_key: { provider, key } },
+  });
+  return resolveStoredRow(row);
+}
+
+function resolveStoredRow(
+  row: IntegrationCredential | null,
+): CredentialResolution {
+  if (!row) return { status: "not_configured" };
+
+  try {
+    const value = decryptCredential({
+      provider: row.provider,
+      key: row.key,
+      ciphertext: row.ciphertext,
+      iv: row.iv,
+      authTag: row.authTag,
+      labelVersion: row.labelVersion,
+      secretSource: row.secretSource,
+    });
+    const legacyRow = row.secretSource === "AUTH_SECRET" || row.secretSource === "NEXTAUTH_SECRET";
+    const currentSource = getAuthSecretWithSource()?.source;
+    return {
+      status: "configured",
+      value,
+      secretSource: row.secretSource as WrappingKeySource,
+      sourceFlipped:
+        legacyRow && currentSource !== undefined && currentSource !== row.secretSource,
+      labelVersion: row.labelVersion,
+      version: credentialVersionOf(row),
+    };
+  } catch (error) {
+    if (error instanceof CredentialDecryptError) {
+      return {
+        status: "needs_reentry",
+        reason: error.message,
+        version: credentialVersionOf(row),
+      };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Convenience: the decrypted value, or null when the credential is missing OR
+ * unreadable (needs re-entry). Resolvers that only need the value use this; a
+ * DB error still propagates.
+ */
+export async function getIntegrationCredentialValue(
+  provider: IntegrationCredentialNamespace,
+  key: string,
+): Promise<string | null> {
+  const resolution = await resolveIntegrationCredential(provider, key);
+  return resolution.status === "configured" ? resolution.value : null;
+}
+
+// ---------------------------------------------------------------------------
+// Write (Full-Admin only — enforced at the API boundary)
+// ---------------------------------------------------------------------------
+
+/**
+ * THE WRITE CONTRACT (#2723). Four rules, and each is structural rather than
+ * remembered:
+ *
+ *  1. EVERY mutator takes a REQUIRED `actor`, so a write with no attribution
+ *     does not compile. `integration-credential-actor.ts` owns the vocabulary
+ *     and says why "no actor" and "a background writer" must not look alike.
+ *  2. EVERY mutator takes a REQUIRED `expect`, so what a writer believed was
+ *     stored is declared at the call site. A stale write LOSES — it throws
+ *     `StaleCredentialWriteError`, changes nothing and audits nothing — rather
+ *     than silently overwriting whoever got there first.
+ *  3. THE SECRET CHANGE AND ITS AUDIT ROW ARE ONE LOCAL TRANSACTION. Before
+ *     this, the credential landed in one statement and its audit row in another
+ *     (in a different module, after two more awaits), so a crash between them
+ *     left a rewritten secret with no evidence. `createAuditLog` takes the
+ *     transaction client, so the pair commits or neither does.
+ *  4. NO PLAINTEXT LEAVES THIS MODULE. The audit payload is built by
+ *     `buildCredentialAuditEvidence` from a type with no field able to hold a
+ *     value, the errors thrown here carry none, and nothing here logs. That is
+ *     a property of the shapes, not of the care taken — which matters, because
+ *     a redaction rule living in the logger is blind to every door that never
+ *     calls the logger.
+ *
+ * AND A READ MUST NOT AUDIT. Every audit row below is written only where a row
+ * actually changed: a no-op `ensureGeneratedCredential` on a healthy key (which
+ * runs on the Xero token READ path) and a delete that matched nothing write
+ * nothing at all.
+ */
+
+export interface SetCredentialResult {
+  provider: IntegrationCredentialNamespace;
+  key: string;
+  secretSource: WrappingKeySource;
+  labelVersion: string;
+  updatedAt: Date;
+  /** The token of the row as it now stands, for a follow-on compare-and-set. */
+  version: CredentialVersion;
+}
+
+/**
+ * Encrypt and persist a credential. Invalidates the writing process's cache
+ * immediately once the transaction commits.
+ *
+ * The capture-time gate runs inside `encryptCredential` BEFORE the row is
+ * claimed — an unusable key (a weak/placeholder auth secret with no ring, or an
+ * invalid `DATA_ENCRYPTION_KEYS`) throws `WeakAuthSecretError`, nothing is
+ * written and nothing is audited. The write always wraps under the CURRENT data
+ * key, which also chooses the stored label (#4456).
+ *
+ * COMPARE-AND-SET, by the expectation the caller declared:
+ *   absent  → `create`; a P2002 means somebody created it first and we lose.
+ *   version → the row is re-read inside the transaction, its token compared,
+ *             and the update CLAIMED on the exact `(ciphertext, iv, authTag)`
+ *             tuple that was read. A concurrent writer changes that tuple (every
+ *             encrypt draws a fresh random IV), so the loser's claim matches
+ *             zero rows and it re-reads instead of clobbering — the discipline
+ *             `replaceUnreadableCredential` below has used since #2079.
+ *   any     → a declared unconditional overwrite, for the sole authority of a
+ *             (provider, key) that has nothing to be stale against.
+ *
+ * Note the VERIFY-RESET rule (any credential write clears the provider's
+ * verified/connected state) is applied by the caller that knows the provider's
+ * verified-state store — e.g. the Xero write path drops stored OAuth tokens so
+ * the operator re-connects. This module owns only the encrypted value.
+ */
+export async function setIntegrationCredential(
+  params: SetIntegrationCredentialParams,
+): Promise<SetCredentialResult> {
+  return withCredentialTransaction([params.provider], (tx) =>
+    setIntegrationCredentialInTransaction({ ...params, tx }),
+  );
+}
+
+/** What every credential write declares. */
+export interface SetIntegrationCredentialParams {
+  provider: IntegrationCredentialNamespace;
+  key: string;
+  value: string;
+  actor: CredentialActor;
+  expect: CredentialWriteExpectation;
+  request?: CredentialRequestContext;
+  /** Why, when the write is the consequence of something else (#3454). */
+  cause?: CredentialMutationCause;
+  /**
+   * The row's own `updatedAt`, kept rather than bumped. ONLY the data-key
+   * re-encrypt passes it (#4456 review): it writes the same value under a new
+   * key, which is not a newer credential, and the verified-marker freshness
+   * rules compare `updatedAt` (`getGoogleSetupState`, the Stripe webhook
+   * marker), so a bump would quietly unverify a provider. Every real change
+   * omits it and gets a fresh timestamp.
+   */
+  keepUpdatedAt?: Date;
+}
+
+/** `keepUpdatedAt` from anything but the data-key re-encrypt's compare-and-set. */
+export class KeepUpdatedAtRefusedError extends Error {
+  constructor() {
+    super(
+      "keepUpdatedAt is only for the data-key re-encrypt (cause data-key-reencrypt) on a version compare-and-set; a real change gets a fresh timestamp.",
+    );
+    this.name = "KeepUpdatedAtRefusedError";
+  }
+}
+
+/**
+ * Refuse, before anything is written, a kept timestamp on any write but the
+ * re-encrypt's (#4456 review): anywhere else it would hide a real change from
+ * the verified-marker freshness rules, and without a version claim it could
+ * stamp a value it never read.
+ */
+function assertKeepUpdatedAtIsAReencrypt(params: SetIntegrationCredentialParams): void {
+  if (params.keepUpdatedAt === undefined) return;
+  if (params.cause?.kind !== "data-key-reencrypt" || params.expect.expect !== "version") {
+    throw new KeepUpdatedAtRefusedError();
+  }
+}
+
+/**
+ * Run `work` in ONE transaction and drop the named providers' cached rows once
+ * it settles, whichever way it settles (#3454).
+ *
+ * The composition point for a credential write that must commit together with
+ * something else — the Xero token set and its legacy mirror, or a Xero client
+ * secret save and the token destruction it causes. The cache rule stays the
+ * store's rather than the caller's: a committed write is visible to this
+ * process at once, and a rolled-back one (a lost compare-and-set, a failed
+ * lease guard) leaves no cached row for the caller's re-read to trust.
+ */
+export async function withCredentialTransaction<T>(
+  providers: readonly IntegrationCredentialNamespace[],
+  work: (tx: Prisma.TransactionClient) => Promise<T>,
+  options?: { timeout?: number; maxWait?: number },
+): Promise<T> {
+  try {
+    return await prisma.$transaction(work, options);
+  } finally {
+    for (const provider of providers) invalidateProviderCredentialCache(provider);
+  }
+}
+
+/**
+ * `setIntegrationCredential` on a transaction the CALLER owns (#3454). The same
+ * contract — required actor, required expectation, the audit row on the same
+ * client — so composing it into a wider transaction gives none of it up. The
+ * caller runs it inside `withCredentialTransaction`, which owns the cache.
+ */
+export async function setIntegrationCredentialInTransaction(
+  params: SetIntegrationCredentialParams & { tx: Prisma.TransactionClient },
+): Promise<SetCredentialResult> {
+  assertCredentialActor(CREDENTIAL_AUDIT_ACTIONS.set, params.actor);
+  assertCredentialWriteExpectation(CREDENTIAL_AUDIT_ACTIONS.set, params.expect);
+  assertKeepUpdatedAtIsAReencrypt(params);
+
+  const encrypted = encryptCredential({
+    provider: params.provider,
+    key: params.key,
+    plaintext: params.value,
+  });
+  // #4456 review: no AUTH_SECRET write while stored data names a ring key.
+  if (!encrypted.secretSource.startsWith(DATA_KEY_SOURCE_PREFIX)) {
+    await assertLegacyWriteAllowed(params.tx);
+  }
+  const written: CredentialRowWrite = {
+    ciphertext: encrypted.ciphertext,
+    iv: encrypted.iv,
+    authTag: encrypted.authTag,
+    secretSource: encrypted.secretSource,
+    labelVersion: encrypted.labelVersion,
+    updatedByUserId: credentialActorMemberId(params.actor),
+    ...(params.keepUpdatedAt === undefined ? {} : { updatedAt: params.keepUpdatedAt }),
+  };
+
+  const updatedAt = await applyCredentialWrite(params.tx, {
+    provider: params.provider,
+    key: params.key,
+    expectation: params.expect,
+    written,
+  });
+
+  await recordCredentialMutation(params.tx, {
+    action: CREDENTIAL_AUDIT_ACTIONS.set,
+    summary: `Set ${params.provider} credential "${params.key}"`,
+    actor: params.actor,
+    provider: params.provider,
+    key: params.key,
+    expectation: describeCredentialExpectation(params.expect),
+    secretSource: encrypted.secretSource,
+    labelVersion: encrypted.labelVersion,
+    cause: params.cause,
+    request: params.request,
+  });
+
+  // A lost claim throws `StaleCredentialWriteError` out of the transaction,
+  // which rolls back; `withCredentialTransaction` drops the cached rows either
+  // way, so the loser's re-read is fresh.
+  return {
+    provider: params.provider,
+    key: params.key,
+    secretSource: encrypted.secretSource,
+    labelVersion: encrypted.labelVersion,
+    updatedAt,
+    version: credentialVersionOf(written),
+  };
+}
+
+
+/**
+ * What a delete is claiming, as a VALUE rather than as a convention.
+ *
+ * A zero row count means two different things here, and the first draft told
+ * them apart by asking whether a claim ciphertext had been assigned — a reader
+ * had to know that `undefined` meant "unconditional" and could not see the rule
+ * being relied on. Two named shapes make the discrimination the type's job, and
+ * carry the claimed columns with the branch that has them.
+ */
+type CredentialDeleteClaim =
+  | { readonly kind: "unconditional" }
+  | {
+      readonly kind: "version";
+      readonly ciphertext: string;
+      readonly iv: string;
+      readonly authTag: string;
+    };
+
+/**
+ * Delete a single credential row (used by disconnect and verify-reset flows).
+ *
+ * Deleting nothing is a no-op, NOT an error and NOT an audit row: verify-reset
+ * fires on every credential write whether or not a marker was ever stamped, and
+ * a row per no-op would bury the real deletions.
+ */
+export async function deleteIntegrationCredential(
+  params: DeleteIntegrationCredentialParams,
+): Promise<void> {
+  await withCredentialTransaction([params.provider], (tx) =>
+    deleteIntegrationCredentialInTransaction({ ...params, tx }),
+  );
+}
+
+/**
+ * The audit summary of a credential delete. One home, so a caller recording a
+ * delete the store itself could not see (the token store's pre-upgrade copy,
+ * #3454) words it the same way.
+ */
+export function deletedCredentialSummary(provider: IntegrationCredentialNamespace, key: string): string {
+  return `Deleted ${provider} credential "${key}"`;
+}
+
+/** What every credential delete declares. */
+export interface DeleteIntegrationCredentialParams {
+  provider: IntegrationCredentialNamespace;
+  key: string;
+  actor: CredentialActor;
+  expect: CredentialDeleteExpectation;
+  request?: CredentialRequestContext;
+  /** Why, when the delete is the consequence of something else (#3454). */
+  cause?: CredentialMutationCause;
+}
+
+/**
+ * `deleteIntegrationCredential` on a transaction the CALLER owns (#3454).
+ * Resolves `true` when a row was removed (and audited) and `false` when there
+ * was nothing to remove, which records nothing, as ever.
+ */
+export async function deleteIntegrationCredentialInTransaction(
+  params: DeleteIntegrationCredentialParams & { tx: Prisma.TransactionClient },
+): Promise<boolean> {
+  assertCredentialActor(CREDENTIAL_AUDIT_ACTIONS.deleted, params.actor);
+  assertCredentialDeleteExpectation(
+    CREDENTIAL_AUDIT_ACTIONS.deleted,
+    params.expect,
+  );
+  const expectation = params.expect;
+
+  let claim: CredentialDeleteClaim = { kind: "unconditional" };
+  if (expectation.expect === "version") {
+    const current = await readRowForWrite(params.tx, params.provider, params.key);
+    // Already gone. The caller wanted it absent and it is absent, so this
+    // is the intended end state rather than a lost race.
+    if (current === null) return false;
+    if (credentialVersionOf(current) !== expectation.version) {
+      throw new StaleCredentialWriteError({
+        provider: params.provider,
+        key: params.key,
+        expectation,
+        observedVersion: credentialVersionOf(current),
+      });
+    }
+    claim = {
+      kind: "version",
+      ciphertext: current.ciphertext,
+      iv: current.iv,
+      authTag: current.authTag,
+    };
+  }
+
+  const removed = await params.tx.integrationCredential.deleteMany({
+    where: {
+      provider: params.provider,
+      key: params.key,
+      // THE CLAIM, when a version was declared, and it names ALL THREE
+      // encrypted columns — the same tuple `applyCredentialWrite` claims.
+      //
+      // Claiming the ciphertext alone is nearly always enough and is exactly
+      // wrong for one value: AES-GCM over an EMPTY plaintext produces an
+      // empty ciphertext whatever the IV, so for a credential holding "" the
+      // stored ciphertext is "" before and after any replacement and a
+      // ciphertext-only claim matches the winner's row. The writer holding
+      // the stale token would then delete the row that replaced it and
+      // report success — a lost race reported as a win, which is the exact
+      // failure this contract exists to remove. The iv and authTag are fresh
+      // on every encrypt whatever the plaintext, so the three together are a
+      // real fence for every value. When this was written no production
+      // delete took this path — they all passed `any` — and the claim was
+      // that #2940 would be the store's first club-editable consumer. It
+      // is: `clearMirotalkSecret` passes the version the setup screen was
+      // shown, because Clear is a genuine read-modify-write and deleting
+      // whatever replaced the secret while reporting success is the failure
+      // this whole contract exists to remove.
+      ...(claim.kind === "unconditional"
+        ? {}
+        : {
+            ciphertext: claim.ciphertext,
+            iv: claim.iv,
+            authTag: claim.authTag,
+          }),
+    },
+  });
+  if (removed.count === 0) {
+    // Removing nothing means two different things, and they must not be
+    // spelled the same way. Under `any` the caller asked for the row to be
+    // gone and it is gone — verify-reset fires on every credential write
+    // whether or not a marker was ever stamped, so a no-op is the common
+    // case and neither an error nor an audit row. Under `version` the row
+    // was there a statement ago and somebody replaced it since, which is a
+    // LOST RACE, and losing silently is the behaviour this whole contract
+    // exists to remove.
+    if (claim.kind === "version") {
+      const winner = await readRowForWrite(params.tx, params.provider, params.key);
+      throw new StaleCredentialWriteError({
+        provider: params.provider,
+        key: params.key,
+        expectation,
+        observedVersion:
+          winner === null ? null : credentialVersionOf(winner),
+      });
+    }
+    return false;
+  }
+
+  await recordCredentialMutation(params.tx, {
+    action: CREDENTIAL_AUDIT_ACTIONS.deleted,
+    summary: deletedCredentialSummary(params.provider, params.key),
+    actor: params.actor,
+    provider: params.provider,
+    key: params.key,
+    expectation: describeCredentialExpectation(expectation),
+    cause: params.cause,
+    request: params.request,
+  });
+  return true;
+}
+
+/**
+ * Does a provider have any stored credential that fails to decrypt? Drives the
+ * unified "N integrations need credentials re-entered (encryption key changed)"
+ * aggregate everywhere (readiness + Integrations hub) off ONE detection path.
+ *
+ * A DB error propagates (the caller decides how to surface an unknown state);
+ * a `not_configured` provider is simply not "needing re-entry".
+ */
+export async function providerNeedsReentry(provider: IntegrationCredentialNamespace): Promise<boolean> {
+  return (await providerUnreadableKeys(provider)).length > 0;
+}
+
+/**
+ * The stored keys of a provider that fail to decrypt, so a wizard can ask for
+ * each one on the step that captures it (#98): an unreadable webhook secret
+ * must not block the earlier keys step that cannot replace it. Empty when
+ * nothing is stored or everything reads. Propagates a DB error.
+ */
+export async function providerUnreadableKeys(provider: IntegrationCredentialNamespace): Promise<string[]> {
+  const rows = await loadProviderRows(provider);
+  if (rows.size === 0) return [];
+  // Each row is tried under the key IT names; a key this deployment lacks is a
+  // CredentialDecryptError like any other, so it needs no special case here.
+  const unreadable: string[] = [];
+  for (const row of rows.values()) {
+    try {
+      decryptCredential({
+        provider: row.provider,
+        key: row.key,
+        ciphertext: row.ciphertext,
+        iv: row.iv,
+        authTag: row.authTag,
+        labelVersion: row.labelVersion,
+        secretSource: row.secretSource,
+      });
+    } catch (error) {
+      if (error instanceof CredentialDecryptError) unreadable.push(row.key);
+      else throw error;
+    }
+  }
+  return unreadable;
+}
+
+/**
+ * The subset of the given providers whose stored credentials fail GCM. Powers
+ * the shared re-entry aggregate. Providers with no stored credentials never
+ * appear. Propagates a DB error.
+ */
+export async function getIntegrationsNeedingReentry(
+  providers: readonly IntegrationCredentialNamespace[],
+): Promise<string[]> {
+  const needing: string[] = [];
+  for (const provider of providers) {
+    if (await providerNeedsReentry(provider)) needing.push(provider);
+  }
+  return needing;
+}

@@ -1,0 +1,261 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    member: { count: vi.fn(), findMany: vi.fn(), findUnique: vi.fn() },
+    passwordResetToken: { create: vi.fn(), deleteMany: vi.fn() },
+    auditLog: { create: vi.fn() },
+  },
+}));
+
+vi.mock("@/lib/auth", () => ({ auth: vi.fn() }));
+
+vi.mock("@/lib/email", () => ({
+  sendMemberSetupInviteEmail: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("@/lib/audit", () => ({
+  logAudit: vi.fn(),
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+import { sendMemberSetupInviteEmail } from "@/lib/email";
+import { logAudit } from "@/lib/audit";
+import { POST } from "@/app/api/admin/members/send-setup-invite/route";
+import { MEMBER_SETUP_INVITE_TTL_MS } from "@/lib/member-setup-invite";
+
+const mockedAuth = vi.mocked(auth);
+const mockedFindMany = vi.mocked(prisma.member.findMany);
+const mockedFindUnique = vi.mocked(prisma.member.findUnique);
+const mockedDeleteTokens = vi.mocked(prisma.passwordResetToken.deleteMany);
+const mockedCreateToken = vi.mocked(prisma.passwordResetToken.create);
+const mockedSendEmail = vi.mocked(sendMemberSetupInviteEmail);
+const mockedLogAudit = vi.mocked(logAudit);
+
+function makeReq(body: unknown) {
+  return new NextRequest("http://localhost/api/admin/members/send-setup-invite", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("Admin Send Setup Invite API", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-26T12:00:00.000Z"));
+    vi.clearAllMocks();
+    mockedFindUnique.mockResolvedValue({
+      active: true,
+      forcePasswordChange: false,
+      accessRoles: [{ role: "ADMIN" }],
+    } as any);
+    mockedCreateToken.mockResolvedValue({
+      id: "tok1",
+      token: "uuid",
+      memberId: "m1",
+      expiresAt: new Date(),
+      used: false,
+      createdAt: new Date(),
+    } as any);
+    mockedDeleteTokens.mockResolvedValue({ count: 1 } as any);
+    // Reset the transport to a clean "delivers" default so a prior test's
+    // failure implementation cannot leak into the next test.
+    mockedSendEmail.mockReset();
+    mockedSendEmail.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns 401 for unauthenticated requests", async () => {
+    mockedAuth.mockResolvedValue(null as any);
+    const res = await POST(makeReq({ memberIds: ["m1"] }));
+    expect(res.status).toBe(401);
+  });
+
+  it("sends a setup invite email with a 7-day token window", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockedFindMany.mockResolvedValue([
+      { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+    ] as any);
+
+    const res = await POST(makeReq({ memberIds: ["m1"] }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sent).toBe(1);
+    expect(body.skipped).toBe(0);
+
+    expect(mockedDeleteTokens).toHaveBeenCalledWith({
+      where: { memberId: "m1" },
+    });
+    expect(mockedCreateToken).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          memberId: "m1",
+          tokenHash: expect.any(String),
+          expiresAt: new Date(Date.now() + MEMBER_SETUP_INVITE_TTL_MS),
+        }),
+      })
+    );
+    expect(mockedSendEmail).toHaveBeenCalledWith(
+      "alice@test.com",
+      "Alice",
+      expect.any(String)
+    );
+    expect(mockedLogAudit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "member.setup-invite-sent",
+        memberId: "a1",
+        targetId: "m1",
+      })
+    );
+  });
+
+  it("sends setup invites to active login-enabled members even when they have a parent link", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockedFindMany.mockResolvedValue([
+      { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+    ] as any);
+
+    const res = await POST(makeReq({ memberIds: ["m1"] }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sent).toBe(1);
+    expect(body.skipped).toBe(0);
+    expect(mockedFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: { in: ["m1"] },
+          active: true,
+          canLogin: true,
+        },
+      })
+    );
+  });
+
+  it("skips inactive and non-login members", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockedFindMany.mockResolvedValue([
+      { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+    ] as any);
+
+    const res = await POST(makeReq({ memberIds: ["m1", "m2"] }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sent).toBe(1);
+    expect(body.skipped).toBe(1);
+    expect(mockedFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: { in: ["m1", "m2"] },
+          active: true,
+          canLogin: true,
+        },
+      })
+    );
+  });
+
+  it("does not rate-limit back-to-back bulk sends (no 10-minute cooldown)", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockedFindMany.mockResolvedValue([
+      { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+      { id: "m2", email: "bob@test.com", firstName: "Bob", lastName: "Jones" },
+    ] as any);
+
+    const first = await POST(makeReq({ memberIds: ["m1", "m2"] }));
+    expect(first.status).toBe(200);
+    expect((await first.json()).sent).toBe(2);
+
+    // A second bulk send immediately after (same admin, fake clock frozen) must
+    // still proceed — the previous 10-minute-per-admin 429 cooldown is gone.
+    const second = await POST(makeReq({ memberIds: ["m1", "m2"] }));
+    expect(second.status).toBe(200);
+    const body = await second.json();
+    expect(body.sent).toBe(2);
+    expect(body.error).toBeUndefined();
+  });
+
+  it("returns honest per-member results including a failed email send", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockedFindMany.mockResolvedValue([
+      { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+      { id: "m2", email: "bob@test.com", firstName: "Bob", lastName: "Jones" },
+    ] as any);
+    // Bob's email delivery rejects; his token is still minted.
+    mockedSendEmail.mockImplementation(async (to: string) => {
+      if (to === "bob@test.com") throw new Error("SES rejected");
+    });
+
+    const res = await POST(makeReq({ memberIds: ["m1", "m2"] }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sent).toBe(1);
+    expect(body.failed).toBe(1);
+    expect(body.skipped).toBe(0);
+    expect(body.results).toHaveLength(2);
+
+    const alice = body.results.find((r: { memberId: string }) => r.memberId === "m1");
+    const bob = body.results.find((r: { memberId: string }) => r.memberId === "m2");
+    expect(alice).toMatchObject({ email: "alice@test.com", name: "Alice Smith", status: "sent" });
+    expect(bob).toMatchObject({ email: "bob@test.com", name: "Bob Jones", status: "failed" });
+    expect(bob.error).toBeTruthy();
+
+    // The token is still created for the failed member so the invite can be resent.
+    expect(mockedCreateToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports skipped ids for ineligible members in results payload", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockedFindMany.mockResolvedValue([
+      { id: "m1", email: "alice@test.com", firstName: "Alice", lastName: "Smith" },
+    ] as any);
+
+    const res = await POST(makeReq({ memberIds: ["m1", "m2", "m3"] }));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sent).toBe(1);
+    expect(body.skipped).toBe(2);
+    expect(body.skippedIds).toEqual(["m2", "m3"]);
+    expect(body.results).toHaveLength(1);
+  });
+
+  it("rejects more than 100 member ids with a 422", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    const memberIds = Array.from({ length: 101 }, (_, i) => `m${i}`);
+
+    const res = await POST(makeReq({ memberIds }));
+
+    expect(res.status).toBe(422);
+    expect(mockedFindMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("Member Setup Invite Email Template", () => {
+  it("uses account setup wording and a 7-day expiry", async () => {
+    const { memberSetupInviteTemplate } = await import("@/lib/email-templates/account");
+
+    const html = memberSetupInviteTemplate(
+      "Alice",
+      "https://example.com/reset?token=abc"
+    );
+
+    expect(html).toContain("Set Up Your Account");
+    expect(html).toContain("Set Up My Password");
+    expect(html).toContain("https://example.com/reset?token=abc");
+    expect(html).toContain("7 days");
+    expect(html).not.toContain("You requested a password reset");
+  });
+});

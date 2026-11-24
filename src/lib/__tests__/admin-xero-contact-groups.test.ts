@@ -1,0 +1,160 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  loadAdminXeroContactGroups,
+  type ContactGroupsFetch,
+} from "@/lib/admin-xero-contact-groups";
+
+function mockResponse(input: { ok: boolean; payload: unknown }) {
+  return {
+    ok: input.ok,
+    json: vi.fn().mockResolvedValue(input.payload),
+  };
+}
+
+describe("loadAdminXeroContactGroups", () => {
+  it("uses cached groups when available", async () => {
+    const fetchImpl = vi.fn<ContactGroupsFetch>().mockResolvedValue(
+      mockResponse({
+        ok: true,
+        payload: {
+          groups: [{ id: "group_1", name: "Adults", contactCount: 12 }],
+          refreshed: false,
+          lastRefreshedAt: "2026-07-05T09:30:00.000Z",
+        },
+      })
+    );
+
+    const result = await loadAdminXeroContactGroups({
+      fallbackToRefreshIfEmpty: true,
+      fetchImpl,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith("/api/admin/xero/contact-groups");
+    expect(result).toEqual({
+      groups: [{ id: "group_1", name: "Adults", contactCount: 12 }],
+      refreshed: false,
+      lastRefreshedAt: "2026-07-05T09:30:00.000Z",
+    });
+  });
+
+  it("reports a null lastRefreshedAt when the cache has never been populated", async () => {
+    const fetchImpl = vi.fn<ContactGroupsFetch>().mockResolvedValue(
+      mockResponse({
+        ok: true,
+        payload: {
+          groups: [],
+          refreshed: false,
+          lastRefreshedAt: null,
+        },
+      })
+    );
+
+    const result = await loadAdminXeroContactGroups({ fetchImpl });
+
+    expect(result.lastRefreshedAt).toBeNull();
+    expect(result.groups).toEqual([]);
+  });
+
+  it("falls back to a live refresh when the cache is empty", async () => {
+    const fetchImpl = vi
+      .fn<ContactGroupsFetch>()
+      .mockResolvedValueOnce(
+        mockResponse({
+          ok: true,
+          payload: {
+            groups: [],
+            refreshed: false,
+          },
+        })
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          ok: true,
+          payload: {
+            groups: [{ id: "group_2", name: "Youth", contactCount: 8 }],
+            refreshed: true,
+          },
+        })
+      );
+
+    const result = await loadAdminXeroContactGroups({
+      fallbackToRefreshIfEmpty: true,
+      fetchImpl,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl).toHaveBeenNthCalledWith(1, "/api/admin/xero/contact-groups");
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      2,
+      "/api/admin/xero/contact-groups?refresh=1"
+    );
+    expect(result).toEqual({
+      groups: [{ id: "group_2", name: "Youth", contactCount: 8 }],
+      refreshed: true,
+      lastRefreshedAt: null,
+    });
+  });
+
+  it("can force a live refresh directly", async () => {
+    const fetchImpl = vi.fn<ContactGroupsFetch>().mockResolvedValue(
+      mockResponse({
+        ok: true,
+        payload: {
+          groups: [{ id: "group_3", name: "Children", contactCount: 4 }],
+          refreshed: true,
+        },
+      })
+    );
+
+    await loadAdminXeroContactGroups({
+      refreshFromXero: true,
+      fetchImpl,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "/api/admin/xero/contact-groups?refresh=1"
+    );
+  });
+
+  it("can request missing contact cache repair during a live refresh", async () => {
+    const fetchImpl = vi.fn<ContactGroupsFetch>().mockResolvedValue(
+      mockResponse({
+        ok: true,
+        payload: {
+          groups: [{ id: "group_3", name: "Children", contactCount: 4 }],
+          refreshed: true,
+        },
+      })
+    );
+
+    await loadAdminXeroContactGroups({
+      refreshFromXero: true,
+      repairMissingContactCache: true,
+      fetchImpl,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "/api/admin/xero/contact-groups?refresh=1&repairMissingContactCache=1"
+    );
+  });
+
+  it("surfaces route error messages", async () => {
+    const fetchImpl = vi.fn<ContactGroupsFetch>().mockResolvedValue(
+      mockResponse({
+        ok: false,
+        payload: {
+          error: "Xero rate limit hit. Please wait a moment and try again.",
+        },
+      })
+    );
+
+    await expect(
+      loadAdminXeroContactGroups({
+        fetchImpl,
+      })
+    ).rejects.toThrow("Xero rate limit hit. Please wait a moment and try again.");
+  });
+});

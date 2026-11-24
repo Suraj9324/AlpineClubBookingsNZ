@@ -1,0 +1,364 @@
+import { reconcileOrganiserExtraInvoiceCash } from "@/lib/organiser-extra-receipt";
+import { type Invoice } from "xero-node";
+import { prisma } from "@/lib/prisma";
+import { clubToday } from "@/lib/club-time";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import {
+  getFinancialYearEndMonth,
+  seasonYearOfCalendarDate,
+} from "@/lib/financial-year";
+import { xeroCalendarDate } from "@/lib/xero-provider-dates";
+import { buildXeroInvoiceUrl } from "@/lib/xero-links";
+import { callXeroApi, getAuthenticatedXeroClient } from "@/lib/xero-api-client";
+import {
+  buildSubscriptionInvoiceMatchOptions,
+  checkMembershipStatus,
+  hasStrongSubscriptionInvoiceMatch,
+} from "@/lib/xero-membership-sync";
+import { type XeroObjectLinkInput, upsertXeroObjectLink } from "@/lib/xero-sync";
+import { retiredCardRefundReversalLink } from "@/lib/xero-card-refund-reversal-outbox";
+import { type IncrementalInvoiceReconciliationResult, type IncrementalMembershipReconciliationResult } from "./types";
+import { buildXeroPaymentDisplayNumber } from "./amounts";
+import { dedupeResolvedXeroObjectLinks, dedupeXeroObjectLinks, getDerivedInboundPaymentRole, isDeletedXeroPaymentStatus, PRIMARY_INVOICE_CASH_ALLOCATIONS_KEY, recoverBookingScopedLinksFromOutboundOperations } from "./object-links";
+import { invoicePaymentsForAbsence, retireDeletedPaymentLinksAbsentFromPayload } from "./deleted-payment-links";
+import { writeXeroInboundAuditLogs } from "./audit";
+import { resolveMemberIdsForContact } from "./contact";
+import { refreshLinkedSubscriptionsForInvoice, syncLinkedPaymentInvoiceMetadata } from "./payment";
+import { syncGroupSettlementForPaidInvoice, syncInternetBankingPaymentsForPaidInvoice } from "./invoice-paid-effects";
+import { alertUnrecountedInvoices, failIfRecountLeftUnsettled, type UnrecountedInvoice } from "./recount-left-unsettled";
+
+import type { ClubFormat } from "@/lib/club-format";
+import { clubFormatValues } from "@/lib/club-format-server";
+
+function buildSkippedInvoiceReconciliation(
+  reason: string
+): IncrementalInvoiceReconciliationResult {
+  return {
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    errorDetails: [],
+    skipped: true,
+    reason,
+  };
+}
+
+/**
+ * The membership season a Xero invoice belongs to, from its CALENDAR DATE.
+ *
+ * `Invoice.date` is a calendar day. The retired `getSeasonYear` decided from
+ * `date.getMonth()`/`getFullYear()` — the HOST's calendar components — so the old
+ * `new Date(invoice.date)` made the season boundary move with the container's
+ * timezone as well as with the wire shape Xero happened to send (#2869). Both
+ * halves are now explicit: the day is classified at the Xero boundary, and the
+ * season is derived from that day's own parts by the shared calendar-date rule.
+ *
+ * When Xero sends no date at all the fallback is the CLUB's today, not the UTC
+ * clock's (`INV-DATE-019`).
+ */
+async function buildSeasonYearFromInvoice(invoice: Invoice): Promise<number> {
+  const zone = await readClubTimeZoneOutsideRequest();
+  const invoiceDate = xeroCalendarDate(invoice.date) ?? clubToday(zone);
+  return seasonYearOfCalendarDate(invoiceDate, getFinancialYearEndMonth());
+}
+
+export async function reconcileXeroInvoice(
+  invoiceId: string,
+  /**
+   * The club's format (#3565), resolved once by the job that walks the events
+   * or the changed invoices — a paid invoice can email a confirmation and write
+   * audit lines with amounts in them.
+   */
+  format: ClubFormat,
+  options?: { skipSubscriptionRefresh?: boolean }
+) {
+  const { xero, tenantId } = await getAuthenticatedXeroClient();
+  const response = await callXeroApi(
+    () => xero.accountingApi.getInvoice(tenantId, invoiceId),
+    {
+      operation: "getInvoice",
+      resourceType: "INVOICE",
+      workflow: "reconcileXeroInvoice",
+      context: `reconcileXeroInvoice(${invoiceId})`,
+    }
+  );
+  const invoice = response.body.invoices?.[0];
+
+  if (!invoice?.invoiceID) {
+    throw new Error(`Xero invoice ${invoiceId} was not found`);
+  }
+
+  await reconcileOrganiserExtraInvoiceCash(invoice);
+  const invoiceUrl = buildXeroInvoiceUrl(invoice.invoiceID);
+  const [existingLinks, recoveredBookingScopedLinks] = await Promise.all([
+    prisma.xeroObjectLink.findMany({
+      where: {
+        xeroObjectId: invoice.invoiceID,
+        xeroObjectType: {
+          in: ["INVOICE", "SUBSCRIPTION"],
+        },
+        active: true,
+      },
+      select: {
+        localModel: true,
+        localId: true,
+        xeroObjectType: true,
+        role: true,
+      },
+    }),
+    recoverBookingScopedLinksFromOutboundOperations("INVOICE", invoice.invoiceID),
+  ]);
+  const relatedLinks = dedupeResolvedXeroObjectLinks([
+    ...existingLinks,
+    ...recoveredBookingScopedLinks,
+  ]);
+
+  // #3979: an invoice paid by an applied overpayment or prepayment leaves no
+  // payment record to link, so its primary-invoice link says so: the settled-
+  // cash audit cannot judge such a receipt from local data. The count is
+  // written every sync, none included, so an allocation Xero has since removed
+  // clears it, and the audit can tell a recorded none from an older sync's
+  // silence (#4095 items 9 and 13).
+  const cashAllocationCount =
+    (invoice.overpayments?.length ?? 0) + (invoice.prepayments?.length ?? 0);
+  for (const link of relatedLinks) {
+    // A voided reversal stops counting as coverage and is not raised again (`INV-PAY-151`).
+    const retired = retiredCardRefundReversalLink(link.role, invoice.status);
+    await upsertXeroObjectLink({
+      localModel: link.localModel,
+      localId: link.localId,
+      xeroObjectType: link.xeroObjectType,
+      xeroObjectId: invoice.invoiceID,
+      xeroObjectNumber: invoice.invoiceNumber ?? null,
+      xeroObjectUrl: invoiceUrl,
+      ...(link.role === "PRIMARY_INVOICE"
+        ? { metadata: { [PRIMARY_INVOICE_CASH_ALLOCATIONS_KEY]: cashAllocationCount }, mergeMetadata: true }
+        : {}),
+      ...(retired ?? {}),
+      role: link.role,
+    });
+  }
+
+  const paymentLinks = dedupeXeroObjectLinks(
+    (invoice.payments ?? []).flatMap((payment) => {
+      if (!payment.paymentID) {
+        return [];
+      }
+
+      return relatedLinks.flatMap((link) => {
+        const role = getDerivedInboundPaymentRole(link);
+        if (!role) {
+          return [];
+        }
+
+        return [
+          {
+            localModel: link.localModel,
+            localId: link.localId,
+            xeroObjectType: "PAYMENT",
+            xeroObjectId: payment.paymentID!,
+            xeroObjectNumber: buildXeroPaymentDisplayNumber(payment),
+            role,
+            // #4531: a payment Xero reports deleted is never re-adopted.
+            active: !isDeletedXeroPaymentStatus(payment.status),
+            metadata: {
+              invoiceId: invoice.invoiceID,
+              amount: payment.amount ?? null,
+              date: payment.date ?? null,
+              paymentType: payment.paymentType ?? null,
+              status: payment.status ?? null,
+            },
+          },
+        ] satisfies XeroObjectLinkInput[];
+      });
+    })
+  );
+
+  for (const link of paymentLinks) {
+    await upsertXeroObjectLink(link);
+  }
+  // #4531: a payment deleted in Xero is left out of the payload; its link is retired once Xero confirms it.
+  const deletedPaymentLinks = await retireDeletedPaymentLinksAbsentFromPayload({
+    session: { xero, tenantId },
+    document: { kind: "INVOICE", id: invoice.invoiceID },
+    payments: invoicePaymentsForAbsence(invoice),
+    localScope: relatedLinks,
+  });
+
+  const linkedPaymentIds = relatedLinks
+    .filter((link) => link.localModel === "Payment" && link.role === "PRIMARY_INVOICE")
+    .map((link) => link.localId);
+  const { matchedPayments, updatedPayments } =
+    await syncLinkedPaymentInvoiceMetadata(
+      invoice.invoiceID,
+      invoice.invoiceNumber ?? null,
+      linkedPaymentIds
+    );
+  const internetBankingPaymentSync =
+    await syncInternetBankingPaymentsForPaidInvoice(
+      invoice,
+      linkedPaymentIds,
+      format,
+    );
+  const groupSettlementSync = await syncGroupSettlementForPaidInvoice(
+    invoice,
+    format,
+  );
+
+  const linkedSubscriptionIds = relatedLinks
+    .filter(
+      (link) =>
+        link.localModel === "MemberSubscription" &&
+        link.role === "SUBSCRIPTION_INVOICE"
+    )
+    .map((link) => link.localId);
+  const { refreshedSubscriptions } = options?.skipSubscriptionRefresh
+    ? { refreshedSubscriptions: new Set<string>() }
+    : await refreshLinkedSubscriptionsForInvoice(
+        invoice.invoiceID,
+        linkedSubscriptionIds
+      );
+
+  const seasonYear = await buildSeasonYearFromInvoice(invoice);
+  // Member-less inbound gate (#2109 FIX-3): the reconciler sees ONE invoice at a
+  // time and cannot run prefer-paid selection, so it treats an invoice as a
+  // subscription ONLY on a STRONG match (account code, the flat primary/fallback
+  // item code, or the text fallback) — never on a union-only fee-schedule code
+  // shared with hut/joining/promo fees. A union-only inbound invoice is simply
+  // not treated as a subscription here (writing no SUBSCRIPTION_INVOICE audit
+  // links and triggering no per-member checkMembershipStatus refresh, which also
+  // removes a recurring per-webhook Xero API cost); per-member detection still
+  // sees it when a member's full invoice set is evaluated. The settings overlap
+  // warning still steers admins away from configuring overlapping codes.
+  const looksLikeSubscriptionInvoice = hasStrongSubscriptionInvoiceMatch(
+    [invoice],
+    seasonYear,
+    await buildSubscriptionInvoiceMatchOptions()
+  );
+  const fallbackSubscriptionMemberIds: string[] = [];
+
+  if (
+    !options?.skipSubscriptionRefresh &&
+    looksLikeSubscriptionInvoice &&
+    refreshedSubscriptions.size === 0
+  ) {
+    const contactId = invoice.contact?.contactID ?? null;
+    if (contactId) {
+      const memberIds = await resolveMemberIdsForContact(contactId);
+      for (const memberId of memberIds) {
+        await checkMembershipStatus(memberId, seasonYear);
+        refreshedSubscriptions.add(`${memberId}:${seasonYear}`);
+        fallbackSubscriptionMemberIds.push(memberId);
+      }
+    }
+  }
+
+  await writeXeroInboundAuditLogs({
+    source: "xero-inbound-invoice",
+    links: [
+      ...relatedLinks.map((link) => ({
+        localModel: link.localModel,
+        localId: link.localId,
+        xeroObjectType: link.xeroObjectType,
+        xeroObjectId: invoice.invoiceID!,
+        xeroObjectNumber: invoice.invoiceNumber ?? null,
+        role: link.role,
+      })),
+      ...paymentLinks,
+      ...fallbackSubscriptionMemberIds.map((memberId) => ({
+        localModel: "Member",
+        localId: memberId,
+        xeroObjectType: "SUBSCRIPTION",
+        xeroObjectId: invoice.invoiceID!,
+        xeroObjectNumber: invoice.invoiceNumber ?? null,
+        role: "SUBSCRIPTION_INVOICE",
+      })),
+    ],
+    metadata: {
+      invoiceId: invoice.invoiceID,
+      invoiceNumber: invoice.invoiceNumber ?? null,
+      matchedPayments,
+      updatedPayments,
+      internetBankingPaymentSync,
+      groupSettlementSync,
+      refreshedSubscriptions: refreshedSubscriptions.size,
+      looksLikeSubscriptionInvoice,
+    },
+  });
+
+  return {
+    handled: true,
+    kind: "INVOICE",
+    resourceId: invoice.invoiceID,
+    invoiceNumber: invoice.invoiceNumber ?? null,
+    matchedPayments,
+    internetBankingPaymentSync,
+    groupSettlementSync,
+    paymentLinksUpdated: paymentLinks.length,
+    deletedPaymentLinks,
+    updatedPayments,
+    refreshedSubscriptions: refreshedSubscriptions.size,
+    relatedLinksUpdated: relatedLinks.length,
+    looksLikeSubscriptionInvoice,
+    // #4095: a correction its settle could not recount. A stored event fails on
+    // it and is retried; the incremental invoice reconciliation alerts a person.
+    ...(internetBankingPaymentSync.unrecountedCorrectionNoteIds.length > 0
+      ? {
+          recountLeftUnsettled: `Invoice ${invoice.invoiceID} was settled, but correction note(s) ${internetBankingPaymentSync.unrecountedCorrectionNoteIds.join(", ")} could not be recounted against its receipt.`,
+        }
+      : {}),
+  };
+}
+
+export async function runIncrementalInvoiceReconciliation(options: {
+  membershipReconciliation: IncrementalMembershipReconciliationResult | null;
+}): Promise<IncrementalInvoiceReconciliationResult> {
+  // The club's format (#3565), resolved once, before any transaction or
+  // lock below — never per amount and never inside a transaction.
+  const format = await clubFormatValues();
+  const changedInvoiceIds =
+    options.membershipReconciliation?.changedInvoiceIds ?? [];
+  if (changedInvoiceIds.length === 0) {
+    return buildSkippedInvoiceReconciliation(
+      "No changed membership invoices required invoice-linked reconciliation."
+    );
+  }
+
+  let processed = 0;
+  let succeeded = 0;
+  let failed = 0;
+  const errorDetails: Array<{ invoiceId: string; error: string }> = [];
+  const unrecounted: UnrecountedInvoice[] = [];
+
+  for (const invoiceId of changedInvoiceIds) {
+    processed += 1;
+
+    try {
+      const reconciled = await reconcileXeroInvoice(invoiceId, format, { skipSubscriptionRefresh: true });
+      // #4095 (PR #4437 review, L2): a recount its settle left unwritten. Unlike
+      // a stored event, nothing retries this invoice: the membership cursor has
+      // already moved past it, and no caller reads `failed`. So a person is
+      // alerted after the loop, and the invoice is reported failed.
+      if ("recountLeftUnsettled" in reconciled && reconciled.recountLeftUnsettled) {
+        unrecounted.push({ invoiceId, message: reconciled.recountLeftUnsettled });
+      }
+      failIfRecountLeftUnsettled(reconciled);
+      succeeded += 1;
+    } catch (error) {
+      failed += 1;
+      errorDetails.push({
+        invoiceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  await alertUnrecountedInvoices(unrecounted);
+
+  return {
+    processed,
+    succeeded,
+    failed,
+    errorDetails,
+  };
+}

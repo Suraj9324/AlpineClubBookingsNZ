@@ -1,0 +1,416 @@
+import type { Prisma } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
+import { WEBHOOK_PROCESSING_LEASE_MINUTES } from "@/lib/webhook-processing-lease";
+import {
+  XERO_ORPHANED_STALE_RUNNING_ERROR_CODE,
+  XERO_REFUND_NOTE_UNRECORDED_ERROR_CODE,
+} from "@/lib/xero-operation-error-codes";
+
+// #4278: re-exported so existing importers keep one name; the definition is in the client-safe module.
+export { XERO_ORPHANED_STALE_RUNNING_ERROR_CODE };
+
+// Issue #819: an outbox operation is claimed by flipping it to RUNNING and
+// stamping startedAt. If the worker dies (or an unexpected dispatch-level error
+// escapes the per-operation failure helper) the row can stay RUNNING forever.
+// The outbox worker runs every ~15 minutes, so a RUNNING row older than this
+// threshold is almost certainly stuck rather than genuinely in flight, and
+// should be surfaced to operators.
+export const STALE_RUNNING_XERO_OPERATION_MINUTES = 15;
+
+/**
+ * #4256: the code a retry's claim stamps on a PARTIAL row it is REPAIRING
+ * (`runWithClaimedOriginal` in `xero-operation-retry.ts`). The repair's own
+ * completion or give-back replaces it. A repair that died instead leaves it on
+ * the stuck RUNNING row, and the stale reset below returns that row to PARTIAL,
+ * payload kept, so Retry repairs it again. FAILED would send it down the
+ * invoice replay, which finds the invoice and records no payment.
+ */
+export const XERO_PARTIAL_REPAIR_RUNNING_CODE = "PARTIAL_REPAIR_RUNNING";
+
+/**
+ * #4356: the code the FAILED refund-note repair's claim stamps
+ * (`runWithClaimedOriginal`). Its completion or give-back replaces it; a stale
+ * reset of a dead run sends the row to FAILED, where it came from.
+ */
+export const XERO_REFUND_NOTE_REPAIR_RUNNING_CODE = "REFUND_NOTE_REPAIR_RUNNING";
+
+/**
+ * #4356 (`INV-INT-029`): the repair claims whose RUNNING row no other caller's
+ * PARTIAL, FAILED or CANCELLED outcome may land on (`outcomeWriteGuard`). Each
+ * repair completes onto its own claim (`retryClaim`), so a late
+ * outcome from a caller sharing the row would replace the payload the repair
+ * reads and make its give-back lose.
+ */
+export const XERO_REPAIR_CLAIM_RUNNING_CODES = [
+  XERO_PARTIAL_REPAIR_RUNNING_CODE,
+  XERO_REFUND_NOTE_REPAIR_RUNNING_CODE,
+] as const;
+
+const STALE_PARTIAL_REPAIR_RESET_MESSAGE =
+  "A repair of this partly completed operation was stuck RUNNING past the staleness threshold and was returned to PARTIAL by an operator. Retry it to repair it again.";
+
+/** The instant before which a RUNNING claim is stale. One threshold for both forms below. */
+function staleRunningThreshold(now: Date): Date {
+  return new Date(now.getTime() - STALE_RUNNING_XERO_OPERATION_MINUTES * 60_000);
+}
+
+/**
+ * THE row-level "is stale RUNNING" predicate (#3462): the row is RUNNING and
+ * was claimed longer ago than the staleness threshold, i.e. it is almost
+ * certainly stuck rather than genuinely in flight.
+ *
+ * It takes the row, status included, because the status is the load-bearing
+ * half: completing or failing a row never clears its `startedAt`, so a
+ * `startedAt`-only check would read every old SUCCEEDED or FAILED row as stuck.
+ * The row-level counterpart of {@link staleRunningXeroOperationFilter}, and
+ * written to agree with it: a null `startedAt` is never stale, exactly as the
+ * filter's `lt` comparison never matches one.
+ */
+export function isStaleRunningXeroOperation(
+  operation: { status: string; startedAt: Date | null | undefined },
+  now: Date = new Date(),
+): boolean {
+  if (operation.status !== "RUNNING" || !operation.startedAt) return false;
+
+  return operation.startedAt.getTime() < staleRunningThreshold(now).getTime();
+}
+
+/**
+ * #3880: the complement - a RUNNING claim young enough to be genuinely in
+ * flight. A sibling that must wait for one waits only this long for a dead one.
+ */
+export function liveRunningXeroOperationFilter(now: Date = new Date()) {
+  return {
+    status: "RUNNING",
+    startedAt: { gte: staleRunningThreshold(now) },
+  } as const;
+}
+
+/**
+ * Prisma `where` filter matching XeroSyncOperation rows stuck in RUNNING past
+ * the staleness threshold. Rows with a null startedAt are never matched by the
+ * `lt` comparison, so only genuinely-claimed-and-stuck rows are counted.
+ */
+export function staleRunningXeroOperationFilter(now: Date = new Date()) {
+  return {
+    status: "RUNNING",
+    startedAt: { lt: staleRunningThreshold(now) },
+  } as const;
+}
+
+/**
+ * #3462: the one wording of a stale-RUNNING reset, bulk or per row. Both
+ * messages start with this lead, which is also how a later Mark failed
+ * recognises a message one of them wrote.
+ */
+const STALE_RUNNING_RESET_LEAD =
+  "Operation was stuck RUNNING past the staleness threshold and was";
+
+export const STALE_RUNNING_XERO_OPERATION_BULK_RESET_MESSAGE = `${STALE_RUNNING_RESET_LEAD} reset to FAILED by an operator.`;
+
+const STALE_RUNNING_MARK_FAILED_MESSAGE = `${STALE_RUNNING_RESET_LEAD} marked FAILED by an operator.`;
+
+const CARRIED_CAUSE_LEAD = " The last error recorded before it stuck: ";
+
+/**
+ * The cause a Mark failed carries forward from the row it marks (#3462). The
+ * earlier error a stranded retry left is usually what the operator must fix.
+ * But when that error is itself an earlier stale reset (the row was marked
+ * failed, requeued and stuck again), only the cause inside it is carried, so
+ * repeated cycles never nest the prefix.
+ */
+function carriedStaleRunningCause(row: {
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+}): string | null {
+  const message = row.lastErrorMessage;
+  if (!message) return null;
+  if (
+    row.lastErrorCode !== XERO_ORPHANED_STALE_RUNNING_ERROR_CODE &&
+    !message.startsWith(STALE_RUNNING_RESET_LEAD)
+  ) {
+    return message;
+  }
+  const at = message.lastIndexOf(CARRIED_CAUSE_LEAD);
+  return at === -1 ? null : message.slice(at + CARRIED_CAUSE_LEAD.length) || null;
+}
+
+type StaleResetWriter = Pick<Prisma.TransactionClient, "xeroSyncOperation">;
+
+/**
+ * THE stale-RUNNING reset write (#3462): one home for the bulk reset and the
+ * per-row Mark failed, so the two can never record different codes - the
+ * contact-create recovery and the booking page read this code back. Only the
+ * `where` differs between them; neither touches the response payload or the
+ * Xero object identity, which may be the only proof of what a dead run created.
+ * The client is required: both callers write inside the transaction that also
+ * writes their audit row. #4256: a stuck PARTIAL repair
+ * (`XERO_PARTIAL_REPAIR_RUNNING_CODE`) goes back to PARTIAL, not FAILED. The
+ * bulk reset writes both; Mark failed, which read the row's code under the same
+ * `startedAt` guard, passes `only` for the one write that row needs. #4688: a
+ * row holding an unrecorded refund note (`XERO_REFUND_NOTE_UNRECORDED_ERROR_CODE`)
+ * goes to FAILED keeping that code (`only: "UNRECORDED"` for Mark failed), so
+ * the fence on its payment's refund notes stays up until Resolve by hand; the
+ * plain FAILED write never matches it, even under `only`, so a stamp landing
+ * after Mark failed's read is never overwritten (that Mark failed then answers
+ * "not stale", and a second press keeps the code).
+ */
+export async function writeStaleRunningXeroOperationReset(
+  where: Prisma.XeroSyncOperationWhereInput,
+  now: Date,
+  lastErrorMessage: string,
+  db: StaleResetWriter,
+  only?: "FAILED" | "PARTIAL" | "UNRECORDED",
+): Promise<{ failed: number; partial: number }> {
+  const count = { failed: 0, partial: 0 };
+  if (only === undefined || only === "FAILED") {
+    const failed = await db.xeroSyncOperation.updateMany({
+      where: {
+        ...where,
+        OR: [
+          { lastErrorCode: null },
+          {
+            lastErrorCode: {
+              notIn: only
+                ? [XERO_REFUND_NOTE_UNRECORDED_ERROR_CODE]
+                : [XERO_PARTIAL_REPAIR_RUNNING_CODE, XERO_REFUND_NOTE_UNRECORDED_ERROR_CODE],
+            },
+          },
+        ],
+      },
+      data: {
+        status: "FAILED",
+        lastErrorCode: XERO_ORPHANED_STALE_RUNNING_ERROR_CODE,
+        lastErrorMessage,
+        completedAt: now,
+      },
+    });
+    count.failed = failed.count;
+  }
+  if (only === undefined || only === "UNRECORDED") {
+    // #4688: the unrecorded note's code stays on the row; only the status and completion move.
+    // The message names the note: Mark failed's carries it forward (`carriedStaleRunningCause`),
+    // and the bulk reset's generic one is not written over it (#4692 review).
+    const unrecorded = await db.xeroSyncOperation.updateMany({
+      where: { ...where, lastErrorCode: XERO_REFUND_NOTE_UNRECORDED_ERROR_CODE },
+      data: {
+        status: "FAILED",
+        lastErrorMessage: only === "UNRECORDED" ? lastErrorMessage : undefined,
+        completedAt: now,
+      },
+    });
+    count.failed += unrecorded.count;
+  }
+  if (only === undefined || only === "PARTIAL") {
+    const repairs = await db.xeroSyncOperation.updateMany({
+      where: { ...where, lastErrorCode: XERO_PARTIAL_REPAIR_RUNNING_CODE },
+      data: {
+        status: "PARTIAL",
+        lastErrorCode: XERO_ORPHANED_STALE_RUNNING_ERROR_CODE,
+        lastErrorMessage: STALE_PARTIAL_REPAIR_RESET_MESSAGE,
+        completedAt: now,
+      },
+    });
+    count.partial = repairs.count;
+  }
+  return count;
+}
+
+export interface MarkedStaleRunningXeroOperation {
+  id: string;
+  entityType: string;
+  operationType: string;
+  localModel: string | null;
+  localId: string | null;
+  startedAt: Date;
+  previousErrorCode: string | null;
+  previousErrorMessage: string | null;
+}
+
+export type MarkStaleRunningXeroOperationFailedResult =
+  | { outcome: "not-found" }
+  | { outcome: "not-stale"; status: string }
+  | { outcome: "marked"; operation: MarkedStaleRunningXeroOperation; returnedTo: "FAILED" | "PARTIAL" };
+
+/**
+ * #3462: the per-row **Mark failed** - the runbook's hand `UPDATE` as one
+ * guarded write. Only a row the census reads as stale-RUNNING qualifies: the
+ * same gate as the bulk reset and the health count, NOT the narrower "stale
+ * and carrying an earlier error" signature of a stranded retry, because a row
+ * whose worker died on its first attempt is stuck in exactly the same way and
+ * needs exactly the same remedy.
+ *
+ * The write is status-guarded on the claim that was read (still RUNNING, still
+ * that `startedAt`, still past the threshold), so a run that completed or
+ * re-claimed the row in the meantime is never overwritten. The earlier error a
+ * stranded retry left on the row is kept in the new message, because it is
+ * usually the cause the operator has to fix before requeueing. Once FAILED, the
+ * row's ordinary Retry / Requeue applies.
+ *
+ * `recordAudit` runs in the same transaction as the write, and is required, so
+ * the state change commits with its audit row or not at all: an audit that
+ * fails rolls the row back to RUNNING rather than leaving an unattributed
+ * critical override behind a 500.
+ */
+export async function markStaleRunningXeroOperationFailed(
+  operationId: string,
+  recordAudit: (
+    tx: Prisma.TransactionClient,
+    operation: MarkedStaleRunningXeroOperation,
+  ) => Promise<void>,
+  now: Date = new Date(),
+): Promise<MarkStaleRunningXeroOperationFailedResult> {
+  const row = await prisma.xeroSyncOperation.findUnique({
+    where: { id: operationId },
+    select: {
+      id: true,
+      status: true,
+      startedAt: true,
+      entityType: true,
+      operationType: true,
+      localModel: true,
+      localId: true,
+      lastErrorCode: true,
+      lastErrorMessage: true,
+    },
+  });
+  if (!row) return { outcome: "not-found" };
+  if (!row.startedAt || !isStaleRunningXeroOperation(row, now)) {
+    return { outcome: "not-stale", status: row.status };
+  }
+
+  const stale = staleRunningXeroOperationFilter(now);
+  const cause = carriedStaleRunningCause(row);
+  const message = `${STALE_RUNNING_MARK_FAILED_MESSAGE}${
+    cause ? `${CARRIED_CAUSE_LEAD}${cause}` : ""
+  }`;
+  const operation: MarkedStaleRunningXeroOperation = {
+    id: row.id,
+    entityType: row.entityType,
+    operationType: row.operationType,
+    localModel: row.localModel,
+    localId: row.localId,
+    startedAt: row.startedAt,
+    previousErrorCode: row.lastErrorCode,
+    previousErrorMessage: row.lastErrorMessage,
+  };
+  const returnedTo = row.lastErrorCode === XERO_PARTIAL_REPAIR_RUNNING_CODE ? "PARTIAL" : "FAILED";
+  // #4688: a row holding an unrecorded refund note goes to FAILED keeping its code (the payment's fence).
+  const write = returnedTo === "PARTIAL" ? "PARTIAL" : row.lastErrorCode === XERO_REFUND_NOTE_UNRECORDED_ERROR_CODE ? "UNRECORDED" : "FAILED";
+  const marked = await prisma.$transaction(async (tx) => {
+    const reset = await writeStaleRunningXeroOperationReset(
+      {
+        id: row.id,
+        status: stale.status,
+        startedAt: { equals: operation.startedAt, lt: stale.startedAt.lt },
+      },
+      now,
+      message,
+      tx,
+      write,
+    );
+    if (reset.failed + reset.partial !== 1) return false;
+    await recordAudit(tx, operation);
+    return true;
+  });
+  if (!marked) {
+    const current = await prisma.xeroSyncOperation.findUnique({
+      where: { id: operationId },
+      select: { status: true },
+    });
+    return current
+      ? { outcome: "not-stale", status: current.status }
+      : { outcome: "not-found" };
+  }
+
+  return { outcome: "marked", operation, returnedTo };
+}
+
+/**
+ * Count outbox operations stuck in RUNNING past the staleness threshold. Pure
+ * visibility; it does not reset or mutate the operations.
+ */
+export async function countStaleRunningXeroOperations(
+  now: Date = new Date(),
+): Promise<number> {
+  return prisma.xeroSyncOperation.count({
+    where: staleRunningXeroOperationFilter(now),
+  });
+}
+
+// Issue #819/#815: an inbound webhook event is claimed by flipping it from
+// RECEIVED/FAILED to PROCESSING (which restamps @updatedAt). If the worker dies
+// mid-reconciliation the row stays PROCESSING. A PROCESSING row whose updatedAt
+// is older than this threshold is a dead attempt's, and the automatic worker
+// takes it over (`INV-INT-039`, `xero-inbound/stale-event-takeover.ts`). It is
+// the one webhook processing lease, shared with the Stripe and SES/SNS claims.
+export const STALE_PROCESSING_XERO_INBOUND_EVENT_MINUTES = WEBHOOK_PROCESSING_LEASE_MINUTES;
+
+// test seam
+/**
+ * Prisma `where` filter matching XeroInboundEvent rows stuck in PROCESSING past
+ * the staleness threshold. updatedAt is restamped when the row is claimed, so
+ * only rows that have been PROCESSING longer than the threshold are matched.
+ */
+export function staleProcessingXeroInboundEventFilter(now: Date = new Date()) {
+  const threshold = new Date(
+    now.getTime() - STALE_PROCESSING_XERO_INBOUND_EVENT_MINUTES * 60_000,
+  );
+
+  return {
+    status: "PROCESSING",
+    updatedAt: { lt: threshold },
+  } as const;
+}
+
+/**
+ * Count inbound events stuck in PROCESSING past the staleness threshold. Pure
+ * visibility; it does not reset or mutate the events. The automatic inbound
+ * worker takes each over on its next run (`INV-INT-039`), and an officer's
+ * Replay takes one over at once, through the same guarded helper. A count that
+ * stays above zero means that worker is not running.
+ */
+export async function countStaleProcessingXeroInboundEvents(
+  now: Date = new Date(),
+): Promise<number> {
+  return prisma.xeroInboundEvent.count({
+    where: staleProcessingXeroInboundEventFilter(now),
+  });
+}
+
+/**
+ * True when a PROCESSING inbound event's last update is older than the staleness
+ * threshold, i.e. it is safe to take over and reprocess it. A null
+ * updatedAt is treated as not-stale so a genuinely fresh claim is never stolen.
+ */
+export function isStaleProcessingXeroInboundEvent(
+  updatedAt: Date | null | undefined,
+  now: Date = new Date(),
+): boolean {
+  if (!updatedAt) {
+    return false;
+  }
+
+  const threshold = new Date(
+    now.getTime() - STALE_PROCESSING_XERO_INBOUND_EVENT_MINUTES * 60_000,
+  );
+
+  return updatedAt.getTime() < threshold.getTime();
+}
+
+export function canReplayXeroInboundEvent(
+  event: { status: string; updatedAt?: Date | string | null },
+  now: Date = new Date(),
+): boolean {
+  if (event.status !== "PROCESSING") {
+    return true;
+  }
+
+  const updatedAt =
+    typeof event.updatedAt === "string" ? new Date(event.updatedAt) : event.updatedAt;
+  if (updatedAt instanceof Date && Number.isNaN(updatedAt.getTime())) {
+    return false;
+  }
+
+  return isStaleProcessingXeroInboundEvent(updatedAt, now);
+}

@@ -1,0 +1,619 @@
+// @vitest-environment jsdom
+
+import { fireEvent, render, screen, waitFor } from "@/lib/__tests__/support/club-time-render";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { itShowsEveryRefusal } from "@/lib/__tests__/support/failed-write-cases";
+
+// #1997: the page derives view-only gating from the session matrix via
+// useAdminAreaEditAccess("membership"). Mock an all-edit admin so the existing
+// approve/refresh/replace action assertions (enabled buttons) hold.
+vi.mock("next-auth/react", () => ({
+  useSession: () => ({
+    data: {
+      user: {
+        id: "admin-1",
+        adminPermissionMatrix: {
+          overview: "edit",
+          bookings: "edit",
+          membership: "edit",
+          finance: "edit",
+          lodge: "edit",
+          content: "edit",
+          support: "edit",
+        },
+      },
+    },
+  }),
+}));
+
+// #4960: the page mirrors its filter and page into the URL.
+const navigation = vi.hoisted(() => ({ search: "", replace: vi.fn() }));
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ replace: navigation.replace, push: vi.fn() }),
+  useSearchParams: () => new URLSearchParams(navigation.search),
+}));
+
+import MemberApplicationsPage from "@/app/(admin)/admin/membership/member-applications/page";
+
+const fetchMock = vi.fn();
+
+function baseApplication(
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    id: "app-base",
+    applicantFirstName: "Pat",
+    applicantLastName: "Member",
+    applicantEmail: "pat@example.com",
+    applicantDateOfBirth: "1990-01-01",
+    applicantPhone: null,
+    applicantAddress: {},
+    familyMembers: [],
+    familyMemberCount: 0,
+    nominator1Email: "nom1@example.com",
+    nominator2Email: "nom2@example.com",
+    nominator1Id: "nom-1",
+    nominator2Id: "nom-2",
+    nominator1Name: "Nom One",
+    nominator2Name: "Nom Two",
+    nominator1ConfirmedAt: null,
+    nominator2ConfirmedAt: null,
+    nominator1TokenExpiresAt: "2026-06-08T00:00:00.000Z",
+    nominator2TokenExpiresAt: "2026-06-08T00:00:00.000Z",
+    nominator1TokenLastSentAt: "2026-06-01T00:00:00.000Z",
+    nominator2TokenLastSentAt: "2026-06-01T00:00:00.000Z",
+    nominator1ReminderCount: 1,
+    nominator2ReminderCount: 4,
+    nominatorReminderLimit: 4,
+    nominator1ReminderExhausted: false,
+    nominator2ReminderExhausted: true,
+    status: "PENDING_NOMINATORS",
+    adminNotes: null,
+    reviewerName: null,
+    reviewedAt: null,
+    createdAt: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function listResponse() {
+  return {
+    applications: [
+      baseApplication({
+        id: "stuck-1",
+        applicantFirstName: "Stuck",
+        applicantLastName: "Nominators",
+        status: "PENDING_NOMINATORS",
+      }),
+      baseApplication({
+        id: "ready-1",
+        applicantFirstName: "Ready",
+        applicantLastName: "Admin",
+        status: "PENDING_ADMIN",
+        nominator1ConfirmedAt: "2026-06-02T00:00:00.000Z",
+        nominator2ConfirmedAt: "2026-06-02T00:00:00.000Z",
+      }),
+    ],
+    pendingCount: 1,
+  };
+}
+
+/**
+ * One request a refusal case answers itself (#4976, ALP-589); every other
+ * request gets the suite's ordinary answer below.
+ */
+let refused: {
+  matches: (url: string, init?: RequestInit) => boolean;
+  answer: () => Response | Promise<Response>;
+} | null = null;
+
+describe("MemberApplicationsPage", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    refused = null;
+    navigation.search = "";
+    global.fetch = fetchMock as typeof fetch;
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (refused?.matches(url, init)) {
+        return Promise.resolve().then(refused.answer);
+      }
+      if (init?.method === "PUT") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ success: true, status: "REJECTED" }),
+        });
+      }
+      // Item 15 (#1931): the joining-fee preview for a PENDING_ADMIN applicant.
+      if (url.includes("/joining-fee/preview")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            defaultAmountCents: 7500,
+            defaultNarration: "Membership joining fee (Adult)",
+            exempt: false,
+            effectiveFrom: "2026-01-01",
+            source: "SCHEDULE",
+          }),
+        });
+      }
+      if (init?.method === "POST") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ success: true, warnings: [] }),
+        });
+      }
+      if (url.startsWith("/api/admin/members?")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            members: [
+              {
+                id: "nom-3",
+                firstName: "Nom",
+                lastName: "Three",
+                email: "nom3@example.com",
+              },
+            ],
+          }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => listResponse() });
+    });
+  });
+
+  it("offers recovery controls for PENDING_NOMINATORS applications", async () => {
+    render(<MemberApplicationsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Stuck Nominators")).not.toBeNull()
+    );
+
+    expect(
+      screen.queryByText(/Refresh the workflow to send fresh links/i)
+    ).not.toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Refresh nomination workflow/i })
+    ).not.toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Reject application/i })
+    ).not.toBeNull();
+    expect(screen.queryByText(/Automatic reminders: 4\/4 exhausted/i)).not.toBeNull();
+  });
+
+  it("does not offer approval for PENDING_NOMINATORS applications", async () => {
+    render(<MemberApplicationsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Ready Admin")).not.toBeNull()
+    );
+
+    // Approve is rendered only for the single PENDING_ADMIN application, never
+    // for the PENDING_NOMINATORS one.
+    expect(screen.getAllByRole("button", { name: /^Approve$/ })).toHaveLength(1);
+  });
+
+  it("refreshes a stuck nominator application via the recovery endpoint", async () => {
+    render(<MemberApplicationsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Stuck Nominators")).not.toBeNull()
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Refresh nomination workflow/i })
+    );
+
+    await waitFor(() => {
+      const postCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/admin/member-applications/stuck-1/nominations/refresh" &&
+          (init as RequestInit | undefined)?.method === "POST"
+      );
+      expect(postCall).toBeDefined();
+    });
+  });
+
+  it("replaces an unconfirmed nominator via the replacement endpoint", async () => {
+    render(<MemberApplicationsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Stuck Nominators")).not.toBeNull()
+    );
+
+    fireEvent.change(screen.getAllByPlaceholderText(/Search name or email/i)[0], {
+      target: { value: "Nom Three" },
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: /Search members/i })[0]);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Nom Three")).not.toBeNull()
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: /^Use$/ })[0]);
+
+    await waitFor(() => {
+      const postCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/admin/member-applications/stuck-1/nominators/nominator1/replace" &&
+          (init as RequestInit | undefined)?.method === "POST"
+      );
+      expect(postCall).toBeDefined();
+      expect(JSON.parse((postCall?.[1] as RequestInit).body as string)).toEqual({
+        memberId: "nom-3",
+      });
+    });
+  });
+
+  it("surfaces the default joining fee and prefills the override fields for a PENDING_ADMIN applicant (#1931)", async () => {
+    render(<MemberApplicationsPage />);
+
+    await waitFor(() => expect(screen.queryByText("Ready Admin")).not.toBeNull());
+
+    // The preview endpoint was called with the applicant's raw inputs (FULL type
+    // + DOB), and the default is surfaced.
+    await waitFor(() => {
+      const previewCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          typeof url === "string" &&
+          url.includes("/joining-fee/preview") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(previewCall).toBeDefined();
+      expect(JSON.parse((previewCall?.[1] as RequestInit).body as string)).toMatchObject({
+        membershipTypeKey: "FULL",
+        dateOfBirth: "1990-01-01",
+      });
+    });
+    expect(await screen.findByText(/Default:/)).toBeTruthy();
+
+    // The amount + narration override fields are prefilled with the default.
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("75.00")).toBeTruthy();
+      expect(screen.getByDisplayValue("Membership joining fee (Adult)")).toBeTruthy();
+    });
+  });
+
+  it("rejects a stuck nominator application via the review endpoint", async () => {
+    render(<MemberApplicationsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Stuck Nominators")).not.toBeNull()
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Reject application/i })
+    );
+
+    // #1786: the reject action now opens the notify-choice dialog; confirm with
+    // the default notify path ("Reject and email applicant") to fire the PUT.
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Reject and email applicant/i,
+      })
+    );
+
+    await waitFor(() => {
+      const putCall = fetchMock.mock.calls.find(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PUT"
+      );
+      expect(putCall).toBeDefined();
+      expect(putCall?.[0]).toBe("/api/admin/member-applications/stuck-1");
+      expect(JSON.parse((putCall?.[1] as RequestInit).body as string)).toMatchObject(
+        { decision: "REJECT" }
+      );
+    });
+  });
+
+  it("#4966: Go back closes the email choice without reviewing the application", async () => {
+    render(<MemberApplicationsPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Stuck Nominators")).not.toBeNull()
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Reject application/i })
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Go back" }));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Email the applicant about this rejection?")
+      ).toBeNull()
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PUT"
+      )
+    ).toBe(false);
+    // The row is untouched and can still be reviewed.
+    expect(
+      screen.getByRole("button", { name: /Reject application/i })
+    ).toBeTruthy();
+  });
+
+  // #4976 (ALP-589): every handler used to parse the reply before checking
+  // `ok`. Their catches already fell back, so these hold the shared reader in
+  // place rather than a visible fix.
+  describe("a refused request says why", () => {
+    async function refreshTheStuckApplication() {
+      render(<MemberApplicationsPage />);
+      await screen.findByText("Stuck Nominators");
+      fireEvent.click(screen.getByRole("button", { name: /Refresh nomination workflow/i }));
+    }
+
+    async function searchForANominator() {
+      render(<MemberApplicationsPage />);
+      await screen.findByText("Stuck Nominators");
+      fireEvent.change(screen.getAllByPlaceholderText(/Search name or email/i)[0], {
+        target: { value: "Nom Three" },
+      });
+      fireEvent.click(screen.getAllByRole("button", { name: /Search members/i })[0]);
+    }
+
+    async function replaceTheNominator() {
+      await searchForANominator();
+      fireEvent.click((await screen.findAllByRole("button", { name: /^Use$/ }))[0]);
+    }
+
+    async function rejectTheStuckApplication() {
+      render(<MemberApplicationsPage />);
+      await screen.findByText("Stuck Nominators");
+      fireEvent.click(screen.getByRole("button", { name: /Reject application/i }));
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Reject and email applicant/i }),
+      );
+    }
+
+    describe("loading the applications", () => {
+      itShowsEveryRefusal({
+        fallback: "Could not load member applications.",
+        submit: async (answer) => {
+          refused = {
+            matches: (url) => url.startsWith("/api/admin/member-applications?"),
+            answer,
+          };
+          render(<MemberApplicationsPage />);
+        },
+      });
+    });
+
+    describe("reviewing an application", () => {
+      itShowsEveryRefusal({
+        fallback: "Could not update the application.",
+        submit: async (answer) => {
+          refused = { matches: (_url, init) => init?.method === "PUT", answer };
+          await rejectTheStuckApplication();
+        },
+      });
+
+      it("reloads the list after a successful review", async () => {
+        await rejectTheStuckApplication();
+
+        expect(await screen.findByText("Application rejected.")).toBeTruthy();
+        await waitFor(() => expect(listLoads()).toBe(2));
+      });
+    });
+
+    describe("refreshing the nomination workflow", () => {
+      itShowsEveryRefusal({
+        fallback: "Could not refresh the nomination workflow.",
+        submit: async (answer) => {
+          refused = { matches: (url) => url.endsWith("/nominations/refresh"), answer };
+          await refreshTheStuckApplication();
+        },
+      });
+
+      it("reloads the list after a successful refresh", async () => {
+        await refreshTheStuckApplication();
+
+        expect(await screen.findByText("Nomination workflow refreshed.")).toBeTruthy();
+        await waitFor(() => expect(listLoads()).toBe(2));
+      });
+    });
+
+    describe("searching for a replacement nominator", () => {
+      itShowsEveryRefusal({
+        fallback: "Could not search members.",
+        submit: async (answer) => {
+          refused = { matches: (url) => url.startsWith("/api/admin/members?"), answer };
+          await searchForANominator();
+        },
+      });
+    });
+
+    describe("replacing a nominator", () => {
+      itShowsEveryRefusal({
+        fallback: "Could not replace the nominator.",
+        submit: async (answer) => {
+          refused = { matches: (url) => url.endsWith("/replace"), answer };
+          await replaceTheNominator();
+        },
+      });
+
+      it("reloads the list after a successful replacement", async () => {
+        await replaceTheNominator();
+
+        expect(await screen.findByText("Nominator replaced with Nom Three.")).toBeTruthy();
+        await waitFor(() => expect(listLoads()).toBe(2));
+      });
+    });
+  });
+});
+
+function listLoads() {
+  return fetchMock.mock.calls.filter(([url]) =>
+    String(url).startsWith("/api/admin/member-applications?"),
+  ).length;
+}
+
+/*
+  #4960 / INV-OPS-020: the route returns 25 applications a page. The worked
+  example: 40 pending applications after an open day. The list says so, and
+  the next page holds the other 15.
+*/
+describe("MemberApplicationsPage paging (#4960)", () => {
+  let listUrls: URL[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    navigation.search = "";
+    listUrls = [];
+    global.fetch = fetchMock as typeof fetch;
+    fetchMock.mockImplementation((input: string) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/admin/member-applications") {
+        listUrls.push(url);
+        const page = Number(url.searchParams.get("page"));
+        const pageRows = page === 1 ? 25 : 15;
+        const applications = Array.from({ length: pageRows }, (_, index) =>
+          baseApplication({
+            id: `app-${page}-${index}`,
+            applicantFirstName: `Applicant${page}x${index}`,
+            status: "PENDING_ADMIN",
+          }),
+        );
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            data: applications,
+            applications,
+            pendingCount: 40,
+            page,
+            pageSize: 25,
+            total: 40,
+            totalPages: 2,
+          }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+  });
+
+  it("shows 25 of 40, reaches the other 15, and restarts at page 1 on a filter change", async () => {
+    render(<MemberApplicationsPage />);
+
+    expect(await screen.findByText("Showing 1–25 of 40")).toBeTruthy();
+    expect(listUrls[0].searchParams.get("status")).toBe("PENDING_ADMIN");
+    expect(listUrls[0].searchParams.get("page")).toBe("1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+    expect(await screen.findByText("Showing 26–40 of 40")).toBeTruthy();
+    expect(listUrls.at(-1)!.searchParams.get("page")).toBe("2");
+    expect(screen.getAllByText(/Applicant2x14/).length).toBeGreaterThan(0);
+    expect(screen.queryAllByText(/Applicant1x0/)).toHaveLength(0);
+    await waitFor(() =>
+      expect(navigation.replace).toHaveBeenLastCalledWith(
+        "/admin/member-applications?page=2",
+        { scroll: false },
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous page" }));
+    expect(await screen.findByText("Showing 1–25 of 40")).toBeTruthy();
+    expect(listUrls.at(-1)!.searchParams.get("page")).toBe("1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+    await screen.findByText("Showing 26–40 of 40");
+    fireEvent.click(screen.getByRole("button", { name: "All" }));
+    await waitFor(() => expect(listUrls.at(-1)!.searchParams.has("status")).toBe(false));
+    expect(listUrls.at(-1)!.searchParams.get("page")).toBe("1");
+    await waitFor(() =>
+      expect(navigation.replace).toHaveBeenLastCalledWith(
+        "/admin/member-applications?status=ALL",
+        { scroll: false },
+      ),
+    );
+  });
+
+  it("opens on the filter and page the URL names", async () => {
+    navigation.search = "status=APPROVED&page=2";
+    render(<MemberApplicationsPage />);
+
+    expect(await screen.findByText("Showing 26–40 of 40")).toBeTruthy();
+    expect(listUrls[0].searchParams.get("status")).toBe("APPROVED");
+    expect(listUrls[0].searchParams.get("page")).toBe("2");
+  });
+
+  /*
+    The page-2 read is held while the officer goes back to page 1. Its late
+    answer must not put page 2's rows under page 1's pager (INV-OPS-020), and
+    the pager is the same focused button through the load.
+  */
+  it("keeps the pager focused through a load and ignores a slower read for a page left", async () => {
+    const slow: { release?: () => void } = {};
+    fetchMock.mockImplementation(async (input: string) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname !== "/api/admin/member-applications") {
+        return { ok: true, json: async () => ({}) };
+      }
+      const page = Number(url.searchParams.get("page"));
+      if (page === 2) {
+        await new Promise<void>((resolve) => {
+          slow.release = resolve;
+        });
+      }
+      const applications = [
+        baseApplication({ id: `app-${page}`, applicantFirstName: `Applicant${page}x0`, status: "PENDING_ADMIN" }),
+      ];
+      return {
+        ok: true,
+        json: async () => ({ applications, pendingCount: 100, page, pageSize: 25, total: 100, totalPages: 4 }),
+      };
+    });
+    render(<MemberApplicationsPage />);
+    expect(await screen.findByText("Showing 1–25 of 100")).toBeTruthy();
+
+    const next = screen.getByRole("button", { name: "Next page" });
+    next.focus();
+    fireEvent.click(next);
+    await waitFor(() => expect(slow.release).toBeDefined());
+    expect(screen.getByRole("button", { name: "Next page" })).toBe(next);
+    expect(document.activeElement).toBe(next);
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous page" }));
+    expect((await screen.findAllByText(/Applicant1x0/)).length).toBeGreaterThan(0);
+
+    slow.release!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.queryAllByText(/Applicant2x0/)).toHaveLength(0);
+    expect(screen.getAllByText(/Applicant1x0/).length).toBeGreaterThan(0);
+    expect(screen.getByText("Showing 1–25 of 100")).toBeTruthy();
+  });
+
+  it("never lets a slower failed read for a page left show its error", async () => {
+    const slow: { release?: () => void } = {};
+    fetchMock.mockImplementation(async (input: string) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname !== "/api/admin/member-applications") {
+        return { ok: true, json: async () => ({}) };
+      }
+      const page = Number(url.searchParams.get("page"));
+      if (page === 2) {
+        await new Promise<void>((resolve) => {
+          slow.release = resolve;
+        });
+        return { ok: false, json: async () => ({ error: "Stale read failed" }) };
+      }
+      const applications = [
+        baseApplication({ id: "app-1", applicantFirstName: "Applicant1x0", status: "PENDING_ADMIN" }),
+      ];
+      return {
+        ok: true,
+        json: async () => ({ applications, pendingCount: 100, page, pageSize: 25, total: 100, totalPages: 4 }),
+      };
+    });
+    render(<MemberApplicationsPage />);
+    await screen.findByText("Showing 1–25 of 100");
+
+    fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+    await waitFor(() => expect(slow.release).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: "Previous page" }));
+    expect((await screen.findAllByText(/Applicant1x0/)).length).toBeGreaterThan(0);
+
+    slow.release!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.queryByText("Stale read failed")).toBeNull();
+    expect(screen.getAllByText(/Applicant1x0/).length).toBeGreaterThan(0);
+  });
+});

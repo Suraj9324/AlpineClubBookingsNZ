@@ -1,0 +1,482 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useParams } from "next/navigation";
+import Link from "next/link";
+import { AlertTriangle, Clock } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import StripeProvider from "@/components/stripe/StripeProvider";
+import PaymentForm from "@/components/stripe/PaymentForm";
+import { useClubIdentity } from "@/components/club-identity-provider";
+import {
+  renderClientBookingMessage,
+  type BookingMessageClubTokens,
+} from "@/lib/booking-message-definitions";
+import { useClubTime } from "@/components/club-time-provider";
+import { formatStayDateOrNull } from "@/lib/club-time";
+import { formatCents } from "@/lib/utils";
+import { FocusedActionError } from "@/components/focused-action-error";
+import { useClubFormat } from "@/components/club-format-provider";
+// The presentation layer this page renders through, split out when the club-time
+// migration carried this file past its 500-line route-page budget. See that
+// file's header for why an allowance was not the answer.
+import {
+  CardPaymentUnavailableNotice,
+  CheckingPaymentCard,
+  FinancialReviewNotice,
+  formatLinkExpiry,
+  internetBankingHeading,
+  NarrativeCard,
+  PAY_LINK_PAGE_HEADING,
+  paymentRecoveryForRefusal,
+  toneForState,
+  type Narrative,
+  type PaymentLinkContext,
+  type PaymentRecovery,
+} from "./pay-link-presentation";
+import { checkCardSuccess } from "./card-success-check";
+import { takeStripeReturn, type CardConfirmation } from "@/lib/stripe-return";
+import { RedirectFailedNotice } from "@/components/stripe/redirect-failed-notice";
+import { FreshLinkCard } from "./fresh-link-card";
+import { PreviousPaymentRefundingNotice } from "@/components/previous-payment-refunding-notice";
+/*
+  #3194 (epic #2797): the sentences a member reads when their saved change is
+  still being priced. Imported, never restated — the booking-detail banner
+  composes the same ones, and two surfaces holding their own copy of a claim
+  about a member's money is the defect this closes (`INV-SSOT`).
+*/
+import {
+  financialReviewNote,
+  financialReviewNoteBesideAnAmount,
+} from "@/lib/booking-financial-review-copy";
+
+export default function PayByLinkPage() {
+  const format = useClubFormat();
+  const club = useClubIdentity();
+  /*
+    `expiresAt` is a real INSTANT — the moment the link stops working — so it has
+    no civil date until a zone is chosen, and the one to choose is the club's
+    PERSISTED setting (CT-4, #2870; INV-CONFIG-002). Deliberately NOT the same
+    route as the stay dates rendered beside it: those are calendar days and take
+    no zone at all. Merging the two is the defect this epic exists to end.
+  */
+  const clubTime = useClubTime();
+  const { token } = useParams<{ token: string }>();
+  const [context, setContext] = useState<PaymentLinkContext | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [clientSecret, setClientSecret] = useState<string | null>(null);
+  const [intentError, setIntentError] = useState<string | null>(null);
+  const [intentLoading, setIntentLoading] = useState(false);
+  const [paymentRecovery, setPaymentRecovery] =
+    useState<PaymentRecovery | null>(null);
+  const [paymentComplete, setPaymentComplete] = useState(false);
+  const [previousPaymentRefunding, setPreviousPaymentRefunding] = useState(false); // #4300
+  const [checkingPayment, setCheckingPayment] = useState(false); // #4300: never the pay buttons after a success
+  const [redirectFailed, setRedirectFailed] = useState(false); // #4955: the provider declined or was cancelled
+  const [bookingMessages, setBookingMessages] = useState<Record<string, string>>({});
+  // #2919 review: the club-level values this page's message tokens resolve to.
+  // Without them an operator's {{CLUB_LODGE_NAME}} reached the member as
+  // literal braces.
+  const [messageTokens, setMessageTokens] =
+    useState<BookingMessageClubTokens | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch(`/api/pay/${encodeURIComponent(token)}`)
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setLoadError(data.error || "This payment link is not valid.");
+        } else {
+          // #4955: a return check that has already read the context wins.
+          setContext((current) => current ?? data);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError("Unable to load this payment link right now.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  // #4955: the redirect exit of a Stripe confirmation. Declared after the
+  // context fetch, so that fetch is already in flight when the check starts.
+  useEffect(() => {
+    const stripeReturn = takeStripeReturn();
+    if (stripeReturn.kind === "check") void afterCardSuccess(stripeReturn.intentId, stripeReturn.confirmation);
+    else if (stripeReturn.kind === "failed") setRedirectFailed(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per page load; the URL is read and cleared
+  }, []);
+
+  useEffect(() => {
+    fetch("/api/booking-messages")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        setBookingMessages(data?.messages ?? {});
+        setMessageTokens(data?.tokens ?? null);
+      })
+      .catch(() => {
+        setBookingMessages({});
+        setMessageTokens(null);
+      });
+  }, []);
+
+  async function startCardPayment() {
+    setIntentLoading(true);
+    setIntentError(null);
+    setRedirectFailed(false); // the returned failure is answered by this attempt
+    try {
+      const res = await fetch(`/api/pay/${encodeURIComponent(token)}/payment-intent`, {
+        method: "POST",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // The refusals a payer must not answer with another payment (#4300 adds
+        // a superseded payment going back), in one table beside the page.
+        const recovery = res.status === 409 ? paymentRecoveryForRefusal(data) : null;
+        if (recovery) {
+          setPaymentRecovery(recovery);
+          return;
+        }
+        throw new Error(data.error || "Unable to start payment");
+      }
+      if (data.alreadyPaid) {
+        setPaymentComplete(true);
+        return;
+      }
+      setPreviousPaymentRefunding(data.previousPaymentRefunding === true);
+      setClientSecret(data.clientSecret);
+    } catch (err) {
+      setIntentError(err instanceof Error ? err.message : "Unable to start payment");
+    } finally {
+      setIntentLoading(false);
+    }
+  }
+
+  // #4300: after a card success, ask the server what it did (`checkCardSuccess`).
+  // #4955: also a `processing` result and a redirect return - both exits.
+  async function afterCardSuccess(paidIntentId: string, confirmation: CardConfirmation) {
+    setCheckingPayment(true);
+    const outcome = await checkCardSuccess(token, paidIntentId, confirmation);
+    if (outcome.kind === "paid") {
+      const settled = outcome.context;
+      if (settled) setContext(settled);
+      // #3194: a paid booking under review reads as its review state, and the
+      // server's narrative (the `!context.payable` branch) confirms the payment
+      // with the review beside it. Composing a card here would drop the amount.
+      const paidUnderReview =
+        settled?.financialReviewPending === true && !settled.payable && !settled.canRequestFreshLink;
+      if (!paidUnderReview) setPaymentComplete(true);
+    } else if (outcome.kind === "fresh") {
+      // The refreshed context: "Amount due" and the form match the new intent.
+      if (outcome.context) setContext(outcome.context);
+      setPreviousPaymentRefunding(outcome.previousPaymentRefunding);
+      setClientSecret(outcome.clientSecret);
+    } else setPaymentRecovery(outcome.recovery);
+    setCheckingPayment(false);
+  }
+
+  if (checkingPayment) return <CheckingPaymentCard />;
+
+  if (loading) {
+    return (
+      <Card className="w-full max-w-lg">
+        {/* No visible title while loading, but every render state of this page
+            still needs its one h1 (#4951) — same sr-only spelling as #1242. */}
+        <h1 className="sr-only">{PAY_LINK_PAGE_HEADING}</h1>
+        <CardContent role="status" className="py-8 text-center text-muted-foreground">Loading...</CardContent>
+      </Card>
+    );
+  }
+
+  // #4955: a context the return check read outranks a failed page-load fetch.
+  if (loadError && !context) {
+    return (
+      <Card className="w-full max-w-lg">
+        <CardHeader>
+          <CardTitle headingLevel={1}>{PAY_LINK_PAGE_HEADING}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-start gap-2 text-warning-11">
+            <AlertTriangle className="h-6 w-6 shrink-0" />
+            <p className="font-medium">{loadError}</p>
+          </div>
+          <p className="mt-3 text-sm text-muted-foreground">
+            Please check you copied the whole link from your email. If it still
+            doesn&apos;t work, contact {club.lodgeName} and we&apos;ll send a fresh one.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!context) return null;
+
+  /*
+    #3194: the club is still working out an amount on this booking. Every branch
+    below either renders `context.narrative` — which the server has already
+    composed with the review sentences in it — or, where the branch renders a
+    card of its own instead, shows the notice explicitly. There is no branch on
+    this page that can reach a member without telling them.
+  */
+  const financialReviewPending = context.financialReviewPending === true;
+
+  // #4300 / #4955: what a payment just made did, when the server says it is not
+  // (yet) settled. Never answered with another payment.
+  const recoveryNotice = (
+    <FocusedActionError
+      id="payment-link-recovery-error"
+      error={paymentRecovery?.message ?? ""}
+      heading={paymentRecovery?.heading}
+      action={
+        paymentRecovery ? (
+          <Button variant="outline" onClick={() => window.location.reload()}>
+            Reload payment status
+          </Button>
+        ) : undefined
+      }
+    />
+  );
+
+  // A completed card payment lands here before the page is re-fetched.
+  if (paymentComplete || context.state === "paid") {
+    const serverNarrative = context.state === "paid";
+    const narrative: Narrative = serverNarrative
+      ? context.narrative
+      : {
+          state: "paid",
+          headline: "Payment received",
+          message: `Thanks ${context.firstName} — your payment is complete.`,
+          // #2919: name the booking's OWN lodge, not the club default. The two
+          // "contact us if this link fails" lines above stay club-level on
+          // purpose — those are about the club, not about a stay.
+          nextStep: `Your booking with ${context.lodgeName ?? club.lodgeName} is confirmed. We look forward to seeing you.`,
+        };
+    return (
+      <NarrativeCard narrative={narrative} tone="success">
+        {/*
+          #3194: the member has just paid IN THIS SESSION, so the context on
+          screen predates the payment and the card above is composed here rather
+          than by the server. A booking under review reaches this branch — a
+          CONFIRMED-unpaid booking can carry an open review and still be paid —
+          and without this notice the last thing it would say is "your booking is
+          confirmed, we look forward to seeing you", which is the same false
+          reassurance in a different sentence.
+
+          `moneyAlreadyMoved: false` is a fact, not a default: what moved here is
+          the booking's OWN price, which the member just paid. Nothing has been
+          refunded or charged FOR THE CHANGE, and a parked review settles nothing
+          by construction.
+
+          Not shown when the server supplied the narrative (`state === "paid"`),
+          because the server composes the review sentences into it already and
+          this would say them twice. That pairing does not arise from this
+          repository's own server at all — a reviewed booking resolves to
+          `financial_review_pending`, never to `paid` — but nothing validates
+          this payload on the way in, so the guard stays rather than relying on
+          that.
+        */}
+        {!serverNarrative && financialReviewPending ? (
+          <FinancialReviewNotice
+            note={financialReviewNote({ moneyAlreadyMoved: false })}
+          />
+        ) : null}
+      </NarrativeCard>
+    );
+  }
+
+  /*
+    #4955: a redirect return reads a fresh context, which may no longer be
+    payable - the link expired while the payer was at their bank, say. The
+    answer about the payment just made still comes first: not "email me a new
+    link", and never the pay buttons. #3194: a booking under review still says
+    so, as on every branch.
+  */
+  if (paymentRecovery && (context.canRequestFreshLink || !context.payable)) {
+    return (
+      <Card className="w-full max-w-lg">
+        <CardHeader>
+          {/* A whole-page state after a redirect return (#4955), so its title is
+              the page's one h1 (#4951). */}
+          <CardTitle headingLevel={1}>Your Payment</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {recoveryNotice}
+          {financialReviewPending ? (
+            <FinancialReviewNotice note={financialReviewNote({ moneyAlreadyMoved: false })} />
+          ) : null}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  /*
+    #3194: `canRequestFreshLink`, not `state === "expired_payable"`. On a booking
+    under review the state is the WORDING state (`financial_review_pending`)
+    while the link is still expired-but-payable, and the member still needs the
+    button that emails them a new one. This field is the link's own fact and is
+    identical to the old test on every booking that is not under review. The
+    narrative rendered here is the server's, which already carries the review
+    sentences.
+  */
+  if (context.canRequestFreshLink) {
+    return <FreshLinkCard token={token} narrative={context.narrative} />;
+  }
+
+  /*
+    #3194: `!context.payable`, not `state !== "payable"`, for the same reason as
+    the branch above — `payable` is present exactly when this link can still take
+    money, which a review does not change. Identical to the old test on every
+    booking that is not under review.
+  */
+  if (!context.payable) {
+    // bumped / cancelled / declined / under_review / financial_review_pending /
+    // unknown — a clear, specific message with a concrete next step, and on a
+    // reviewed booking the narrative the server composed carries the review
+    // sentences, so no separate notice is needed here.
+    //
+    // A PAID booking under review lands HERE rather than in the paid branch
+    // above, because its wording state is the review's. That is the path a
+    // member takes when they paid by internet banking, or when a redirect-based
+    // card method returns them to this URL and the page re-fetches — so the
+    // narrative it renders has to confirm the payment as well as disclose the
+    // review, and since #3194 it does (`buildPaidWithFinancialReviewNarrative`).
+    const tone = toneForState(context.state);
+    const showRebook =
+      context.state === "bumped" ||
+      context.state === "cancelled_pre_payment" ||
+      context.state === "cancelled_post_payment" ||
+      context.state === "declined";
+    return (
+      <NarrativeCard narrative={context.narrative} tone={tone}>
+        {showRebook ? (
+          <Button asChild variant="outline">
+            <Link href="/booking-requests">Book these dates again</Link>
+          </Button>
+        ) : null}
+      </NarrativeCard>
+    );
+  }
+
+  const payable = context.payable;
+  const confirmed = (confirmation: CardConfirmation) => (paidIntentId: string) => {
+    setClientSecret(null);
+    void afterCardSuccess(paidIntentId, confirmation);
+  };
+
+  return (
+    <Card className="w-full max-w-lg">
+      <CardHeader>
+        <CardTitle headingLevel={1}>Complete Your Payment</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="rounded-md border bg-muted p-3 text-sm text-muted-foreground">
+          {/* INV-CAP-039: the booking's OWN lodge, so the guest knows what the
+              money is for. Never `club.lodgeName`: with no lodge on the wire
+              the line is left out rather than naming the club default. */}
+          {context.lodgeName ? <p>Lodge: {context.lodgeName}</p> : null}
+          <p className={context.lodgeName ? "mt-1" : undefined}>
+            Dates: {formatStayDateOrNull(payable.checkIn, format) ?? payable.checkIn} to{" "}
+            {formatStayDateOrNull(payable.checkOut, format) ?? payable.checkOut}
+          </p>
+          <p className="mt-1">Guests: {payable.guestCount}</p>
+          <p className="mt-1 font-semibold text-foreground">
+            Amount due: {formatCents(payable.amountCents, format)}
+          </p>
+          <p className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
+            <Clock className="h-3.5 w-3.5" />
+            This payment link expires on{" "}
+            {formatLinkExpiry(payable.expiresAt, clubTime)}.
+          </p>
+        </div>
+
+        {/*
+          #3194: directly under the amount, because the first sentence of the
+          note is about that amount.
+
+          `amountPredatesTheChange: true` is a FACT about this card, not a
+          default. "Amount due" above is `booking.finalPriceCents`, and both
+          services that can park an edit write that column back UNCHANGED while
+          saving the new dates and deleting the departing guest's row — so this
+          card shows a post-edit stay beside a pre-edit price. A member who reads
+          it as settled and pays it overpays by exactly the amount nobody could
+          work out. The note says so in as many words.
+
+          Above the pay controls rather than below them, so it is read before the
+          member decides — and the controls stay armed. A parked change can
+          surrender nights nobody can value while the stay itself goes ahead, and
+          this link is the only way an unregistered guest can pay at all, so
+          hiding the button would cost them the booking when the hold expired
+          without moving a cent of the money under review. What the note removes
+          is the false reassurance, not the ability to pay.
+        */}
+        {financialReviewPending ? (
+          <FinancialReviewNotice
+            note={financialReviewNoteBesideAnAmount({
+              amountPredatesTheChange: true,
+            })}
+          />
+        ) : null}
+
+        {recoveryNotice}
+
+        <PreviousPaymentRefundingNotice show={!paymentRecovery && previousPaymentRefunding} />
+        {paymentRecovery ? null : clientSecret ? (
+          <StripeProvider key={clientSecret} clientSecret={clientSecret}>
+            <PaymentForm
+              amountCents={payable.amountCents}
+              returnUrl={typeof window !== "undefined" ? window.location.href : ""}
+              // #4300: the server says what the payment did - settled, or (an
+              // intent an edit superseded) going back with a fresh one to pay.
+              onSuccess={confirmed("succeeded")}
+              onProcessing={confirmed("processing")}
+            />
+          </StripeProvider>
+        ) : (
+          <div className="space-y-3">
+            {redirectFailed ? <RedirectFailedNotice nextStep="Choose how to pay below." /> : null}
+            {payable.cardPaymentAvailable !== false ? (
+              <Button onClick={startCardPayment} disabled={intentLoading}>
+                {intentLoading ? "Preparing..." : "Pay by card"}
+              </Button>
+            ) : (
+              <CardPaymentUnavailableNotice />
+            )}
+            <FocusedActionError id="payment-link-intent-error" error={intentError ?? ""} />
+
+            {payable.internetBankingReference ? (
+              <div className="rounded-md border border-border p-3 text-sm">
+                <p className="font-medium text-foreground">{internetBankingHeading(payable)}</p>
+                <p className="mt-1 text-muted-foreground">
+                  {/* #2919 review: every token this body may carry, not just the
+                      payment reference — and the lodge is THIS booking's. */}
+                  {renderClientBookingMessage({
+                    template:
+                      bookingMessages["paymentLink.internetBanking.description"],
+                    fallback:
+                      "Use reference {{paymentReference}} when making a direct transfer. The booking will be confirmed after the Xero invoice payment is reconciled.",
+                    clubTokens: messageTokens,
+                    lodgeName: context.lodgeName ?? null,
+                    data: {
+                      paymentReference: payable.internetBankingReference,
+                    },
+                  })}
+                </p>
+                <p className="mt-2 font-mono text-foreground">{payable.internetBankingReference}</p>
+              </div>
+            ) : null}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

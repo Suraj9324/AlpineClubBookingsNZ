@@ -1,0 +1,1229 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+
+import {
+  classifyUnreleased,
+  compareFragmentNames,
+  compileChangelog,
+  parseArgs,
+  POINTER_NOTE_END,
+  POINTER_NOTE_START,
+  readFragments,
+  releaseHeading,
+  releaseHeadingDate,
+  releaseSection,
+  retiredAllowancePaths,
+  releaseDateToday,
+  toLines,
+} from "./compile-changelog.mjs";
+import { rebaseFragmentLink, rebaseFragmentLinks } from "./fragment-links.mjs";
+
+const NOTE_BODY = "Entries for the next release live in `changelog.d/` — one file per PR.";
+/** The note exactly as CHANGELOG.md carries it: prose inside its sentinels. */
+const NOTE = [POINTER_NOTE_START, "", NOTE_BODY, "", POINTER_NOTE_END].join("\n");
+
+const HISTORY = [
+  "## 0.13.2 - 2026-07-23",
+  "",
+  "- **An older, already released entry (#1234).** Historical text that must be",
+  "  copied through untouched.",
+  "",
+].join("\n");
+
+function changelogWith(unreleasedBody) {
+  return [
+    "# Changelog",
+    "",
+    "All notable public reference-release changes should be recorded here.",
+    "",
+    "## Unreleased",
+    "",
+    NOTE,
+    ...(unreleasedBody ? ["", unreleasedBody] : []),
+    "",
+    HISTORY,
+  ].join("\n");
+}
+
+const tempRoots = [];
+
+/** Build a throwaway repo root with a CHANGELOG.md and a changelog.d/ dir. */
+function makeRepo({ changelog = changelogWith(""), fragments = {} } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "compile-changelog-"));
+  tempRoots.push(root);
+  fs.writeFileSync(path.join(root, "CHANGELOG.md"), changelog);
+  const dir = path.join(root, "changelog.d");
+  fs.mkdirSync(dir);
+  for (const [name, body] of Object.entries(fragments)) {
+    fs.writeFileSync(path.join(dir, name), body);
+  }
+  return root;
+}
+
+function git(root, ...args) {
+  return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+}
+
+function makeTrackedAllowanceRepo({ fragments = {}, allowances = {} } = {}) {
+  const root = makeRepo({ fragments });
+  const dir = path.join(root, "size-allowances.d");
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, "README.md"), "# Allowance convention\n");
+  for (const [name, body] of Object.entries(allowances)) {
+    fs.writeFileSync(path.join(dir, name), body);
+  }
+  git(root, "init", "-q");
+  git(root, "config", "core.autocrlf", "false");
+  git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "add", "--all");
+  git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "merged fixtures");
+  git(root, "update-ref", "refs/remotes/origin/main", "HEAD");
+  return root;
+}
+
+function allowanceFiles(root) {
+  return fs.readdirSync(path.join(root, "size-allowances.d")).sort();
+}
+
+function read(root) {
+  return fs.readFileSync(path.join(root, "CHANGELOG.md"), "utf8");
+}
+
+function fragmentFiles(root) {
+  return fs.readdirSync(path.join(root, "changelog.d")).sort();
+}
+
+function silentLog() {
+  const lines = [];
+  const log = (line) => lines.push(line);
+  log.lines = lines;
+  log.text = () => lines.join("\n");
+  return log;
+}
+
+afterEach(() => {
+  while (tempRoots.length > 0) {
+    fs.rmSync(tempRoots.pop(), { recursive: true, force: true });
+  }
+});
+
+describe("compile-changelog", () => {
+  it("compiles fragments into a new release section and deletes them", () => {
+    const root = makeRepo({
+      fragments: {
+        "2448-tolerant-reads.md": "- **Booking requests tolerate a slow read (#2448).** Body.\n",
+        "2452-changelog-fragments.md": "- **Changelog entries move to fragments (#2452).** Body.\n",
+        "README.md": "# How to write a fragment\n",
+        ".gitkeep": "",
+      },
+    });
+    const log = silentLog();
+
+    const result = compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log });
+
+    expect(result.written).toBe(true);
+    expect(result.fragments).toEqual([
+      "2448-tolerant-reads.md",
+      "2452-changelog-fragments.md",
+    ]);
+    const compiled = read(root);
+    expect(compiled).toContain("## 0.14.0 - 2026-08-04");
+    expect(compiled).toContain("- **Booking requests tolerate a slow read (#2448).** Body.");
+    expect(compiled).toContain("- **Changelog entries move to fragments (#2452).** Body.");
+    // The Unreleased heading and its pointer note survive, with no entries left.
+    expect(compiled).toContain(`## Unreleased\n\n${NOTE}\n\n## 0.14.0 - 2026-08-04`);
+    // History is copied through byte-for-byte.
+    expect(compiled.slice(compiled.indexOf("## 0.13.2"))).toBe(`${HISTORY.trimEnd()}\n`);
+    // Consumed fragments are gone; the convention files stay.
+    expect(fragmentFiles(root)).toEqual([".gitkeep", "README.md"]);
+    expect(log.text()).toContain("Compiled and deleted 2 fragment(s)");
+  });
+
+  it("orders fragments by PR number, not by string comparison", () => {
+    const root = makeRepo({
+      fragments: {
+        "2448-later.md": "- **Later PR (#2448).**\n",
+        "999-earlier.md": "- **Earlier PR (#999).**\n",
+      },
+    });
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    const compiled = read(root);
+    expect(compiled.indexOf("(#999)")).toBeLessThan(compiled.indexOf("(#2448)"));
+  });
+
+  it("folds legacy entries written directly under Unreleased into the same section", () => {
+    const legacy = [
+      "- **A legacy entry written before fragments (#2400).** First paragraph.",
+      "",
+      "  A continuation paragraph that belongs to the same entry.",
+      "- **A second legacy entry (#2401).** Body.",
+    ].join("\n");
+    const root = makeRepo({
+      changelog: changelogWith(legacy),
+      fragments: { "2452-fragments.md": "- **A fragment entry (#2452).** Body.\n" },
+    });
+    const log = silentLog();
+
+    const result = compileChangelog({
+      repoRoot: root,
+      version: "0.14.0",
+      date: "2026-08-04",
+      log,
+    });
+
+    expect(result.foldedLegacyEntries).toBe(true);
+    const compiled = read(root);
+    const section = compiled.slice(
+      compiled.indexOf("## 0.14.0"),
+      compiled.indexOf("## 0.13.2"),
+    );
+    expect(section).toContain("(#2400)");
+    expect(section).toContain("A continuation paragraph that belongs to the same entry.");
+    expect(section).toContain("(#2401)");
+    expect(section).toContain("(#2452)");
+    // Legacy entries lead the section; fragments follow in filename order.
+    expect(section.indexOf("(#2400)")).toBeLessThan(section.indexOf("(#2452)"));
+    // Nothing is left under Unreleased except the pointer note.
+    expect(compiled).toContain(`## Unreleased\n\n${NOTE}\n\n## 0.14.0`);
+    expect(log.text()).toContain("Folded in the entries");
+  });
+
+  /*
+    THE INVERTED-ORDER CASE, and the reason the note is sentinel-anchored.
+
+    `CHANGELOG.md` is `merge=union` (#2451). Merging a branch that still writes
+    its entry directly under `## Unreleased` can therefore put that entry ABOVE
+    the pointer note — reproduced with real git: the branch side of a union
+    merge wins the position. A compiler that split the section positionally
+    ("everything above the first bullet is the note") would then read the note
+    as part of the entries: it would be published inside the release section AND
+    deleted from `## Unreleased` for good, with no error and nothing to notice.
+  */
+  it("keeps the pointer note in place when an entry sits above it (union-merge order)", () => {
+    const inverted = [
+      "# Changelog",
+      "",
+      "All notable public reference-release changes should be recorded here.",
+      "",
+      "## Unreleased",
+      "",
+      "- **An entry a union merge landed above the note (#2400).** First paragraph.",
+      "",
+      "  A continuation paragraph that belongs to the same entry.",
+      "",
+      NOTE,
+      "",
+      HISTORY,
+    ].join("\n");
+    const root = makeRepo({
+      changelog: inverted,
+      fragments: { "2452-fragments.md": "- **A fragment entry (#2452).** Body.\n" },
+    });
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    const compiled = read(root);
+    // 1. The note survives, re-emitted canonically directly under Unreleased.
+    expect(compiled).toContain(`## Unreleased\n\n${NOTE}\n\n## 0.14.0 - 2026-08-04`);
+    // 2. It never enters the release section.
+    const section = compiled.slice(compiled.indexOf("## 0.14.0"), compiled.indexOf("## 0.13.2"));
+    expect(section).not.toContain(POINTER_NOTE_START);
+    expect(section).not.toContain(NOTE_BODY);
+    // The entry that was above it is released, continuation and all.
+    expect(section).toContain("(#2400)");
+    expect(section).toContain("A continuation paragraph that belongs to the same entry.");
+    expect(section).toContain("(#2452)");
+    // And the note exists exactly once in the whole file — not duplicated.
+    expect(compiled.split(POINTER_NOTE_START).length - 1).toBe(1);
+  });
+
+  it("restores the pointer note when Unreleased has lost it", () => {
+    const root = makeRepo({
+      changelog: [
+        "# Changelog",
+        "",
+        "## Unreleased",
+        "",
+        "- **An entry with no pointer note above it (#2400).** Body.",
+        "",
+        HISTORY,
+      ].join("\n"),
+    });
+    const log = silentLog();
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log });
+
+    const compiled = read(root);
+    expect(compiled).toContain(`## Unreleased\n\n${POINTER_NOTE_START}\n`);
+    expect(compiled).toContain("changelog.d/README.md");
+    expect(compiled.indexOf(POINTER_NOTE_END)).toBeLessThan(compiled.indexOf("## 0.14.0"));
+    expect(log.text()).toContain("Restored the changelog.d pointer note");
+  });
+
+  it("warns loudly about unrecognised content under Unreleased instead of silently keeping it", () => {
+    const stray = "TODO: someone please turn the refund fix into a proper entry.";
+    const root = makeRepo({
+      changelog: changelogWith(`${stray}\n\n- **A real entry (#2400).** Body.`),
+    });
+    const log = silentLog();
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log });
+
+    expect(log.text()).toContain('WARNING: unrecognised content left under "## Unreleased"');
+    expect(log.text()).toContain(stray);
+    const compiled = read(root);
+    // Neither released...
+    const section = compiled.slice(compiled.indexOf("## 0.14.0"), compiled.indexOf("## 0.13.2"));
+    expect(section).not.toContain(stray);
+    expect(section).toContain("(#2400)");
+    // ...nor deleted: it stays under Unreleased, below the note.
+    expect(compiled).toContain(`${NOTE}\n\n${stray}\n\n## 0.14.0 - 2026-08-04`);
+  });
+
+  it("refuses to guess when the pointer-note sentinel is malformed", () => {
+    const unterminated = makeRepo({
+      changelog: [
+        "# Changelog",
+        "",
+        "## Unreleased",
+        "",
+        POINTER_NOTE_START,
+        "",
+        NOTE_BODY,
+        "",
+        HISTORY,
+      ].join("\n"),
+      fragments: { "2452-fragments.md": "- **Entry (#2452).**\n" },
+    });
+    expect(() =>
+      compileChangelog({
+        repoRoot: unterminated,
+        version: "0.14.0",
+        date: "2026-08-04",
+        log: silentLog(),
+      }),
+    ).toThrow(/unterminated/);
+
+    const duplicated = makeRepo({
+      changelog: changelogWith(NOTE),
+      fragments: { "2452-fragments.md": "- **Entry (#2452).**\n" },
+    });
+    expect(() =>
+      compileChangelog({
+        repoRoot: duplicated,
+        version: "0.14.0",
+        date: "2026-08-04",
+        log: silentLog(),
+      }),
+    ).toThrow(/more than one/);
+  });
+
+  it("keeps the real CHANGELOG.md pointer note inside its sentinels", () => {
+    const real = fs.readFileSync(
+      path.resolve(import.meta.dirname, "..", "..", "CHANGELOG.md"),
+      "utf8",
+    );
+    const unreleased = real.slice(
+      real.indexOf("## Unreleased"),
+      real.indexOf("\n## ", real.indexOf("## Unreleased") + 1),
+    );
+    expect(unreleased).toContain(POINTER_NOTE_START);
+    expect(unreleased).toContain(POINTER_NOTE_END);
+    expect(unreleased.indexOf(POINTER_NOTE_START)).toBeLessThan(
+      unreleased.indexOf("changelog.d/README.md"),
+    );
+    expect(unreleased.indexOf("changelog.d/README.md")).toBeLessThan(
+      unreleased.indexOf(POINTER_NOTE_END),
+    );
+  });
+
+  it("is a no-op with a clear message when there is nothing to compile", () => {
+    const root = makeRepo({ fragments: { "README.md": "# How to write a fragment\n" } });
+    const before = read(root);
+    const log = silentLog();
+
+    const result = compileChangelog({
+      repoRoot: root,
+      version: "0.14.0",
+      date: "2026-08-04",
+      log,
+    });
+
+    expect(result.written).toBe(false);
+    expect(read(root)).toBe(before);
+    expect(log.text()).toContain("Nothing to compile");
+    expect(log.text()).toContain("CHANGELOG.md was left unchanged");
+  });
+
+  it("retires committed allowance fragments with a real release, preserving README and untracked drafts", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: {
+        "2991-old.md": "file: src/lib/waitlist.ts\n",
+        "3031-new.md": "file: src/lib/waitlist.ts\n",
+      },
+    });
+    fs.writeFileSync(path.join(root, "size-allowances.d", "next-local.md"), "draft\n");
+    const log = silentLog();
+
+    const result = compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log });
+
+    expect(result.written).toBe(true);
+    expect(result.retiredAllowances).toEqual([
+      "size-allowances.d/2991-old.md",
+      "size-allowances.d/3031-new.md",
+    ]);
+    expect(allowanceFiles(root)).toEqual(["README.md", "next-local.md"]);
+    expect(read(root)).toContain("## 0.14.0 - 2026-08-04");
+    expect(log.text()).toContain("Retired 2 committed size-allowance fragment(s)");
+  });
+
+  it("shows allowance retirement in dry-run without changing any files", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "file: src/lib/waitlist.ts\n" },
+    });
+    const before = read(root);
+    const log = silentLog();
+
+    const result = compileChangelog({
+      repoRoot: root,
+      version: "0.14.0",
+      date: "2026-08-04",
+      dryRun: true,
+      log,
+    });
+
+    expect(result.written).toBe(false);
+    expect(result.retiredAllowances).toEqual(["size-allowances.d/2991-old.md"]);
+    expect(read(root)).toBe(before);
+    expect(fragmentFiles(root)).toEqual(["2452-release.md"]);
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md"]);
+    expect(log.text()).toContain("size-allowances.d/2991-old.md (spent allowance; would be deleted)");
+    expect(log.text()).toContain("Source is local origin/main; refresh it before release prep");
+  });
+
+  it("restores all release inputs after a later unlink failure, then retries safely", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: {
+        "2991-old.md": "first allowance\n",
+        "3031-new.md": "second allowance\n",
+      },
+    });
+    const before = read(root);
+    const fragment = path.join(root, "changelog.d", "2452-release.md");
+    const allowance = path.join(root, "size-allowances.d", "3031-new.md");
+
+    expect(() =>
+      compileChangelog({
+        repoRoot: root,
+        version: "0.14.0",
+        date: "2026-08-04",
+        log: silentLog(),
+        removeFile(file) {
+          fs.rmSync(file);
+          if (file === allowance) throw new Error("injected unlink failure after deletion");
+        },
+      }),
+    ).toThrow(/Could not remove .*3031-new\.md: injected unlink failure after deletion.*original files restored.*retried/);
+    expect(read(root)).toBe(before);
+    expect(fs.readFileSync(fragment, "utf8")).toBe("- **Release entry (#2452).**\n");
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "3031-new.md", "README.md"]);
+
+    const retry = compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+    expect(retry.written).toBe(true);
+    expect(read(root)).toContain("## 0.14.0 - 2026-08-04");
+    expect(allowanceFiles(root)).toEqual(["README.md"]);
+  });
+
+  it("does not overwrite a concurrent edit while reporting incomplete rollback", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "original allowance\n" },
+    });
+    const before = read(root);
+    const allowance = path.join(root, "size-allowances.d", "2991-old.md");
+
+    expect(() =>
+      compileChangelog({
+        repoRoot: root,
+        version: "0.14.0",
+        date: "2026-08-04",
+        log: silentLog(),
+        removeFile(file) {
+          if (file === allowance) {
+            fs.writeFileSync(file, "concurrent edit\n");
+            throw new Error("injected conflict");
+          }
+          fs.rmSync(file);
+        },
+      }),
+    ).toThrow(/Could not remove .*2991-old\.md: injected conflict.*restoration was incomplete.*2991-old\.md/);
+    expect(read(root)).toBe(before);
+    expect(fs.readFileSync(path.join(root, "changelog.d", "2452-release.md"), "utf8"))
+      .toBe("- **Release entry (#2452).**\n");
+    expect(fs.readFileSync(allowance, "utf8")).toBe("concurrent edit\n");
+  });
+
+  it("detects an allowance edited after the snapshot and before its unlink", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "original allowance\n" },
+    });
+    const before = read(root);
+    const allowance = path.join(root, "size-allowances.d", "2991-old.md");
+    const removed = [];
+
+    expect(() =>
+      compileChangelog({
+        repoRoot: root,
+        version: "0.14.0",
+        date: "2026-08-04",
+        log: silentLog(),
+        removeFile(file) {
+          removed.push(file);
+          fs.rmSync(file);
+          if (file.endsWith("2452-release.md")) fs.writeFileSync(allowance, "concurrent edit\n");
+        },
+      }),
+    ).toThrow(/2991-old\.md.*restoration was incomplete.*2991-old\.md/);
+    expect(removed).not.toContain(allowance);
+    expect(read(root)).toBe(before);
+    expect(fs.readFileSync(allowance, "utf8")).toBe("concurrent edit\n");
+    expect(fs.readFileSync(path.join(root, "changelog.d", "2452-release.md"), "utf8"))
+      .toBe("- **Release entry (#2452).**\n");
+  });
+
+  it("refuses a changelog fragment edited after composition and before the apply snapshot", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- original release entry\n" },
+      allowances: { "2991-old.md": "original allowance\n" },
+    });
+    const before = read(root);
+    const fragment = path.join(root, "changelog.d", "2452-release.md");
+
+    expect(() => compileChangelog({
+      repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog(),
+      beforeApplySnapshot() { fs.writeFileSync(fragment, "- concurrent release entry\n"); },
+    })).toThrow(/Changelog fragment changed after it was read.*2452-release\.md/);
+    expect(read(root)).toBe(before);
+    expect(fs.readFileSync(fragment, "utf8")).toBe("- concurrent release entry\n");
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md"]);
+  });
+
+  it("refuses an allowance edited after the first preflight and before the apply snapshot", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- original release entry\n" },
+      allowances: { "2991-old.md": "original allowance\n" },
+    });
+    const before = read(root);
+    const allowance = path.join(root, "size-allowances.d", "2991-old.md");
+
+    expect(() => compileChangelog({
+      repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog(),
+      beforeApplySnapshot() { fs.writeFileSync(allowance, "concurrent allowance edit\n"); },
+    })).toThrow(/Merged allowance changed during release preflight/);
+    expect(read(root)).toBe(before);
+    expect(fs.readFileSync(allowance, "utf8")).toBe("concurrent allowance edit\n");
+    expect(fragmentFiles(root)).toEqual(["2452-release.md"]);
+  });
+
+  it("refuses a CHANGELOG edit after composition and before the first write", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- original release entry\n" },
+      allowances: { "2991-old.md": "original allowance\n" },
+    });
+    const changelog = path.join(root, "CHANGELOG.md");
+    const original = read(root);
+
+    expect(() => compileChangelog({
+      repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog(),
+      beforeApplySnapshot() { fs.writeFileSync(changelog, `${original}\nconcurrent edit\n`); },
+    })).toThrow(/CHANGELOG\.md changed after it was read/);
+    expect(read(root)).toBe(`${original}\nconcurrent edit\n`);
+    expect(fragmentFiles(root)).toEqual(["2452-release.md"]);
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md"]);
+  });
+
+  it("keeps an allowance committed only on the release-prep branch", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-merged.md": "file: src/lib/waitlist.ts\n" },
+    });
+    fs.writeFileSync(path.join(root, "size-allowances.d", "9999-branch-only.md"), "branch note\n");
+    git(root, "add", "size-allowances.d/9999-branch-only.md");
+    git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "branch-only allowance");
+
+    const result = compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    expect(result.retiredAllowances).toEqual(["size-allowances.d/2991-merged.md"]);
+    expect(allowanceFiles(root)).toEqual(["9999-branch-only.md", "README.md"]);
+  });
+
+  it("refuses to discard a merged allowance edited on the release-prep branch", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-merged.md": "original\n" },
+    });
+    fs.writeFileSync(path.join(root, "size-allowances.d", "2991-merged.md"), "branch revision\n");
+    git(root, "add", "size-allowances.d/2991-merged.md");
+    git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "branch revision");
+    const before = read(root);
+
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() }),
+    ).toThrow(/branch edits/);
+    expect(read(root)).toBe(before);
+    expect(allowanceFiles(root)).toEqual(["2991-merged.md", "README.md"]);
+  });
+
+  it("refuses a stale base ref before changing a release", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "file: src/lib/waitlist.ts\n" },
+    });
+    fs.writeFileSync(path.join(root, "size-allowances.d", "2992-new.md"), "merged later\n");
+    git(root, "add", "size-allowances.d/2992-new.md");
+    git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "new main");
+    git(root, "update-ref", "refs/remotes/origin/main", "HEAD");
+    git(root, "checkout", "-q", "HEAD~1");
+    const before = read(root);
+
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() }),
+    ).toThrow(/start release-prep from it/);
+    expect(read(root)).toBe(before);
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md"]);
+  });
+
+  it("does not retire allowances when there is no changelog release to compile", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "README.md": "# Changelog convention\n" },
+      allowances: { "2991-old.md": "file: src/lib/waitlist.ts\n" },
+    });
+    const before = read(root);
+    const log = silentLog();
+
+    const result = compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log });
+
+    expect(result.written).toBe(false);
+    expect(result.retiredAllowances).toEqual([]);
+    expect(read(root)).toBe(before);
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md"]);
+    expect(log.text()).toContain("remain until a release is compiled");
+  });
+
+  it("fails before writing the changelog if a committed allowance has local edits", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "file: src/lib/waitlist.ts\n" },
+    });
+    fs.appendFileSync(path.join(root, "size-allowances.d", "2991-old.md"), "local edit\n");
+    const before = read(root);
+
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() }),
+    ).toThrow(/local edits/);
+    expect(read(root)).toBe(before);
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md"]);
+  });
+
+  it("retires a valid spaced allowance filename accepted by the budget reader", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991 old allowance.md": "file: src/lib/waitlist.ts\n" },
+    });
+    expect(retiredAllowancePaths(root)).toEqual(["size-allowances.d/2991 old allowance.md"]);
+
+    const result = compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    expect(result.retiredAllowances).toEqual(["size-allowances.d/2991 old allowance.md"]);
+    expect(allowanceFiles(root)).toEqual(["README.md"]);
+  });
+
+  it("refuses an unsafe direct-child allowance before release writes", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "bad\u200e.md": "file: src/lib/waitlist.ts\n" },
+    });
+    const before = read(root);
+    expect(() => retiredAllowancePaths(root)).toThrow(/Unsafe allowance filename/);
+    expect(() => compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() }))
+      .toThrow(/Unsafe allowance filename/);
+    expect(read(root)).toBe(before);
+  });
+
+  it("fails closed on a nested Git path before writing the changelog", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "file: src/lib/waitlist.ts\n" },
+    });
+    const nested = path.join(root, "size-allowances.d", "nested");
+    fs.mkdirSync(nested);
+    fs.writeFileSync(path.join(nested, "wrong.md"), "not a direct child\n");
+    git(root, "add", "size-allowances.d/nested/wrong.md");
+    git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "nested path");
+    git(root, "update-ref", "refs/remotes/origin/main", "HEAD");
+    const before = read(root);
+
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() }),
+    ).toThrow(/Unsafe allowance path/);
+    expect(read(root)).toBe(before);
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md", "nested"]);
+  });
+
+  it("refuses a linked allowance directory before writing the changelog", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "file: src/lib/waitlist.ts\n" },
+    });
+    const dir = path.join(root, "size-allowances.d");
+    const realDir = path.join(root, "held-allowances");
+    fs.renameSync(dir, realDir);
+    fs.symlinkSync(realDir, dir, process.platform === "win32" ? "junction" : "dir");
+    const before = read(root);
+
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() }),
+    ).toThrow(/must be a real directory/);
+    expect(read(root)).toBe(before);
+    expect(fs.existsSync(path.join(realDir, "2991-old.md"))).toBe(true);
+  });
+
+  it("refuses a symlink recorded in the merged Git tree even if the checkout materialises a file", () => {
+    const root = makeTrackedAllowanceRepo({
+      fragments: { "2452-release.md": "- **Release entry (#2452).**\n" },
+      allowances: { "2991-old.md": "file: src/lib/waitlist.ts\n" },
+    });
+    const blob = execFileSync("git", ["-C", root, "hash-object", "-w", "--stdin"], {
+      encoding: "utf8",
+      input: "README.md",
+    }).trim();
+    git(root, "update-index", "--add", "--cacheinfo", "120000", blob, "size-allowances.d/2991-old.md");
+    git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "merged link");
+    git(root, "update-ref", "refs/remotes/origin/main", "HEAD");
+    const before = read(root);
+
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() }),
+    ).toThrow(/must not be a symlink/);
+    expect(read(root)).toBe(before);
+    expect(allowanceFiles(root)).toEqual(["2991-old.md", "README.md"]);
+  });
+
+  it("leaves every file untouched in --dry-run and reports the plan", () => {
+    const root = makeRepo({
+      fragments: { "2452-fragments.md": "- **A fragment entry (#2452).** Body.\n" },
+      changelog: changelogWith("- **A legacy entry (#2400).** Body."),
+    });
+    const before = read(root);
+    const log = silentLog();
+
+    const result = compileChangelog({
+      repoRoot: root,
+      version: "0.14.0",
+      date: "2026-08-04",
+      dryRun: true,
+      log,
+    });
+
+    expect(result.written).toBe(false);
+    expect(read(root)).toBe(before);
+    expect(fragmentFiles(root)).toEqual(["2452-fragments.md"]);
+    expect(log.text()).toContain('[dry run] Would add "## 0.14.0 - 2026-08-04"');
+    expect(log.text()).toContain("changelog.d/2452-fragments.md (would be deleted)");
+    expect(log.text()).toContain('the entries currently written directly under "## Unreleased"');
+    expect(log.text()).toContain("No files were changed");
+  });
+
+  it("rewrites a fragment's relative links so they resolve from the repository root (#5214)", () => {
+    const root = makeRepo({
+      fragments: {
+        "5214-links.md": [
+          "- **Links survive compiling (#5214).** See [the guide](../docs/guides/club-time.md#setup),",
+          "  the ![diagram](<../docs/images/flow chart.png>) and [the changelog README](README.md).",
+          "",
+          "  [ref]: ../CONFIGURATION.md",
+          "",
+        ].join("\n"),
+      },
+    });
+    for (const file of ["docs/guides/club-time.md", "docs/images/flow chart.png", "CONFIGURATION.md"]) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), "");
+    }
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    const compiled = read(root);
+    expect(compiled).toContain("[the guide](docs/guides/club-time.md#setup)");
+    expect(compiled).toContain("![diagram](<docs/images/flow chart.png>)");
+    expect(compiled).toContain("[the changelog README](changelog.d/README.md)");
+    expect(compiled).toContain("  [ref]: CONFIGURATION.md");
+    // Each rewritten target names a real file relative to CHANGELOG.md's directory.
+    for (const target of ["docs/guides/club-time.md", "docs/images/flow chart.png", "CONFIGURATION.md"]) {
+      expect(fs.existsSync(path.join(root, target))).toBe(true);
+    }
+  });
+
+  it("leaves external, absolute, same-page and example links alone when rebasing (#5214)", () => {
+    for (const target of ["https://example.test/a.md", "mailto:x@example.test", "//cdn.example.test/x", "/docs/A.md", "#heading", ""]) {
+      expect(rebaseFragmentLink(target)).toBe(target);
+    }
+    expect(rebaseFragmentLink("../docs/A.md?plain=1#L3")).toBe("docs/A.md?plain=1#L3");
+    expect(rebaseFragmentLink("./other.md")).toBe("changelog.d/other.md");
+
+    const body = [
+      "- Prose [real](../docs/A.md), code `[example](../docs/B.md)`, and [`code text`](../docs/C.md).",
+      "",
+      "  ```markdown",
+      "  [fenced example](../docs/D.md)",
+      "  ```",
+    ].join("\n");
+    expect(rebaseFragmentLinks(body, "x.md")).toBe(
+      [
+        "- Prose [real](docs/A.md), code `[example](../docs/B.md)`, and [`code text`](docs/C.md).",
+        "",
+        "  ```markdown",
+        "  [fenced example](../docs/D.md)",
+        "  ```",
+      ].join("\n"),
+    );
+  });
+
+  it("rebases both targets of an image wrapped in a link (#5214)", () => {
+    expect(rebaseFragmentLinks("- Badge [![alt](../img/a.png)](../docs/A.md).", "x.md")).toBe(
+      "- Badge [![alt](img/a.png)](docs/A.md).",
+    );
+  });
+
+  it("rewrites a link whose text or target wraps onto the next line (#5214)", () => {
+    const body = [
+      "- See the [hut leader",
+      "  guide](../docs/g.md#x), the [badge",
+      "  ![alt](../img/a.png)](",
+      "  ../docs/A.md) and a `[wrapped",
+      "  example](../docs/B.md)` in code.",
+    ].join("\n");
+    expect(rebaseFragmentLinks(body, "x.md")).toBe(
+      [
+        "- See the [hut leader",
+        "  guide](docs/g.md#x), the [badge",
+        "  ![alt](img/a.png)](",
+        "  docs/A.md) and a `[wrapped",
+        "  example](../docs/B.md)` in code.",
+      ].join("\n"),
+    );
+    // A blank line ends the paragraph, so brackets either side are not one link.
+    expect(rebaseFragmentLinks("- [not\n\n  a link](../docs/A.md)", "x.md")).toBe("- [not\n\n  a link](../docs/A.md)");
+  });
+
+  it("refuses a wrapped link that points outside the repository (#5214)", () => {
+    expect(() => rebaseFragmentLinks("- See [the\n  outside](../../x.md).", "w.md")).toThrow(
+      /changelog\.d\/w\.md links "\.\.\/\.\.\/x\.md", which points outside the repository/,
+    );
+  });
+
+  it("rebases a link nested in an image's alt text without corrupting either target (#5214)", () => {
+    expect(rebaseFragmentLinks("- ![see [x](../docs/y.md)](../img/a.png)", "x.md")).toBe(
+      "- ![see [x](docs/y.md)](img/a.png)",
+    );
+  });
+
+  it("rebases an angle-bracket reference definition, spaces and next-line targets included (#5214)", () => {
+    const body = [
+      "- See [ref] and [other].",
+      "",
+      "  [ref]: <../docs/y.md>",
+      "  [spaced]: <../docs/my file.md#a>",
+      "  [other]:",
+      "    ../docs/z.md \"Title\"",
+    ].join("\n");
+    expect(rebaseFragmentLinks(body, "x.md")).toBe(
+      [
+        "- See [ref] and [other].",
+        "",
+        "  [ref]: <docs/y.md>",
+        "  [spaced]: <docs/my file.md#a>",
+        "  [other]:",
+        "    docs/z.md \"Title\"",
+      ].join("\n"),
+    );
+    expect(() => rebaseFragmentLinks("  [out]: <../../x.md>", "x.md")).toThrow(/points outside the repository/);
+  });
+
+  it("leaves prose after a bare `[label]:` and definition-shaped prose lines unchanged (#5214)", () => {
+    const body = ["- Notes follow.", "", "  [note]:", "  See below for the details.", "  [Label]: text that is prose, not a link."].join("\n");
+    expect(rebaseFragmentLinks(body, "x.md")).toBe(body);
+  });
+
+  it("leaves links in a backtick fence alone past a `~~~` line inside it (#5214)", () => {
+    const body = ["- Example:", "  ```md", "  ~~~", "  [a](../docs/A.md)", "  ```", "  See [b](../docs/B.md)."].join("\n");
+    expect(rebaseFragmentLinks(body, "x.md")).toBe(body.replace("(../docs/B.md)", "(docs/B.md)"));
+  });
+
+  it("rebases fragments but leaves legacy Unreleased entries as written (#5214)", () => {
+    // A legacy entry was written in CHANGELOG.md itself, so its links already
+    // resolve from the root; rebasing it would break them.
+    const root = makeRepo({
+      changelog: changelogWith("- **Legacy (#2400).** See [root](docs/A.md) and [up](../outside.md)."),
+      fragments: { "5214-new.md": "- **Fragment (#5214).** See [it](../docs/A.md).\n" },
+    });
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    expect(releaseSection(read(root), "0.14.0").body).toBe(
+      "- **Legacy (#2400).** See [root](docs/A.md) and [up](../outside.md).\n" +
+        "- **Fragment (#5214).** See [it](docs/A.md).",
+    );
+  });
+
+  it("rebases late fragments under --append and leaves the prepared section's links alone (#5214)", () => {
+    const prepared = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      NOTE,
+      "",
+      "## 0.13.3 - 2026-10-31",
+      "",
+      "- **Prepared (#4400).** See [root](docs/A.md).",
+      "",
+      HISTORY,
+    ].join("\n");
+    const root = makeRepo({
+      changelog: prepared,
+      fragments: { "4500-late.md": "- **Late (#4500).** See [the\n  guide](../docs/B.md#x).\n" },
+    });
+
+    compileChangelog({ repoRoot: root, version: "0.13.3", date: "2026-11-02", append: true, log: silentLog() });
+
+    expect(releaseSection(read(root), "0.13.3").body).toBe(
+      "- **Prepared (#4400).** See [root](docs/A.md).\n- **Late (#4500).** See [the\n  guide](docs/B.md#x).",
+    );
+
+    const escaping = makeRepo({
+      changelog: prepared,
+      fragments: { "4501-bad.md": "- **Bad (#4501).** See [it](../../x.md).\n" },
+    });
+    expect(() =>
+      compileChangelog({ repoRoot: escaping, version: "0.13.3", date: "2026-11-02", append: true, log: silentLog() }),
+    ).toThrow(/points outside the repository/);
+    expect(read(escaping)).toBe(prepared);
+    expect(fragmentFiles(escaping)).toEqual(["4501-bad.md"]);
+  });
+
+  it("refuses a fragment link that points outside the repository, before writing anything (#5214)", () => {
+    const changelog = changelogWith("");
+    const root = makeRepo({
+      changelog,
+      fragments: { "5214-escape.md": "- **Bad link (#5214).** See [it](../../elsewhere.md).\n" },
+    });
+
+    expect(() => compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() })).toThrow(
+      /changelog\.d\/5214-escape\.md links "\.\.\/\.\.\/elsewhere\.md", which points outside the repository/,
+    );
+    expect(read(root)).toBe(changelog);
+    expect(fragmentFiles(root)).toEqual(["5214-escape.md"]);
+  });
+
+  it("normalises a CRLF fragment written by a Windows editor", () => {
+    const root = makeRepo({
+      fragments: { "2452-fragments.md": "- **CRLF entry (#2452).**\r\n\r\n  Second paragraph.\r\n" },
+    });
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    expect(read(root)).not.toContain("\r");
+  });
+
+  it("refuses to compile a version that is already released", () => {
+    const root = makeRepo({
+      fragments: { "2452-fragments.md": "- **Entry (#2452).**\n" },
+    });
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.13.2", date: "2026-08-04", log: silentLog() }),
+    ).toThrow(/already has a "## 0.13.2" section/);
+  });
+
+  it("appends late fragments to an existing, untagged section only when asked (#4465)", () => {
+    const prepared = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      NOTE,
+      "",
+      "## 0.13.3 - 2026-10-31",
+      "",
+      "- **Prepared entry (#4400).**",
+      "  Continued.",
+      "",
+      HISTORY,
+    ].join("\n");
+    const root = makeRepo({ changelog: prepared, fragments: { "4500-late.md": "- **Late entry (#4500).**\n" } });
+
+    // The default still refuses an existing section.
+    expect(() => compileChangelog({ repoRoot: root, version: "0.13.3", date: "2026-11-02", log: silentLog() })).toThrow(
+      /already has a "## 0.13.3" section/,
+    );
+
+    const dryLog = silentLog();
+    compileChangelog({ repoRoot: root, version: "0.13.3", date: "2026-11-02", append: true, dryRun: true, log: dryLog });
+    expect(dryLog.text()).toContain('Would append to "## 0.13.3 - 2026-10-31" in CHANGELOG.md');
+    expect(read(root)).toBe(prepared);
+
+    const log = silentLog();
+    const result = compileChangelog({ repoRoot: root, version: "0.13.3", date: "2026-11-02", append: true, log });
+    expect(result.written).toBe(true);
+    const compiled = read(root);
+    expect(releaseSection(compiled, "0.13.3")).toEqual({
+      heading: "## 0.13.3 - 2026-10-31",
+      body: "- **Prepared entry (#4400).**\n  Continued.\n- **Late entry (#4500).**",
+    });
+    expect(compiled).not.toContain("2026-11-02");
+    expect(compiled.match(/^## 0\.13\.3 /gm)).toHaveLength(1);
+    expect(compiled).toContain(`## Unreleased\n\n${NOTE}\n\n## 0.13.3 - 2026-10-31`);
+    expect(compiled.slice(compiled.indexOf("## 0.13.2"))).toBe(`${HISTORY.trimEnd()}\n`);
+    expect(fragmentFiles(root)).toEqual([]);
+    expect(log.text()).toContain('Appended to "## 0.13.3 - 2026-10-31" in CHANGELOG.md.');
+  });
+
+  it("refuses to append to any section but the newest, even when run directly", () => {
+    const prepared = ["# Changelog", "", "## Unreleased", "", NOTE, "", "## 0.13.3 - 2026-10-31", "", "- **Newest (#4400).**", "", HISTORY].join("\n");
+    const root = makeRepo({ changelog: prepared, fragments: { "4500-late.md": "- **Late (#4500).**\n" } });
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.13.2", date: "2026-11-02", append: true, log: silentLog() }),
+    ).toThrow(/"## 0\.13\.2 - 2026-07-23" is not the newest release section in CHANGELOG\.md \(that is "## 0\.13\.3 - 2026-10-31"\)/);
+    expect(read(root)).toBe(prepared);
+    expect(fragmentFiles(root)).toEqual(["4500-late.md"]);
+  });
+
+  it("refuses to append when the section does not exist", () => {
+    const root = makeRepo({ fragments: { "4500-late.md": "- **Late (#4500).**\n" } });
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-11-02", append: true, log: silentLog() }),
+    ).toThrow(/has no "## 0.14.0" section to append to/);
+    expect(fragmentFiles(root)).toEqual(["4500-late.md"]);
+  });
+
+  it("reads a section's heading and body, and classifies Unreleased, from text", () => {
+    const text = changelogWith("- **Direct entry (#1).**");
+    expect(releaseSection(text, "0.13.2")).toEqual({
+      heading: "## 0.13.2 - 2026-07-23",
+      body: HISTORY.split("\n").slice(2).join("\n").trim(),
+    });
+    expect(releaseSection(text, "0.13")).toBeNull();
+    expect(classifyUnreleased(text).legacy).toEqual(["- **Direct entry (#1).**"]);
+    expect(classifyUnreleased(changelogWith("")).legacy).toEqual([]);
+    expect(classifyUnreleased("# Changelog\n\n## 0.1.0 - 2026-01-01\n")).toBeNull();
+  });
+
+  it("reads the date back from a compiled heading, and refuses a hand-edited one", () => {
+    expect(releaseHeadingDate(releaseHeading("0.14.0", "2026-11-20"), "0.14.0")).toBe("2026-11-20");
+    expect(releaseHeadingDate("## 0.14.0 - 2026-11-20  ", "0.14.0")).toBe("2026-11-20");
+    // releaseSection finds a section by version alone, so these reach a reader of the date.
+    expect(releaseHeadingDate("## 0.14.0 (2026-11-20)", "0.14.0")).toBeNull();
+    expect(releaseHeadingDate("## 0.14.0 - 2026-11-20)", "0.14.0")).toBeNull();
+    expect(releaseHeadingDate("## 0.14.0 - soon", "0.14.0")).toBeNull();
+    expect(releaseHeadingDate("## 0.14.0 -", "0.14.0")).toBeNull();
+    expect(releaseHeadingDate("## 0.14.1 - 2026-11-20", "0.14.0")).toBeNull();
+  });
+
+  it("splits text into lines whatever its line endings", () => {
+    expect(toLines("a\r\nb\nc")).toEqual(["a", "b", "c"]);
+    expect(toLines("")).toEqual([""]);
+  });
+
+  it("rejects a malformed version or date", () => {
+    const root = makeRepo();
+    expect(() => compileChangelog({ repoRoot: root, version: "v0.14", log: silentLog() })).toThrow(
+      /Version must look like/,
+    );
+    expect(() =>
+      compileChangelog({ repoRoot: root, version: "0.14.0", date: "4 Aug 2026", log: silentLog() }),
+    ).toThrow(/Date must be YYYY-MM-DD/);
+  });
+
+  it("inserts above the newest release when there is no Unreleased heading", () => {
+    const root = makeRepo({
+      changelog: `# Changelog\n\nAll notable changes.\n\n${HISTORY}`,
+      fragments: { "2452-fragments.md": "- **Entry (#2452).**\n" },
+    });
+
+    compileChangelog({ repoRoot: root, version: "0.14.0", date: "2026-08-04", log: silentLog() });
+
+    const compiled = read(root);
+    expect(compiled.indexOf("## 0.14.0")).toBeLessThan(compiled.indexOf("## 0.13.2"));
+    expect(compiled.endsWith("\n")).toBe(true);
+  });
+
+  it("reads only compilable fragments, in order", () => {
+    const root = makeRepo({
+      fragments: {
+        "b.md": "- b\n",
+        "a.md": "- a\n",
+        "README.md": "# readme\n",
+        ".gitkeep": "",
+        "notes.txt": "ignored",
+      },
+    });
+    expect(readFragments(path.join(root, "changelog.d")).map((f) => f.name)).toEqual([
+      "a.md",
+      "b.md",
+    ]);
+    expect(readFragments(path.join(root, "no-such-dir"))).toEqual([]);
+  });
+
+  it("sorts numeric filename chunks numerically and everything else stably", () => {
+    expect(["2448-b.md", "999-a.md", "10-c.md"].sort(compareFragmentNames)).toEqual([
+      "10-c.md",
+      "999-a.md",
+      "2448-b.md",
+    ]);
+    expect(["b.md", "a.md"].sort(compareFragmentNames)).toEqual(["a.md", "b.md"]);
+    expect(compareFragmentNames("2452-a.md", "2452-a.md")).toBe(0);
+  });
+
+  it("parses CLI arguments", () => {
+    expect(parseArgs(["0.14.0", "2026-08-04"])).toEqual({
+      version: "0.14.0",
+      date: "2026-08-04",
+      dryRun: false,
+      append: false,
+    });
+    expect(parseArgs(["--dry-run", "0.14.0", "--append"])).toEqual({
+      version: "0.14.0",
+      date: undefined,
+      dryRun: true,
+      append: true,
+    });
+  });
+
+  it("dates a release in the zone it is given, or the machine's own, never a fixed one (#4571)", () => {
+    const instant = new Date("2026-08-03T20:00:00Z");
+    expect(releaseDateToday(instant, "Pacific/Auckland")).toBe("2026-08-04");
+    expect(releaseDateToday(instant, "America/Denver")).toBe("2026-08-03");
+    expect(releaseDateToday(instant, "UTC")).toBe("2026-08-03");
+    expect(releaseDateToday()).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it("names no time zone in the release tooling (#4571, INV-CONFIG-002)", () => {
+    for (const file of ["scripts/release/compile-changelog.mjs", "scripts/release/cut-release.mjs", "scripts/release/release-notes.mjs", "scripts/release/upgrade-docs.mjs"]) {
+      expect(fs.readFileSync(file, "utf8"), file).not.toMatch(/timeZone:\s*["'][A-Za-z]+\/[A-Za-z_]+["']/);
+    }
+  });
+});
+
+describe("compile-changelog run directly (#4569)", () => {
+  it("runs its main block when started through a symlink, never exiting 0 having done nothing", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "compile-changelog-link-"));
+    try {
+      const link = path.join(dir, "compile-changelog.mjs");
+      fs.symlinkSync(path.resolve("scripts/release/compile-changelog.mjs"), link);
+      // No version: a main block that runs refuses loudly; one that is skipped
+      // (the old unresolved argv[1] check) exits 0 and prints nothing.
+      let status = 0;
+      let stderr = "";
+      try {
+        execFileSync(process.execPath, [link], { cwd: dir, encoding: "utf8", stdio: "pipe" });
+      } catch (error) {
+        status = error.status;
+        stderr = String(error.stderr);
+      }
+      expect(status).toBe(1);
+      expect(stderr).toContain("compile-changelog failed");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("after-deploy step fragments (#5379)", () => {
+  const DEPLOY = "## Who\n\nowner\n\n## What to do\n\nRun the report once.\n\n## How to check it worked\n\nIt lists no rows.\n";
+  const ENTRY = "- **An entry (#5379).** Body.\n";
+
+  it("never compiles a deploy step into CHANGELOG.md, and leaves it in place on a plain compile", () => {
+    const root = makeRepo({ fragments: { "5379-entry.md": ENTRY, "5309-stuck-report.deploy.md": DEPLOY } });
+    const log = silentLog();
+
+    const result = compileChangelog({ repoRoot: root, version: "0.15.0", date: "2026-11-23", log });
+
+    expect(result.fragments).toEqual(["5379-entry.md"]);
+    expect(result.deploySteps).toMatchObject([{ name: "5309-stuck-report.deploy.md", pr: 5309, who: "owner" }]);
+    expect(read(root)).not.toContain("Run the report once");
+    expect(fragmentFiles(root)).toEqual(["5309-stuck-report.deploy.md"]);
+    expect(log.text()).toContain("release:cut prepare files them in the release documents");
+  });
+
+  it("deletes the deploy steps with the entries when release:cut consumes them", () => {
+    const root = makeRepo({ fragments: { "5379-entry.md": ENTRY, "5309-stuck-report.deploy.md": DEPLOY } });
+
+    compileChangelog({ repoRoot: root, version: "0.15.0", date: "2026-11-23", consumeDeployFragments: true, log: silentLog() });
+
+    expect(fragmentFiles(root)).toEqual([]);
+    expect(read(root)).toContain("- **An entry (#5379).** Body.");
+  });
+
+  it("consumes deploy steps alone without touching CHANGELOG.md", () => {
+    const root = makeRepo({ fragments: { "5309-stuck-report.deploy.md": DEPLOY } });
+    const before = read(root);
+
+    const result = compileChangelog({ repoRoot: root, version: "0.15.0", date: "2026-11-23", consumeDeployFragments: true, log: silentLog() });
+
+    expect(result.written).toBe(false);
+    expect(read(root)).toBe(before);
+    expect(fragmentFiles(root)).toEqual([]);
+  });
+
+  it("refuses a malformed deploy step before any write, in a dry run too, naming every problem", () => {
+    const fragments = {
+      "5379-entry.md": ENTRY,
+      "5309-good.deploy.md": DEPLOY,
+      "5310-bad.deploy.md": DEPLOY.replace("owner", "everyone"),
+      "5311-worse.deploy.md": "Run it after deploying.\n",
+    };
+    const root = makeRepo({ fragments });
+    const before = read(root);
+
+    for (const dryRun of [true, false]) {
+      expect(() =>
+        compileChangelog({ repoRoot: root, version: "0.15.0", date: "2026-11-23", dryRun, consumeDeployFragments: true, log: silentLog() }),
+      ).toThrow(/2 after-deploy step fragment\(s\).*malformed[\s\S]*5310-bad\.deploy\.md: .*one of owner[\s\S]*5311-worse\.deploy\.md: .*no "## Who"/);
+    }
+    expect(read(root)).toBe(before);
+    expect(fragmentFiles(root)).toEqual(Object.keys(fragments).sort());
+    for (const [name, body] of Object.entries(fragments)) {
+      expect(fs.readFileSync(path.join(root, "changelog.d", name), "utf8")).toBe(body);
+    }
+  });
+
+  it("restores consumed deploy steps when a removal fails part way", () => {
+    const root = makeRepo({ fragments: { "5379-entry.md": ENTRY, "5309-stuck-report.deploy.md": DEPLOY } });
+    const before = read(root);
+    const deploy = path.join(root, "changelog.d", "5309-stuck-report.deploy.md");
+
+    expect(() =>
+      compileChangelog({
+        repoRoot: root,
+        version: "0.15.0",
+        date: "2026-11-23",
+        consumeDeployFragments: true,
+        log: silentLog(),
+        removeFile(file) {
+          fs.rmSync(file);
+          if (file === deploy) throw new Error("injected unlink failure");
+        },
+      }),
+    ).toThrow(/injected unlink failure.*original files restored/);
+    expect(read(root)).toBe(before);
+    expect(fs.readFileSync(deploy, "utf8")).toBe(DEPLOY);
+    expect(fragmentFiles(root)).toEqual(["5309-stuck-report.deploy.md", "5379-entry.md"]);
+  });
+});

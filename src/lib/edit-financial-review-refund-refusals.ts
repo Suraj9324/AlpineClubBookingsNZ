@@ -1,0 +1,170 @@
+/**
+ * THE REFUSALS A REVIEW REFUND OR CREDIT CAN GIVE, AND WHY EACH ONE IS A
+ * REFUSAL (#3032, #3170, epic #2797).
+ *
+ * Lifted out of `edit-financial-review-settlement.ts` on #3529, on the seam
+ * `edit-financial-review-charge-refusals.ts` was cut on in #3181: these three
+ * are officer-facing SENTENCES, each carrying the reason it exists, and the
+ * module they came from is about choosing a route and moving the money.
+ * Deliberately dependency-free - no `server-only`, no Prisma, no provider
+ * client - so a surface that needs to show one of these before the click can
+ * import it without dragging the settlement machinery in behind it.
+ */
+
+import type { ClubFormat } from "@/lib/club-format";
+import { formatCents } from "@/lib/utils";
+
+/**
+ * Raised when the review carries no `BookingModification` to settle against -
+ * either because none was recorded, or because the stored `reviewContext` cannot
+ * be read back at all. Two of the three routes key their exactly-once on that
+ * id, so without one the only alternatives are to guess which row to settle
+ * against or to mint a second anchor silently. Both are worse than telling the
+ * operator plainly and leaving the task open.
+ */
+export const REVIEW_SETTLEMENT_ANCHOR_MISSING_MESSAGE =
+  "This review is not linked to the booking change it came from, so the amount cannot be settled automatically. Hand the amount back another way, then dismiss this task with a note recording what you paid and how - the note is the record that the money was settled outside the system.";
+
+/**
+ * Owner decision D-3032-1 obliges this case to be handled deliberately rather
+ * than discovered at runtime. A confirmed review amount settles against the
+ * ORIGINAL edit's `BookingModification` row, and
+ * `MemberCredit.sourceBookingModificationId` is `@unique` - so if that edit had
+ * already issued a credit of its own, a second credit against the same row
+ * cannot be represented.
+ *
+ * Left unhandled it is not a clean failure: `createBookingModificationCredit`
+ * would reach `assertMatchingBookingModificationCredit` and throw an untyped
+ * `Error`, which falls past the route's `instanceof ManualBookingPaymentError`
+ * check and reaches the operator as "Could not close the refund task" with a 500
+ * in monitoring - for a database doing exactly what it was asked to.
+ *
+ * ANY pre-existing credit on the anchor is refused, including one whose amount
+ * happens to equal the confirmed figure. That is not over-caution: a matching
+ * amount is indistinguishable from a coincidence, and treating it as a replay
+ * would mark the task COMPLETED having moved nothing - money lost in silence,
+ * which is the failure this epic exists to prevent. A genuine replay never gets
+ * here, because a second completion of a COMPLETED task is refused by the status
+ * check in the caller.
+ *
+ * It is a DEFENSIVE refusal rather than a routine one: an edit whose amount
+ * could not be proven computes no settlement, so it issues no credit of its own
+ * and leaves the anchor free.
+ *
+ * WHAT THE OPERATOR IS TOLD TO DO WITH IT, and why that leaves an honest row.
+ * The amount IS owed, so "dismiss it" would be wrong under a reading of DISMISSED
+ * as "no adjustment is due". That is not what DISMISSED means here: the epic's
+ * requirement is that a dismissal must not PRETEND MONEY MOVED, and the note is
+ * REQUIRED on every dismissal precisely so the row says which decision it was.
+ * The wording below therefore asks for the note to record the hand-back, and the
+ * DISMISSED definition in `manual-refund-task-resolution.ts` and `INV-PAY-051` is
+ * stated to match. Leaving the task OPEN instead would be the dishonest option:
+ * it would hold a money question that has already been answered, and the
+ * pending-review fence would keep refusing the member's edits for as long as it
+ * stayed there.
+ */
+export const REVIEW_CREDIT_ANCHOR_TAKEN_MESSAGE =
+  "The booking change behind this review has already issued account credit, so a second credit cannot be recorded against it. Hand the amount back another way, then dismiss this task with a note recording what you paid and how - the note is the record that the money was settled outside the system.";
+
+/**
+ * #5061 follow-up (`INV-PAY-154`): the account-credit route on a booking whose
+ * captured card payment is under an OPEN or LOST Stripe dispute. The bank is
+ * taking that money back from the club, so crediting the member as well would
+ * pay them twice - as a disputed edit or cancel mints no credit either. The
+ * task stays OPEN until the dispute is settled in Stripe.
+ */
+export const REVIEW_CREDIT_DISPUTED_MESSAGE =
+  "This booking's card payment is disputed by the cardholder, so the amount cannot be given back as account credit while the dispute is open or lost. Check the dispute in Stripe; once it is won, complete this task again, or hand the money back another way and dismiss it with a note saying what was done.";
+
+/**
+ * The pre-claim cap on the card route.
+ *
+ * `refundPaymentTransactions` refuses an amount larger than the captured Stripe
+ * total - but it runs AFTER the commit, where a refusal is the worst possible
+ * outcome: the failure was swallowed, a recovery operation that could never
+ * succeed was enqueued, no `REFUNDED` event was written, and the route still
+ * answered "Refund recorded as paid back by hand" over a permanently COMPLETED
+ * task with nothing moved. Asking the same question here, before the claim, turns
+ * that into a refusal the operator can act on with the task still OPEN.
+ *
+ * It is the captured-payment check as well. `Payment.source` defaults to `STRIPE`
+ * in the schema, so routing on that column alone sends a hand-settled booking
+ * with nothing captured down the card path; the refundable total this cap is
+ * measured against is zero there, so the same refusal catches it.
+ */
+export const REVIEW_REFUND_EXCEEDS_CAPTURED_MESSAGE =
+  "That is more than this booking's card payment can give back - check the amount against the booking's payment history, or hand the money back another way and dismiss this task with a note saying what was done.";
+
+/**
+ * #3827 (`INV-PAY-117`): the by-hand route's pre-claim cap. Refunds already
+ * promised back by hand on the payment - an edit's, or an approved refund
+ * request's - are not yet in its refunded total, so the ledger cap alone
+ * would let this review promise the same cash a second time.
+ */
+export const REVIEW_REFUND_EXCEEDS_UNPROMISED_CASH_MESSAGE =
+  "That is more than this booking's payment still holds once the refunds already promised back by hand are counted - settle or dismiss those refund tasks first, or confirm a smaller amount.";
+
+/**
+ * #3949 (`INV-PAY-137`): the cap of a hand-back paid back to the group
+ * organiser out of the group's internet-banking payment. The joiner's share of
+ * that payment, less what has already gone back on it and the other refunds
+ * still promised on it, is all this task can record.
+ */
+export const GROUP_MIRROR_HAND_BACK_EXCEEDS_CASH_MESSAGE =
+  "That is more than the group organiser's payment still holds for this booking once its earlier refunds and the other refunds promised back on it are counted - check the booking's payment, then settle or dismiss the other refund tasks first.";
+
+/**
+ * #3791 (owner decision 2): a review completed after the booking was cancelled
+ * nets its share against the credit the cancellation already restored, which
+ * means re-running the cancellation's tier on what would have been applied had
+ * the share come back first. That is only honest where the policy in force
+ * still reproduces the restore actually made. When it does not - the policy was
+ * edited since, or the restore was made under some other rule - no figure here
+ * can be shown to be right, so the task stays OPEN rather than guessing.
+ */
+export const REVIEW_CANCELLATION_RESTORE_UNREPRODUCIBLE_MESSAGE =
+  "This booking was cancelled and its account credit restored under terms the current cancellation policy no longer reproduces, so the share cannot be netted against that restore automatically. Work out what is still owed, hand it back another way, then dismiss this task with a note saying what was done.";
+
+/**
+ * #3835: the same refusal on a captured payment's share, whose cancellation
+ * REFUNDED by tier: the frozen figures must reproduce that refund and restore
+ * before the share is netted against them (`capturedShareOwedAfterCancellationCents`).
+ */
+export const REVIEW_CANCELLATION_REFUND_UNREPRODUCIBLE_MESSAGE =
+  "This booking was cancelled and refunded under terms the current cancellation policy no longer reproduces, so the share cannot be netted against that refund automatically. Work out what is still owed, hand it back another way, then dismiss this task with a note saying what was done.";
+
+/**
+ * #3835: the card route's cap against refunds already promised to the card and
+ * not yet made (`assertCardRefundNotOverPromised`). The payment history shows
+ * the headroom before those refunds land, so the sentence names them.
+ */
+export function reviewRefundOverPromisedMessage({
+  refundCents,
+  promisedCents,
+  availableCents,
+  format,
+}: {
+  refundCents: number;
+  promisedCents: number;
+  availableCents: number;
+  format: ClubFormat;
+}): string {
+  return `This booking's card already has ${formatCents(promisedCents, format)} of refunds promised and not yet made (the cancellation's, or an earlier review's), so only ${formatCents(availableCents, format)} of the ${formatCents(refundCents, format)} this review owes the card can be refunded to it now. Wait for those refunds to finish (or settle a failed one in the refund recovery queue) and complete this review again.`;
+}
+
+/**
+ * #3835 / #3653 (`INV-PAY-114`): a review on a cancelled joiner's booking the
+ * group organiser paid by card. That cancellation refunded the organiser, out
+ * of the group's combined payment and clamped to the group's own debt, so its
+ * figures are not a tier a share can be netted against.
+ */
+export const REVIEW_CANCELLATION_ORGANISER_PAID_MESSAGE =
+  "This booking was paid for by the group organiser and has been cancelled, so its share cannot be netted against what the organiser was refunded automatically. Work out what is still owed to the organiser, hand it back another way, then dismiss this task with a note saying what was done.";
+
+/**
+ * #3949 (`INV-PAY-137`): the same refusal on one the group organiser paid for by Internet Banking. Nothing was
+ * refunded automatically: the cancellation's own refund to the organiser is paid by bank transfer from its own task
+ * (the joiner's cancel's hand-back, or the group cancel's organiser hand-back).
+ */
+export const REVIEW_CANCELLATION_ORGANISER_PAID_BY_BANK_MESSAGE =
+  "This booking was paid for by the group organiser by internet banking and has been cancelled, so its share cannot be netted against the cancellation's own refund to the organiser, which is paid by bank transfer from its own task. Work out what is still owed to the organiser beyond that, pay it to them by bank transfer, then dismiss this task with a note saying what was done.";

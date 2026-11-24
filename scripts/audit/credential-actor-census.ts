@@ -1,0 +1,813 @@
+/**
+ * The credential-actor census (#2723).
+ *
+ * WHY THIS EXISTS. Every mutation of the encrypted `IntegrationCredential`
+ * store must carry explicit actor context, and the store's required `actor`
+ * argument is what makes omitting it a compile error. A type is the right first
+ * line and it is not the only one it needs: an `as never` cast in a test double,
+ * a value crossing from untyped JavaScript, a `@ts-expect-error`, or a writer
+ * that skips the store and reaches the Prisma delegate directly all get past it.
+ * This tool answers the question nothing in the repository could answer before:
+ * "how many credential mutators are called, from where, and which of them do not
+ * name an actor?" The contract test beside it
+ * (`src/lib/__tests__/credential-actor-census.test.ts`) turns that answer into a
+ * gate.
+ *
+ * IT ENUMERATES FROM THE TREE, NOT FROM A LIST. That distinction is the whole
+ * value. A population measured by walking a hand-written set of paths is not the
+ * population — it is the list, and the list is what goes stale. Everything below
+ * comes from walking `src/`, `scripts/`, `e2e/` and `prisma/` on every run.
+ *
+ * WHAT COUNTS AS A SITE. Three ways to mutate a stored credential:
+ *
+ *  1. `setIntegrationCredential(params)`     — the store's upsert/CAS writer
+ *  2. `ensureGeneratedCredential(params)`    — a create-only generator (its one
+ *     caller, the wrapped Xero token key, and the module were retired by #3806
+ *     R2; the name stays recognised so a reintroduced one is still a site)
+ *  3. `deleteIntegrationCredential(params)`  — the store's remover
+ *
+ * and the in-transaction forms of 1 and 3 (`…InTransaction(params)`, #3454),
+ * which take the same params object plus the caller's `tx` (including ServerNZ
+ * connection replacement and its answer reset under one fence, #4436, and the
+ * push secret an address move removes or a registration stores, #4470);
+ *
+ * and one way to go round them all:
+ *
+ *  4. `<client>.integrationCredential.<anything but a read>(…)` — a direct
+ *     Prisma write that never reaches the store, so no required argument can
+ *     catch it.
+ *
+ * Form 4 is inventoried separately as a BYPASS. The store module itself is the
+ * approved home for those statements; anywhere else is a finding. The delegate's
+ * mutating surface is defined by INVERSION — anything that is not one of the
+ * eight reads in `DELEGATE_READ_METHODS` — because a deny-list of writes missed
+ * `createManyAndReturn` and `updateManyAndReturn` and would miss whatever Prisma
+ * adds next. Element access (`tx["integrationCredential"]`), a declared alias
+ * (`const rows = tx.integrationCredential`), a destructure renamed or not
+ * (`const { integrationCredential: rows } = tx`) and a second alias hop are all
+ * followed, because the audit census's review demonstrated the first two as
+ * silent bypasses of a property-access-only check and this census's own review
+ * demonstrated the rest.
+ *
+ * A mutator reached under a RENAMED IMPORT (`import { setIntegrationCredential
+ * as save }`) or parked in a local is followed the same way, so it stays in the
+ * pinned write-site population rather than dropping out of the measurement.
+ *
+ * ONE FORM IS NOT TYPESCRIPT AT ALL: raw SQL DML against `"IntegrationCredential"`
+ * in a migration, or through `$executeRaw*` from TypeScript. Both are scanned,
+ * because a migration that rewrites a credential row is a mutation nobody can
+ * attribute either. READS are deliberately not counted — a `SELECT` carries no
+ * actor and needs none, and counting them would bury the writes.
+ *
+ * WHAT IT STILL DOES NOT SEE is inherited from the shared walk
+ * (`ts-call-site-scan.ts`) and stated there: no type checker, so an alias made
+ * by assignment rather than declaration, or a delegate handed back from a
+ * helper, is invisible. That is why the required ARGUMENT and the runtime
+ * assertions in `integration-credential-actor.ts` are the primary defences and
+ * this census is the backstop.
+ *
+ * Run it: `pnpm run credential:census` prints a deterministic TSV.
+ */
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+
+import ts from "typescript";
+
+import {
+  eachNode,
+  findTopLevelProperty,
+  isDeclarationName,
+  listSourceFiles,
+  literalText,
+  parseSourceFile,
+  propertyName,
+  resolveObjectLiteral,
+  symbolChain,
+  toPosix,
+  unwrap,
+  type ResolvedObject,
+} from "./ts-call-site-scan";
+import { isMainModule } from "../lib/is-main-module.mjs";
+
+/**
+ * The modules that OWN the credential boundary; their own writes are not sites.
+ *
+ * This is an exemption from the one check that can see a writer which skips the
+ * store, so adding a module here is a reviewed change and the contract test pins
+ * the count. Two today: the store and the compare-and-set claim. (The
+ * create-only generator was the third until #3806 R2 retired the wrapped Xero
+ * token key, its only caller, and the module with it.)
+ */
+export const CREDENTIAL_BOUNDARY_MODULES = [
+  "src/lib/integration-credentials.ts",
+  "src/lib/integration-credential-claim.ts",
+] as const;
+
+/** The mutators every credential writer must go through. */
+export const CREDENTIAL_MUTATORS = [
+  "setIntegrationCredential",
+  "ensureGeneratedCredential",
+  "deleteIntegrationCredential",
+  // The same two writes on a transaction the caller owns (#3454), for a
+  // credential change that must commit with something else. They take the same
+  // required actor and expectation, in the same single params object, so a
+  // caller of these is a site exactly like a caller of the two above.
+  "setIntegrationCredentialInTransaction",
+  "deleteIntegrationCredentialInTransaction",
+] as const;
+
+export type CredentialMutator = (typeof CREDENTIAL_MUTATORS)[number];
+
+/**
+ * Which mutators require a declared write expectation as well as an actor.
+ *
+ * `ensureGeneratedCredential` is deliberately not one of them: its expectation
+ * is not the caller's to choose — create-only, never overwrite a readable row —
+ * so an `expect` parameter there would be a decision with one legal answer.
+ */
+const MUTATORS_REQUIRING_EXPECTATION: ReadonlySet<string> = new Set([
+  "setIntegrationCredential",
+  "deleteIntegrationCredential",
+  "setIntegrationCredentialInTransaction",
+  "deleteIntegrationCredentialInTransaction",
+]);
+
+/** The Prisma delegate a bypass reaches. */
+const CREDENTIAL_DELEGATE = "integrationCredential";
+
+/**
+ * THE RETIRED XERO TOKEN TABLE (#3454, dropped in #3806 R3). The tokens live
+ * only in the credential store. Any write of the old delegate is a bypass,
+ * including one inside the token store: there is no mirror left to keep in
+ * step, and a reintroduced write would plant a refresh token with no actor.
+ */
+export const TOKEN_MIRROR_DELEGATE = "xeroToken";
+
+/** Empty: no module may write the retired delegate. */
+export const TOKEN_MIRROR_BOUNDARY_MODULES = [] as const;
+
+/**
+ * SQL that restores an empty token row so an operator can return to R2.
+ * Credential SQL in the same file is still a bypass. The census test pins
+ * this list to exactly that path, and asserts the insert writes empty token
+ * columns rather than a real token.
+ */
+export const TOKEN_MIRROR_SQL_EXEMPT_PATHS = [
+  "prisma/migrations/20261210100000_contract_drop_xero_token/rollback.sql",
+] as const;
+
+/**
+ * The delegate's READ surface — and everything else on it counts as a mutation.
+ *
+ * THE SET IS INVERTED ON PURPOSE, and it is the one design decision in this file
+ * worth arguing about. The obvious shape is a deny-list of mutating methods, and
+ * that is what this census shipped with: seven names, `create` … `deleteMany`.
+ * The generated delegate has seventeen. `createManyAndReturn` and
+ * `updateManyAndReturn` were not among the seven, so a writer could rewrite a
+ * stored ciphertext, iv and auth tag with one of them, name no actor, write no
+ * audit row, and be reported as no bypass at all — measured against this very
+ * scanner before the inversion.
+ *
+ * A deny-list of mutations fails OPEN on the next Prisma release, because the
+ * methods that get added are mostly write shapes. The read surface —
+ * `findUnique`, `findMany`, `count`, `aggregate`, `groupBy` and their variants —
+ * is small and has been stable for years, so an allow-list of reads fails
+ * CLOSED: a method nobody here has heard of is reported, a reviewer looks at it
+ * once, and either it is a genuine write or it joins this list with a reason.
+ * A false finding costs one reading; a false clean costs an unattributable
+ * secret rewrite.
+ */
+const DELEGATE_READ_METHODS: ReadonlySet<string> = new Set([
+  "aggregate",
+  "count",
+  "findFirst",
+  "findFirstOrThrow",
+  "findMany",
+  "findUnique",
+  "findUniqueOrThrow",
+  "groupBy",
+]);
+
+/** Does this delegate method change stored credential material? */
+function isMutatingDelegateMethod(method: string): boolean {
+  return !DELEGATE_READ_METHODS.has(method);
+}
+
+const RAW_SQL_METHODS = new Set([
+  "$executeRaw",
+  "$executeRawUnsafe",
+  "$queryRaw",
+  "$queryRawUnsafe",
+]);
+
+/**
+ * What the call site says about the actor.
+ *
+ *  - `literal`   an inline object whose `kind` is a string literal, so the
+ *                reviewer can read "admin" or "system" at the site.
+ *  - `forwarded` an `actor` key is present but decided elsewhere — a variable, a
+ *                shorthand property, a spread, a parameter passed through. This
+ *                is a legitimate shape (a route hoists one actor for nine
+ *                writes) and it is PINNED rather than accepted silently.
+ *  - `absent`    no `actor` key at all. This is the population that must be
+ *                empty, and the one a seeded actorless writer lands in.
+ */
+export type CredentialActorEvidence =
+  | { kind: "literal"; value: string }
+  | { kind: "forwarded"; expression: string }
+  | { kind: "absent" };
+
+/** The same three answers for the declared write expectation. */
+export type CredentialExpectationEvidence =
+  | { kind: "literal"; value: string }
+  | { kind: "forwarded"; expression: string }
+  | { kind: "absent" }
+  /** The mutator does not take one — `ensureGeneratedCredential`. */
+  | { kind: "not-applicable" };
+
+export type CredentialWriteSite = {
+  /** Repo-relative POSIX path. */
+  file: string;
+  /** Stable identity: enclosing symbol chain plus an ordinal among its peers. */
+  id: string;
+  symbol: string;
+  line: number;
+  mutator: CredentialMutator;
+  actor: CredentialActorEvidence;
+  expectation: CredentialExpectationEvidence;
+};
+
+export type CredentialBypassSite = {
+  file: string;
+  id: string;
+  symbol: string;
+  line: number;
+  /** `integrationCredential.upsert`, or `raw.$executeRaw`. */
+  statement: string;
+};
+
+export type CredentialActorCensus = {
+  /** Every call of a store mutator, outside the boundary modules. */
+  sites: CredentialWriteSite[];
+  /** Sites passing no `actor` at all. MUST be empty. */
+  actorless: CredentialWriteSite[];
+  /** Sites whose actor is decided elsewhere. Pinned, not forbidden. */
+  actorForwarded: CredentialWriteSite[];
+  /** Sites that must declare an expectation and pass none. MUST be empty. */
+  expectationless: CredentialWriteSite[];
+  /**
+   * Direct Prisma/raw writes to the credential table outside its boundary
+   * modules, and any write of the retired Xero token delegate (#3806).
+   */
+  bypasses: CredentialBypassSite[];
+  /** Writes of the retired delegate from a module the boundary still allows. Empty. */
+  tokenMirrorWrites: CredentialBypassSite[];
+  /** Files walked, so a scan that resolved nothing cannot read as clean. */
+  filesScanned: number;
+};
+
+const SCAN_ROOTS = ["src", "scripts", "e2e", "prisma"] as const;
+
+/**
+ * `__mocks__` and `generated` hold no real writer. `__tests__` and the spec
+ * files are skipped by the shared walk's own test-file filter — a test double
+ * calling the store is not a production writer, and pinning them would make the
+ * census move every time somebody adds a case.
+ *
+ * `e2e` is NOT skipped, unlike the audit census: the E2E stack seeds real
+ * credentials through the real store, so a seed that stopped naming an actor is
+ * a finding.
+ */
+const SKIP_DIRECTORIES = new Set([
+  "__tests__",
+  "__mocks__",
+  "node_modules",
+  "generated",
+  "fixtures",
+  "test-utils",
+]);
+
+function isBoundaryModule(file: string): boolean {
+  return (CREDENTIAL_BOUNDARY_MODULES as readonly string[]).includes(file);
+}
+
+/** The `actor` / `expect` evidence on one resolved params object. */
+function resolveKeyEvidence(
+  params: ResolvedObject | null,
+  key: string,
+  discriminator: string,
+): CredentialActorEvidence {
+  if (params === null) return { kind: "forwarded", expression: "(not a literal)" };
+  const property = findTopLevelProperty(params, key);
+  if (!property) {
+    // Fail closed: an object with a key this walk cannot NAME might be setting
+    // exactly this one, so it is "decided elsewhere", never "absent".
+    return params.unreadableKeys
+      ? { kind: "forwarded", expression: "(unreadable keys)" }
+      : { kind: "absent" };
+  }
+  if (property.kind === "opaque") {
+    return { kind: "forwarded", expression: property.text };
+  }
+  const inner = unwrap(property.value);
+  if (ts.isObjectLiteralExpression(inner)) {
+    const resolved = resolveObjectLiteral(inner);
+    const discriminatorProperty = findTopLevelProperty(resolved, discriminator);
+    if (discriminatorProperty?.kind === "assignment") {
+      const text = literalText(discriminatorProperty.value);
+      if (text !== null) return { kind: "literal", value: text };
+    }
+    return { kind: "forwarded", expression: `(${discriminator} not literal)` };
+  }
+  return { kind: "forwarded", expression: inner.getText().replace(/\s+/g, " ") };
+}
+
+function resolveParams(argument: ts.Expression | undefined): ResolvedObject | null {
+  if (!argument) return null;
+  const inner = unwrap(argument);
+  if (!ts.isObjectLiteralExpression(inner)) return null;
+  return resolveObjectLiteral(inner);
+}
+
+/** Is this expression the named Prisma delegate (`integrationCredential` unless said)? */
+function isCredentialDelegate(
+  expression: ts.Expression,
+  delegate: string = CREDENTIAL_DELEGATE,
+): boolean {
+  const inner = unwrap(expression);
+  if (ts.isPropertyAccessExpression(inner)) {
+    return inner.name.text === delegate;
+  }
+  if (ts.isElementAccessExpression(inner)) {
+    return literalText(inner.argumentExpression) === delegate;
+  }
+  return ts.isIdentifier(inner) && inner.text === delegate;
+}
+
+/**
+ * Grow a set of names by following identifier-to-identifier copies until it
+ * stops growing, so a chain of aliases is followed however long it is.
+ */
+function followCopies<T>(
+  seed: Map<string, T>,
+  copies: readonly { from: string; to: string }[],
+): Map<string, T> {
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const copy of copies) {
+      const value = seed.get(copy.from);
+      if (value !== undefined && !seed.has(copy.to)) {
+        seed.set(copy.to, value);
+        grew = true;
+      }
+    }
+  }
+  return seed;
+}
+
+/**
+ * Local names that hold the credential delegate.
+ *
+ * FOUR SHAPES, and only the first was followed before #2723's review:
+ *
+ *   const rows = tx.integrationCredential;              // a declared alias
+ *   const { integrationCredential } = tx;               // destructured
+ *   const { integrationCredential: rows } = tx;         // destructured, RENAMED
+ *   const rows = tx.integrationCredential; const r = rows;  // a second hop
+ *
+ * The unrenamed destructure used to be caught only by accident — the receiver is
+ * then the bare identifier `integrationCredential`, which `isCredentialDelegate`
+ * matches as a last resort — so the renamed form and every second hop were
+ * invisible. They are followed explicitly now, because "caught by accident" is
+ * what stops being true the moment somebody renames a variable.
+ */
+function collectDelegateAliases(
+  ast: ts.SourceFile,
+  delegate: string = CREDENTIAL_DELEGATE,
+): Set<string> {
+  const aliases = new Map<string, true>();
+  const copies: { from: string; to: string }[] = [];
+
+  eachNode(ast, (node) => {
+    if (!ts.isVariableDeclaration(node) || !node.initializer) return;
+
+    if (ts.isIdentifier(node.name)) {
+      if (isCredentialDelegate(node.initializer, delegate)) {
+        aliases.set(node.name.text, true);
+        return;
+      }
+      const inner = unwrap(node.initializer);
+      // `const r = rows;` — recorded now, resolved once every direct alias is in.
+      if (ts.isIdentifier(inner)) {
+        copies.push({ from: inner.text, to: node.name.text });
+      }
+      return;
+    }
+
+    if (ts.isObjectBindingPattern(node.name)) {
+      for (const element of node.name.elements) {
+        const source = element.propertyName
+          ? propertyName(element.propertyName)
+          : ts.isIdentifier(element.name)
+            ? element.name.text
+            : null;
+        if (source !== delegate) continue;
+        if (ts.isIdentifier(element.name)) aliases.set(element.name.text, true);
+      }
+    }
+  });
+
+  return new Set(followCopies(aliases, copies).keys());
+}
+
+/**
+ * Local names that hold a store MUTATOR, so a renamed import still counts.
+ *
+ *   import { setIntegrationCredential as save } from "@/lib/integration-credentials";
+ *   const save = setIntegrationCredential;
+ *
+ * Matching the callee's spelling alone would drop both out of the pinned write-
+ * site population entirely — and that population is what makes the contract test
+ * strong: a new writer cannot be added without editing the pinned map in the
+ * same diff. The required ARGUMENT still catches an omission at either site, so
+ * this closes a completeness gap rather than a live hole; the census is not
+ * allowed to claim a completeness it does not have.
+ */
+function collectMutatorAliases(ast: ts.SourceFile): Map<string, CredentialMutator> {
+  const isMutator = (name: string): name is CredentialMutator =>
+    (CREDENTIAL_MUTATORS as readonly string[]).includes(name);
+  const aliases = new Map<string, CredentialMutator>();
+  const copies: { from: string; to: string }[] = [];
+
+  eachNode(ast, (node) => {
+    if (ts.isImportSpecifier(node)) {
+      const imported = node.propertyName?.text ?? node.name.text;
+      if (isMutator(imported)) aliases.set(node.name.text, imported);
+      return;
+    }
+    if (!ts.isVariableDeclaration(node) || !node.initializer) return;
+    if (!ts.isIdentifier(node.name)) return;
+    const inner = unwrap(node.initializer);
+    if (ts.isIdentifier(inner)) {
+      if (isMutator(inner.text)) aliases.set(node.name.text, inner.text);
+      else copies.push({ from: inner.text, to: node.name.text });
+      return;
+    }
+    if (ts.isPropertyAccessExpression(inner) && isMutator(inner.name.text)) {
+      aliases.set(node.name.text, inner.name.text);
+    }
+  });
+
+  return followCopies(aliases, copies);
+}
+
+/** `INSERT`/`UPDATE`/`DELETE` against the table, in one SQL string. */
+export function classifyCredentialSql(text: string): string | null {
+  const flat = text.replace(/\s+/g, " ");
+  const table = /"?(?:public"?\.)?"?IntegrationCredential"?/i;
+  if (!table.test(flat)) return null;
+  if (/\bINSERT\s+INTO\s+"?(?:public"?\.)?"?IntegrationCredential"?/i.test(flat)) {
+    return "insert";
+  }
+  if (/\bUPDATE\s+"?(?:public"?\.)?"?IntegrationCredential"?/i.test(flat)) {
+    return "update";
+  }
+  if (/\bDELETE\s+FROM\s+"?(?:public"?\.)?"?IntegrationCredential"?/i.test(flat)) {
+    return "delete";
+  }
+  return null;
+}
+
+/** `INSERT`/`UPDATE`/`DELETE` against the retired Xero token table, in one SQL string. */
+export function classifyTokenMirrorSql(text: string): string | null {
+  const flat = text.replace(/\s+/g, " ");
+  // Built from parts so this source file does not itself quote the table.
+  // A non-identifier on either side, so FinanceXeroToken (the quotes sit before
+  // Finance) and a name that merely continues this one are not this table.
+  const mirrorTable = ["Xero", "Token"].join("");
+  const table =
+    "(?<![A-Za-z0-9_])" +
+    '"?' +
+    String.raw`(?:public"?\.)?` +
+    '"?' +
+    mirrorTable +
+    '"?' +
+    "(?![A-Za-z0-9_])";
+  const statements: Array<[string, string]> = [
+    ["xero-token.insert", String.raw`\bINSERT\s+INTO\s+`],
+    ["xero-token.update", String.raw`\bUPDATE\s+`],
+    ["xero-token.delete", String.raw`\bDELETE\s+FROM\s+`],
+  ];
+  for (const [kind, verb] of statements) {
+    if (new RegExp(verb + table, "i").test(flat)) return kind;
+  }
+  return null;
+}
+
+/** Either table's DML, so every SQL door checks both. */
+function classifyGuardedSql(text: string): string | null {
+  return classifyCredentialSql(text) ?? classifyTokenMirrorSql(text);
+}
+
+/**
+ * A migration file. Credential DML is always a bypass. Token-table DML is a
+ * bypass too, except the one rollback that restores an empty row for R2.
+ */
+function classifySqlFile(relativePath: string, text: string): string | null {
+  const credential = classifyCredentialSql(text);
+  if (credential !== null) return credential;
+  const mirror = classifyTokenMirrorSql(text);
+  if (mirror === null) return null;
+  if ((TOKEN_MIRROR_SQL_EXEMPT_PATHS as readonly string[]).includes(relativePath)) {
+    return null;
+  }
+  return mirror;
+}
+
+/** Every argument of a `$executeRawUnsafe(...)`-style call, as one string. */
+function rawSqlText(call: ts.CallExpression): string {
+  return call.arguments.map((argument) => argument.getText()).join(" ");
+}
+
+function scanFile(file: string, repoRoot: string): {
+  sites: CredentialWriteSite[];
+  bypasses: CredentialBypassSite[];
+  tokenMirrorWrites: CredentialBypassSite[];
+} {
+  const relativePath = toPosix(relative(repoRoot, file));
+  const ast = parseSourceFile(file);
+  const aliases = collectDelegateAliases(ast);
+  const mirrorAliases = collectDelegateAliases(ast, TOKEN_MIRROR_DELEGATE);
+  const tokenMirrorWrites: CredentialBypassSite[] = [];
+  const isMirrorBoundary = (TOKEN_MIRROR_BOUNDARY_MODULES as readonly string[]).includes(
+    relativePath,
+  );
+  const mutatorAliases = collectMutatorAliases(ast);
+  const sites: CredentialWriteSite[] = [];
+  const bypasses: CredentialBypassSite[] = [];
+  const ordinals = new Map<string, number>();
+
+  const nextId = (symbol: string): string => {
+    const seen = ordinals.get(symbol) ?? 0;
+    ordinals.set(symbol, seen + 1);
+    return `${relativePath}::${symbol}#${seen}`;
+  };
+
+  eachNode(ast, (node) => {
+    if (!ts.isCallExpression(node)) return;
+    if (isDeclarationName(node)) return;
+
+    const line =
+      ast.getLineAndCharacterOfPosition(node.getStart(ast)).line + 1;
+    const symbol = symbolChain(node);
+    const callee = unwrap(node.expression);
+
+    // --- form 1-3: a store mutator -----------------------------------------
+    const calleeName = ts.isIdentifier(callee)
+      ? callee.text
+      : ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : null;
+
+    const mutatorCalled =
+      calleeName === null
+        ? null
+        : (CREDENTIAL_MUTATORS as readonly string[]).includes(calleeName)
+          ? (calleeName as CredentialMutator)
+          : (mutatorAliases.get(calleeName) ?? null);
+
+    if (mutatorCalled !== null) {
+      if (!isBoundaryModule(relativePath)) {
+        const params = resolveParams(node.arguments[0]);
+        const mutator = mutatorCalled;
+        sites.push({
+          file: relativePath,
+          id: nextId(symbol),
+          symbol,
+          line,
+          mutator,
+          actor: resolveKeyEvidence(params, "actor", "kind"),
+          expectation: MUTATORS_REQUIRING_EXPECTATION.has(mutator)
+            ? resolveKeyEvidence(params, "expect", "expect")
+            : { kind: "not-applicable" },
+        });
+      }
+      return;
+    }
+
+    // --- form 4: a direct Prisma write -------------------------------------
+    if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+      const method = ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : literalText(callee.argumentExpression);
+      const receiver = callee.expression;
+      const receiverIsDelegate =
+        isCredentialDelegate(receiver) ||
+        (ts.isIdentifier(unwrap(receiver)) &&
+          aliases.has((unwrap(receiver) as ts.Identifier).text));
+      if (
+        method !== null &&
+        isMutatingDelegateMethod(method) &&
+        receiverIsDelegate &&
+        !isBoundaryModule(relativePath)
+      ) {
+        bypasses.push({
+          file: relativePath,
+          id: nextId(symbol),
+          symbol,
+          line,
+          statement: `${CREDENTIAL_DELEGATE}.${method}`,
+        });
+      }
+      const receiverIsMirror =
+        isCredentialDelegate(receiver, TOKEN_MIRROR_DELEGATE) ||
+        (ts.isIdentifier(unwrap(receiver)) &&
+          mirrorAliases.has((unwrap(receiver) as ts.Identifier).text));
+      if (method !== null && isMutatingDelegateMethod(method) && receiverIsMirror) {
+        (isMirrorBoundary ? tokenMirrorWrites : bypasses).push({
+          file: relativePath,
+          id: nextId(symbol),
+          symbol,
+          line,
+          statement: `${TOKEN_MIRROR_DELEGATE}.${method}`,
+        });
+      }
+    }
+
+    // --- raw SQL from TypeScript -------------------------------------------
+    if (
+      ts.isPropertyAccessExpression(callee) &&
+      RAW_SQL_METHODS.has(callee.name.text) &&
+      classifyGuardedSql(rawSqlText(node)) !== null
+    ) {
+      bypasses.push({
+        file: relativePath,
+        id: nextId(symbol),
+        symbol,
+        line,
+        statement: `raw.${callee.name.text}`,
+      });
+    }
+  });
+
+  // A tagged template (`prisma.$executeRaw`...`) is not a CallExpression, so it
+  // is walked on its own.
+  eachNode(ast, (node) => {
+    if (!ts.isTaggedTemplateExpression(node)) return;
+    const tag = unwrap(node.tag);
+    if (!ts.isPropertyAccessExpression(tag)) return;
+    if (!RAW_SQL_METHODS.has(tag.name.text)) return;
+    if (classifyGuardedSql(node.template.getText()) === null) return;
+    const symbol = symbolChain(node);
+    bypasses.push({
+      file: relativePath,
+      id: nextId(symbol),
+      symbol,
+      line: ast.getLineAndCharacterOfPosition(node.getStart(ast)).line + 1,
+      statement: `raw.${tag.name.text}`,
+    });
+  });
+
+  return { sites, bypasses, tokenMirrorWrites };
+}
+
+function listSqlFiles(dir: string, out: string[]): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      listSqlFiles(full, out);
+      continue;
+    }
+    if (entry.name.endsWith(".sql")) out.push(full);
+  }
+  return out;
+}
+
+export function scanCredentialActorCensus(
+  repoRoot: string = process.cwd(),
+): CredentialActorCensus {
+  const sites: CredentialWriteSite[] = [];
+  const bypasses: CredentialBypassSite[] = [];
+  const tokenMirrorWrites: CredentialBypassSite[] = [];
+  let filesScanned = 0;
+
+  for (const root of SCAN_ROOTS) {
+    const rootPath = join(repoRoot, root);
+    let files: string[] = [];
+    try {
+      files = listSourceFiles(rootPath, [], SKIP_DIRECTORIES);
+    } catch {
+      continue; // a root that does not exist in this tree
+    }
+    for (const file of files) {
+      filesScanned += 1;
+      const result = scanFile(file, repoRoot);
+      sites.push(...result.sites);
+      bypasses.push(...result.bypasses);
+      tokenMirrorWrites.push(...result.tokenMirrorWrites);
+    }
+  }
+
+  // Migration SQL. A migration that rewrites a credential row is a mutation
+  // nobody can attribute, so it is inventoried with the TypeScript bypasses.
+  let sqlFiles: string[] = [];
+  try {
+    sqlFiles = listSqlFiles(join(repoRoot, "prisma", "migrations"), []);
+  } catch {
+    sqlFiles = [];
+  }
+  for (const file of sqlFiles) {
+    filesScanned += 1;
+    const relativePath = toPosix(relative(repoRoot, file));
+    const text = readFileSync(file, "utf8");
+    const kind = classifySqlFile(relativePath, text);
+    if (kind === null) continue;
+    bypasses.push({
+      file: relativePath,
+      id: `${relativePath}::<sql>#0`,
+      symbol: "<sql>",
+      line: 1,
+      statement: `sql.${kind}`,
+    });
+  }
+
+  const byId = (a: { id: string }, b: { id: string }) =>
+    a.id.localeCompare(b.id);
+  sites.sort(byId);
+  bypasses.sort(byId);
+  tokenMirrorWrites.sort(byId);
+
+  return {
+    sites,
+    actorless: sites.filter((site) => site.actor.kind === "absent"),
+    actorForwarded: sites.filter((site) => site.actor.kind === "forwarded"),
+    expectationless: sites.filter((site) => site.expectation.kind === "absent"),
+    bypasses,
+    tokenMirrorWrites,
+    filesScanned,
+  };
+}
+
+export function describeCredentialActor(
+  evidence: CredentialActorEvidence,
+): string {
+  if (evidence.kind === "literal") return evidence.value;
+  if (evidence.kind === "forwarded") return `(forwarded) ${evidence.expression}`;
+  return "(absent)";
+}
+
+export function describeCredentialExpectation(
+  evidence: CredentialExpectationEvidence,
+): string {
+  if (evidence.kind === "literal") return evidence.value;
+  if (evidence.kind === "forwarded") return `(forwarded) ${evidence.expression}`;
+  return `(${evidence.kind})`;
+}
+
+export function renderCredentialCensusTsv(
+  census: CredentialActorCensus,
+): string {
+  const rows = [
+    ["file", "symbol", "line", "mutator", "actor", "expectation"].join("\t"),
+  ];
+  for (const site of census.sites) {
+    rows.push(
+      [
+        site.file,
+        site.symbol,
+        String(site.line),
+        site.mutator,
+        describeCredentialActor(site.actor),
+        describeCredentialExpectation(site.expectation),
+      ].join("\t"),
+    );
+  }
+  for (const bypass of census.bypasses) {
+    rows.push(
+      [bypass.file, bypass.symbol, String(bypass.line), bypass.statement, "-", "-"].join(
+        "\t",
+      ),
+    );
+  }
+  return rows.join("\n");
+}
+
+function main(): void {
+  const census = scanCredentialActorCensus();
+  process.stdout.write(`${renderCredentialCensusTsv(census)}\n`);
+  process.stdout.write(
+    `\n# files scanned: ${census.filesScanned}` +
+      `\n# mutator call sites: ${census.sites.length}` +
+      `\n# actorless: ${census.actorless.length}` +
+      `\n# actor forwarded: ${census.actorForwarded.length}` +
+      `\n# expectationless: ${census.expectationless.length}` +
+      `\n# bypasses: ${census.bypasses.length}\n`,
+  );
+}
+
+// `tsx scripts/audit/credential-actor-census.ts` runs the census; importing it
+// (the contract test does) must not.
+if (isMainModule(import.meta.url)) {
+  main();
+}

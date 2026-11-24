@@ -1,0 +1,1988 @@
+import { xeroCalendarDate } from "@/lib/xero-provider-dates";
+import { storedShortBookingId } from "@/lib/booking-reference";
+import { bookingWorthCents } from "@/lib/booking-payment-state";
+import { type Invoice } from "xero-node";
+import { bookingPromoEmailFields } from "@/lib/booking-promo-email-options";
+import { BookingEventType, BookingStatus, CreditType, ManualRefundTaskKind, PaymentSource, PaymentStatus, PaymentTransactionKind } from "@prisma/client";
+import { bookingOwner } from "@/lib/booking-owner";
+import { prisma } from "@/lib/prisma";
+import logger from "@/lib/logger";
+import {
+  sendAdminPaymentFailureAlert,
+  sendBookingCancelledEmail,
+  sendBookingConfirmedEmail,
+} from "@/lib/email";
+import { findSettlingInternetBankingTransactionId, recordSettlingTransaction } from "@/lib/payment-settler";
+import {
+  findSecondInstrumentSettlement,
+  recordManualSettlementConflict,
+  raiseSecondInstrumentSettlementAlert,
+  recordSecondInstrumentMarkerInTransaction,
+} from "@/lib/xero-inbound/settlement-conflicts";
+import { applyGroupSettlementSucceededFromInvoice } from "@/lib/group-settlement";
+import { GROUP_SETTLEMENT_INVOICE_ROLE } from "@/lib/group-settlement-invoice-binding";
+import { alertGroupSettlementInvoice } from "@/lib/group-settlement-invoice-alerts";
+import { reconcileBedAllocationsForBookingWithLodgeLockHeld } from "@/lib/bed-allocation-lifecycle";
+import { releaseBookingPromoRedemptions } from "@/lib/promo";
+import { settleHostingCoverageAfterCommit } from "@/lib/adult-member-hosting-coverage-drain";
+import { enqueueOwnHostingCoverageReevaluation } from "@/lib/adult-member-hosting-review";
+import {
+  acquireLodgeCapacityLock,
+  checkCapacityForGuestRanges,
+} from "@/lib/capacity";
+import { recordBookingEvent } from "@/lib/booking-events";
+import { bookingHasCapacityOverride, isPaidLikeBookingStatus } from "@/lib/booking-status";
+import { processWaitlistForDates } from "@/lib/waitlist";
+import { enqueueXeroAccountCreditNoteOperation } from "@/lib/xero-operation-outbox";
+import { createAuditLog } from "@/lib/audit";
+import { routeLateCashToPartPaymentReview } from "@/lib/part-payment-review-cover";
+import { clearStaleCreditElection } from "@/lib/booking-credit-election";
+import { reportUnappliedCreditElection } from "@/lib/booking-credit-election-report";
+import { getProvisionalNonMemberChildSummary } from "@/lib/booking-split-summary";
+import { MANUAL_REFUND_TASK_REASON_MAX } from "@/lib/manual-subscription-payment";
+import { NOT_NON_CANCELLATION_HAND_BACK_WHERE } from "@/lib/manual-refund-task-settlement-rules";
+import { formatCents } from "@/lib/utils";
+import type { ClubFormat } from "@/lib/club-format";
+import { syncBookingLedgerSettlements } from "@/lib/booking-ledger-settlement-sync";
+import { postCancellationLedgerLines } from "@/lib/booking-ledger-cancellation-sync";
+import { postStoredBookingConfirmationLedgerLines } from "@/lib/booking-ledger-confirmation-sync";
+import { postBookingReceipts, postHandBackObligation, resolveBookingMoneyPostingContext } from "@/lib/member-money/doors";
+import { syncBookingLedgerCredits } from "@/lib/booking-ledger-credit-sync";
+import { internetBankingLateCashCreditDescription, sumInternetBankingMintedCentsForBookings } from "@/lib/internet-banking-late-cash-credit";
+import { lockMemberCreditLedger, restoreCreditFromBooking } from "@/lib/member-credit";
+import { lockPaymentForRefundedTotal } from "@/lib/payment-transactions";
+import { findUnconvergedAppliedCreditDeallocation, XeroAppliedCreditOperationBusyError } from "@/lib/xero-applied-credit-operation-serialization";
+import {
+  hasInvoiceClearingNote,
+  retirePendingClearingNote,
+} from "@/lib/invoice-clearing-note-evidence";
+import {
+  decideInternetBankingReceiptFigure,
+  paidInvoiceFacts,
+} from "@/lib/xero-inbound/settle-from-cash";
+import { IB_RECEIPT_KEPT_REASON } from "@/lib/xero-inbound/ib-receipt-reasons";
+import { afterKeptSettleCommits, type KeptSettleFollowUp } from "@/lib/xero-inbound/kept-settle-correction-recount";
+import {
+  cashSettlementMarkerInTransaction,
+  raiseCashSettlementAlert,
+  readCashSettlementNotice,
+  type CashSettlementMarker,
+} from "@/lib/xero-inbound/settle-from-cash-notice";
+import { exactPrefix } from "@/lib/prisma-exact-prefix";
+import { LOCK1_HOLDER_TRANSACTION_BUDGET } from "@/lib/db-transaction";
+import { groupSettlementMismatchMessage } from "@/lib/xero-inbound/group-settlement-mismatch-message";
+import {
+  classifyXeroInvoiceCashEvidence,
+  quantifyXeroInvoiceCashCents,
+  type XeroInvoiceCashQuantification,
+} from "@/lib/xero-inbound/invoice-cash-evidence";
+
+export { classifyXeroInvoiceCashEvidence, quantifyXeroInvoiceCashCents };
+
+function isPaidXeroInvoice(invoice: Invoice): boolean {
+  const status = String(invoice.status ?? "").toUpperCase();
+  return status === "PAID" || Boolean(invoice.fullyPaidOnDate);
+}
+
+// Resolve how much a credit-minting arm may mint for one payment (#1459,
+// #1505). Two independent clamps apply:
+//  - Per payment (#1459): verified cash floors the mint at `min(face,
+//    knownCents)`, flagged partial when it undercuts the payment's face
+//    amount so the alerts can name both figures.
+//  - Per invoice, aggregate (#1505): `otherPaymentsMintedCents` is the cash of
+//    this SAME invoice already minted as credit for OTHER matched Internet
+//    Banking payments; the mint is further capped at the invoice's remaining
+//    cash (`knownCents - otherPaymentsMintedCents`). The per-payment clamp
+//    alone let two never-settled payments matched to one invoice each mint
+//    `min(own, cash)`, so their SUM could exceed the invoice's cash; this cap
+//    apportions the invoice's cash across its payments so the aggregate can
+//    never exceed it. `aggregateCapped` is true when this second clamp bit.
+// When NOTHING quantified but the classifier still saw positive cash evidence,
+// fall back to the payment's full amount (the issue-blessed fallback: minting
+// the zero floor would silently under-credit a genuinely cash-settled invoice,
+// and this arm only guards degraded payloads).
+function resolveMintableCents(
+  faceCents: number,
+  cash: XeroInvoiceCashQuantification,
+  otherPaymentsMintedCents = 0
+): {
+  mintableCents: number;
+  mintPartial: boolean;
+  cashUnverified: boolean;
+  aggregateCapped: boolean;
+} {
+  if (cash.knownCents <= 0 && !cash.complete) {
+    // Nothing quantifiable (degraded payload only; the fresh getInvoice fetch
+    // behind the caller always carries the amount fields). The aggregate cap
+    // needs a known cash figure to apportion against, so it cannot apply here
+    // — fall back to the issue-blessed full-amount mint exactly as pre-#1505.
+    return {
+      mintableCents: faceCents,
+      mintPartial: false,
+      cashUnverified: true,
+      aggregateCapped: false,
+    };
+  }
+  const perPaymentCents = Math.min(faceCents, cash.knownCents);
+  const invoiceRemainingCents = Math.max(
+    0,
+    cash.knownCents - otherPaymentsMintedCents
+  );
+  const mintableCents = Math.min(perPaymentCents, invoiceRemainingCents);
+  return {
+    mintableCents,
+    mintPartial: mintableCents < faceCents,
+    cashUnverified: !cash.complete,
+    aggregateCapped: mintableCents < perPaymentCents,
+  };
+}
+
+// The pipeline's already-minted sum (#1505) lives with its description prefix
+// in `internet-banking-late-cash-credit.ts` (#3827): a refund appeal's cap
+// reads the same rows, so the spelling has one home (`INV-SSOT`).
+
+export async function syncInternetBankingPaymentsForPaidInvoice(
+  invoice: Invoice,
+  linkedPaymentIds: string[],
+  format: ClubFormat,
+) {
+  const invoiceId = invoice.invoiceID ?? null;
+  const invoiceNumber = invoice.invoiceNumber ?? null;
+  const result = {
+    matchedInternetBankingPayments: 0,
+    paidInternetBankingPayments: 0,
+    paidInternetBankingBookings: 0,
+    creditedInternetBankingBookings: 0,
+    partialCashCreditedInternetBankingBookings: 0,
+    skippedAlreadyPaidBookings: 0,
+    skippedNoCashEvidencePayments: 0,
+    // B5 (#2262): inbound PAID events that landed on a manually settled
+    // booking. Surfaced in the inbound-event result JSON the replay route
+    // returns, so the fence is never a quiet return.
+    manualSettlementConflicts: 0,
+    // #3638: inbound cash on the invoice of a booking a card payment had
+    // already settled. Counted here as well as raised, like the #2262 fence.
+    secondInstrumentSettlementConflicts: 0,
+    // #4095: corrections a kept settle could not recount; the event fails on them.
+    unrecountedCorrectionNoteIds: [] as string[],
+  };
+
+  if (!invoiceId || !isPaidXeroInvoice(invoice)) {
+    return result;
+  }
+
+  const paymentWhere = [
+    {
+      xeroInvoiceId: invoiceId,
+    },
+    ...(linkedPaymentIds.length > 0
+      ? [
+          {
+            id: {
+              in: linkedPaymentIds,
+            },
+          },
+        ]
+      : []),
+  ];
+  const paymentFilter = {
+    source: PaymentSource.INTERNET_BANKING,
+    OR: paymentWhere,
+  };
+
+  // #1435: settlement itself is cash-gated, not just credit minting (#1357).
+  // Without positive cash evidence the loop settles NOTHING — no
+  // PaymentTransaction/Payment SUCCEEDED flip, no booking PAID flip, no
+  // member credit, no emails.
+  const cashEvidence = classifyXeroInvoiceCashEvidence(invoice);
+  const invoiceHasCashPayment = cashEvidence === "cash";
+  if (!invoiceHasCashPayment) {
+    // The app's own clearing-note echo (every ordinary unpaid-IB
+    // cancellation) lands here, so this arm stays slim: no booking-graph
+    // joins beyond what the admin alert below needs.
+    const matchedPayments = await prisma.payment.findMany({
+      where: paymentFilter,
+      select: {
+        id: true,
+        amountCents: true,
+        booking: {
+          select: {
+            status: true,
+            checkIn: true,
+            checkOut: true,
+            member: { select: { firstName: true, lastName: true } },
+            // #3369: the owner may be an Organisation; bookingOwner() reads both.
+            organisation: { select: { name: true, email: true } },
+          },
+        },
+      },
+    });
+    result.matchedInternetBankingPayments = matchedPayments.length;
+    if (matchedPayments.length === 0) {
+      return result;
+    }
+
+    if (cashEvidence === "indeterminate") {
+      // A payload carrying neither amountPaid nor payments proves nothing
+      // either way. Throwing (rather than settling blind or skipping
+      // terminally) hands the event to the inbound FAILED-retry machinery,
+      // which re-fetches the invoice fresh on every sweep: a transient
+      // degradation self-heals, and a persistent one surfaces as a loud,
+      // operator-replayable FAILED event instead of a booking that silently
+      // never settles (#1435 owner decision).
+      logger.warn(
+        { invoiceId, invoiceNumber, matchedPayments: matchedPayments.length },
+        "Xero PAID invoice payload carried neither amountPaid nor payments; refusing to settle Internet Banking payments without cash evidence"
+      );
+      throw new Error(
+        `Xero PAID invoice ${invoiceId} carried neither amountPaid nor payments; refusing to settle ${matchedPayments.length} Internet Banking payment(s) without cash evidence (#1435)`
+      );
+    }
+
+    // Zero-cash PAID (credit-note allocation). Settle nothing — but keep the
+    // linkage the pre-gate loop provided: stamp MISSING invoice identifiers
+    // (never status) on the matched payments and their PRIMARY transactions,
+    // so a later real-cash event for this invoice still matches them
+    // (#1357's stale-invoice flow depends on that match). This also covers
+    // the multi-payment case syncLinkedPaymentInvoiceMetadata deliberately
+    // leaves alone (it only stamps a canonical single match).
+    const matchedPaymentIds = matchedPayments.map((payment) => payment.id);
+    await prisma.paymentTransaction.updateMany({
+      where: {
+        paymentId: { in: matchedPaymentIds },
+        source: PaymentSource.INTERNET_BANKING,
+        kind: PaymentTransactionKind.PRIMARY,
+        xeroInvoiceId: null,
+      },
+      data: { xeroInvoiceId: invoiceId, xeroInvoiceNumber: invoiceNumber },
+    });
+    await prisma.payment.updateMany({
+      where: { id: { in: matchedPaymentIds }, xeroInvoiceId: null },
+      data: { xeroInvoiceId: invoiceId, xeroInvoiceNumber: invoiceNumber },
+    });
+
+    result.skippedNoCashEvidencePayments = matchedPayments.length;
+    logger.info(
+      { invoiceId, invoiceNumber, matchedPayments: matchedPayments.length },
+      "Xero invoice reports PAID without cash payments (credit-note allocation); Internet Banking settlement skipped"
+    );
+
+    // An allocation-cleared invoice for a LIVE booking means an operator
+    // cleared it Xero-side (e.g. wrote it off with a credit note) while the
+    // booking still awaits payment in the app — under the default
+    // non-holding config nothing will ever settle or expire that booking,
+    // so tell the admins instead of parking it silently. The routine
+    // clearing-note echo never fires this: its booking is already CANCELLED.
+    for (const payment of matchedPayments) {
+      if (
+        payment.booking.status === BookingStatus.CANCELLED ||
+        payment.booking.status === BookingStatus.PAID
+      ) {
+        continue;
+      }
+      await sendAdminPaymentFailureAlert({
+        memberName: `${bookingOwner(payment.booking).member.firstName} ${bookingOwner(payment.booking).member.lastName}`,
+        checkIn: payment.booking.checkIn,
+        checkOut: payment.booking.checkOut,
+        amountCents: payment.amountCents,
+        errorMessage:
+          "This booking's Xero invoice reports PAID via credit-note allocation, not a cash payment, so the app did not settle it and the booking still awaits payment. If the invoice was written off in Xero, cancel the booking in the app; if the member actually paid, record the cash payment against the invoice in Xero.",
+        paymentIntentId: invoiceId,
+      }, format).catch((err) =>
+        logger.error(
+          { err, paymentId: payment.id, invoiceId },
+          "Failed to alert admins about an allocation-cleared invoice on a live booking"
+        )
+      );
+    }
+    return result;
+  }
+
+  // #1459: quantified once per invoice; sizes both credit-minting arms below
+  // (already-cancelled and late-capacity-failure). The clamp is per payment —
+  // cash is not apportioned across multiple matched payments, a shape no app
+  // flow produces (group settlements ride their own settlement path).
+  const invoiceCash = quantifyXeroInvoiceCashCents(invoice);
+  // #3979: the invoice's total and the credit notes Xero lists as applied to it.
+  const invoiceFacts = paidInvoiceFacts(invoice);
+  const receiptDate = xeroCalendarDate(invoice.fullyPaidOnDate)
+    ?? (invoice.payments?.length === 1 ? xeroCalendarDate(invoice.payments[0]?.date) : null);
+
+  const payments = await prisma.payment.findMany({
+    where: paymentFilter,
+    include: {
+      booking: {
+        include: {
+          member: true,
+          // #3369: the owner may be an Organisation; bookingOwner() reads both.
+          organisation: { select: { name: true, email: true } },
+          guests: { include: { nights: true } },
+          promoRedemptions: {
+            include: {
+              promoCode: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  result.matchedInternetBankingPayments = payments.length;
+
+  // #1505: the set of bookings whose Internet Banking payments are matched to
+  // this invoice. Each minting arm below caps its mint at the invoice's cash
+  // MINUS what has already been minted for the OTHER bookings in this set, so
+  // the aggregate credit across every matched payment can never exceed the
+  // invoice's cash. With a single matched payment this set has one entry, the
+  // "other bookings" list is empty, and the aggregate cap is inert — leaving
+  // the #1459 per-payment clamp exactly as it was.
+  const matchedBookingIds = Array.from(
+    new Set(payments.map((payment) => payment.bookingId))
+  );
+
+  // #4627: the journal's posting context, resolved before any payment's transaction (`INV-LOCK-004`).
+  const journal = payments.length > 0 ? await resolveBookingMoneyPostingContext() : null;
+  for (const payment of payments) {
+    // #3979: written inside the transaction, alerted only after it commits.
+    // Declared through `as` so the read after the await is not narrowed to null.
+    let cashSettlementMarker = null as CashSettlementMarker | null;
+    let keptFollowUp = { correctionNotes: [], floorAlert: null } as KeptSettleFollowUp;
+    const outcome = await prisma.$transaction(async (tx) => {
+      // #4516 (M4b): the PRIMARY rows this delivery moved to captured, the only receipts its hook may collect.
+      // Null until the receipt is written: an arm that returns before it posts nothing.
+      let receiptRowIds = null as string[] | null;
+      const settled = await (async () => {
+      cashSettlementMarker = null;
+      keptFollowUp = { correctionNotes: [], floorAlert: null };
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+
+      // Pre-lock read: only the lodge key, which is immutable. The booking's
+      // owner is NOT (member merge re-points it holding the lodge key, #3792),
+      // so every field below, the owner included, comes from the post-lodge-lock
+      // read that follows.
+      const lodgeTarget = await tx.payment.findUnique({
+        where: { id: payment.id },
+        select: { source: true, booking: { select: { lodgeId: true } } },
+      });
+      if (!lodgeTarget || lodgeTarget.source !== PaymentSource.INTERNET_BANKING) {
+        return { type: "missing" as const };
+      }
+      await acquireLodgeCapacityLock(tx, lodgeTarget.booking.lodgeId);
+
+      const fresh = await tx.payment.findUnique({
+        where: { id: payment.id },
+        include: {
+          booking: {
+            include: {
+              member: true,
+              // #3369: the owner may be an Organisation; bookingOwner() reads both.
+              organisation: { select: { name: true, email: true } },
+              guests: { include: { nights: true } },
+              promoRedemptions: { include: { promoCode: true } },
+            },
+          },
+        },
+      });
+
+      if (!fresh || fresh.source !== PaymentSource.INTERNET_BANKING) {
+        return { type: "missing" as const };
+      }
+      // #3792 (INV-LOCK-002): lock(1), then the immutable lodge key, then the
+      // member credit-ledger key, all before the first Payment row write below:
+      // the order the inbound credit-note sync (member key, then Payment) and
+      // every cancel take them in, so no two can deadlock. The key comes from
+      // this post-lodge-lock read, and the late capacity cancel's restore reuses
+      // it. #3369: no member, no key.
+      const creditLedgerMemberId = bookingOwner(fresh.booking).memberId;
+      if (creditLedgerMemberId) await lockMemberCreditLedger(creditLedgerMemberId, tx);
+      // #4217: then the Payment row, which a card refund holds without lock(1);
+      // the figures (re-read here) and the rows are read under it (`INV-LOCK-002`).
+      await lockPaymentForRefundedTotal(tx, fresh.id);
+      const lockedFigures = await tx.payment.findUnique({ where: { id: fresh.id } });
+      if (!lockedFigures || lockedFigures.source !== PaymentSource.INTERNET_BANKING) {
+        return { type: "missing" as const };
+      }
+      Object.assign(fresh, lockedFigures);
+
+      // B5 (#2262) — the RECIPROCAL fence, and the counterpart to the outbound
+      // refusal. An admin recorded this booking's payment as cash / an off-Xero
+      // bank transfer; Xero now reports the same booking's invoice PAID. The
+      // club may be holding the same money twice, and only a person can decide
+      // which is real, so this pipeline writes NOTHING further and raises a
+      // durable alert instead of returning quietly.
+      //
+      // Placed BEFORE the transactionUpdate below on purpose, so the settle
+      // loop never stamps a Xero invoice id onto a manually settled payment's
+      // rows.
+      //
+      // Keyed on `manuallyMarkedPaidAt` ALONE, with NO status conjunct:
+      //  * PAID     — the plain double settlement;
+      //  * CANCELLED — must conflict, because the inbound path would otherwise
+      //    mint member credit for this cash while an OPEN ManualRefundTask
+      //    already owes the member the same money: a double refund;
+      //  * COMPLETED — must conflict, because cron-complete-bookings flips
+      //    PAID -> COMPLETED post-stay, so a late bank transfer lands here.
+      // And with no "…and carries no Xero id" conjunct either: two stampers
+      // outside this loop (syncLinkedPaymentInvoiceMetadata, which runs BEFORE
+      // it, and the zero-cash arm below) can legitimately have stamped an id
+      // onto a manual row, and that must not launder its provenance.
+      if (fresh.manuallyMarkedPaidAt) {
+        return {
+          type: "manualSettlementConflict" as const,
+          payment: fresh,
+          bookingStatus: fresh.booking.status,
+          // Carried so the discriminated union keeps type-checking at the
+          // shared `outcome.paymentWasPending` read below; this arm never
+          // counts as a payment the inbound pipeline settled.
+          paymentWasPending: false,
+        };
+      }
+
+      // #3638 — read BEFORE the receipt below is written: for a CANCELLED
+      // booking the test asks whether this bank cash is new (and, when it is
+      // not, whether this invoice's conflict was already recorded). Acted on
+      // after the receipt, which is recorded either way.
+      const secondInstrument = await findSecondInstrumentSettlement(tx, {
+        paymentId: fresh.id,
+        bookingId: fresh.bookingId,
+        bookingStatus: fresh.booking.status,
+        invoiceId,
+        includeCancelled: true,
+      });
+
+      // #3979 (`INV-PAY-125`): the receipt is the cash this invoice collected.
+      // Decided once, at the transition (no captured PRIMARY row yet), from the
+      // rows read here under the locks above and after both fences, and only
+      // when the cash belongs to this payment alone; otherwise the stored
+      // figure stays and the operators are told after the commit.
+      const receiptFigure = await decideInternetBankingReceiptFigure(tx, {
+        invoiceId,
+        payment: fresh,
+        cash: invoiceCash,
+        matchedPayments: payments.length,
+        secondInstrument: secondInstrument !== null,
+        invoice: invoiceFacts,
+      });
+      keptFollowUp = { correctionNotes: receiptFigure.plan.kind !== "rewrite" ? receiptFigure.appliedCorrectionNotes : [], floorAlert: receiptFigure.floorAlert };
+      const cashSettlementNotice = await readCashSettlementNotice(tx, {
+        plan: receiptFigure.plan,
+        recordedCents: receiptFigure.receiptCents,
+        cash: invoiceCash,
+        matchedPayments: payments.length,
+        booking: {
+          id: fresh.bookingId,
+          finalPriceCents: fresh.booking.finalPriceCents,
+          cancelled: fresh.booking.status === BookingStatus.CANCELLED,
+        },
+        changeFeeCents: fresh.changeFeeCents,
+      });
+      // For a booking the settle leaves live: the notice's durable marker, in
+      // this transaction, or one an earlier delivery wrote but never sent.
+      const markLiveBooking = async () => {
+        cashSettlementMarker = await cashSettlementMarkerInTransaction(tx, {
+          bookingId: fresh.bookingId,
+          invoiceId,
+          invoiceNumber,
+          notice: cashSettlementNotice,
+        });
+      };
+
+      const receiptRows = {
+        paymentId: fresh.id,
+        source: PaymentSource.INTERNET_BANKING,
+        kind: PaymentTransactionKind.PRIMARY,
+      };
+      // Refunded rows keep their refund bookkeeping on replays (#1357).
+      const refunded = [PaymentStatus.REFUNDED, PaymentStatus.PARTIALLY_REFUNDED];
+      const newlyReceived = (await tx.paymentTransaction.findMany({
+        where: { ...receiptRows, status: { notIn: [...refunded, PaymentStatus.SUCCEEDED] } },
+        select: { id: true },
+      })).map((row) => row.id);
+      const transactionUpdate = await tx.paymentTransaction.updateMany({
+        where: { ...receiptRows, status: { notIn: refunded } },
+        data: {
+          status: PaymentStatus.SUCCEEDED,
+          xeroInvoiceId: invoiceId,
+          xeroInvoiceNumber: invoiceNumber,
+          ...receiptFigure.primaryRowWrite,
+        },
+      });
+
+      if (transactionUpdate.count === 0) {
+        // A refunded PRIMARY row is excluded from the update above but still
+        // exists — only mint a fresh SUCCEEDED row when none exists at all.
+        const existingPrimary = await tx.paymentTransaction.findFirst({
+          where: {
+            paymentId: fresh.id,
+            source: PaymentSource.INTERNET_BANKING,
+            kind: PaymentTransactionKind.PRIMARY,
+          },
+          select: { id: true },
+        });
+        if (!existingPrimary) {
+          const created = await tx.paymentTransaction.create({
+            data: {
+              paymentId: fresh.id,
+              kind: PaymentTransactionKind.PRIMARY,
+              source: PaymentSource.INTERNET_BANKING,
+              stripePaymentIntentId: null,
+              xeroInvoiceId: invoiceId,
+              xeroInvoiceNumber: invoiceNumber,
+              reference: fresh.reference ?? undefined,
+              amountCents: receiptFigure.receiptCents,
+              status: PaymentStatus.SUCCEEDED,
+              reason: receiptFigure.primaryRowWrite.reason ?? IB_RECEIPT_KEPT_REASON,
+            },
+          });
+          newlyReceived.push(created.id);
+        }
+      }
+
+      // #3979: the payment's columns follow its receipt, as the officer cash
+      // settle writes both (`payment-reconciliation.ts`): its figure, its
+      // refunded total and its status, as the ledger projects them from the
+      // same rows. The in-memory figure says what was written, so every return
+      // carries it; the cancel arms size their credit from the receipt.
+      const { paymentColumns } = receiptFigure;
+      if (
+        paymentColumns &&
+        (paymentColumns.amountCents !== fresh.amountCents ||
+          paymentColumns.refundedAmountCents !== fresh.refundedAmountCents)
+      ) {
+        await tx.payment.update({
+          where: { id: fresh.id },
+          data: {
+            amountCents: paymentColumns.amountCents,
+            refundedAmountCents: paymentColumns.refundedAmountCents,
+          },
+        });
+        fresh.amountCents = paymentColumns.amountCents;
+      }
+
+      // #3581: the one Internet Banking receipt writer that does NOT end in
+      // `reconcilePaymentAggregates` — it sets the payment's columns itself,
+      // below — so the booking ledger's receipt line is posted here, in this
+      // transaction, from the row just written. Review of #3604 found it
+      // missing: without this call a member who pays by bank transfer got no
+      // ledger line at all. A manually settled payment never reaches this
+      // point (it returned above), so the row is a genuine bank receipt.
+      await syncBookingLedgerSettlements({ paymentId: fresh.id, store: tx });
+      receiptRowIds = newlyReceived;
+
+      const paymentWasPending = fresh.status !== PaymentStatus.SUCCEEDED;
+      // A PAID invoice event must never un-refund money (#1357, the #1353
+      // raise-only spirit): a payment already (PARTIALLY_)REFUNDED keeps its
+      // refund state on replays — only the invoice identifiers are refreshed.
+      const paymentInRefundedState =
+        fresh.status === PaymentStatus.REFUNDED ||
+        fresh.status === PaymentStatus.PARTIALLY_REFUNDED;
+      // #3979: a rewrite's status is the one its rows project (a #1765 card
+      // refund leaves it part refunded), never a blanket SUCCEEDED.
+      const settledStatus = paymentColumns
+        ? paymentColumns.status
+        : paymentInRefundedState
+          ? null
+          : PaymentStatus.SUCCEEDED;
+      if (
+        paymentWasPending ||
+        !fresh.xeroInvoiceId ||
+        fresh.xeroInvoiceNumber !== invoiceNumber ||
+        (settledStatus !== null && settledStatus !== fresh.status) ||
+        // #3979: the transition always touches the payment, even when it keeps
+        // the stored figure, so the refunded-total repair's claim on the row it
+        // read (`updatedAt`) sees that the receipt was recorded.
+        receiptFigure.plan.kind !== "replay"
+      ) {
+        await tx.payment.update({
+          where: { id: fresh.id },
+          data: {
+            ...(settledStatus === null ? {} : { status: settledStatus }),
+            xeroInvoiceId: invoiceId,
+            xeroInvoiceNumber: invoiceNumber,
+          },
+        });
+      }
+
+      // #3638 — a SECOND instrument. The receipt above is recorded, because the
+      // bank transfer did arrive; but a card payment had already settled this
+      // booking, so the club may now hold the price twice. Before #3638 this
+      // fell into the quiet `alreadyPaid` arm below (a counter, nothing else).
+      // Raised instead, once per invoice, and nothing further is written: no
+      // PAID re-claim (which would also flip a COMPLETED booking back to PAID),
+      // no credit, no refund. The durable marker is written HERE, in this
+      // transaction, so it commits with the receipt; the alert follows the
+      // commit. The rule: `INV-PAY-102`.
+      if (secondInstrument) {
+        return {
+          type: "secondInstrumentConflict" as const,
+          payment: fresh,
+          paymentWasPending,
+          bookingStatus: fresh.booking.status,
+          settledBy: secondInstrument,
+          marker: await recordSecondInstrumentMarkerInTransaction(tx, {
+            bookingId: fresh.bookingId,
+            amountCents: fresh.amountCents,
+            bookingStatus: fresh.booking.status,
+            invoiceId,
+            invoiceNumber,
+            settledBy: secondInstrument,
+          }),
+        };
+      }
+
+      // #3638: COMPLETED is as settled as PAID. A replay on a completed
+      // booking used to fall through to the PAID claim below, flipping it
+      // back to PAID and re-running the paid arm's side effects (the
+      // confirmation email among them).
+      if (
+        isPaidLikeBookingStatus(fresh.booking.status)
+      ) {
+        await markLiveBooking();
+        return {
+          type: "alreadyPaid" as const,
+          payment: fresh,
+          paymentWasPending,
+        };
+      }
+
+      // #1587: the already-cancelled credit-mint arm, hoisted into a local
+      // closure so it is reachable from BOTH the pre-lock CANCELLED branch and
+      // the post-lodge-lock re-read (a booking a concurrent actor cancelled
+      // inside the lodge-lock wait window). Cash that arrived for a cancelled
+      // booking becomes member credit — resurrecting it to PAID would be a
+      // phantom capacity claim + inconsistent money state. The body is
+      // byte-identical to the pre-#1587 arm and closes over tx/payment context/
+      // paymentWasPending and the invoice-scoped cash context lexically.
+      const runAlreadyCancelledCreditMintArm = async (
+        settlementPayment = fresh,
+        originalPaymentStatus = fresh.status,
+      ) => {
+        // A member paying the stale open invoice of an already-cancelled
+        // booking (#1357, F17) must not land silently — but this branch is
+        // reachable for EVERY cancelled booking whose invoice reports PAID,
+        // and Xero also reports PAID when our own invoice-clearing credit
+        // note is allocated (zero cash). Minting therefore requires ALL of:
+        //  1. positive CASH evidence on the invoice (amountPaid, falling back
+        //     to actual payment records) — an allocation-cleared invoice has
+        //     credit applied, not cash, and must mint nothing. Since #1435
+        //     the loop entry enforces this for every arm; the re-assert here
+        //     is belt-and-braces for MINTING only (if the outer gate is ever
+        //     reshaped, the settlement flips in the other arms are pinned by
+        //     the #1435 regression tests, not by this condition);
+        //  2. a payment that never settled (PENDING/FAILED) — a
+        //     paid-then-cancelled booking's replayed event is old money that
+        //     the cancellation flow already settled under its own policy;
+        //  3. no credit already minted by THIS pipeline (matched by its own
+        //     descriptions — never by amount, which collides with unrelated
+        //     cancellation-flow rows and misses policy-tiered ones).
+        const paymentNeverSettled =
+          originalPaymentStatus === PaymentStatus.PENDING ||
+          originalPaymentStatus === PaymentStatus.FAILED;
+
+        // #3369: this arm mints MEMBER CREDIT, and an organisation-owned
+        // booking has no member account to mint into. It never had a usable one
+        // either — the invented school member could not sign in, so credit
+        // minted against it was unspendable. But the CASH IS REAL: a school has
+        // paid for a booking the club has cancelled, and the club now holds
+        // money it owes back.
+        //
+        // The first cut of this stage answered that with a `logger.warn` whose
+        // comment claimed it gave the club "a visible, actionable line". It did
+        // not. No task was raised, nothing reached the stuck-state dashboard,
+        // and the caller treats this outcome as an ordinary silent one — so a
+        // school's money became a log line and a clean webhook.
+        //
+        // It now raises a `ManualRefundTask`, which is this repository's
+        // durable record of exactly this thing: money the system cannot move
+        // itself. It appears on the payments board, it carries the amount, and
+        // it stays open until somebody closes it. The admin alert beside the
+        // other three anomalies in this arm's caller says the same thing by
+        // email. The branch sits BELOW the cash quantification so the task is
+        // raised for the cents that actually arrived rather than the payment's
+        // face amount — the same figure the member arm would have credited.
+        const creditMemberId = bookingOwner(settlementPayment.booking).memberId;
+
+        // #1459: size the mint by the invoice's quantified CASH, never by a
+        // face amount alone. On a mixed invoice — the member part-pays in cash
+        // and the remainder is cleared by credit allocation (the app's own
+        // invoice-clearing note, an operator write-off, or an operator-allocated
+        // member credit note) — `amountPaid` is only the cash portion, and
+        // minting the whole would credit money that never arrived.
+        // #3979: the face is the RECEIPT's figure - the cash when the settle
+        // recorded it, else the stored receipt - never the payment's total,
+        // which also counts other captures (#1765). So a mixed invoice is told
+        // apart from the invoice side instead (`mixedInvoiceExpectedCents`: the
+        // cash the invoice expected, its total less the member's own applied
+        // credit), and the alert still names the part cleared some other way.
+        // #1505: further cap the mint at the invoice's cash NOT already minted
+        // for the other payments matched to it, so two never-settled payments
+        // on one invoice can never in aggregate mint more than its cash. The
+        // sum excludes this booking's own credit (read fresh under the advisory
+        // lock), which keeps the cap stable across replays.
+        const otherMintedCents = await sumInternetBankingMintedCentsForBookings(
+          tx,
+          matchedBookingIds.filter((id) => id !== settlementPayment.bookingId)
+        );
+        const mint = resolveMintableCents(
+          receiptFigure.receiptCents,
+          invoiceCash,
+          otherMintedCents,
+        );
+        const { mintableCents, cashUnverified, aggregateCapped } = mint;
+        const mintPartial = receiptFigure.isPartPayment(mint);
+
+        // #3643 (`INV-PAY-108`, ORCHESTRATOR DECISION 3): while a part-payment
+        // review names this payment, open or closed, neither arm below sizes
+        // or mints anything. The event is written onto the review instead, in
+        // this transaction, and the treasurer decides the cash.
+        const reviewRouting =
+          invoiceHasCashPayment && paymentNeverSettled
+            ? await routeLateCashToPartPaymentReview(tx, {
+                paymentId: settlementPayment.id,
+                eventInvoiceId: invoiceId,
+                cashCents: invoiceCash.knownCents,
+              })
+            : ({ routed: false } as const);
+        const partPaymentReviewRouted = reviewRouting.routed;
+        const partPaymentReviewReopened = reviewRouting.routed && reviewRouting.reopened;
+        const partPaymentReviewNoted = reviewRouting.routed && reviewRouting.noted;
+        const actionableCents = partPaymentReviewRouted ? 0 : mintableCents;
+
+        if (!creditMemberId) {
+          // The same three conditions the member arm mints under: cash really
+          // arrived, the payment never settled, and there are cents to hand
+          // back. Idempotent on the (booking, payment, kind) triple rather than
+          // on status, so a replay after an officer has CLOSED the task does
+          // not raise a second one — a webhook may be delivered any number of
+          // times, and this is money.
+          const handBackCents = actionableCents;
+          const shouldHandBack =
+            invoiceHasCashPayment && paymentNeverSettled && handBackCents > 0;
+          const alreadyRaised = shouldHandBack
+            ? await tx.manualRefundTask.findFirst({
+                where: {
+                  bookingId: settlementPayment.bookingId,
+                  paymentId: settlementPayment.id,
+                  kind: ManualRefundTaskKind.CANCELLED_BOOKING_HAND_BACK,
+                  // #3827 (`INV-PAY-117`): an edit's refund hand-back on the
+                  // same payment is not this cancellation's.
+                  ...NOT_NON_CANCELLATION_HAND_BACK_WHERE,
+                },
+                select: { id: true },
+              })
+            : null;
+          // #3535: cash arrived, so the pending clearing note is retired here
+          // too, as in the member arm - left to run, the worker would refuse it
+          // (the invoice owes less than the note), and the alert would claim a
+          // note "was ALREADY issued" when none will be.
+          if (shouldHandBack) {
+            await retirePendingClearingNote(tx, settlementPayment.bookingId);
+          }
+          if (shouldHandBack && !alreadyRaised) {
+            const task = await tx.manualRefundTask.create({
+              data: {
+                bookingId: settlementPayment.bookingId,
+                paymentId: settlementPayment.id,
+                amountCents: handBackCents,
+                kind: ManualRefundTaskKind.CANCELLED_BOOKING_HAND_BACK,
+                // Fixed at creation, like every other hand-back: the figure
+                // comes from the invoice's quantified cash, not from an
+                // officer's judgement, so it is not amendable at completion.
+                raisedAmountCents: handBackCents,
+                reason: `Booking ${storedShortBookingId(settlementPayment.bookingId)} was cancelled and an Internet Banking payment arrived for it. The booking belongs to an organisation, which has no member account for the money to be held as credit, so it must be returned to the organisation by hand (#3369).`.slice(
+                  0,
+                  MANUAL_REFUND_TASK_REASON_MAX,
+                ),
+              },
+              select: { id: true },
+            });
+            // #4516 (M4d): the organisation's late cash is a hand-back debt. This delivery holds lock(1) and, by now,
+            // the Payment row, so the owner is read plainly (no Payment -> booking edge, INV-LOCK-002): this arm runs only
+            // for an organisation's booking, whose owner no member merge moves.
+            if (journal) {
+              await postHandBackObligation(tx, journal, { bookingId: settlementPayment.bookingId, taskId: task.id, amountCents: handBackCents, origin: "XERO", debtorRead: "plain" });
+            }
+          }
+          logger.warn(
+            {
+              invoiceId,
+              paymentId: settlementPayment.id,
+              bookingId: settlementPayment.bookingId,
+              organisationId: settlementPayment.booking.organisationId,
+              handBackCents,
+              taskRaised: shouldHandBack && !alreadyRaised,
+              partPaymentReviewRouted,
+            },
+            "Internet Banking payment on a cancelled organisation-owned booking: no member account to credit, so a manual hand-back task carries the money instead (#3369)."
+          );
+          return {
+            type: "alreadyCancelled" as const,
+            payment: settlementPayment,
+            // The enclosing value, exactly as the member arm's return below
+            // uses it. The first cut passed `paymentNeverSettled` here, which
+            // is derived from the argument rather than from the outer read and
+            // therefore diverged from the member arm on the post-lock re-entry.
+            paymentWasPending,
+            credited: false,
+            creditedCents: 0,
+            creditedPartial: false,
+            invoiceExpectedCents: receiptFigure.mixedInvoiceExpectedCents ?? receiptFigure.receiptCents,
+            cashUnverified,
+            aggregateCapped,
+            laterCashCents: 0,
+            zeroCashAnomaly: false,
+            // What the caller alerts on. Zero means there was nothing to hand
+            // back — a replay, an allocation-cleared invoice — and stays silent
+            // exactly as the member arm does in the same states.
+            organisationHandBackCents: shouldHandBack ? handBackCents : 0,
+            partPaymentReviewRouted,
+            partPaymentReviewReopened,
+            partPaymentReviewNoted,
+            // #3535: either note shape, not only the old refund note's field.
+            clearingNoteAlreadyIssued: await hasInvoiceClearingNote(tx, settlementPayment),
+          };
+        }
+
+        // Looked up unconditionally (amount included): the dedup gate needs
+        // its existence, and the later-cash detection below needs its size.
+        const existingCredit = await tx.memberCredit.findFirst({
+          where: {
+            memberId: creditMemberId,
+            sourceBookingId: settlementPayment.bookingId,
+            type: CreditType.CANCELLATION_REFUND,
+            description: {
+              in: [
+                internetBankingLateCashCreditDescription(settlementPayment.bookingId, { bookingCancelled: false }),
+                internetBankingLateCashCreditDescription(settlementPayment.bookingId, { bookingCancelled: true }),
+              ],
+            },
+          },
+          select: { id: true, amountCents: true },
+        });
+
+        const credited =
+          invoiceHasCashPayment &&
+          paymentNeverSettled &&
+          !existingCredit &&
+          actionableCents > 0;
+
+        // A partial mint's remainder never auto-credits: a later PAID event
+        // for this invoice lands here with a settled payment (or the dedup
+        // hit) and mints nothing. When the VERIFIED cash now exceeds what was
+        // already minted, say so instead of staying silent — the member is
+        // owed the delta and only an operator can size the top-up. The
+        // comparison uses the aggregate-apportioned `mintableCents` (#1505), so
+        // a multi-payment replay whose cash was already shared out does not
+        // raise a false later-cash alert on every sweep.
+        const laterCashCents =
+          !credited &&
+          existingCredit &&
+          invoiceCash.complete &&
+          mintableCents > existingCredit.amountCents
+            ? mintableCents - existingCredit.amountCents
+            : 0;
+
+        // A never-settled payment whose creditable cash is zero settled with no
+        // credit behind it — never silent. Two causes, both loud below: the
+        // classifier and quantifier disagree at zero (cash-classified evidence
+        // that quantifies to nothing), or the invoice's cash was already fully
+        // minted for the other payments matched to it (#1505 aggregate cap).
+        const zeroCashAnomaly =
+          !partPaymentReviewRouted &&
+          invoiceHasCashPayment &&
+          paymentNeverSettled &&
+          !existingCredit &&
+          mintableCents === 0 &&
+          settlementPayment.amountCents > 0;
+        if (zeroCashAnomaly) {
+          logger.warn(
+            {
+              invoiceId,
+              paymentId: settlementPayment.id,
+              bookingId: settlementPayment.bookingId,
+              aggregateCapped,
+            },
+            aggregateCapped
+              ? "Xero PAID invoice's cash was already fully minted for other Internet Banking payments on the same invoice; no further member credit minted for this cancelled booking (#1505)"
+              : "Xero PAID invoice classified as cash-settled but its cash quantified to zero; no member credit minted for the cancelled booking"
+          );
+        } else if (aggregateCapped && credited) {
+          logger.warn(
+            {
+              invoiceId,
+              paymentId: settlementPayment.id,
+              bookingId: settlementPayment.bookingId,
+              mintableCents,
+              otherMintedCents,
+              invoiceCashCents: invoiceCash.knownCents,
+            },
+            "Internet Banking credit mint reduced by the per-invoice aggregate cap: other payments on this invoice already claimed part of its cash (#1505)"
+          );
+        }
+
+        if (credited) {
+          const mintedCredit = await tx.memberCredit.create({ // #4685: its id names it to its Xero note's stamp
+            data: {
+              memberId: creditMemberId,
+              amountCents: actionableCents,
+              type: CreditType.CANCELLATION_REFUND,
+              description: internetBankingLateCashCreditDescription(settlementPayment.bookingId, { bookingCancelled: true }),
+              sourceBookingId: settlementPayment.bookingId,
+            },
+          });
+          await syncBookingLedgerCredits({ bookingId: settlementPayment.bookingId, store: tx });
+          // Real cash arrived, so the hold-expiry release's still-pending
+          // invoice-clearing refund credit note (which would post a fictional
+          // cash refund) is obsolete — retire it in the same transaction. An
+          // already-executed note can't be retired here; the admin alert
+          // below calls out that state for manual reconciliation.
+          await tx.xeroSyncOperation.updateMany({
+            where: {
+              localModel: "Payment",
+              localId: settlementPayment.id,
+              direction: "OUTBOUND",
+              entityType: "CREDIT_NOTE",
+              operationType: "CREATE",
+              status: "PENDING",
+              // #4146: the id's characters matched literally, never as `LIKE` wildcards.
+              correlationKey: exactPrefix(`payment:${settlementPayment.id}:refund-credit-note:`),
+            },
+            data: {
+              status: "CANCELLED",
+            },
+          });
+          // #3535: a hold released since then queued the booking-anchored
+          // clearing note instead, just as obsolete once cash arrived.
+          await retirePendingClearingNote(tx, settlementPayment.bookingId);
+          await enqueueXeroAccountCreditNoteOperation(
+            settlementPayment.id,
+            actionableCents,
+            { store: tx, memberCreditId: mintedCredit.id },
+          );
+        }
+
+        return {
+          type: "alreadyCancelled" as const,
+          payment: settlementPayment,
+          paymentWasPending,
+          credited,
+          creditedCents: actionableCents,
+          creditedPartial: mintPartial,
+          // #3979: what the invoice expected in cash, the figure a mixed
+          // invoice's alert names beside the cash that arrived.
+          invoiceExpectedCents: receiptFigure.mixedInvoiceExpectedCents ?? receiptFigure.receiptCents,
+          cashUnverified,
+          aggregateCapped,
+          laterCashCents,
+          zeroCashAnomaly,
+          // #3369: the member arm never hands back to an organisation, by
+          // construction — it only runs when there IS a member. Stated rather
+          // than left to the union, so both arms return the same shape.
+          organisationHandBackCents: 0,
+          partPaymentReviewRouted,
+          partPaymentReviewReopened,
+          partPaymentReviewNoted,
+          // #3535: either note shape, not only the old refund note's field.
+          clearingNoteAlreadyIssued: await hasInvoiceClearingNote(tx, settlementPayment),
+        };
+      };
+
+      if (fresh.booking.status === BookingStatus.CANCELLED) {
+        return runAlreadyCancelledCreditMintArm();
+      }
+
+      // Reconciliation writes bed allocations even for an already-held
+      // CONFIRMED booking. The immutable lodge key is held from the top of this
+      // transaction (#3792); consume only this post-lock snapshot.
+      const locked = await tx.payment.findUnique({
+        where: { id: fresh.id },
+        include: {
+          booking: {
+            include: {
+              member: true,
+              // #3369: the owner may be an Organisation; bookingOwner() reads both.
+              organisation: { select: { name: true, email: true } },
+              guests: { include: { nights: true } },
+              promoRedemptions: { include: { promoCode: true } },
+            },
+          },
+        },
+      });
+      if (!locked || locked.source !== PaymentSource.INTERNET_BANKING) {
+        throw new Error(
+          "Internet Banking payment disappeared during Xero reconciliation",
+        );
+      }
+      // #3638: the same second-instrument test against the post-lodge-lock
+      // snapshot. Defence in depth, not a second chance: lock(1) has been held
+      // since the read above, and card settlement and cancellation both take
+      // lock(1), so the booking's status cannot have changed during the
+      // lodge-lock wait. The CANCELLED question is not asked here because the
+      // receipt is already written — the read above is where it is answered.
+      const lockedSecondInstrument = await findSecondInstrumentSettlement(tx, {
+        paymentId: locked.id,
+        bookingId: locked.bookingId,
+        bookingStatus: locked.booking.status,
+        invoiceId,
+        includeCancelled: false,
+      });
+      if (lockedSecondInstrument) {
+        return {
+          type: "secondInstrumentConflict" as const,
+          payment: fresh,
+          paymentWasPending,
+          bookingStatus: locked.booking.status,
+          settledBy: lockedSecondInstrument,
+          marker: await recordSecondInstrumentMarkerInTransaction(tx, {
+            bookingId: locked.bookingId,
+            amountCents: locked.amountCents,
+            bookingStatus: locked.booking.status,
+            invoiceId,
+            invoiceNumber,
+            settledBy: lockedSecondInstrument,
+          }),
+        };
+      }
+      if (
+        isPaidLikeBookingStatus(locked.booking.status)
+      ) {
+        await markLiveBooking();
+        return {
+          type: "alreadyPaid" as const,
+          payment: fresh,
+          paymentWasPending,
+        };
+      }
+      if (locked.booking.status === BookingStatus.CANCELLED) {
+        return runAlreadyCancelledCreditMintArm(locked, fresh.status);
+      }
+
+      if (
+        locked.booking.status === BookingStatus.PAYMENT_PENDING &&
+        !locked.internetBankingHoldSlots
+      ) {
+        // Two-lock composition (multi-lodge). The outer pg_advisory_xact_lock(1)
+        // above sequences Internet Banking webhook/reconciliation processing;
+        // it no longer excludes per-lodge booking creators, who serialize on
+        // hash(lodge) instead. Flipping an unheld PAYMENT_PENDING booking to
+        // PAID here is a net-new capacity claim, so it must ALSO take the
+        // booking's per-lodge lock to serialize against those creators. lodgeId
+        // is immutable, so keying the lock from the pre-lock read is safe.
+        // #1587: a concurrent actor may have CANCELLED this booking while we
+        // waited on the lodge lock — the pre-lock branch decision above was
+        // taken under lock(1) only, so a cancellation that landed inside the
+        // lodge-lock wait window is only visible now. Flipping it to PAID from
+        // here would resurrect a cancelled booking (a phantom capacity claim
+        // and inconsistent money state). Route the cash into the SAME
+        // already-cancelled credit-mint arm instead, exactly as if the
+        // cancellation had been observed before the payment landed. Only the
+        // post-lock-CANCELLED path changes; every other post-lock state falls
+        // through to the capacity gate / PAID flip below unchanged.
+        // Only an unheld PAYMENT_PENDING booking still needs the capacity gate.
+        // If the post-lock read shows it moved on (already CONFIRMED/PAID by a
+        // concurrent path, or a switch-to-Internet-Banking now holds its
+        // slots), skip the gate and fall through to the PAID flip below: those
+        // states already hold their beds, so there is no net-new claim to
+        // serialize.
+        const capacity = await checkCapacityForGuestRanges(
+          locked.booking.lodgeId,
+          locked.booking.checkIn,
+          locked.booking.checkOut,
+          locked.booking.guests,
+          locked.booking.id,
+          tx,
+        );
+
+        // Persisted capacity override (#1771): read off the post-lock snapshot
+        // (locked is non-null whenever capacity was actually checked, but guard
+        // it so TS stays happy on the { available: true } branch). The marker is
+        // immutable, so the pre- vs post-lock read cannot disagree.
+        const lockedHasOverride = bookingHasCapacityOverride(locked.booking);
+
+        if (!capacity.available && lockedHasOverride) {
+          // The booking was deliberately admitted above the ceiling by an admin,
+          // so a late Internet Banking payment must settle it, not cancel + mint
+          // a credit. Fall through to the PAID flip below.
+          logger.info(
+            { invoiceId, paymentId: fresh.id, bookingId: fresh.bookingId },
+            "Settling an over-capacity Internet Banking booking with a persisted capacity override (#1771); skipping the capacity cancel"
+          );
+        }
+        if (!capacity.available && !lockedHasOverride) {
+          // #3792: this cancel restores the booking's applied credit below,
+          // under the member credit-ledger key taken at the top of this
+          // transaction (global -> lodge -> member, INV-LOCK-002). Before its
+          // first write it refuses to run while an applied-credit deallocation
+          // has not converged, exactly as the hold release and the
+          // never-captured cancel do. Throwing rolls the whole claim back; the
+          // inbound event retries after its backoff.
+          // #3369: an organisation-owned booking has no credit ledger.
+          const unconvergedDeallocation = await findUnconvergedAppliedCreditDeallocation(fresh.id, tx);
+          if (unconvergedDeallocation) {
+            throw new XeroAppliedCreditOperationBusyError(
+              `Applied-credit deallocation ${unconvergedDeallocation.id} is ${unconvergedDeallocation.status} for payment ${fresh.id}; the late capacity cancel waits for it to converge`,
+            );
+          }
+          // #2265 (#2319 door 2). This booking is being cancelled and its cash
+          // turned into account credit, so no consumer will ever read its
+          // stored election again (both require PAYMENT_PENDING). Clear it here
+          // too, for the same reason the PAID arm does: no terminal booking
+          // carries a stale election. Nothing is lost — the election never
+          // moved money, and the cash the member did send is minted as credit
+          // just below.
+          await clearStaleCreditElection(tx, locked.booking);
+          const cancelled = await tx.booking.updateMany({
+            where: {
+              id: fresh.bookingId,
+              status: locked.booking.status,
+            },
+            data: {
+              status: BookingStatus.CANCELLED,
+              draftExpiresAt: null,
+            },
+          });
+          if (cancelled.count === 0) {
+            throw new Error(
+              "Xero reconciliation lost its capacity-failure cancellation claim",
+            );
+          }
+          await reconcileBedAllocationsForBookingWithLodgeLockHeld({
+            bookingId: fresh.bookingId,
+            db: tx,
+          });
+          await releaseBookingPromoRedemptions(tx, fresh.bookingId);
+          // #3792: the account credit the booking had applied goes back too, in
+          // full — a capacity cancel is not the member's choice, so no policy
+          // tier applies. The same helper and the same place as the settle's
+          // capacity void (payment-reconciliation.ts), under the locks taken
+          // above. The helper posts the restore's ledger line, and its unique
+          // `restoredFromBookingId` makes a replay, or the orphan heal, a no-op.
+          const creditRestoredCents = creditLedgerMemberId
+            ? await restoreCreditFromBooking(creditLedgerMemberId, fresh.bookingId, tx)
+            : 0;
+          // #3611: the cash goes back as credit, so nothing is kept; a booking
+          // already confirmed on the ledger (a mark-paid since reversed) has its
+          // stay taken back, under the lock(1) this transaction took first.
+          await postCancellationLedgerLines({ store: tx, journal: journal!, bookingId: fresh.bookingId, lodgeId: locked.booking.lodgeId, keptCents: 0, site: "xero-inbound:late-capacity-cancel" });
+
+          // #1459: this arm mints too, so it takes the same quantified-cash
+          // clamp as the already-cancelled arm — a live booking's invoice can
+          // also be mixed (operator write-off or allocated credit note plus
+          // partial cash).
+          // #1505: and the same per-invoice aggregate cap — the sum excludes
+          // this booking's own credit, so the mint (and therefore the
+          // amount-keyed dedup below) is stable across replays.
+          const otherMintedCents =
+            await sumInternetBankingMintedCentsForBookings(
+              tx,
+              matchedBookingIds.filter((id) => id !== fresh.bookingId)
+            );
+          // #3979: the receipt's figure as the face, and the invoice side for a
+          // mixed invoice, as the already-cancelled arm above.
+          const mint = resolveMintableCents(receiptFigure.receiptCents, invoiceCash, otherMintedCents);
+          const { mintableCents, cashUnverified, aggregateCapped } = mint;
+          const mintPartial = receiptFigure.isPartPayment(mint);
+          if (aggregateCapped) {
+            logger.warn(
+              { invoiceId, paymentId: fresh.id, bookingId: fresh.bookingId, mintableCents, otherMintedCents, invoiceCashCents: invoiceCash.knownCents },
+              "Internet Banking credit mint reduced by the per-invoice aggregate cap on the late-capacity-failure arm: other payments on this invoice already claimed part of its cash (#1505)"
+            );
+          }
+
+          const creditDescription = internetBankingLateCashCreditDescription(fresh.bookingId, { bookingCancelled: false });
+          // #3369: the same decision as the cancelled arm above — an
+          // organisation-owned booking has no member account, so there is
+          // nothing to mint into and nothing to dedupe against. The warning is
+          // what makes the money the treasurer's to return rather than a
+          // balance nobody can reach.
+          const lateCapacityCreditMemberId = bookingOwner(fresh.booking).memberId;
+          if (!lateCapacityCreditMemberId) {
+            logger.warn(
+              {
+                invoiceId,
+                paymentId: fresh.id,
+                bookingId: fresh.bookingId,
+                organisationId: fresh.booking.organisationId,
+              },
+              "Internet Banking payment on an organisation-owned booking that failed capacity: no member account to credit, so no credit was minted. Refund the organisation directly (#3369)."
+            );
+          }
+          const existingCredit = lateCapacityCreditMemberId ? await tx.memberCredit.findFirst({
+            where: {
+              memberId: lateCapacityCreditMemberId,
+              sourceBookingId: fresh.bookingId,
+              amountCents: mintableCents,
+              type: CreditType.CANCELLATION_REFUND,
+              description: creditDescription,
+            },
+            select: { id: true },
+          }) : null;
+          const mintedCredit = lateCapacityCreditMemberId && !existingCredit && mintableCents > 0 ? await tx.memberCredit.create({
+              data: {
+                memberId: lateCapacityCreditMemberId,
+                amountCents: mintableCents,
+                type: CreditType.CANCELLATION_REFUND,
+                description: creditDescription,
+                sourceBookingId: fresh.bookingId,
+              },
+            }) : null;
+          if (mintedCredit) await syncBookingLedgerCredits({ bookingId: fresh.bookingId, store: tx });
+
+          // Enqueue the offsetting Xero account-credit note inside this same
+          // transaction so the outbox intent commits atomically with the local
+          // credit. Doing this post-commit risked a crash window that left a
+          // local credit with no Xero mirror and no self-healing path (the
+          // booking is now CANCELLED, so a re-run early-returns without
+          // re-enqueueing). The enqueue is a local insert, no-ops when the
+          // amount is <= 0, and dedups, so it is safe to run in-tx. #4685: it names the credit its note stamps.
+          await enqueueXeroAccountCreditNoteOperation(fresh.id, mintableCents, {
+            store: tx, memberCreditId: (mintedCredit ?? existingCredit)?.id,
+          });
+
+          return {
+            type: "capacityFailed" as const,
+            payment: fresh,
+            paymentWasPending,
+            credited: !existingCredit && mintableCents > 0,
+            creditedCents: mintableCents,
+            creditedPartial: mintPartial,
+            invoiceExpectedCents: receiptFigure.mixedInvoiceExpectedCents ?? receiptFigure.receiptCents,
+            cashUnverified,
+            aggregateCapped,
+            creditRestoredCents,
+          };
+        }
+      }
+
+      // #2265 (#2319 door 2). The member has paid the invoiced amount in cash,
+      // so a stored credit election can no longer be honoured on this booking —
+      // clear it rather than leave a settled booking advertising an outstanding
+      // election. Read off `fresh`, which is a post-`lock(1)` snapshot, and
+      // taken as a guarded claim; see claimStaleCreditElection for the full
+      // reasoning and for who can still reach here carrying one.
+      const staleCreditElectionCents = await clearStaleCreditElection(
+        tx,
+        locked.booking
+      );
+
+      const claimed = await tx.booking.updateMany({
+        where: {
+          id: fresh.bookingId,
+          status: locked.booking.status,
+        },
+        data: {
+          status: BookingStatus.PAID,
+          draftExpiresAt: null,
+        },
+      });
+      if (claimed.count === 0) {
+        throw new Error("Xero reconciliation lost its booking status claim");
+      }
+      // #4211 (`INV-PAY-043`): the bank receipt's row settled it; a card capture arriving later is refunded.
+      await recordSettlingTransaction(tx, { paymentId: fresh.id, transactionId: await findSettlingInternetBankingTransactionId(tx, fresh.id) });
+      // #4628: this PAID claim is the booking's confirmation, as the settle's is (`INV-MONEY-032`): its
+      // charge lines post here, under lock(1) and the lodge key, and link to the journal charge its binding posted.
+      await postStoredBookingConfirmationLedgerLines(tx, fresh.bookingId, journal!);
+      await reconcileBedAllocationsForBookingWithLodgeLockHeld({
+        bookingId: fresh.bookingId,
+        db: tx,
+      });
+
+      // #2576 §9. An inbound Xero PAID is a confirmation, so the hosting facts are
+      // re-read rather than trusted. Enqueued and never refused: the money is
+      // already in the club's bank account by the time Xero tells us, so the only
+      // available answer is to allow the transition and escalate anything uncovered
+      // to an urgent incident (§8).
+      //
+      // #3039: `bestEffort` KEEPS THAT PREMISE TRUE now that the seam also reaches
+      // ANOTHER account's rows. The Group Trip fan-out takes a per-trip advisory key
+      // and a `Member FOR KEY SHARE NOWAIT` fence over the sibling owners, and both
+      // are lost fail-fast to a third party editing their own booking in the same
+      // trip — which would roll THIS transaction back and refuse a PAID claim for an
+      // invoice that is already paid. So the cross-account half degrades to the cron
+      // instead. That is safe here, and only here, because CONFIRMED and PAID are
+      // both eligible coverage sources and PAYMENT_PENDING -> PAID only ADDS one: a
+      // Xero PAID can restore a sibling's cover, never remove it, so the worst case
+      // of skipping is a favourable re-evaluation arriving three hours later. The
+      // booking's own item is still written. `GroupTripFanOutOptions` carries the
+      // full rule and the discriminator for any future caller.
+      await enqueueOwnHostingCoverageReevaluation(
+        fresh.bookingId,
+        tx,
+        { cause: "SYSTEM_CHANGE" },
+        undefined,
+        { bestEffort: true },
+      );
+
+      await markLiveBooking();
+      return {
+        type: "paid" as const,
+        payment: fresh,
+        paymentWasPending,
+        staleCreditElectionCents,
+      };
+      })();
+      // Only on normal completion, after the paid arm's confirmation has posted R01; a throw above rolls back
+      // with its own error. Only the paid arm collects: a second instrument (either check), a cancelled booking,
+      // a capacity failure or an already-paid booking keeps the full receipt unapplied.
+      if (receiptRowIds !== null) {
+        await postBookingReceipts(tx, journal!, { paymentId: payment.id,
+          decision: { transactionIds: receiptRowIds, collect: settled.type === "paid", effectiveDate: receiptDate ?? undefined } });
+      }
+      return settled;
+    }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+
+    if (outcome.type === "missing") {
+      continue;
+    }
+
+    // #2576 §9: drain what the PAID transition queued, per booking, now that it has
+    // committed. Scoped to this booking's owner so one invoice's settlement never
+    // runs another member's backlog inside this webhook.
+    await settleHostingCoverageAfterCommit({
+      bookingId: outcome.payment.bookingId,
+    });
+
+    // #4095 (`INV-PAY-126`): a kept receipt holds the stored figure, so a
+    // correction already synced against it is recounted now; a replay recounts
+    // again, so an event retried for one left unrecounted finishes it (#4449: a backstop).
+    result.unrecountedCorrectionNoteIds.push(...(await afterKeptSettleCommits(invoiceId, outcome.payment.id, keptFollowUp, format)));
+
+    // #3979 (`INV-PAY-125`): a kept figure, or cash that disagrees with what
+    // the booking owes, is never silent on a booking the settle leaves live:
+    // its marker committed with the receipt, and the alert goes out now. The
+    // two cancel arms turn the cash into credit and alert about it themselves,
+    // with the figures, so they write no marker.
+    const marker = cashSettlementMarker;
+    if (marker) {
+      await raiseCashSettlementAlert({
+        payment: outcome.payment,
+        memberName: `${bookingOwner(outcome.payment.booking).member.firstName} ${bookingOwner(outcome.payment.booking).member.lastName}`.trim(),
+        marker,
+        invoiceId,
+        format,
+      });
+    }
+
+    if (outcome.type === "manualSettlementConflict") {
+      // B5 (#2262). Loud on every axis: a counter in the returned result, an
+      // error log, a durable admin-only BookingEvent (once per payment+invoice)
+      // and an admin alert throttled by a cross-instance cooldown so webhook
+      // replays re-count without re-spamming. NO money state was changed.
+      result.manualSettlementConflicts += 1;
+      logger.error(
+        {
+          bookingId: outcome.payment.bookingId,
+          paymentId: outcome.payment.id,
+          bookingStatus: outcome.bookingStatus,
+          invoiceId,
+          invoiceNumber,
+        },
+        "Inbound Xero PAID landed on a manually settled booking (#2262): the club may hold the same money twice — nothing was written"
+      );
+      await recordManualSettlementConflict({
+        payment: outcome.payment,
+        bookingStatus: outcome.bookingStatus,
+        invoiceId,
+        invoiceNumber,
+        format,
+      });
+      continue;
+    }
+
+    if (outcome.paymentWasPending) {
+      result.paidInternetBankingPayments += 1;
+    }
+
+    if (outcome.type === "secondInstrumentConflict") {
+      // #3638. Loud on the same axes as the #2262 fence: a counter, an error
+      // log, one durable admin-only BookingEvent per invoice (written in the
+      // transaction above) and an admin alert sent once per marker. No money
+      // moved.
+      result.secondInstrumentSettlementConflicts += 1;
+      logger.error(
+        {
+          bookingId: outcome.payment.bookingId,
+          paymentId: outcome.payment.id,
+          bookingStatus: outcome.bookingStatus,
+          settledBySource: outcome.settledBy.source,
+          settledByPaymentIntentId: outcome.settledBy.stripePaymentIntentId,
+          conflictKind: outcome.settledBy.conflictKind,
+          markerId: outcome.marker.id,
+          invoiceId,
+          invoiceNumber,
+        },
+        "Inbound Xero PAID landed on a booking a card payment had already settled (#3638): the club may hold the price twice"
+      );
+      await raiseSecondInstrumentSettlementAlert({
+        payment: outcome.payment,
+        marker: outcome.marker,
+        invoiceId,
+        format,
+      });
+      continue;
+    }
+
+    if (outcome.type === "alreadyPaid") {
+      result.skippedAlreadyPaidBookings += 1;
+      continue;
+    }
+
+    if (outcome.type === "alreadyCancelled") {
+      // `credited` is the one state where new cash landed and was minted.
+      // Routine replays, allocation-driven PAID flips (our own clearing
+      // notes), and paid-then-cancelled histories all reach this arm with
+      // credited=false and stay silent — EXCEPT the two anomalies below
+      // (verified later cash exceeding the minted credit, and cash-classified
+      // evidence that quantified to zero), which alert instead of parking a
+      // money discrepancy silently.
+      if (outcome.credited) {
+        result.creditedInternetBankingBookings += 1;
+        if (outcome.creditedPartial) {
+          result.partialCashCreditedInternetBankingBookings += 1;
+        }
+        await recordBookingEvent({
+          bookingId: outcome.payment.bookingId,
+          type: BookingEventType.CREDITED,
+          amountCents: outcome.creditedCents,
+          reason: outcome.creditedPartial
+            ? "Internet Banking cash received after cancellation; cash portion held as account credit."
+            : "Internet Banking payment received after cancellation; amount held as account credit.",
+        });
+        sendBookingCancelledEmail(
+          {
+            bookingId: outcome.payment.booking.id,
+            recipientMemberId: bookingOwner(outcome.payment.booking).memberId,
+          },
+          bookingOwner(outcome.payment.booking).member.email,
+          bookingOwner(outcome.payment.booking).member.firstName,
+          outcome.payment.booking.checkIn,
+          outcome.payment.booking.checkOut,
+          outcome.creditedCents,
+          format,
+          "credit",
+          0,
+          outcome.payment.booking.lodgeId,
+        ).catch((err) =>
+          logger.error(
+            { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+            "Failed to email member about credit for payment on cancelled booking"
+          )
+        );
+        const unverifiedSuffix = outcome.cashUnverified
+          ? " Cash amounts could not be fully verified from the Xero payload — confirm the figures against the invoice in Xero."
+          : "";
+        sendAdminPaymentFailureAlert({
+          memberName: `${bookingOwner(outcome.payment.booking).member.firstName} ${bookingOwner(outcome.payment.booking).member.lastName}`,
+          checkIn: outcome.payment.booking.checkIn,
+          checkOut: outcome.payment.booking.checkOut,
+          amountCents: outcome.creditedCents,
+          errorMessage: outcome.aggregateCapped
+            ? `Internet Banking cash of ${formatCents(outcome.creditedCents, format)} was credited for an already-cancelled booking, but this invoice's cash was already partly credited to other Internet Banking payment(s) matched to the same invoice. This payment's face amount is ${formatCents(outcome.invoiceExpectedCents, format)}; only the invoice's remaining cash is held as the member's account credit, because the aggregate credit across all payments on one invoice can never exceed the invoice's cash. Verify the invoice's payments in Xero. If more cash arrives for this invoice later it will NOT credit automatically — top up the member's account credit manually.${outcome.clearingNoteAlreadyIssued ? " An invoice-clearing credit note was ALREADY issued for this invoice, so also check Xero for duplicate settlement artifacts." : ""}${unverifiedSuffix}`
+            : outcome.creditedPartial
+            ? `Internet Banking cash of ${formatCents(outcome.creditedCents, format)} was received for an already-cancelled booking whose ${formatCents(outcome.invoiceExpectedCents, format)} payment was otherwise settled by credit allocation in Xero (mixed invoice). Only the cash portion is held as the member's account credit — verify the allocation source on the invoice (the app's own invoice-clearing credit note is routine; a manual write-off or an operator-allocated member credit note needs its own follow-up). If more cash arrives for this invoice later it will NOT credit automatically — top up the member's account credit manually.${outcome.clearingNoteAlreadyIssued ? " An invoice-clearing credit note was ALREADY issued for this invoice, so also check Xero for duplicate settlement artifacts." : ""}${unverifiedSuffix}`
+            : outcome.clearingNoteAlreadyIssued
+              ? `Internet Banking payment was received for an already-cancelled booking. The amount is held as the member's account credit — and an invoice-clearing credit note was ALREADY issued for this invoice, so Xero needs manual reconciliation (remove the clearing note's allocation or void the clearing note — or, for an older refund note, its refund payment — or the duplicate artifact).${unverifiedSuffix}`
+              : `Internet Banking payment was received for an already-cancelled booking. The amount is held as the member's account credit; follow up with the member if a bank refund is more appropriate.${unverifiedSuffix}`,
+          paymentIntentId: invoiceId,
+        }, format).catch((err) =>
+          logger.error(
+            { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+            "Failed to alert admins about Internet Banking payment on cancelled booking"
+          )
+        );
+      } else if (outcome.laterCashCents > 0) {
+        sendAdminPaymentFailureAlert({
+          memberName: `${bookingOwner(outcome.payment.booking).member.firstName} ${bookingOwner(outcome.payment.booking).member.lastName}`,
+          checkIn: outcome.payment.booking.checkIn,
+          checkOut: outcome.payment.booking.checkOut,
+          amountCents: outcome.laterCashCents,
+          errorMessage: `Additional Internet Banking cash of ${formatCents(outcome.laterCashCents, format)} appears on the invoice of a cancelled booking that was already credited (verified cash now ${formatCents(outcome.creditedCents, format)}, credited so far ${formatCents(outcome.creditedCents - outcome.laterCashCents, format)}). Later cash never credits automatically — verify the invoice in Xero and top up the member's account credit manually.`,
+          paymentIntentId: invoiceId,
+        }, format).catch((err) =>
+          logger.error(
+            { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+            "Failed to alert admins about later cash on an already-credited cancelled booking"
+          )
+        );
+      } else if (outcome.organisationHandBackCents > 0) {
+        // #3369: a school paid for a booking the club had already cancelled.
+        // There is no member account to hold the money as credit, so the arm
+        // above raised a manual hand-back task and this says so out loud — the
+        // fourth anomaly in a list of three, and for the same reason as the
+        // other three: money that moved without a member-facing outcome must
+        // never be silent.
+        sendAdminPaymentFailureAlert({
+          memberName: `${bookingOwner(outcome.payment.booking).member.firstName} ${bookingOwner(outcome.payment.booking).member.lastName}`.trim(),
+          checkIn: outcome.payment.booking.checkIn,
+          checkOut: outcome.payment.booking.checkOut,
+          amountCents: outcome.organisationHandBackCents,
+          errorMessage: `Internet Banking cash of ${formatCents(outcome.organisationHandBackCents, format)} arrived for an already-cancelled booking that belongs to an ORGANISATION. An organisation has no member account, so the money is NOT held as account credit — a manual refund task has been raised on the payments board for that amount and stays open until somebody returns the money and closes it. Verify the invoice in Xero, then refund the organisation directly.${outcome.clearingNoteAlreadyIssued ? " An invoice-clearing credit note was ALREADY issued for this invoice, so also check Xero for duplicate settlement artifacts." : ""}${outcome.cashUnverified ? " Cash amounts could not be fully verified from the Xero payload — confirm the figures against the invoice in Xero." : ""}`,
+          paymentIntentId: invoiceId,
+        }, format).catch((err) =>
+          logger.error(
+            { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+            "Failed to alert admins about an Internet Banking payment on a cancelled organisation-owned booking"
+          )
+        );
+      } else if (outcome.partPaymentReviewRouted) {
+        // #3643 (`INV-PAY-108`, ORCHESTRATOR DECISION 3): a part-payment review
+        // names this payment, so this event moved no money and was written
+        // onto the review. The email is best-effort; the note on the review is
+        // the record. Sent only when this event wrote the note, so a replay
+        // that found one says nothing again.
+        if (outcome.partPaymentReviewNoted) sendAdminPaymentFailureAlert({
+          memberName: `${bookingOwner(outcome.payment.booking).member.firstName} ${bookingOwner(outcome.payment.booking).member.lastName}`.trim(),
+          checkIn: outcome.payment.booking.checkIn,
+          checkOut: outcome.payment.booking.checkOut,
+          amountCents: outcome.payment.amountCents,
+          errorMessage: `Xero reports the invoice of a cancelled booking as paid. When the booking was cancelled, a payment was already recorded against that invoice and a review was raised in the hand-back queue for the treasurer to settle it in Xero. While that review exists the app never credits or hands back cash for the invoice by itself, so nothing has been credited or handed back; the review now records that Xero reported the invoice paid, and with how much cash. ${outcome.partPaymentReviewReopened ? "The review had been closed, so it has been put back on the queue." : "The review is still open on the queue."} Check the invoice in Xero, settle any cash beyond what the review already covered, then close the review with a note saying what you did.`,
+          paymentIntentId: invoiceId,
+        }, format).catch((err) =>
+          logger.error(
+            { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+            "Failed to alert admins about a paid invoice on a cancelled booking under part-payment review"
+          )
+        );
+      } else if (outcome.zeroCashAnomaly) {
+        sendAdminPaymentFailureAlert({
+          memberName: `${bookingOwner(outcome.payment.booking).member.firstName} ${bookingOwner(outcome.payment.booking).member.lastName}`,
+          checkIn: outcome.payment.booking.checkIn,
+          checkOut: outcome.payment.booking.checkOut,
+          amountCents: outcome.payment.amountCents,
+          errorMessage: outcome.aggregateCapped
+            ? "This cancelled booking's Xero invoice reports PAID, but the invoice's cash was already fully credited to other Internet Banking payment(s) matched to the same invoice, so this payment was marked settled with NO member credit (the aggregate credit across all payments on one invoice can never exceed the invoice's cash). Reconcile the invoice manually in Xero and credit the member if additional cash actually arrived for this payment."
+            : "This cancelled booking's Xero invoice reports PAID with cash-classified evidence that quantifies to zero, so the payment was marked settled but NO member credit was minted. Reconcile the invoice manually in Xero and credit the member if cash actually arrived.",
+          paymentIntentId: invoiceId,
+        }, format).catch((err) =>
+          logger.error(
+            { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+            "Failed to alert admins about zero-quantified cash on a cancelled booking"
+          )
+        );
+      }
+      continue;
+    }
+
+    if (outcome.type === "capacityFailed") {
+      result.creditedInternetBankingBookings += 1;
+      if (outcome.credited && outcome.creditedPartial) {
+        result.partialCashCreditedInternetBankingBookings += 1;
+      }
+
+      await recordBookingEvent({
+        bookingId: outcome.payment.bookingId,
+        type: BookingEventType.CANCELLED,
+        amountCents: outcome.payment.amountCents,
+        reason: "Internet Banking payment reconciled after capacity was no longer available.",
+      });
+      if (outcome.credited) {
+        await recordBookingEvent({
+          bookingId: outcome.payment.bookingId,
+          type: BookingEventType.CREDITED,
+          amountCents: outcome.creditedCents,
+          reason: outcome.creditedPartial
+            ? "Cash portion of the Internet Banking payment held as account credit."
+            : "Paid Internet Banking amount held as account credit.",
+        });
+      }
+      // #3792: the applied credit restored in the cancel's claim, recorded the
+      // way the hold release records its own.
+      if (outcome.creditRestoredCents > 0) {
+        await recordBookingEvent({
+          bookingId: outcome.payment.bookingId,
+          type: BookingEventType.CREDITED,
+          amountCents: outcome.creditRestoredCents,
+          reason: "Applied account credit returned in full: the booking was cancelled for capacity.",
+        });
+      }
+
+      // The Xero account-credit note is now enqueued inside the reconcile
+      // transaction above (atomic with the local credit), so there is no
+      // post-commit fire-and-forget enqueue here.
+      sendAdminPaymentFailureAlert({
+        memberName: `${bookingOwner(outcome.payment.booking).member.firstName} ${bookingOwner(outcome.payment.booking).member.lastName}`,
+        checkIn: outcome.payment.booking.checkIn,
+        checkOut: outcome.payment.booking.checkOut,
+        amountCents: outcome.credited ? outcome.creditedCents : outcome.payment.amountCents,
+        errorMessage: `Internet Banking payment reconciled, but the lodge no longer had capacity. The booking was cancelled and member account credit was created.${outcome.creditRestoredCents > 0 ? ` The ${formatCents(outcome.creditRestoredCents, format)} of account credit the booking had applied was restored to the member in full.` : ""}${outcome.creditedPartial && !outcome.aggregateCapped ? ` Only ${formatCents(outcome.creditedCents, format)} of the ${formatCents(outcome.invoiceExpectedCents, format)} payment arrived as cash (mixed invoice) — the credit was sized at the cash portion; verify the allocation source on the invoice in Xero.` : ""}${outcome.aggregateCapped ? ` This invoice's cash was already partly credited to other Internet Banking payment(s) matched to the same invoice, so this booking's credit was capped at the invoice's remaining cash${outcome.credited ? ` (${formatCents(outcome.creditedCents, format)}, from a ${formatCents(outcome.invoiceExpectedCents, format)} payment)` : " (nothing remained, so no credit was created)"}; the aggregate credit across all payments on one invoice can never exceed the invoice's cash. Verify the invoice's payments in Xero.` : ""}${outcome.cashUnverified ? " Cash amounts could not be fully verified from the Xero payload — confirm the figures against the invoice in Xero." : ""}`,
+        paymentIntentId: invoiceId,
+      }, format).catch((err) =>
+        logger.error(
+          { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+          "Failed to alert admins about late Internet Banking capacity failure"
+        )
+      );
+      sendBookingCancelledEmail(
+        {
+          bookingId: outcome.payment.booking.id,
+          recipientMemberId: bookingOwner(outcome.payment.booking).memberId,
+        },
+        bookingOwner(outcome.payment.booking).member.email,
+        bookingOwner(outcome.payment.booking).member.firstName,
+        outcome.payment.booking.checkIn,
+        outcome.payment.booking.checkOut,
+        outcome.credited ? outcome.creditedCents : outcome.payment.amountCents,
+        format,
+        "credit",
+        // #3792: the applied credit the cancel restored, as the hold release passes it.
+        outcome.creditRestoredCents,
+        outcome.payment.booking.lodgeId,
+        // A capacity cancel is not the member's choice: restored in full, not by policy.
+        "in-full",
+      ).catch((err) =>
+        logger.error(
+          { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+          "Failed to email member about late Internet Banking cancellation"
+        )
+      );
+      processWaitlistForDates({
+        checkIn: outcome.payment.booking.checkIn,
+        checkOut: outcome.payment.booking.checkOut,
+        lodgeId: outcome.payment.booking.lodgeId,
+      }, format).catch((err) =>
+        logger.error(
+          { err, bookingId: outcome.payment.bookingId },
+          "Failed to process waitlist after late Internet Banking cancellation"
+        )
+      );
+      continue;
+    }
+
+    result.paidInternetBankingBookings += 1;
+
+    try {
+      await createAuditLog({
+        action: "booking.payment.confirmed",
+        targetId: outcome.payment.bookingId,
+        subjectMemberId: bookingOwner(outcome.payment.booking).memberId,
+        entityType: "Booking",
+        entityId: outcome.payment.bookingId,
+        category: "payment",
+        outcome: "success",
+        summary: "Internet Banking payment confirmed from Xero",
+        details: JSON.stringify({
+          source: "xero-inbound-invoice",
+          paymentId: outcome.payment.id,
+          xeroInvoiceId: invoiceId,
+          xeroInvoiceNumber: invoiceNumber,
+          amountCents: outcome.payment.amountCents,
+          finalCapacityClaimed:
+            outcome.payment.booking.status === BookingStatus.PAYMENT_PENDING &&
+            !outcome.payment.internetBankingHoldSlots,
+        }),
+        metadata: {
+          source: "xero-inbound-invoice",
+          paymentId: outcome.payment.id,
+          paymentSource: PaymentSource.INTERNET_BANKING,
+          xeroInvoiceId: invoiceId,
+          xeroInvoiceNumber: invoiceNumber,
+          amountCents: outcome.payment.amountCents,
+          finalCapacityClaimed:
+            outcome.payment.booking.status === BookingStatus.PAYMENT_PENDING &&
+            !outcome.payment.internetBankingHoldSlots,
+        },
+      });
+    } catch (err) {
+      logger.error(
+        { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+        "Failed to audit Internet Banking payment reconciliation"
+      );
+    }
+
+    // #2265 (#2319 door 2). The settle cleared a stored credit election this
+    // invoice could not honour — the member bank-transferred the full invoiced
+    // amount while holding credit they had asked to spend. Reported through the
+    // shared reporter so the member's booking history and the operator alert read
+    // identically however the clear was reached.
+    if (outcome.staleCreditElectionCents != null) {
+      await reportUnappliedCreditElection({
+        format,
+        bookingId: outcome.payment.bookingId,
+        memberId: bookingOwner(outcome.payment.booking).memberId,
+        memberFirstName: bookingOwner(outcome.payment.booking).member.firstName,
+        memberLastName: bookingOwner(outcome.payment.booking).member.lastName,
+        checkIn: outcome.payment.booking.checkIn,
+        checkOut: outcome.payment.booking.checkOut,
+        electionCents: outcome.staleCreditElectionCents,
+        paidAmountCents: outcome.payment.amountCents,
+        source: "xero-inbound-invoice",
+        reference: invoiceId,
+        extraDetails: { xeroInvoiceId: invoiceId, xeroInvoiceNumber: invoiceNumber },
+      });
+    }
+
+    await recordBookingEvent({
+      bookingId: outcome.payment.bookingId,
+      type: BookingEventType.MEMBER_PAID,
+      amountCents: outcome.payment.amountCents,
+      reason: "Internet Banking payment reconciled from Xero.",
+    });
+
+    // Split-booking parent (#738/#1942): describe the provisional non-member
+    // child so the Internet-Banking/invoice-settled confirmation explains the
+    // separate later charge. Read-only; null on non-split bookings.
+    const provisionalGuests = await getProvisionalNonMemberChildSummary({
+      id: outcome.payment.bookingId,
+      memberId: bookingOwner(outcome.payment.booking).memberId,
+    });
+
+    sendBookingConfirmedEmail(
+      {
+        bookingId: outcome.payment.booking.id,
+        recipientMemberId: bookingOwner(outcome.payment.booking).memberId,
+      },
+      bookingOwner(outcome.payment.booking).member.email,
+      bookingOwner(outcome.payment.booking).member.firstName,
+      outcome.payment.booking.checkIn,
+      outcome.payment.booking.checkOut,
+      outcome.payment.booking.guests.length,
+      // #3955 review F8: what the member paid for — the booking's worth, its
+      // price plus a change fee recorded on the payment (the email nets credit).
+      bookingWorthCents({
+        finalPriceCents: outcome.payment.booking.finalPriceCents,
+        changeFeeCents: outcome.payment.changeFeeCents,
+      }),
+      format,
+      {
+        // Always thread the booking's lodge so the confirmation email carries
+        // that lodge's name/travel note/door code, promo or not (multi-lodge).
+        lodgeId: outcome.payment.booking.lodgeId,
+        ...(provisionalGuests ? { provisionalGuests } : {}),
+        ...bookingPromoEmailFields(outcome.payment.booking),
+      }
+    ).catch((err) =>
+      logger.error(
+        { err, bookingId: outcome.payment.bookingId, paymentId: outcome.payment.id },
+        "Failed to send booking confirmation email after Internet Banking reconciliation"
+      )
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Match a paid Xero invoice to an Internet Banking group settlement and, when
+ * found, flip every joiner child booking to PAID. This is the settlement parallel
+ * to `syncInternetBankingPaymentsForPaidInvoice`: a single combined invoice
+ * settles the whole ORGANISER_PAYS group at once.
+ *
+ * #3642 (`INV-PAY-105`): the invoice's cash is compared with the settlement's
+ * total under the settle lock, and a paid invoice that can no longer settle
+ * anything is never silent — one the settlement abandoned (released by the
+ * reaper, replaced, or left behind by a card payment before this shipped), and
+ * one that lands on a settlement a card payment already settled, both alert.
+ * This handler sees only PAID invoices: one that is part-paid is caught before
+ * the app would release or replace it — by the reaper, the replacement, and
+ * the VOID worker, which all read the invoice in Xero first.
+ */
+export async function syncGroupSettlementForPaidInvoice(invoice: Invoice, format: ClubFormat) {
+  const invoiceId = invoice.invoiceID ?? null;
+  const result = {
+    matchedGroupSettlements: 0,
+    settledGroupSettlements: 0,
+    settledChildBookings: 0,
+    skippedNoCashEvidenceSettlements: 0,
+  };
+
+  if (!invoiceId || !isPaidXeroInvoice(invoice)) {
+    return result;
+  }
+
+  const settlement = await prisma.groupBookingSettlement.findFirst({
+    where: {
+      xeroInvoiceId: invoiceId,
+      source: PaymentSource.INTERNET_BANKING,
+    },
+    select: { id: true, status: true, stripePaymentIntentId: true },
+  });
+
+  // #3642: an invoice the settlement no longer points at. Its object link is
+  // kept (deactivated) when a settlement abandons it, so a payment that still
+  // lands on it is recognised here instead of matching nothing.
+  const abandonedFor = settlement
+    ? null
+    : await prisma.xeroObjectLink.findFirst({
+        where: {
+          localModel: "GroupBookingSettlement",
+          xeroObjectType: "INVOICE",
+          xeroObjectId: invoiceId,
+          role: GROUP_SETTLEMENT_INVOICE_ROLE,
+        },
+        select: { localId: true },
+      });
+  // A cancelled group's invoice is never abandoned by the reaper (#3642), but
+  // one retired before that rule shipped still reads as paid after cancel.
+  const abandonedGroupCancelled = abandonedFor
+    ? (
+        await prisma.groupBookingSettlement.findUnique({
+          where: { id: abandonedFor.localId },
+          select: { groupBooking: { select: { status: true } } },
+        })
+      )?.groupBooking.status === "CANCELLED"
+    : false;
+
+  if (!settlement && !abandonedFor) {
+    return result;
+  }
+  result.matchedGroupSettlements = 1;
+
+  // #1435: the combined group invoice is subject to the same rule as the
+  // per-payment loop above — a PAID event produced by credit-note allocation
+  // (e.g. an operator writing the invoice off in Xero) carries zero cash and
+  // must not flip a whole group of child bookings to PAID. The settlement
+  // stays PENDING for the group-settlement reaper's normal expiry handling.
+  const cashEvidence = classifyXeroInvoiceCashEvidence(invoice);
+  const settlementId = settlement?.id ?? abandonedFor!.localId;
+
+  if (!settlement) {
+    // #3642: the club was paid on an invoice it had already retired. Nothing
+    // is settled from it; the operators refund or re-apply it by hand. A
+    // zero-cash PAID (the clearing of a voided or written-off invoice) is not
+    // money and is not alerted.
+    if (cashEvidence === "cash") {
+      logger.error(
+        { invoiceId, settlementId },
+        "Paid group settlement invoice was already abandoned by its settlement - operator review required"
+      );
+      await alertGroupSettlementInvoice(
+        {
+          kind: "paid_after_abandon",
+          settlementId,
+          invoiceId,
+          errorMessage: abandonedGroupCancelled
+            ? `Group settlement invoice ${invoiceId} was paid after the organiser cancelled the group. No child bookings were settled; refund or credit the organiser in Xero.`
+            : `Group settlement invoice ${invoiceId} was paid after the settlement stopped using it (the settlement lapsed or was replaced). No bookings were settled from it; refund the organiser, or apply the payment to the group's current bill by hand.`,
+        },
+        format
+      );
+    }
+    return result;
+  }
+
+  // SUCCEEDED alone: "was this settlement applied?", not "has the organiser
+  // paid?" (`organiserHasPaidSettlement`, #3672), which also counts a refund.
+  if (settlement.status === PaymentStatus.SUCCEEDED) {
+    // Settled by THIS invoice, a re-fetch of the same payment: nothing to do.
+    // Settled by a card: the Internet Banking path nulls the intent pointer,
+    // so an intent on a settled row means a card paid it (the pre-#3642 card
+    // path left the invoice and source behind). The organiser has paid twice,
+    // and before #3642 the second payment was kept without a word.
+    const settledByCard = settlement.stripePaymentIntentId !== null;
+    if (settledByCard && cashEvidence === "cash") {
+      logger.error(
+        { invoiceId, settlementId },
+        "Paid group settlement invoice landed on a settlement already paid by card - operator refund required"
+      );
+      await alertGroupSettlementInvoice(
+        {
+          kind: "paid_twice",
+          settlementId,
+          invoiceId,
+          errorMessage: `Group settlement invoice ${invoiceId} was paid, but the group had already been settled by card. The organiser has paid twice; refund one payment.`,
+        },
+        format
+      );
+    }
+    return result;
+  }
+
+  if (cashEvidence !== "cash") {
+    if (cashEvidence === "indeterminate") {
+      // Same durable-deferral rule as the per-payment loop: hand the event
+      // to the inbound FAILED-retry machinery rather than settling blind or
+      // skipping terminally.
+      logger.warn(
+        { invoiceId, settlementId: settlement.id },
+        "Xero PAID group settlement invoice payload carried neither amountPaid nor payments; refusing to settle without cash evidence"
+      );
+      throw new Error(
+        `Xero PAID invoice ${invoiceId} carried neither amountPaid nor payments; refusing to settle group settlement ${settlement.id} without cash evidence (#1435)`
+      );
+    }
+    result.skippedNoCashEvidenceSettlements = 1;
+    logger.info(
+      { invoiceId, settlementId: settlement.id },
+      "Xero group settlement invoice reports PAID without cash payments (credit-note allocation); settlement skipped"
+    );
+    return result;
+  }
+
+  // #3642: what the organiser actually paid. A figure that could not be read
+  // exactly is never used to settle a whole group; it goes to the operators.
+  const cash = quantifyXeroInvoiceCashCents(invoice);
+  if (!cash.complete) {
+    logger.error(
+      { invoiceId, settlementId: settlement.id, knownCents: cash.knownCents },
+      "Paid group settlement invoice cash could not be quantified exactly - operator review required"
+    );
+    await alertGroupSettlementInvoice(
+      {
+        kind: "paid_unreadable",
+        settlementId: settlement.id,
+        invoiceId,
+        errorMessage: `Group settlement invoice ${invoiceId} was paid, but the amount paid could not be read exactly (at least ${formatCents(cash.knownCents, format)}). No bookings were settled; check the payment in Xero and settle the group by hand.`,
+      },
+      format
+    );
+    return result;
+  }
+
+  try {
+    const applied = await applyGroupSettlementSucceededFromInvoice(invoiceId, format, {
+      collectedCents: cash.knownCents,
+    });
+    if (applied.outcome === "settled") {
+      result.settledGroupSettlements = 1;
+      result.settledChildBookings = applied.settledBookingIds.length;
+    } else if (
+      applied.outcome === "amount_mismatch" ||
+      applied.outcome === "cancelled"
+    ) {
+      // A child booking changed while the combined invoice sat open (#1033),
+      // or the money that arrived is not the settlement's total (#3642): the
+      // bank transfer no longer matches what is owed. Unlike Stripe there is
+      // nothing to auto-refund, so alert the operators; the settlement stays
+      // PENDING for manual reconciliation.
+      logger.error(
+        { invoiceId, settlementId: settlement.id, mismatch: applied.mismatch },
+        applied.outcome === "cancelled"
+          ? "Paid group settlement invoice belongs to a cancelled group - operator refund required"
+          : "Paid group settlement invoice does not match what the settlement owes - operator review required"
+      );
+      // #3642: behind the same per-invoice cooldown as every other arm, so a
+      // stable mismatch on a PAID invoice alerts once per window, not once per
+      // re-fetch.
+      await alertGroupSettlementInvoice(
+        {
+          kind: "paid_not_applied",
+          settlementId: settlement.id,
+          invoiceId,
+          errorMessage:
+            applied.outcome === "cancelled"
+              ? `Group settlement invoice ${invoiceId} was paid after the organiser cancelled the group. No child bookings were settled; refund or credit the organiser in Xero.`
+              : groupSettlementMismatchMessage(invoiceId, applied.mismatch, format),
+        },
+        format
+      );
+    }
+  } catch (err) {
+    // #1887: same durable-deferral rule as the indeterminate-cash arms above
+    // (#1435) — a failed apply (DB contention, lock timeout, capacity-lock
+    // conflict) must not let the inbound event complete as PROCESSED, or the
+    // settlement sits PENDING forever while the organiser's money is in the
+    // bank and the group-settlement expiry path can later cancel the whole
+    // group's child bookings despite payment. Rethrow so the event lands
+    // FAILED and the backoff sweep re-fetches the invoice and retries.
+    // (amount_mismatch above is the one intentionally-terminal outcome: it
+    // returns a value, alerts the operators, and never reaches this catch.)
+    logger.error(
+      { err, invoiceId, settlementId: settlement.id },
+      "Failed to settle group booking from paid Xero invoice"
+    );
+    throw err;
+  }
+
+  return result;
+}

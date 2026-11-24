@@ -1,0 +1,215 @@
+import { bookingOwner } from "@/lib/booking-owner";
+import { MEMBER_BOOKING_LIST_ORDER, memberVisibleBookingWhere } from "@/lib/member-self-read";
+import { auth } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import Link from "next/link";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { MyBookingsList, type MyBookingItem } from "./_components/my-bookings-list";
+import { MyWholeLodgeRequests } from "./_components/my-whole-lodge-requests";
+import { MyExceptionRequests } from "./_components/my-exception-requests";
+import { loadMyWholeLodgeRequests } from "@/lib/member-whole-lodge-request-list";
+import { readMemberExceptionRequests } from "@/lib/booking-exception-request-service";
+import { bookingsWithOpenFinancialReview } from "@/lib/booking-financial-review-visibility";
+import {
+  BOOKING_MONEY_RECONCILIATION_SELECT,
+  reconcileStoredBookingMoney,
+} from "@/lib/booking-money-reconciliation-store";
+import { bookingMoneyReconciliationForViewer } from "@/lib/booking-money-reconciliation-audience";
+import { canSeeBookingAdminTools } from "@/lib/admin-permissions";
+import {
+  BOOKING_LIST_LODGE_SELECT,
+  bookingListLodgeLabel,
+  countActiveLodgesForBookingList,
+} from "@/lib/lodges";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = {
+  title: "My bookings",
+};
+
+export default async function MyBookingsPage() {
+  const session = await auth();
+  if (!session) return null;
+
+  /*
+    WHO IS LOOKING, on a page that had no idea (#3278).
+
+    "My bookings" is a member's own list, so the page never needed a viewer
+    before. The stored-money verdict needs one, for two reasons. It is
+    officer-only (owner decision, 20 September 2026); and this list is not
+    purely the viewer's own bookings — the `where` below also selects bookings
+    the viewer merely appears on as a GUEST, whose figure belongs to another
+    member. Printing an integrity verdict about that member's money to this one
+    is the exposure, and it is not cured by the viewer being a member in good
+    standing.
+
+    The signal is `canSeeBookingAdminTools`, which is the SAME predicate the
+    booking-detail page gates the rest of a booking's private integrity
+    evidence on (`canSeeAdminTools`) rather than a second officer test invented
+    for this page — a Full Admin or a `bookings:edit` holder. An officer who is
+    also a member therefore sees the mark on their own list, and everyone else
+    sees their amounts exactly as they did before this feature existed.
+  */
+  const canSeeAdminTools = canSeeBookingAdminTools(session.user);
+
+  // #2263 — the member's own whole-lodge requests, through the one loader the
+  // AI app's `list_my_whole_lodge_requests` also reads (ALP-797). Nothing from
+  // a request row reaches the client except the fields its allowlist names.
+  const wholeLodgeRequests = await loadMyWholeLodgeRequests(session.user.id);
+
+  // #2562 — the member's own booking-policy exception requests, both flavours.
+  // Projected by `readMemberExceptionRequests`, which is the ONE place a request
+  // row is reduced to something a member may see: a strict allowlist with no slot
+  // for the officer's internal note, whose column the read does not even select.
+  const exceptionRequests = await readMemberExceptionRequests(session.user.id);
+
+  const [bookings, activeLodgeCount] = await Promise.all([
+    prisma.booking.findMany({
+      where: memberVisibleBookingWhere(session.user.id),
+      include: {
+        // #3278: the stored-money classification below is derived from THIS read,
+        // so the per-night and adjustment evidence it needs rides along here
+        // rather than arriving from a second query. The relation shapes are the
+        // canonical `BOOKING_MONEY_RECONCILIATION_SELECT`'s own, spread rather
+        // than retyped (`INV-SSOT`); the Booking scalars it names come with the
+        // `include`. A second read would let a commit land between the two and
+        // have the page render one read's total wearing the other read's verdict.
+        guests: {
+          include: {
+            nights: BOOKING_MONEY_RECONCILIATION_SELECT.guests.select.nights,
+          },
+        },
+        promoRedemptions: BOOKING_MONEY_RECONCILIATION_SELECT.promoRedemptions,
+        nightAdjustments: BOOKING_MONEY_RECONCILIATION_SELECT.nightAdjustments,
+        // #796 discriminator: a group joiner also links to its organiser via
+        // parentBookingId, so the list needs the join row to tell it apart from a
+        // genuine #738 split child. Mirrors [id]/page.tsx's nonMemberGuestChildren
+        // filter (`hasNonMembers && !groupBookingJoin`).
+        groupBookingJoin: { select: { id: true } },
+        // INV-CAP-039: the row's own lodge, for `bookingListLodgeLabel` below.
+        lodge: BOOKING_LIST_LODGE_SELECT,
+      },
+      // Newest start date first, with a stable createdAt tiebreaker (#771).
+      orderBy: [...MEMBER_BOOKING_LIST_ORDER],
+    }),
+    // INV-CAP-039: read from the database alongside the list, never inferred
+    // from a client-side lodge list that can fail to load (#2701).
+    countActiveLodgesForBookingList(prisma),
+  ]);
+
+  // Split-booking grouping (#738): a mixed party is a member booking plus a
+  // linked provisional non-member booking. Label both so a family reads as one.
+  const memberBookingIdsWithLinkedGuests = new Set(
+    bookings
+      .map((booking) => booking.parentBookingId)
+      .filter((id): id is string => Boolean(id)),
+  );
+
+  /*
+    #3033 (epic #2797): which of these bookings have money held for review.
+
+    ONE batched read for the whole list, not one per card. Every booking on this
+    screen shows `finalPriceCents` — which a structural edit UPDATES — so a
+    booking whose adjustment is unresolved currently shows a figure that looks
+    authoritative and is not the whole story. That is the "never a stale figure"
+    case, and the qualifier below is what stops the number speaking for itself.
+  */
+  const bookingsUnderFinancialReview = await bookingsWithOpenFinancialReview(
+    bookings.map((booking) => booking.id),
+  );
+
+  const items: MyBookingItem[] = bookings.map((booking) => {
+    // #3278: classified from the row this page is about to render, which is the
+    // contract every other reader of the projection keeps. Nothing can commit
+    // between the number and its verdict, and a booking that disappears while
+    // the page renders cannot strand the list looking for a row that is gone.
+    const moneyReconciliation = bookingMoneyReconciliationForViewer(
+      reconcileStoredBookingMoney(booking),
+      { canSeeAdminTools },
+    );
+    // #1975/#796: only a genuine #738 split child (a provisional non-member
+    // booking) is nestable. A group joiner also carries parentBookingId but is
+    // presented by the organiser group card, not nested here. Mirror the detail
+    // page's discriminator exactly ([id]/page.tsx nonMemberGuestChildren:
+    // `hasNonMembers && !groupBookingJoin`).
+    const isNestableSplitChild =
+      Boolean(booking.parentBookingId) &&
+      booking.hasNonMembers &&
+      !booking.groupBookingJoin;
+    return {
+      id: booking.id,
+      checkIn: booking.checkIn.toISOString(),
+      checkOut: booking.checkOut.toISOString(),
+      guestCount: booking.guests.length,
+      finalPriceCents: booking.finalPriceCents,
+      lodgeLabel: bookingListLodgeLabel(activeLodgeCount, booking.lodge),
+      moneyReconciliation,
+      // #3033: the price above is the post-change total, and it is real — but a
+      // booking with an open review has an adjustment on top of it that nobody
+      // has worked out yet, so the row must not let it read as the final word.
+      financialReviewPending: bookingsUnderFinancialReview.has(booking.id),
+      status: booking.status,
+      // #1975: expose the parent link ONLY for a genuine split child, so the
+      // list nests it as a sub-row inside its parent's card. A #796 joiner
+      // (join row present) is never carried for nesting.
+      parentBookingId: isNestableSplitChild ? booking.parentBookingId : null,
+      // #2002: the "provisional non-member guests · linked to your member
+      // booking" label must key on the SAME discriminator as nesting, not raw
+      // parentBookingId. A #796 group joiner also carries parentBookingId, so
+      // keying on it alone falsely labelled the member's own joiner booking as
+      // a #738 split child on its own top-level row. A joiner is simply the
+      // member's own booking here (its group presentation lives on the
+      // organiser's card, matching [id]/page.tsx's `!groupBookingJoin` gate),
+      // so it shows no special linked label. `guest-linked` (viewer is a guest
+      // on someone else's booking) and `linked-parent` are unaffected.
+      linkLabel:
+        bookingOwner(booking).memberId !== session.user.id
+          ? "guest-linked"
+          : isNestableSplitChild
+            ? "provisional-child"
+            : memberBookingIdsWithLinkedGuests.has(booking.id)
+              ? "linked-parent"
+              : null,
+    };
+  });
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-3xl font-bold">My Bookings</h1>
+        <Button asChild>
+          <Link href="/book">New Booking</Link>
+        </Button>
+      </div>
+
+      {items.length === 0 ? (
+        <Card>
+          <CardContent className="p-6 text-center">
+            <p className="text-muted-foreground mb-4">You haven&apos;t made any bookings yet.</p>
+            <Button asChild>
+              <Link href="/book">Book a Stay</Link>
+            </Button>
+          </CardContent>
+        </Card>
+      ) : (
+        <MyBookingsList bookings={items} />
+      )}
+
+      {/* Hidden entirely when the member has no requests (D3). Decided HERE
+          rather than inside the component so the client bundle for it is not
+          even mounted for the ordinary member who has never used the feature. */}
+      {wholeLodgeRequests.length > 0 ? (
+        <MyWholeLodgeRequests requests={wholeLodgeRequests} />
+      ) : null}
+
+      {/* Hidden entirely for a member who has never raised one, on the same
+          reasoning as the whole-lodge section above (#2263 D3): an ordinary member
+          never meets a feature they are not using, and the client bundle for it is
+          not mounted for them either. */}
+      {exceptionRequests.length > 0 ? (
+        <MyExceptionRequests requests={exceptionRequests} />
+      ) : null}
+    </div>
+  );
+}

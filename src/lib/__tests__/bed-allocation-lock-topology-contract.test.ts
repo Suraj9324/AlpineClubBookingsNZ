@@ -1,0 +1,693 @@
+import fs, { readFileSync } from "fs";
+import path from "path";
+import { describe, expect, it } from "vitest";
+import { toPosix } from "../../../scripts/audit/ts-call-site-scan";
+import { balancedBrackets } from "./support/balanced-brackets";
+import { blankLiterals, stripComments } from "./support/strip-comments";
+import { CENSUS_TIMEOUT_MS } from "@/test/census-timeout";
+
+function source(relativePath: string): string {
+  return readFileSync(path.resolve(process.cwd(), relativePath), "utf8");
+}
+
+/** Every `.ts`/`.tsx` source under `dir`, excluding declarations. */
+function walkSources(dir: string, files: string[] = []): string[] {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "node_modules") continue;
+      walkSources(full, files);
+    } else if (/\.(ts|tsx)$/.test(entry.name) && !entry.name.endsWith(".d.ts")) {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+function isTestFile(relPath: string): boolean {
+  return (
+    relPath.includes("__tests__") ||
+    /\.(test|spec)\.tsx?$/.test(relPath) ||
+    relPath.includes(".integration.")
+  );
+}
+
+/**
+ * The bracketed region opening at `openIndex`, as original text. It throws on an
+ * unbalanced region or an offset that is not an opening bracket, so an index
+ * found over masked text (`structure`) is the one to pass.
+ */
+function balancedFrom(text: string, openIndex: number, structure?: string): string {
+  return balancedBrackets(text, openIndex, structure).text;
+}
+
+/**
+ * Exactly one function's body, braces balanced from its own opening `{`.
+ *
+ * Every writer below used to be sliced out of the 4,484-line
+ * `admin-bed-allocation.ts` by "from this signature to the next symbol's name",
+ * and #2688 put each one at the END of its own small module — where that idiom
+ * degenerates into "to end of file" and anything appended below the function can
+ * satisfy an ordering chain on its behalf (#2688 review F2, measured on
+ * `runAutoBedAllocation`). A balanced body needs no next-symbol anchor and
+ * cannot be widened by anything outside the function.
+ *
+ * The parameter list is balanced first, then the return type is stepped over by
+ * tracking angle brackets, so a `Promise<{ … }>` annotation is not mistaken for
+ * the body.
+ */
+function functionBody(source: string, signature: string): string {
+  // The signature, its parentheses and the return type are read over masked
+  // text, so a mention in a comment or string is not the function.
+  const structure = blankLiterals(source);
+  const at = structure.indexOf(signature);
+  expect(at, `${signature} is not in this file`).toBeGreaterThanOrEqual(0);
+  const parensAt = structure.indexOf("(", at);
+  const params = balancedFrom(source, parensAt, structure);
+
+  let angle = 0;
+  let bodyAt = -1;
+  for (let i = parensAt + params.length; i < source.length; i += 1) {
+    const char = structure[i];
+    if (char === "<") angle += 1;
+    else if (char === ">") angle = Math.max(0, angle - 1);
+    else if (char === "{" && angle === 0) {
+      bodyAt = i;
+      break;
+    }
+  }
+  expect(bodyAt, `${signature} has no body`).toBeGreaterThan(parensAt);
+  return balancedFrom(source, bodyAt, structure);
+}
+
+function between(text: string, start: string, end: string): string {
+  const startIndex = text.indexOf(start);
+  const endIndex = text.indexOf(end, startIndex + start.length);
+  expect(startIndex).toBeGreaterThanOrEqual(0);
+  expect(endIndex).toBeGreaterThan(startIndex);
+  return text.slice(startIndex, endIndex);
+}
+
+function expectInOrder(text: string, tokens: readonly string[]): void {
+  let cursor = -1;
+  for (const token of tokens) {
+    const next = text.indexOf(token, cursor + 1);
+    expect(next, `Expected ${token} after offset ${cursor}`).toBeGreaterThan(
+      cursor,
+    );
+    cursor = next;
+  }
+}
+
+describe("bed allocation lock topology", () => {
+  it("uses immutable sorted lodge keys and one lodge-narrowed selector for approval row locks and update", () => {
+    const text = source("src/lib/bed-allocation-approval.ts");
+    const selector = between(
+      text,
+      "function buildApproveBedAllocationsWhere",
+      "export async function approveBedAllocationsWithLocksHeld",
+    );
+    expect(selector).toContain(
+      "if (input.lodgeId) where.room = lodgeNullTolerantScope(input.lodgeId)",
+    );
+    const approval = functionBody(
+      text,
+      "export async function approveBedAllocations(input",
+    );
+    expectInOrder(approval, [
+      "const lockWhere = buildApproveBedAllocationsWhere(input)",
+      "await prisma.lodge.findMany",
+      'orderBy: { id: "asc" }',
+      "prisma.$transaction",
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock",
+      "where: lockWhere",
+      "ORDER BY \"id\"",
+      "FOR UPDATE",
+      "approveBedAllocationsWithLocksHeld",
+      "createAuditLog",
+    ]);
+  });
+
+  it("serializes reviewed removal global then actual sorted lodges then rows", () => {
+    const text = source("src/lib/bed-allocation-removal.ts");
+    const apply = functionBody(
+      text,
+      "export async function applyBedAllocationRemoval",
+    );
+    expectInOrder(apply, [
+      "resolveImmutableLodgeKeys",
+      "prisma.$transaction",
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock",
+      "ORDER BY \"id\"",
+      "FOR UPDATE",
+      "deleteMany",
+      "updateMany",
+      "BED_ALLOCATION_REMOVAL_APPLIED",
+      "BED_ALLOCATION_PARTNERS_PROMOTED",
+    ]);
+    expect(text).toContain(
+      "for (const primaryKeyChunk of chunkValues(primaryKeys))",
+    );
+    for (const token of [
+      "for (const lockIdChunk of lockIds)",
+      "Prisma.join(lockIdChunk)",
+      "chunkBedAllocationRemovalIds(selectedIds)",
+      "chunkBedAllocationRemovalIds(siblingIds)",
+    ]) {
+      expect(apply).toContain(token);
+    }
+  });
+
+  it("serializes reviewed moves global then sorted lodges, member families, and allocation rows", () => {
+    const text = source("src/lib/bed-allocation-move.ts");
+    const apply = functionBody(
+      text,
+      "export async function applyBedAllocationMove",
+    );
+    expectInOrder(apply, [
+      "pg_advisory_xact_lock(1)",
+      "loadRelatedRows(base, tx)",
+      "moveLodgeIds(base, discoveryRows)",
+      "acquireLodgeCapacityLock",
+      "loadMoveState(base, tx)",
+      "acquireMemberLifecycleLocks",
+      "acquireMemberPartnerLinkLocks",
+      "lockMoveRows",
+      "authoritativeBase = await loadMoveBase",
+      "authoritative = await loadMoveState",
+      "preview.digest !== input.request.previewDigest",
+      "updateReviewedMoveRows",
+      "BED_ALLOCATION_MOVE_APPLIED",
+    ]);
+    // Asserted over the WHOLE module, not just this body: bounding the slice
+    // above (#2688 review F2) would otherwise have narrowed this negative claim,
+    // and "nowhere in the move writer" is what it means. There is no occurrence
+    // in the file today.
+    expect(text).not.toContain("lockMemberNights");
+    expect(text).toContain('ORDER BY "bedId", "stayDate", "isSecondOccupant", "id"');
+    expect(apply).toContain("}, LOCK1_HOLDER_TRANSACTION_BUDGET);");
+    const guardedUpdate = between(
+      text,
+      "async function updateReviewedMoveRows",
+      "export async function applyBedAllocationMove",
+    );
+    expect(guardedUpdate.match(/UPDATE "BedAllocation"/g) ?? []).toHaveLength(1);
+    for (const guard of [
+      'allocation."bookingId" = reviewed."bookingId"',
+      'allocation."bookingGuestId" = reviewed."bookingGuestId"',
+      'allocation."roomId" = reviewed."roomId"',
+      'allocation."bedId" = reviewed."bedId"',
+      'allocation."stayDate" = reviewed."stayDate"',
+      'allocation."updatedAt" = reviewed."updatedAt"',
+    ]) {
+      expect(guardedUpdate).toContain(guard);
+    }
+  });
+
+  it("keeps the reviewed-removal PostgreSQL races on the guarded CI harness and production writer entrypoints", () => {
+    const harness = source(
+      "src/lib/__tests__/concurrency-lock-races.realdb.test.ts",
+    );
+    expect(harness).toContain(
+      'import "./bed-allocation-removal-races.realdb.test"',
+    );
+
+    const races = source(
+      "src/lib/__tests__/bed-allocation-removal-races.realdb.test.ts",
+    );
+    expect(races).toContain(
+      'process.env.RUN_CONCURRENCY_RACE_TESTS === "1"',
+    );
+    expect(races).toContain("CONCURRENCY_RACE_DATABASE_URL");
+    expect(races).toContain("concurrency_race_1881");
+    for (const writer of [
+      "applyBedAllocationRemoval",
+      "moveBedAllocationsSameDate",
+      "runAutoBedAllocation",
+      "reconcileBedAllocationsForBooking",
+      "cancelBooking",
+    ]) {
+      expect(races).toContain(writer);
+    }
+  });
+
+  it("rebuilds the board auto-allocation plan only after global then lodge", () => {
+    // #2688: `runAutoBedAllocation` is now the whole of its own module. The
+    // slice ran to end of file on that basis, which is true today and enforced
+    // by nothing — anything appended below the function could satisfy the order
+    // on its behalf (#2688 review F2). Brace-balanced from the function's own
+    // body instead, so only this function can.
+    const autoRun = functionBody(
+      source("src/lib/bed-allocation-auto-allocate.ts"),
+      "export async function runAutoBedAllocation(",
+    );
+    expectInOrder(autoRun, [
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock(tx, lodgeId)",
+      "getBedAllocationDashboard",
+      "suggestedAllocations.map",
+      "bedAllocation.createMany",
+    ]);
+  });
+
+  it("locks global exactly once then lodge before each school conversion", () => {
+    const school = source("src/lib/school-booking-request.ts");
+    const conversions = [
+      between(
+        school,
+        "export async function approveSchoolBookingRequest(",
+        "export type MemberWholeLodgeApprovalOverride",
+      ),
+      school.slice(
+        school.indexOf(
+          "export async function approveMemberWholeLodgeRequest(",
+        ),
+      ),
+    ];
+
+    for (const conversion of conversions) {
+      expect(conversion.match(/pg_advisory_xact_lock\(1\)/g) ?? []).toHaveLength(
+        1,
+      );
+      expectInOrder(conversion, [
+        "pg_advisory_xact_lock(1)",
+        "acquireLodgeCapacityLock",
+        "reconcileBedAllocationsForBookingWithLodgeLockHeld",
+      ]);
+    }
+  });
+
+  it("locks global, lodge, then member credit for internet-banking expiry", () => {
+    const release = between(
+      source("src/lib/internet-banking-payment-cron.ts"),
+      "function releaseOneHold",
+      "export async function releaseExpiredInternetBankingHolds",
+    );
+    expectInOrder(release, [
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock",
+      "lockMemberCreditLedger",
+      "reconcileBedAllocationsForBookingWithLodgeLockHeld",
+    ]);
+  });
+
+  // #3792: the late capacity cancel restores applied credit, so it joins the
+  // member tier third and reads the deallocation fence before its first write.
+  it("locks global, lodge, then member credit before the late internet-banking capacity cancel restores credit", () => {
+    const reconcile = between(
+      source("src/lib/xero-inbound/invoice-paid-effects.ts"),
+      "export async function syncInternetBankingPaymentsForPaidInvoice(",
+      'type: "capacityFailed" as const',
+    );
+    expectInOrder(reconcile, [
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock(tx, lodgeTarget.booking.lodgeId)",
+      "const fresh = await tx.payment.findUnique(",
+      "const creditLedgerMemberId = bookingOwner(fresh.booking).memberId",
+      "lockMemberCreditLedger(creditLedgerMemberId, tx)",
+      "tx.payment.update(",
+      "if (!capacity.available && !lockedHasOverride)",
+      "findUnconvergedAppliedCreditDeallocation(fresh.id, tx)",
+      "clearStaleCreditElection(tx, locked.booking)",
+      "restoreCreditFromBooking(creditLedgerMemberId, fresh.bookingId, tx)",
+    ]);
+  });
+
+  // #3792: member merge re-points `Booking.memberId` holding the lodge key but
+  // not lock(1), so an owner read taken before the lodge key can name a member
+  // the booking no longer has. The member key must come from a read made AFTER
+  // the lodge key, and the restore must reuse that same id, or the restore takes
+  // a second member key after the Payment row and reopens the 40P01.
+  it("keys the settle capacity void's member lock and restore on one post-lodge-lock owner read", () => {
+    const settle = stripComments(functionBody(
+      source("src/lib/payment-reconciliation.ts"),
+      "async function settleBookingPaymentInTransaction(",
+    ));
+    expectInOrder(settle, [
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock(tx, bookingLodgeId)",
+      "const booking = await tx.booking.findUnique(",
+      "const settleCreditLedgerMemberId = bookingOwner(booking).memberId",
+      "lockMemberCreditLedger(settleCreditLedgerMemberId, tx)",
+      "tx.payment.upsert(",
+      "restoreCreditFromBooking(settleCreditLedgerMemberId, booking.id, tx)",
+    ]);
+    const restores = settle.split("restoreCreditFromBooking(").length - 1;
+    expect(restores, "the settle has exactly one restore, keyed on the locked id").toBe(1);
+  });
+
+  // #3792: the restore joins the member credit-ledger tier ITSELF, so the
+  // inbound credit-note sync (same key) cannot read applied rows a restore in
+  // flight is about to give back. That makes every caller's transaction take
+  // the member key at the restore: each must already hold lock(1) (or, for the
+  // orphan heal, the member key itself) and must take neither lock(1) nor a
+  // lodge key after it (INV-LOCK-002, global -> lodge -> member).
+  it("takes the member credit-ledger lock inside restoreCreditFromBooking, before its read", () => {
+    const body = functionBody(
+      source("src/lib/member-credit.ts"),
+      "export async function restoreCreditFromBooking(",
+    );
+    expectInOrder(body, [
+      "if (tx) await lockMemberCreditLedger(memberId, tx)",
+      "db.memberCredit.findMany",
+      "db.memberCredit.createMany",
+    ]);
+  });
+
+  // #3792: the four restore callers that also lock or write the booking's
+  // Payment row take the member key explicitly, in its INV-LOCK-002 place.
+  it.each([
+    ["the paid cancel", "src/lib/booking-cancel.ts", "lockMemberCreditLedger(paidCreditLedgerMemberId, tx)", "lockPaymentForRefundedTotal(tx, fresh.payment.id)"],
+    ["the pending cancel", "src/lib/booking-cancel.ts", "lockMemberCreditLedger(pendingCreditLedgerMemberId, tx)", "tx.payment.update("],
+    ["the settle capacity void", "src/lib/payment-reconciliation.ts", "lockMemberCreditLedger(settleCreditLedgerMemberId, tx)", "tx.payment.upsert("],
+    // #4217 (Q2): the settle's first touch of its Payment row is now its lock.
+    ["the late capacity cancel", "src/lib/xero-inbound/invoice-paid-effects.ts", "lockMemberCreditLedger(creditLedgerMemberId, tx)", "lockPaymentForRefundedTotal(tx, fresh.id)"],
+  ])("%s takes lock(1), the lodge key, then the member key, before the Payment row", (_label, file, memberLock, paymentRow) => {
+    const text = stripComments(source(file));
+    const memberAt = text.indexOf(memberLock);
+    expect(memberAt, `${memberLock} is not in ${file}`).toBeGreaterThanOrEqual(0);
+    const txAt = text.lastIndexOf("pg_advisory_xact_lock(1)", memberAt);
+    expect(
+      text.slice(txAt, memberAt),
+      `${file}: the Payment row is locked or written before ${memberLock}`,
+    ).not.toContain(paymentRow);
+    expectInOrder(text.slice(txAt), [
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock(",
+      memberLock,
+      paymentRow,
+    ]);
+  });
+
+  it("calls restoreCreditFromBooking only after the global (or member) key, and takes no wider key after it", () => {
+    const CALL = "restoreCreditFromBooking(";
+    const PAYMENT_ROW_TOKENS = [
+      "lockPaymentForRefundedTotal(",
+      "tx.payment.update(",
+      "tx.payment.updateMany(",
+      "tx.payment.upsert(",
+      "FOR NO KEY UPDATE",
+      "FOR UPDATE",
+    ];
+    const sites: string[] = [];
+    for (const full of walkSources(path.resolve(process.cwd(), "src"))) {
+      // Repo-relative POSIX, so the reviewed population below reads the same on
+      // Windows and Linux.
+      const rel = toPosix(path.relative(process.cwd(), full));
+      if (isTestFile(rel) || rel === "src/lib/member-credit.ts") continue;
+      const text = stripComments(readFileSync(full, "utf8"));
+      if (!text.includes(CALL)) continue;
+      // Calls and enclosing transactions are found over masked text: a mention
+      // inside a string is not a call and has no bracket to read.
+      const structure = blankLiterals(text);
+      let at = structure.indexOf(CALL);
+      while (at >= 0) {
+        // The transaction the call runs in: the nearest enclosing
+        // `$transaction(` callback, or the settle's tx-taking function.
+        const txAt = structure.lastIndexOf("$transaction(", at);
+        let region = txAt >= 0 ? balancedFrom(text, structure.indexOf("(", txAt), structure) : "";
+        let offset = txAt;
+        if (txAt < 0 || txAt + region.length < at) {
+          const fnAt = structure.lastIndexOf("async function settleBookingPaymentInTransaction(", at);
+          expect(fnAt, `${rel}: no enclosing transaction for a restore`).toBeGreaterThanOrEqual(0);
+          region = functionBody(text.slice(fnAt), "async function settleBookingPaymentInTransaction(");
+          offset = text.indexOf(region, fnAt);
+        }
+        const callInRegion = at - offset;
+        const before = region.slice(0, callInRegion);
+        const after = region.slice(callInRegion);
+        sites.push(rel);
+        expect(
+          before.includes("pg_advisory_xact_lock(1)") || before.includes("lockMemberCreditLedger("),
+          `${rel}: a restore before the global (or member) key`,
+        ).toBe(true);
+        // The member key before the transaction's first Payment row lock or
+        // write: the inbound credit-note sync takes the member key and then
+        // updates the Payment row, so the reverse order here could deadlock
+        // against it. The key is the caller's own, or the one the restore takes.
+        const paymentRowAt = Math.min(
+          ...PAYMENT_ROW_TOKENS.map((token) => region.indexOf(token)).filter((index) => index >= 0),
+        );
+        const memberKeyAt = Math.min(
+          ...["lockMemberCreditLedger(", CALL].map((token) => region.indexOf(token)).filter((index) => index >= 0),
+        );
+        if (Number.isFinite(paymentRowAt)) {
+          expect(memberKeyAt, `${rel}: a Payment row locked or written before the member key`).toBeLessThan(paymentRowAt);
+        }
+        const lodgeAt = region.indexOf("acquireLodgeCapacityLock(");
+        if (lodgeAt >= 0 && region.indexOf("lockMemberCreditLedger(") >= 0) {
+          expect(lodgeAt, `${rel}: the member key before the lodge key`).toBeLessThan(region.indexOf("lockMemberCreditLedger("));
+        }
+        expect(after, `${rel}: lock(1) taken after a restore`).not.toContain("pg_advisory_xact_lock(1)");
+        expect(after, `${rel}: a lodge key taken after a restore`).not.toContain("acquireLodgeCapacityLock(");
+        at = structure.indexOf(CALL, at + CALL.length);
+      }
+    }
+    // The reviewed population: a new caller is a new member-key site.
+    // #3809: the never-captured branch's restore became two calls (tiered
+    // when a reduction refunded the whole card, whole otherwise). Both sit in
+    // the same branch, after its lock(1), lodge key and member key, on the
+    // same `bookingOwner(fresh)` the key was taken for — reviewed, not new.
+    expect(sites.sort()).toEqual([
+      "src/lib/booking-cancel.ts",
+      "src/lib/booking-cancel.ts",
+      "src/lib/booking-cancel.ts",
+      "src/lib/booking-cancel.ts",
+      "src/lib/booking-cancel.ts",
+      "src/lib/booking-cancel.ts",
+      "src/lib/internet-banking-payment-cron.ts",
+      "src/lib/orphaned-applied-credit-backfill.ts",
+      "src/lib/payment-reconciliation.ts",
+      "src/lib/xero-inbound/invoice-paid-effects.ts",
+    ]);
+    // Walks and masks every file under src/, so it has its own budget, as the
+    // other tree-scanning censuses do (docs/TESTING.md, "Suites that time out
+    // under load and pass alone").
+  }, CENSUS_TIMEOUT_MS);
+
+  it.each([
+    ["src/lib/group-settlement.ts", "const candidateChildren"],
+    [
+      "src/lib/cron-group-settlement-reaper.ts",
+      "const candidateChildren",
+    ],
+  ])("pre-locks and re-reads the child lodge union in %s", (file, marker) => {
+    const text = source(file);
+    const start = text.indexOf(marker);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const block = text.slice(start);
+    expectInOrder(block, [
+      "const candidateChildren",
+      "candidateChildren.map((child) => child.lodgeId)",
+      "acquireLodgeCapacityLock",
+      "const children = await tx.booking.findMany",
+      "!lockedLodgeIds.has(child.lodgeId)",
+      "reconcileBedAllocationsForBookingWithLodgeLockHeld",
+    ]);
+  });
+
+  it("takes the global cohort lock before a cancelled booking soft delete", () => {
+    const softDelete = between(
+      source("src/lib/booking-delete.ts"),
+      "async function softDeleteCancelledBooking",
+      "async function loadBookingForDelete",
+    );
+    expectInOrder(softDelete, [
+      "prisma.$transaction",
+      "pg_advisory_xact_lock(1)",
+      "loadBookingForDelete",
+      "reconcileBedAllocationsForBookingWithGlobalLockHeld",
+    ]);
+  });
+
+  it("locks partner-share lodges then the member before the member-detail write and held sweep", () => {
+    const memberDetail = source("src/lib/admin-member-detail-service.ts");
+    const transaction = between(
+      memberDetail,
+      "const updated = await prisma.$transaction(async (tx) => {",
+      "    if (\n      existing.active !== updated.active",
+    );
+    expectInOrder(transaction, [
+      "acquireFuturePartnerSharedAllocationLocks(tx, [id], clubTodayDateOnly)",
+      "acquireMemberLifecycleLocks(tx, [id])",
+      "const updatedMember = await tx.member.update",
+      "sweepFuturePartnerSharedAllocationsWithLocksHeld",
+    ]);
+  });
+
+  it("locks partner-share lodges then every member before the bulk write and held sweep", () => {
+    const bulkUpdate = source("src/app/api/admin/members/bulk-update/route.ts");
+    const transaction = between(
+      bulkUpdate,
+      "const result = await prisma.$transaction(async (tx) => {",
+      "    for (const { memberId, reason, swept } of sweptSharesByMember)",
+    );
+    expectInOrder(transaction, [
+      "acquireFuturePartnerSharedAllocationLocks(tx, sweepLockMemberIds, clubTodayForBulk)",
+      "acquireMemberLifecycleLocks(tx, sweepLockMemberIds)",
+      "await tx.member.updateMany",
+      "sweepFuturePartnerSharedAllocationsWithLocksHeld",
+    ]);
+  });
+
+  it("status-guards every cross-lodge waitlist unwind before reconciliation", () => {
+    const text = source("src/lib/waitlist-cross-lodge.ts");
+    const revert = between(
+      text,
+      "async function revertOfferToWaitlisted",
+      "const CROSS_LODGE_MINIMUM_STAY_ERROR",
+    );
+    expectInOrder(revert, [
+      "booking.updateMany",
+      "status: BookingStatus.WAITLIST_OFFERED",
+      "reverted.count === 0",
+      "reconcileBedAllocationsForBookingWithLodgeLockHeld",
+    ]);
+
+    const priceUnwind = between(
+      text,
+      'if (newBooking.finalPriceCents !== quotedPriceCents)',
+      "// Phase 3",
+    );
+    expectInOrder(priceUnwind, [
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock",
+      "booking.updateMany",
+      "status: newBooking.status",
+      "cancelled.count === 0",
+      "reconcileBedAllocationsForBookingWithLodgeLockHeld",
+      "status: BookingStatus.WAITLIST_OFFERED",
+      "return refreshedOffer.count === 1",
+      "!refreshedCurrentOffer",
+    ]);
+
+    const phaseThree = text.slice(text.indexOf("// Phase 3"));
+    expectInOrder(phaseThree, [
+      "pg_advisory_xact_lock(1)",
+      "acquireLodgeCapacityLock",
+      // #5433 review A: the entry is re-read under both locks, and only a
+      // window restart since Phase 1 (its deadline and updatedAt) is still
+      // this offer; every other field is still Phase 1's.
+      "offerSnapshotAcrossWindowRestart(tx, entry)",
+      "booking.updateMany",
+      "status: BookingStatus.WAITLIST_OFFERED",
+      "updatedAt: snapshot.updatedAt",
+      "waitlistOfferedAt: entry.waitlistOfferedAt",
+      "waitlistOfferExpiresAt: snapshot.waitlistOfferExpiresAt",
+      "waitlistOfferedLodgeId: entry.waitlistOfferedLodgeId",
+      "waitlistOfferedPriceCents: entry.waitlistOfferedPriceCents",
+      "cancelled.count === 0",
+      "reconcileBedAllocationsForBookingWithLodgeLockHeld",
+    ]);
+  });
+
+  it.each([
+    ["src/lib/cron-waitlist.ts", "BookingStatus.WAITLIST_OFFERED"],
+    ["src/lib/cron-complete-bookings.ts", "BookingStatus.PAID"],
+  ])("uses locks, a fresh read, and a status claim in %s", (file, status) => {
+    const text = source(file);
+    expectInOrder(text, [
+      "const candidates",
+      "for (const candidate of candidates)",
+      "prisma.$transaction",
+      "pg_advisory_xact_lock(1)",
+      "const key = await tx.booking.findUnique",
+      "acquireLodgeCapacityLock",
+      "const booking = await tx.booking.findUnique",
+      "booking.updateMany",
+      status,
+      "claimed.count === 0",
+      "reconcileBedAllocationsForBookingWithLodgeLockHeld",
+    ]);
+  });
+
+  /**
+   * `Booking.lodgeId` is IMMUTABLE for the row's life, and this is the only
+   * thing that says so (#2672).
+   *
+   * Merge's partner-share lodge derivation
+   * (`partnerShareGuestRowLodgeIds` in `bed-allocation-lifecycle.ts`) reads
+   * `BookingGuest.memberId` and takes the booking's lodge key. Its completeness
+   * argument has three legs; two are schema-enforced (`BedAllocation.bookingGuestId`
+   * is a NOT NULL FK, `Booking.lodgeId`/`LodgeRoom.lodgeId` are NOT NULL) and the
+   * third — that nothing ever MOVES a booking between lodges — was prose only.
+   *
+   * What breaking it costs, precisely: a merge derives lodge {A} and locks it;
+   * a concurrent "move this booking to the other lodge" write re-points the
+   * booking to B. A `Booking` update takes no lock on `Member`, so merge's
+   * sorted `Member … FOR UPDATE` does not fence it, and
+   * `assertPartnerShareLodgeCoverageWithLocksHeld` — which re-derives the LODGE
+   * from the booking — cannot see a move committed after it runs.
+   * `reconcileBedAllocationsForBookingWithLodgeLockHeld` then allocates at B and
+   * the sweep judges bed inventory in a lodge merge never serialised against,
+   * with NO refusal. That is strictly worse than the #2672 class it replaces,
+   * which at least 409s.
+   *
+   * So the scan is deliberately structural rather than a string match: it walks
+   * every non-test source, extracts the balanced `data`/`create`/`update`
+   * payload of every `.booking.update`/`.updateMany`/`.upsert` call, and also
+   * looks for a raw `UPDATE "Booking" … SET … "lodgeId"`. `prisma/migrations`
+   * is out of scope on purpose — the one-off backfill
+   * (`SET "lodgeId" = default_lodge_id() WHERE "lodgeId" IS NULL`) predates the
+   * column being NOT NULL and is not a runtime writer.
+   */
+  it("keeps Booking.lodgeId immutable: no writer moves a booking between lodges", () => {
+    const offenders: string[] = [];
+    for (const file of walkSources(path.resolve(process.cwd(), "src"))) {
+      const rel = toPosix(path.relative(process.cwd(), file));
+      if (isTestFile(rel)) continue;
+      const text = fs.readFileSync(file, "utf8");
+
+      // Call sites and payload keys are found over masked text, so a
+      // `.booking.update(` named in a comment or string is not a call.
+      const structure = text.includes(".booking.") ? blankLiterals(text) : text;
+      const writeCall = /\.booking\.(update|updateMany|upsert)\(/g;
+      let call: RegExpExecArray | null;
+      while ((call = writeCall.exec(structure)) !== null) {
+        const open = call.index + call[0].length - 1;
+        const argsEnd = balancedBrackets(text, open, structure).end;
+        const args = text.slice(open, argsEnd + 1);
+        const argsStructure = structure.slice(open, argsEnd + 1);
+        const payloadKey = /(?:^|[\s,{])(data|create|update)\s*:/g;
+        let payloadMatch: RegExpExecArray | null;
+        while ((payloadMatch = payloadKey.exec(argsStructure)) !== null) {
+          const braceStart = argsStructure.indexOf(
+            "{",
+            payloadMatch.index + payloadMatch[0].length - 1,
+          );
+          if (braceStart === -1) continue;
+          const payload = balancedFrom(args, braceStart, argsStructure);
+          if (/(?:^|[\s,{])lodgeId\s*:/.test(payload)) {
+            offenders.push(
+              `${rel}: .booking.${call[1]}() ${payloadMatch[1]} block writes lodgeId`,
+            );
+          }
+        }
+      }
+
+      if (
+        /UPDATE\s+(?:"public"\.)?"?Booking"?[\s\S]{0,600}?\bSET\b[\s\S]{0,600}?"?lodgeId"?\s*=/i.test(
+          text,
+        )
+      ) {
+        offenders.push(`${rel}: raw UPDATE "Booking" … SET "lodgeId"`);
+      }
+    }
+
+    expect(
+      offenders,
+      "INV-CAP-030 (#2672): merge's partner-share lodge derivation reads " +
+        "Booking.lodgeId as IMMUTABLE for the row's life. A writer here reopens the " +
+        "unlocked-lodge escape in its SILENT form — a booking moved mid-merge is " +
+        "fenced by nothing (a Booking update takes no lock on Member, so merge's " +
+        "`Member … FOR UPDATE` does not stop it) and the sweep judges bed inventory " +
+        "in an unserialised lodge with NO refusal at all. If you genuinely need to " +
+        "move a booking between lodges, give the guest-date writers a " +
+        "`member-lifecycle:` tier first (issue #2672 Option 2) and re-do the " +
+        "deadlock pass in docs/CONCURRENCY_AND_LOCKING.md -> " +
+        '"Merge joins the bed-allocation cohort".',
+    ).toEqual([]);
+  }, CENSUS_TIMEOUT_MS);
+});

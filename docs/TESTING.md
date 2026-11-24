@@ -1,0 +1,2445 @@
+# Unit Test Harness
+
+**Audience:** Developer, Agent.
+
+How the Vitest unit suite is set up, and the one convention that matters most
+when a test involves a date: **every test run has a fixed "today"**.
+
+The Playwright browser suite is a separate thing with its own document —
+[`E2E_PLAYWRIGHT.md`](E2E_PLAYWRIGHT.md). The journeys each suite is expected to
+cover live in [`END_TO_END_TEST_MATRIX.md`](END_TO_END_TEST_MATRIX.md).
+
+Run it with `pnpm test` (`vitest run`). It needs `DATABASE_URL` set to any value —
+an unreachable dummy is correct and a live seeded database is not — so
+`prisma.config.ts` resolves. See [`../CONTRIBUTING.md`](../CONTRIBUTING.md) for
+the full local gate.
+
+## Accessibility lint ratchets (#4466)
+
+The full `eslint-plugin-jsx-a11y` recommended configuration applies to JSX/TSX.
+The component mapping covers TableRow, TableCell, TableHead and Button. Because
+jsx-a11y treats native table rows as interactive, the local
+`accessibility/no-mouse-only-table-row` rule also requires a button or link
+inside a clickable row (#4970); a link with its own `onClick` is a separate
+action and does not count. Keep the row's mouse shortcut and put keyboard
+activation on that control.
+The local `accessibility/minimum-text-size` rule rejects static sizes below 12px
+in Tailwind classes, inline `fontSize` properties, CSS declarations and CSS
+`@apply` classes. Absolute CSS units (including `pt`) are converted to pixels;
+`rem`/`em` literals assume 16px. Runtime sizes and computed
+expressions still need browser/design review. CSS uses the tolerant parser for
+Tailwind syntax; it is not a general CSS validity gate.
+
+The local `accessibility/no-nested-interactive` rule (#4553) rejects a link or
+button inside another one: a `next/link` `Link`, the ui `Button`, `<a>` or
+`<button>` nested in any of them: two tab stops for one action, and invalid
+HTML. axe's `nested-interactive` reports only a link inside a button, never a
+button inside a link, so this rule is the check for that direction. Write `<Button asChild><Link>…</Link></Button>`; an `asChild` Button renders no
+element of its own (only a bare `asChild` or `asChild={true}` counts). Link
+and Button are matched by import, so a wrapper
+component that renders one is outside the rule.
+
+[`eslint-suppressions.json`](../eslint-suppressions.json) records existing debt
+using ESLint's built-in per-file/per-rule counts. Normal `pnpm run lint` applies
+it automatically: new files and increased counts fail, and unused suppressions
+also fail. It is a count ratchet: replacing a violation in the same file with
+another of the same rule does not increase the count. Do not regenerate or grow
+the baseline to pass lint. After fixing debt, run
+`pnpm exec eslint src --prune-suppressions` and commit the reductions. Check
+commands do not modify it.
+
+Focused rule and ratchet contracts run with
+`pnpm run test:named scripts/eslint/accessibility.test.mjs scripts/eslint/ratchet.test.mjs scripts/eslint/fixture-import.test.mjs scripts/eslint/design-system.test.mjs`.
+The shared axe fixture and mobile project are described in
+[`E2E_PLAYWRIGHT.md`](E2E_PLAYWRIGHT.md#accessibility-and-mobile-checks-4466).
+
+### Design-system control ratchet (#4467)
+
+Five local rules in `scripts/eslint/design-system.mjs` report what bypasses the
+primitives in `src/components/ui/`, each naming the one to use:
+`design-system/no-raw-button`, `no-raw-input`, `no-raw-select` and
+`no-raw-table` for the intrinsic JSX element, and `no-native-confirm` for the
+browser's confirm box. A radio is `Radio` from `src/components/ui/radio.tsx`.
+The confirm rule covers a call through `window`, `globalThis`, `self`, `top` or
+`parent`, destructured from one of them, or called bare when the name resolves
+to the global. A `confirm` from `useConfirm()` is the sanctioned one.
+Today's usages are recorded in `eslint-suppressions.json` with the debt above,
+per file and per rule, so swapping a raw `<select>` for a raw `<button>` still
+fails. Migrate, then prune; never add a count.
+
+**Never an eslint-disable comment: migrate to the primitive.**
+`design-system.test.mjs` fails on any disable or rule-config comment naming a
+`design-system/` rule, and on a disable naming no rule where they apply.
+
+A suppression is keyed by path, so `ratchet.test.mjs` fails on an entry whose
+file no longer exists: a new file at that path would inherit the allowance. A
+deleted file's entries go in the same PR. A moved or renamed file's entries
+move to the new path in the same PR, at the same count; the count never rises.
+
+The exceptions are named:
+
+- **By path** (`eslint.config.mjs`): `src/components/ui/` itself; test files
+  (`__tests__/`, `*.test.*`, `src/test/`), which are not app UI and mock
+  primitives with raw stand-ins; and the files in `PRIMITIVE_IMPLEMENTATIONS`,
+  each excused one rule with a written reason: the admin table shell and sort
+  header (#1805).
+- **By element** (the rule): `<input type="hidden">`, and an
+  `<input type="file">` hidden by a literal `hidden` attribute or an
+  unprefixed `hidden` or `sr-only` class, the picker a `Button` opens. Neither
+  holds when a JSX spread comes after an attribute it relies on, or when a
+  class could show the input again (`block`, `md:flex`, `focus:not-sr-only`).
+  A visible file input uses `<Input type="file">`.
+
+Not covered: `React.createElement`, an element named through a variable
+(`const Tag = "button"; <Tag />`), a `confirm` reached through an alias, and
+`<textarea>`.
+
+### Testing a form on the shared form layer (#4467)
+
+The pattern is in [`UX_FLOW_MAP.md`](UX_FLOW_MAP.md#forms-4467). A form on it
+is tested in jsdom, like
+`src/app/(admin)/admin/membership/committee/__tests__/committee-role-form.test.tsx`:
+
+- **Assert the wiring by resolving it.** Read the control's
+  `aria-describedby`, look each id up with `document.getElementById`, and
+  check the text and the order: error first, example last. Testing Library's
+  `toHaveAccessibleDescription` does the same in one step where the order does
+  not matter.
+- **Assert the summary holds focus, not that it got it.** Use
+  `expectToHoldFocus` from `src/lib/__tests__/helpers/focus.ts`.
+  react-hook-form's own focus-the-first-error runs again on a timer, so a
+  bare `waitFor` passes even while it steals focus a tick later.
+- **Wrap a submit in `act`.** The submit is asynchronous: the resolver, then
+  the handler, then the state update that raises `submitCount` and moves
+  focus.
+- **Assert the payload and the route, as well as the errors.** A migrated
+  form must send what it sent before.
+
+`src/components/ui/__tests__/form.test.tsx` pins the primitives themselves.
+`src/lib/__tests__/shared-form-schema-census.test.ts` reads source from disk,
+so `test:related` cannot select it; run it with `test:named` when you add or
+move a schema in `src/lib/forms/`, its route or its form.
+
+## Stateful Xero and Stripe fakes
+
+Tests can keep provider state across a whole money journey instead of returning
+unrelated responses from each mock. Import
+[`XeroFake`](../src/test/providers/xero-fake.ts) or
+[`StripeFake`](../src/test/providers/stripe-fake.ts), and create a fresh instance
+per test. These helpers have no credentials, network calls, database or Vitest
+dependency. Unit and realdb tests can use them directly; Playwright's Node-side
+fixtures can use them behind a test transport adapter. They do not install HTTP
+routes or replace either provider SDK automatically; the transports below are
+the only way to point app code at them.
+
+```ts
+const xero = new XeroFake();
+const contact = xero.createContact("contact", "member-a");
+const invoice = xero.createInvoice("charge", contact.contactID, 8000);
+xero.payInvoice("receipt", invoice.invoiceID, 5000);
+expect(xero.snapshot().invoices[0].amountDueCents).toBe(3000);
+```
+
+All amounts are integer cents. Methods accepting an operation key take it first:
+retrying the same request returns its original response, while changed parameters
+reject. Keys live for the instance's lifetime; expiry is not modeled. Snapshots
+are detached copies, so retaining a reading before a later void models delayed
+delivery. `invoiceWire` in the
+[`round-trip harness`](../src/test/providers/round-trip-harness.ts) converts
+invoice reads to the native Xero JSON boundary used by the production observer.
+
+Xero models contacts, authorised invoices, receipts, credit notes, allocations,
+allocation removal, payment deletion and voids. A paid invoice refuses a new
+allocation; remove existing allocations/payments before voiding a document.
+`payCreditNote` records a hand-back separately from an allocation. Stripe models
+manual authorisation, one full or partial capture, cancellation, pending and
+successful refunds, later failure, and dashboard refunds. Pending refunds reserve
+capture capacity; failed refunds release it. `snapshot().events` retains immutable
+Stripe event payloads for delivery/replay tests, including the subscribed
+`charge.refunded` (with a charge/refund-list projection) and `refund.failed` events.
+Taxes, fees, FX, API pagination,
+authentication, rate limits and transport failures are outside these models.
+
+### Driving production code through the fakes
+
+The test transports put the fakes behind the app's own provider clients (#4908),
+so production writers, inbound sync and webhook handlers run unmocked:
+
+```ts
+import { setXeroClientForTests, resetXeroClientForTests } from "@/lib/xero-test-client-override";
+// Stripe: setStripeClientForTests from "@/lib/stripe-test-client-override"
+const fake = new XeroFake("race-1234-");
+setXeroClientForTests(xeroTransport(fake));
+await createXeroInvoiceForBooking(bookingId); // the production push
+expect(fake.snapshot().invoices).toHaveLength(1);
+// afterAll: resetXeroClientForTests()
+```
+
+[`xeroTransport`](../src/test/providers/xero-transport.ts) serves the
+`accountingApi` calls for invoices, payments, credit notes, allocations and
+contacts. Replies are native Xero JSON (invoices through `invoiceWire`) passed
+through xero-node's own deserializer. Every call still goes through
+`callXeroApi` and `withXeroRetry`, so `failNext({ statusCode: 429, ... })`
+reaches the app as the real `XeroDailyLimitError`. Both injected failures and
+fake refusals leave as xero-node does, a JSON string; a refusal is a 400
+`ValidationException` carrying the fake's message, which the app's own error
+readers parse.
+[`stripeTransport`](../src/test/providers/stripe-transport.ts) serves payment
+intents, captures and refunds through `setStripeClientForTests`, and its
+`events()` returns the fake's events as Stripe delivers them, ready for
+`processStripeWebhookEvent`. Fake refusals come back as the SDK's
+`StripeInvalidRequestError`, and a reused idempotency key with other
+parameters as `StripeIdempotencyError`. A call either transport does not model
+throws rather than guessing, and neither ever touches the network. Xero lists page as Xero
+does (`page` and `pageSize`). Not modelled: Xero payment dates and the
+organisation record; Stripe payment-method
+collection (an intent is authorised on create) and any `expand` but an
+intent's `latest_charge`. While a Xero session is installed, `isXeroConnected()`
+reports connected, so the journeys that check it first take their Xero path.
+
+`setXeroClientForTests` and `setStripeClientForTests` throw unless `NODE_ENV`
+is `test`, and every read re-checks it, so production cannot set
+the override. Both seams are built from one rule,
+[`createTestOnlyOverride`](../src/lib/test-only-override.ts). No environment variable reaches it.
+[`production-import-census.test.ts`](../src/test/providers/production-import-census.test.ts)
+fails if any non-test file under `src/` imports test code: `src/test/`, a
+`__tests__` directory or a `*.test.*` / `*.spec.*` file. The existing
+`vi.mock` suites stay as they are; new money journeys should prefer the
+transports.
+
+Two realdb suites prove the path end to end:
+[`xero-invoice-round-trip.realdb.test.ts`](../src/test/providers/xero-invoice-round-trip.realdb.test.ts)
+pushes a booking invoice, pays it in parts in the fake and reconciles each
+state, and
+[`stripe-webhook-round-trip.realdb.test.ts`](../src/test/providers/stripe-webhook-round-trip.realdb.test.ts)
+delivers a dashboard refund, its redelivery and a later `refund.failed`. A
+ledger stage writes its own per-pair proofs on these transports.
+
+### Contract fixtures and sandbox captures
+
+The fixture contract suite pins selected behavior to
+[`provider-contracts.json`](../src/test/providers/fixtures/provider-contracts.json).
+**These fixtures are synthetic examples, not sandbox recordings** (their
+`provenance.kind` is `synthetic`). Their public API references and repository
+error-example source are recorded in the JSON; sandbox conformance remains
+unverified. Do not regenerate expectations from the fake.
+
+A reviewed recording goes beside it as
+`provider-contracts.recorded-sandbox.json`, with the same keys. When that file
+exists the suite runs against it instead, and its title names the kind and
+capture date it ran. A recording's `provenance` sets `kind` to
+`recorded-sandbox`, `capturedOn` to the capture date, `apiVersions` to the Xero
+and Stripe API versions used, and `reviewedIn` to the issue or PR holding the
+review. The suite refuses a recording missing any of these, and any fixture
+holding an email address, a credential, a Xero GUID or a Stripe object id.
+
+**Capturing sandbox fixtures (owner step).** Only the owner captures, against a
+Xero demo company and Stripe test mode, never the club's live organisation or
+account:
+
+1. In Xero, create a contact and an $80.00 invoice, record a $50.00 payment,
+   create a $30.00 credit note and allocate it, then try allocating another
+   $10.00 credit note to the paid invoice. Remove the allocation, void the note
+   and delete the payment. Save the invoice, credit note and payment replies and
+   the refusal for each key in the `xero` block.
+2. In Stripe test mode, authorise $80.00 with manual capture, capture $50.00,
+   refund $20.00, let it succeed, then fail it with Stripe's test card for a
+   failed refund. Make a $50.00 refund in the dashboard, try a further $0.01
+   refund, and save the replies and the `charge.refunded` event for each key in
+   the `stripe` block.
+3. Sanitise: keep only the fields the synthetic file pins, replace every
+   provider id with the alias the fake mints (`invoice-1`, `intent-1`, and so
+   on), and remove every name, email, tenant id, account id and token.
+4. Fill in `provenance`, run the contract suite, and open a PR. The PR is
+   reviewed by someone other than the person who captured the fixture, who
+   checks the sanitising line by line before merge. Where the recording and the
+   fakes disagree, the fake is fixed; the recording stands.
+
+Run the provider suites with:
+
+```sh
+pnpm run test:named src/test/providers/provider-fakes.test.ts src/test/providers/provider-contracts.test.ts src/test/providers/ledger-scenarios.test.ts src/test/providers/round-trip.test.ts src/test/providers/provider-transports.test.ts src/test/providers/production-import-census.test.ts
+```
+
+The two realdb suites need the race harness's disposable PostgreSQL
+(`RUN_CONCURRENCY_RACE_TESTS=1` and `CONCURRENCY_RACE_DATABASE_URL`) and run in
+the `realdb-all` CI job.
+
+The fast-check properties use fixed seeds (4460 and 4461) and the shared frozen
+clock. They compare independently imported state with outbound journal totals
+after every prefix, require no new postings on round trips, and check external
+refund corrections and redelivery. The journal and adapters are test models for
+#4461, not production ledger implementations. Scenario witnesses cover #3911,
+#4336, #4434 and #4380; passing them does not close those application bugs or
+prove production sync correctness.
+
+## CI shards and the required check
+
+Pull-request and `main` CI run the complete unit suite in four independent
+Vitest file shards (`pnpm test --shard=1/4` through `4/4`). Each shard checks
+out the whole tree and full Git history: a disk-scanning census still sees all
+source files, and every test file, including each census and frozen-clock test,
+is assigned to exactly one shard. All shards use the same `vitest.config.mts`
+and its ordered setup files. The clock-rollover canary still runs the unsharded
+suite on `main` and nightly; it is not a pull-request check.
+
+`verify` remains the single required status context. It runs lint, typecheck,
+knip, the production build and its proofs without a `needs:` edge or job-level
+condition, then `scripts/ci/require-test-shards.mjs` checks that all four shard
+jobs from the **same Actions run attempt** completed successfully. Missing,
+duplicate, skipped, cancelled, failed or timed-out shards, API errors and a
+bounded wait ([how long](../CONTRIBUTING.md#branch-protection)) all fail `verify`; a job that never reported cannot silently pass.
+Re-run the whole workflow rather than only a failed job if a partial re-run
+leaves successful shards absent from the new attempt. This does not add a
+branch-protection context. The required shards do not collect coverage: the
+money modules' coverage and mutation score are measured by two separate,
+non-required workflows ([below](#coverage-and-mutation-testing-of-the-money-modules)).
+
+`scripts/ci/require-test-shards.test.mjs` checks the gate and exercises Vitest
+5's actual run sequencer against the discovered file set. `vitest list --shard`
+does **not** apply sharding in this version, so comparing four `list` outputs
+would falsely suggest every file runs four times.
+
+The required `Migration drift check` also runs the opt-in PostgreSQL race
+proofs. Its dedicated service binds only to loopback, and Docker selects an
+available host port from 55442–65535 rather than requiring port 55442 to be
+free. The workflow validates the resolved URL with the existing race-database
+guard before migration, then shares it through `CONCURRENCY_RACE_DATABASE_URL`;
+the seeded ledger-history database derives its URL from that same endpoint.
+Missing or unsafe endpoint metadata fails the job. Port-range exhaustion or
+service startup failure also stays a failure; neither skips nor passes the
+real database checks.
+
+## Coverage and mutation testing of the money modules
+
+Two separate measures, both advisory, answer "which money paths does no test
+reach" and "which tests would still pass if the code were wrong" (#4459,
+programme #4450). Neither is a required check, neither is part of `verify`, and
+neither may become one without the owner adding a context to branch protection
+([`CONTRIBUTING.md`](../CONTRIBUTING.md#branch-protection)).
+
+**What counts as a money module** is decided by `.github/CODEOWNERS`, the owner's
+own list of the `src/lib` modules that mint, charge, refund, credit, settle or
+size money, and `scripts/lib/money-modules.mjs` reads it: every `/src/lib/`
+pattern in CODEOWNERS is a coverage glob, so a module is measured the day it is
+owned. The same file adds what the issue names beyond that ownership: every Xero
+module (the inbound handlers in `xero-inbound/` included), the booking ledger,
+and the refund, credit, settlement and money-named helpers. `MONEY_MODULE_GLOBS`
+is the result. `vitest.config.mts` (`test.coverage.include`) and the ratchet
+script read it; the Stryker config reads `MUTATION_TARGET_GLOBS`, the narrower
+set it mutates, and `vitest.stryker.config.mts` reads `MUTATION_TEST_FILES`. Do
+not spell the list again. The module never throws on import (`vitest.config.mts`
+loads it, so one odd CODEOWNERS line must not stop every test run); a pattern it
+cannot read is reported as data and the ratchet test fails on it.
+`scripts/ci/money-test-ratchet.test.ts` fails a glob that matches no file, a
+CODEOWNERS-owned `src/lib` file the set leaves out, and a module the
+[CODEOWNERS census](../src/lib/__tests__/codeowners-census.test.ts) says must
+stay owned that is not measured.
+
+### Coverage
+
+- **Where it runs.** `.github/workflows/money-coverage.yml`, on a pull request
+  or push to `main` that changes code, tests, scripts, the schema, dependencies,
+  the measurement's own configuration or CODEOWNERS (a docs-only change skips it
+  and leaves no check), and on demand. Four shard jobs run the unit suite exactly as the
+  required shards do, with `--coverage --reporter=blob`; one job merges the four
+  blobs with `vitest --merge-reports --coverage` and judges the result. It is a
+  separate workflow because turning coverage on in the required shards would
+  slow jobs `verify` depends on and let an instrumentation timeout redden a
+  required check. The cost is five more jobs per pull request (four shard
+  runners and the merge), in parallel with the required ones, so the wait is
+  about one shard plus a short merge.
+  Coverage is off unless `--coverage` is passed, so `pnpm test` is unchanged. A
+  test that fails under instrumentation (a disk-scanning census can time out)
+  does not stop the report: the required shards own test failures, and the job
+  warns.
+- **How it reports.** Open the `Money coverage ratchet` job's summary: for lines,
+  statements, functions and branches, what the figure is compared with, the bar,
+  now and the change, then the ten files with the most uncovered lines. The job
+  goes red when a figure is lower than the bar, or when the pull request lowers
+  the committed floor. Because it is not a required check, red informs and
+  blocks nothing, and nothing else makes anyone read it, so a pull request that
+  touches money modules says `Money coverage ratchet: green` or `red` and why in
+  its ready comment (`agents/ISSUE_WORKFLOW.md`, "The ready comment"). The lane
+  either adds the missing tests or says why not.
+- **The bar** is the latest successful `main` run's own figure, read from that
+  run's `money-coverage-summary` artifact (kept 30 days), less 0.1 percentage
+  points for measurement noise (a flaky test, a timing-dependent branch), and
+  never below the committed floor. Figures are compared to two decimals, so a
+  pull request that moves lines from 87.96 to 87.01 fails, and one that moves
+  them to 87.90 passes; because of the floor, `main` cannot drift down 0.09
+  points a pull request for ever. With no such artifact (a first run, or none
+  within 30 days) the bar is the floor, `scripts/ci/money-test-baseline.json`,
+  and the summary says "committed floor". A pull request into a branch other
+  than `main` (an `epic/**` branch) is held to the floor too, and the summary
+  says so, because `main`'s figures do not describe that branch. The judge job
+  needs `actions: read` to find and download the artifact.
+- **Recovering from a red `main`.** On a push to `main` the judge records and
+  does not fail (its step is `continue-on-error` for the `push` event), so a drop
+  that was accepted at review becomes `main`'s figure and the next pull request
+  is held to that. The summary still shows the table. If a drop is real but
+  accepted, nothing more is needed, unless it takes `main` below the committed
+  floor: then lower the floor in the same pull request that accepts it, say why
+  in the PR, and expect the job on that PR to go red (a lowered
+  floor turns it red). Re-run `coverage --update` from a later green `main` artifact to
+  tighten the floor again.
+- **The floor** is `scripts/ci/money-test-baseline.json`. Judging a pull request
+  never writes it, so lanes do not collide on it (the
+  [fragment-directory rule](../changelog.d/README.md) is for an artifact every
+  lane adds to; this file is raised on purpose). To raise it after coverage
+  improves, download the `money-coverage-summary` artifact from a green `main`
+  run and run
+  `node scripts/ci/money-test-ratchet.mjs coverage --update --summary <file>`:
+  it keeps the higher of each stored and measured figure and never lowers one.
+  A pull request that lowers it turns the job red (`--base-ref`, the branch the
+  pull request targets), so removing well-covered code is a visible decision.
+- **Measured** (5 Nov 2026, 498 files): lines 88.99%, statements 87.97%,
+  functions 89.29%, branches 82.01%. The floor holds 88, 87, 88 and 81: the
+  whole-percent floor of each, with a point more room on functions and branches,
+  where the margin to a whole number was under half a point (a CI reading 0.3
+  lower would otherwise sit under the floor). It was
+  measured on a development machine rather than in CI, so it is deliberately a
+  little loose until a green `main` run's artifact tightens it with `--update`
+  (and the bar is `main`'s own figure whenever one exists). The figure counts
+  only what the unit shards run. Real-database suites (`*.realdb.test.ts`) are skipped
+  there, so a module they alone exercise, such as `booking-ledger-back-post.ts`,
+  reads 0% however well they cover it. The summary's worst-files list is the
+  answer to "which money paths does no test reach".
+- **Locally**, without running the whole suite: coverage of a file only comes
+  from tests that import it, so `vitest related` over the money files measures
+  the same figure as the full run.
+
+  ```sh
+  pnpm exec vitest related --run --coverage --testTimeout=60000 $(node scripts/ci/money-test-ratchet.mjs list-files)
+  node scripts/ci/money-test-ratchet.mjs coverage
+  ```
+
+  This runs a large part of the suite (the disk-scanning censuses import money
+  modules too: 1,237 test files, about seventeen minutes on four cores) and a
+  census with its own explicit timeout can still fail under the load; the longer
+  `--testTimeout` covers the rest.
+
+### Mutation testing
+
+- **What it does.** [Stryker](https://stryker-mutator.io) changes the code a
+  little (flips a sign, drops a guard, moves a boundary) and runs the unit tests
+  against each change. A mutant the tests catch is *killed*; one they miss
+  *survived*, which is a place the code could be wrong with the suite still
+  green. `MUTATION_TARGET_GLOBS` in `scripts/lib/money-modules.mjs` names the
+  modules: the pure ledger planners (confirmation, edit, cancellation,
+  settlement, credit), the balance and posting-key helpers, the write door's
+  validators, and the cancellation, refund-method and edit-refund hand-back
+  arithmetic. They are the ones a fast unit test can kill; the Prisma-facing
+  `*-sync.ts` modules are exercised by real-database suites a mutation run has
+  no database for. `MUTATION_TEST_FILES` names the suites it runs, through
+  `vitest.stryker.config.mts`.
+- **When it runs.** `.github/workflows/money-mutation.yml`: nightly at 14:30 UTC
+  and on demand (`workflow_dispatch`), never on a pull request. It takes about
+  eight minutes.
+- **Where the report is.** Runs are listed at
+  <https://github.com/thatskiff33/AlpineClubBookingsNZ/actions/workflows/money-mutation.yml>;
+  the first nightly run after this merges produces the first report. Open a
+  run's `money-mutation-report` artifact (kept 30 days): `index.html` shows every
+  mutant in the source with its status, and `mutation.json` is the same data. The
+  job summary lists the score and each survivor by file and line. The recorded
+  score below is from a local run before the workflow existed.
+- **Locally.** `pnpm run mutation` runs the whole set;
+  `pnpm exec stryker run --mutate src/lib/booking-ledger-balance.ts` runs one
+  module (under a minute) and the report lands in `reports/mutation/`
+  (gitignored). Then `node scripts/ci/money-test-ratchet.mjs mutation` prints the
+  score and the survivors.
+- **The score is recorded and ratcheted** in the same baseline file:
+  `mutation.score` is the last recorded figure and `mutation.breakBelowPercent`
+  (one point under it) is Stryker's `thresholds.break`, so a run below it fails.
+  Raise both with
+  `node scripts/ci/money-test-ratchet.mjs mutation --update` after a run that
+  improved the score.
+- **Recorded score** (5 Nov 2026, 938 mutants): **78.04%**. 731 killed, 1 timed
+  out, 122 survived, 84 not covered by any test. By module: `booking-ledger-balance`,
+  `cancel-refund-method` 100%; `booking-ledger-cancellation-posting` 98.3%;
+  `-confirmation-posting` 92.5%; `-modification-posting` 92.4%;
+  `-settlement-posting` 86.6%; `-credit-posting` 86.8%; `-write` 85.5%;
+  `-posting-keys` 83.8%; `paid-cancellation-money` 76.7%;
+  `booking-ledger-charge-line` 55.2% (the survivors are narration strings and
+  the promotion line, which only the edit and cancellation suites reach);
+  `edit-refund-hand-back` 27.3%, 75 of its mutants reached by no test.
+
+### A model-based test of the ledger
+
+`src/lib/__tests__/booking-ledger-model.property.test.ts` drives the five pure
+ledger planners (confirmation, edit, cancellation, settlement, credit) with
+`fast-check`'s `commands` through random histories of booking, edit, payment,
+refund, credit and cancellation events, against an in-memory store that behaves
+like the write door. After **every** step it asserts the ledger identities
+against a model that holds only the events' own sums: `charged` is the stay as it
+stands (or what the club kept once cancelled), `settled` is captures less
+recorded refunds plus credit consumed less credit issued, per method, and
+`owed = charged + adjusted - settled`. It also asserts the structural rules the
+sums lean on (append-only, a reversal mirrors exactly the line it names and a
+line is reversed once, charge lines that still stand add up to `charged`) and
+that running every sync again, and re-posting every line ever posted, changes
+nothing. The seed is fixed (4459, as the provider round trips pin 4460 and 4461),
+nothing reads the clock, and it runs in about a second.
+
+Write a new event as a `Cmd` class with a `check` precondition and a `run` that
+goes through `step()`, so no command can skip the identities. A shrunk
+counterexample prints as the command list, for example
+`confirm(0 cents, promo -1),replay()`. The model is the specification: when a
+planner changes on purpose, change the model's sum, never the assertion to match
+the code.
+
+## Shared setup
+
+`vitest.config.mts` points every test file at three setup files, in order —
+`vitest.clock-setup.ts`, `vitest.async-local-storage-setup.ts`, then
+`vitest.setup.ts`. Between them they:
+
+- **freeze the clock** — the rest of this page;
+- stub `server-only` (a Next.js guard with no meaning in the Node test
+  environment) so server-side modules can be imported at all;
+- supply fake email-delivery environment values, because
+  `src/lib/email-delivery.ts` refuses to build a transport without them
+  (nodemailer is mocked, so nothing is ever sent);
+- **set React Testing Library's async window to 4,000ms** under jsdom — the
+  section below.
+
+It also names one **global** setup, `vitest.global-setup.ts`, which runs once
+per run in the main process, not in every worker, so it has no place in that
+order. It clears the scratch folders Vitest leaks into the system temp directory
+(#3671). Vitest never removes its root `os.tmpdir()/<nanoid>` folder, so every
+run leaks one, and a project's folder survives any run that is killed or whose
+delete fails. The sweep starts a detached child process that the run does not
+wait for. It removes a folder only when all of these hold:
+
+- the name is exactly a nanoid;
+- it holds nothing but real `ssr/` or `client/` directories of Vitest's files,
+  never a link;
+- the newest modification time of the folder and of those marker directories is
+  more than 24 hours old;
+- it is not this run's own folder.
+
+A live run refreshes its own folders every ten minutes. The full explanation,
+including what the guards do and do not guarantee, is the docstring of
+`scripts/lib/vitest-temp-sweep.ts`. The tests are in
+`scripts/__tests__/vitest-temp-sweep.test.ts`.
+
+The `.mts` extension is deliberate, not incidental (#2864). Vite reads a plain
+`.ts` config as CommonJS, so from 8.2.1 it warns on every run that this file
+uses ESM syntax, and once `configLoader: "native"` becomes vite's default such a
+file stops loading at all. `.mts` is unambiguously ESM, which the native loader
+reads directly. It is the narrow fix: the alternative — `"type": "module"` in
+`package.json` — would reinterpret every `.js` file in the repository. Because
+the file is now ESM, it has no `__dirname`; the `@` alias is built from
+`import.meta.dirname` instead. If you rename it again, `frozen-test-clock.test.ts`
+reads it from disk by name and will fail loudly rather than silently skip.
+
+Vitest 5 clears mock call histories before each test while keeping mock
+implementations. A test cannot assert calls made while a statically imported
+module was evaluated during collection: that history has already been cleared.
+For a module-registration assertion, call `vi.resetModules()` and dynamically
+`import()` the module inside the test, then inspect the mock calls. See
+`src/lib/__tests__/public-layout-config.test.ts` for the cache-registration
+example.
+
+## The RTL async window is 4,000ms, not the 1,000ms default
+
+RTL's async utilities — `findBy*`, `findAllBy*`, `waitFor`,
+`waitForElementToBeRemoved` — run on their **own** clock, `asyncUtilTimeout`,
+entirely separate from vitest's `testTimeout`. It defaults to 1,000ms, and when
+it expires RTL throws
+
+```
+TestingLibraryElementError: Unable to find role="button" and name "Any member"
+```
+
+which reads like a missing element. **It is a timeout.** Written off as flake
+three times on this repository before #2944 named it.
+
+Measured for #2944 by instrumenting RTL's `asyncWrapper` over one pass of
+`src/app/(admin)` — 73 files, 546 tests, 558 async waits:
+
+| Runner | Slowest single wait | Margin against the 1,000ms default |
+| --- | --- | --- |
+| Idle developer machine | 470ms | 2.1x |
+| Same box, 12 competing CPU burners | 1,144ms | none — 3 of 558 waits blew the window |
+
+CI runs a suite roughly 1.7x slower than an idle developer machine (measured in
+#2923), which puts that idle 470ms at ~800ms before another job shares the box.
+So the default is not a comfortable ceiling load occasionally grazes; a busy
+runner goes straight through it, and because scheduling decides which wait loses,
+a **different** suite fails each run. `vitest.setup.ts` therefore configures
+4,000ms repo-wide, and `src/lib/__tests__/rtl-async-util-timeout.test.ts` reads
+the value back so it cannot be dropped silently.
+
+The exposure is repo-wide rather than confined to the handful of suites that had
+gone red, which is why the setting is not per file: of the 314 test files that
+import `@testing-library/react` or `@testing-library/dom`, **219** use at least
+one async utility (131 `findBy*`/`findAllBy*`, 199 `waitFor`, none
+`waitForElementToBeRemoved`), spread across 82 files under `src/lib`, 69 under
+`src/components`, 66 under `src/app` and 2 under `src/hooks`. The measurements, and why the
+value is 4,000ms rather than 5,000ms (it has to stay below `testTimeout`, or
+vitest's opaque "Test timed out in 5000ms" replaces RTL's message naming the
+query), are stated in full beside the setting.
+
+**A wider window is not a licence to wait instead of think.** A test that
+interacts with a page before that page has settled has an ordering bug, and a
+wider window converts it into a slow pass rather than fixing it. The next section
+is the worked example.
+
+## Settle before you interact with a mocked child component
+
+```ts
+import { settleLodgeScopedPage } from "@/lib/__tests__/helpers/lodge-scope-settle";
+
+render(<HutLeadersPage />);
+await settleLodgeScopedPage("/api/admin/hut-leaders?lodgeId=");
+fireEvent.click(screen.getByRole("button", { name: /pick range/i }));
+expect(screen.getByLabelText("Start Date")).toHaveValue("2099-07-10");
+```
+
+`/admin/hut-leaders` and `/admin/roster` render their date controls and their
+occupancy calendar together behind one `lodgeScopeReady` gate, and both reset
+workspace state in a `useEffect` keyed on the settled lodge. In a browser those
+two cannot collide, because React flushes pending passive effects before
+dispatching a discrete input event.
+
+In a suite that **mocks the calendar** they can. The mock's button is in the DOM
+on the commit that first renders the gated form, so `findByRole` can resolve on a
+commit whose passive effects have not run and `fireEvent` dispatches immediately.
+The page applies the picked range, the pending reset effect fires straight after,
+and the date inputs go back to empty — failing a *synchronous* assertion that no
+window can reach. On `/admin/hut-leaders` step 2 of the form only renders once
+dates are chosen, so the same loss presents as `Unable to find role="button" and
+name "Any member"` instead.
+
+Measured for #2944 on `occupancy-calendar-pages.test.tsx` under 12 CPU burners:
+with the window already at 4,000ms and `testTimeout` at 60,000ms, **1 failure in
+30 runs** on the synchronous assertion; with the settle and the window back at
+its 1,000ms default, **30/30 green**. That pair is the whole argument for keeping
+these two fixes separate.
+
+This is test-only. Both pages gate the real date inputs behind nested
+`lodgeScopeReady` checks — a probe against the real page with a deferred lodges
+API showed the pre-settle DOM is 563 characters, header and notice only (#2885).
+
+**Do not** "simplify" a settle back to an immediate click, and **do not** wrap the
+synchronous expectations in `waitFor` to make them retry. The first restores the
+bug; the second hides it behind a slow pass.
+
+### It is not only the calendar, and not only the click
+
+The rule is about the page being **at rest**, so it is not confined to the three
+suites #2950 named, nor to a mocked *calendar*. It applies wherever a test drives
+a mocked child of a lodge-scoped page and then reads the DOM. #2953 measured a
+second suite where both halves bit, `bed-allocation-board-booking-scope.test.tsx`:
+
+**Settle before you interact.** That suite mocks `LodgeSelect`, so its buttons are
+clickable on the commit that first renders the board — before the passive effect
+that adopts the lodge the server echoed (#2701) has run. A click in that gap sets
+the selection to null and the still-queued adoption puts it straight back, so the
+board's scope key round-trips to the value it already had, `useScopedDashboard`
+never sees a change, and the request the test is asserting on is **never issued at
+all**. Measured with a probe that clicked deliberately early: exactly one board
+request, permanently. That state is terminal, which is why it presented as a full
+4,000ms `waitFor` window followed by a failed *synchronous* assertion — 4,125ms on
+CI, and 1 failure in 20 runs locally under 20 competing CPU burners.
+
+**Settle before you assert, too.** Awaiting a *request* is not awaiting the render
+it causes, and a page that has answered one question may still be moving. The same
+board makes **three** requests after that click, not two: the deep link, the
+unscoped read the test asserts on, and a third once #2701 re-adopts the lodge the
+server echoed. `useScopedDashboard` clears its value on every scope change, so the
+badge the test reads next is unmounted twice in between, and a synchronous read
+landing in one of those gaps fails as `Unable to find an element with the text:
+Focused booking` — 2 failures in 30 runs, in ~150ms each, so an ordering failure
+rather than a slow one. Wait for the page to reach rest, then assert once. Waiting
+on the page's own request and render is a **settle**; folding the assertion into
+that wait is a **retry**, and the prohibition above still stands.
+
+With both settles, that suite ran **30/30 under 20 competing CPU burners with the
+RTL window forced back to its 1,000ms default** — the same both-directions proof
+#2944 used, and the reason a wider window was never the fix here.
+
+## Which project typechecks a test
+
+`pnpm run typecheck` runs three TypeScript projects, and between them they must
+read every tracked `.ts`, `.tsx`, `.mts` and `.cts` file in the repository
+except `.semgrep/tests/acb-client-server-boundary.tsx` and
+`.semgrep/tests/acb-unsafe-raw-sql.ts`. Those two files are deliberately broken
+samples read only by Semgrep's `--test` runner; typechecking them would defeat
+their purpose. Every other file is a root of exactly one project:
+
+- **`tsconfig.json`** — the app, and the canonical compiler baseline the other
+  two extend (#2693): `target` and `lib` at ES2022, `strict`,
+  `noImplicitOverride`, `noUnusedLocals`, `noUnusedParameters`, and
+  `allowJs: false`. It excludes Vitest test/spec files under `src/` and
+  `scripts/`, everything under `__tests__/`, the Playwright suite, and the
+  Vitest config and setup files, so none of that is in the app's type surface.
+- **`tsconfig.test.json`** — the Vitest project: every `.ts`, `.tsx`, `.mts`
+  and `.cts` test/spec file and `__tests__/` directory under `src/` and
+  `scripts/`, plus `vitest.config.mts` and the two setup files. It supplies
+  `vitest/globals` and Node's types.
+- **`tsconfig.e2e.json`** — the Playwright suite: `e2e/**/*.ts`,
+  `playwright.config.ts` and the contract specs and their React fixtures under
+  `scripts/e2e-contracts/` (`.ts` and `.tsx`), with Node's types and nothing
+  from Vitest. Specs reach application code through imports (`@/lib/...`),
+  never by listing it.
+
+Vitest also collects JavaScript test files. The `scripts/**/*.test.mjs`
+suites — each the test of a tool that runs under a bare `node`, so both stay
+`.mjs` — execute in Vitest and are typechecked by **no** project.
+That is not a loss: before #2693 they were loaded with `allowJs: true,
+checkJs: false`, which produced no diagnostics either. Their names are pinned in
+`src/lib/__tests__/typecheck-project-coverage.test.ts`, so a new JavaScript
+test fails that contract until it is either written in TypeScript (the default)
+or named there deliberately. The JavaScript modules that TypeScript tests
+import — `eslint.config.mjs`, `scripts/ci/check-allow-builds.mjs`,
+`scripts/ci/server-only-boundary-selftest.mjs`,
+`scripts/sync-user-guide-wiki.mjs`, the k6 harness's pure helpers under
+`load/lib/` (`contention-invariant.js`, `stay-window.js`, `target-guard.js` and
+`volume-users.js`) and the Stripe stub `load/stripe-stub/server.mjs` — carry a
+sibling `.d.mts` / `.d.ts` declaring their exports; the same contract pins each
+pair.
+
+Put a supported new Vitest test under `src/` or `scripts/` and the existing
+patterns cover it; put one somewhere else and you must add the pattern.
+`typecheck-project-coverage.test.ts` fails if any tracked TypeScript file ends
+up in no project or in more than one. It also pins Vitest's actual default
+extension glob, requires every TypeScript Vitest file in the test project only,
+requires `allowJs` off in every project, and refuses compound JSX extensions
+that Vitest would collect but TypeScript cannot load. It asks TypeScript itself
+which files each project lists rather than reimplementing tsconfig's glob rules.
+
+That guard exists because the gap was real and silent (#2875): `tsconfig.json`
+excluded the test files and `tsconfig.test.json` re-included only the `src/`
+half, so everything under `scripts/__tests__/` was typechecked by neither
+project. Deliberate `const x: number = "string"` errors planted in those files
+produced a completely green `npm run typecheck`.
+
+Two habits the baseline depends on. Delete `tsconfig*.tsbuildinfo` before
+trusting a clean run after a compiler-option change — `incremental` build info
+has false-passed a config change here before. And `useDefineForClassFields` is
+pinned `false` on purpose. Next's SWC reads only that explicit key (never the
+target), so the pin governs the whole production build; Vite/Vitest apply the
+resolved `tsconfig.json` to the files it includes and derive `true` from an
+ES2022 target when the key is absent, so the pin also governs every app module
+a test imports. Classes declared inside test files — excluded from
+`tsconfig.json` — are transformed with the default [[Define]] semantics, as
+they were before #2693. The tree has some eighty `Error` subclasses that
+declare fields and assign them after `super()`; flipping the pin is a runtime
+change to decide separately, not a tidy-up.
+
+## `noUncheckedIndexedAccess`
+
+Plain English: TypeScript can be told that looking something up by index or by
+key — `rows[0]`, `byId[memberId]` — might find nothing. That rule
+(`noUncheckedIndexedAccess`) is permanently on in `tsconfig.json`, because a
+lookup that quietly pretends to have found a value is how a missing tier
+becomes a silent zero. It got there in stages (programme #2694, issues
+#2799-#2802): the errors were recorded behind a temporary ratchet, paid down a
+slice at a time, and the ratchet was deleted once the count reached zero — a
+ratchet whose baseline is empty is a compiler option with extra steps. From
+here it is an ordinary compiler error like any other, caught by
+`pnpm run typecheck` and in the editor.
+
+The Playwright project (`tsconfig.e2e.json`) inherits the flag and has been
+held to it since #3363, so anything that project includes (`e2e/**`, including
+`e2e/setup` and `e2e/tools`, and `playwright.config.ts`) that indexes into
+an array or a keyed record must prove the element is there the same way
+application code does. Only `tsconfig.test.json` — the Vitest project — still
+extends `tsconfig.json` and explicitly turns the flag back off (see the comment
+there). Programme #2694 was scoped to `tsconfig.json` throughout — "application
+code before tests" — and forcing the flag on across the unit tests surfaces a
+large number of pre-existing diagnostics that stage never measured or budgeted.
+The owner parked that as a separate decision on #3363; until it is taken on
+deliberately, new unit-test code is not held to this rule.
+
+**#3363 is the one home for how many.** The count is a measurement rather than
+a fact about the design, so a second copy goes stale silently and nobody can
+tell which copy is wrong — this page deliberately does not restate it, and
+neither should anything else.
+
+**What counts as a fix**, for new code that trips this. A batch with a
+meaningful count of new `!` non-null assertions is a failed batch, not a
+finding to negotiate; the same goes for casts, broad `any`, and suppression
+comments — they spend the effort and buy nothing. A lookup that cannot miss is
+restructured so the type says so:
+
+- read the first element once and let its absence be the emptiness check
+  (`const [first] = xs; if (!first) …`) instead of a separate `length` check
+  followed by an index;
+- `entries()` instead of a counting loop, wherever the index was only ever
+  wanted for a row number or a `sortOrder`;
+- walk adjacent pairs instead of indexing `i + 1`, and iterate `slice(0, n)`
+  instead of counting to `n`;
+- carry a value alongside the object it belongs to instead of in a parallel
+  array read back by position — one array of records instead of two arrays
+  correlated by index;
+- a fixed `slice` (or destructure) where the string's shape is already
+  validated — `YYYY-MM`, `yyyy-MM-dd` — gives a plain `string` with no new
+  refusal, and a malformed value still becomes `NaN` exactly as before;
+- a regex's mandatory capture group: destructure it and let its absence be the
+  pattern's own rejection, rather than indexing the match array;
+- `as const` on a table of `[key, label]` rows — a `string[][]` literal
+  destructures to `string | undefined`, which a computed property name
+  (`{ [key]: … }`, TS2464) and a form lookup both reject; the tuple form also
+  retires the casts often built up around it.
+
+A lookup that can genuinely miss is handled the way the domain says: a missing
+tier is a policy error to surface, a missing capacity row means the lodge has
+no capacity. Where it is genuinely reachable, a test pins the chosen behaviour;
+where it is unreachable, a comment says why in terms a reviewer can check.
+
+Where the type truly cannot carry the proof, the shared guard is `must` in
+`src/lib/indexed-access.ts` — a named throw at the point the invariant is
+assumed, not a fallback value. It is for a lookup the surrounding code already
+guarantees (a fixed-size colour scale, a loop's own bound, a `length === 1`
+check just above it) — reach for it sparingly, after the restructures above
+have been ruled out, and say at the call site why the miss cannot happen.
+
+## The frozen test clock
+
+Plain English: tests are not allowed to know what today's real date is. Every
+test file starts with "today" pinned to **1 July 2026**, and it stays there.
+
+Precisely: `vitest.clock-setup.ts` calls
+`vi.useFakeTimers({ toFake: ["Date"] })` and
+`vi.setSystemTime(2026-07-01T00:00:00.000Z)` in its own module body, for every
+file. The mechanism lives in
+[`../src/lib/__tests__/helpers/clock.ts`](../src/lib/__tests__/helpers/clock.ts).
+
+Two details there are load-bearing rather than stylistic:
+
+- **A module body, not a `beforeAll`.** A `beforeAll` runs only after every
+  module in the file's import graph has already been evaluated. Module-level date
+  constants are real code — `src/components/admin-sidebar.tsx` used to build its
+  unpaid-finished-stays deep link from today's date at import time — and a
+  hook-based freeze left those on the real clock while the tests checking them
+  saw the frozen one. That particular constant no longer exists: #3123 moved it
+  into the render, because a value evaluated once per bundle load was also stale
+  for the life of the browser tab. The hazard is unchanged, because it belongs to
+  module evaluation order rather than to that one file.
+- **Its own setup file, listed first.** A module's imports evaluate before its
+  body, so an install inside `vitest.setup.ts` would still be too late for
+  everything `vitest.setup.ts` imports. Vitest evaluates `setupFiles` in order,
+  so a dedicated first file freezes the clock before any other module in the run.
+
+A root `beforeEach` then re-freezes before each test **if and only if** nothing
+is currently mocking `Date`. Dozens of suites undo their own pin with
+`vi.useRealTimers()` in an `afterEach`; where their later describes have no clock
+hooks, those tests used to drop straight back out of the freeze — the rollover
+canary caught two doing exactly that. A suite that deliberately pinned another
+instant is left completely alone, so this only ever converts "real clock" back to
+"frozen clock", never one pin into another.
+
+The check is `vi.getMockedSystemTime() !== null`, not `vi.isFakeTimers()`,
+because Vitest has two mocked-`Date` states and only one installs fake timers: a
+bare `vi.setSystemTime(...)` called while timers are real mocks `Date` on its own
+and leaves `vi.isFakeTimers()` false. Guarding on fake timers overwrote that kind
+of pin with the default instant.
+
+And what the re-freeze restores is always the **default** instant, never a
+suite's own pin — see rule 4 below.
+
+### Why
+
+Four separate times, CI went red on `main` and on every open pull request at the
+same moment because the calendar moved on — issues #2426, #2401, #2443 and
+#2479. The shape never varied: a suite fixes a date ("a booking on 2026-08-01",
+"a payment link that expires in 48 hours"), the code under test asks the real
+clock, and on the day the real date passes the fixture the suite fails. Nothing
+is in any diff to blame, so whoever is working that morning burns an hour
+proving it is not their fault.
+
+The quieter version is worse. A `expect(res.status).not.toBe(403)` assertion
+that starts passing off an unrelated `400 Cannot book in the past` has stopped
+testing anything at all, and says nothing while it does so (#2443).
+
+Each of the four fixes pinned one suite after it broke. Freezing once, centrally,
+removes the whole class instead.
+
+### Why this instant
+
+`2026-07-01T00:00:00.000Z` is midnight UTC, which is **midday** in
+`Pacific/Auckland`. A CI runner in UTC and a club in NZ therefore agree on what
+calendar day it is, so no date-only fixture becomes zone-dependent — the property
+the #2426/#2401 fixes already relied on. It also sits before every mid-2026
+fixture in the repo.
+
+**It never advances.** There is no per-release bump. Forward-looking risk is the
+canary's job, below (owner decision, 2 August 2026).
+
+### Only `Date` is faked
+
+`toFake: ["Date"]` fakes `Date` and nothing else. `setTimeout`, `setInterval`,
+`queueMicrotask` and `performance.now()` stay real, so awaited promises resolve
+normally and elapsed-time measurements still work. Freezing timers as well would
+hang half the suite; this is the approach #2479 proved on one suite before it was
+generalised.
+
+## Writing a date-bearing test
+
+1. **Write dates relative to 1 July 2026.** A "future" booking is
+   `2026-08-01`; a "past" one is `2026-06-01`. They stay future and past for
+   good.
+2. **Never write a fixture relative to the real clock** — no
+   `new Date(Date.now() + 7 * 86_400_000)` to mean "next week" against a
+   hard-coded expectation. Under the freeze this is deterministic, but it hides
+   which date the test actually means.
+3. **Need a different fixed instant? Pin it in the file, do not opt out.** A
+   suite's own `vi.setSystemTime(...)` in its own `beforeAll`/`beforeEach` wins,
+   because the freeze is already installed by the time any hook runs;
+   `vitest.config.mts` pins `sequence.hooks: "stack"` so the setup file's
+   `afterAll` restore stays last. The `vi.mock("@/lib/date-only", …)` idiom (see
+   `site-banners.test.ts`) also still works and is unaffected.
+
+   The worked example is `nz-today-date-only.test.tsx` (#2682), which pins
+   `2026-06-30T21:00:00.000Z` — 09:00 on 1 July 2026 in New Zealand, and the
+   *previous* UTC day. Its whole subject is that the two disagree, so it also
+   shows the two guards a suite like that needs: it asserts up front that the
+   UTC day and the club day really are different (a fixture that drifted out of
+   the divergence window would otherwise pass vacuously), and it asserts that
+   the environment's zone is still `Pacific/Auckland`, so a contributor doing what rule
+   6 below describes gets one clear environment failure instead of five that
+   read like product bugs. A suite that keeps the DEFAULT instant but hard-codes
+   fixture dates against it should assert that too — `night-occupancy-parity.test.ts`
+   (#2681) pins `getTodayDateOnly()` to `2026-07-01` for that reason.
+
+   The club-zone half of that is a shared helper, so every suite says the same
+   thing and says it before any date assertion runs:
+
+   ```ts
+   import { expectClubTimeZonePremise } from "@/lib/__tests__/helpers/club-time-zone";
+
+   beforeEach(() => {
+     expectClubTimeZonePremise();
+     vi.setSystemTime(divergentInstant);
+   });
+   ```
+
+   Calling it from the `beforeEach` that pins the instant is what makes the
+   explanation arrive first: a wrong `TZ` then fails the hook with one sentence
+   about the environment, instead of failing every test with a bare
+   `expected '2026-06-14' to be '2026-06-15'` that reads like the product bug
+   the suite exists to prove fixed (#2834).
+
+   **A suite whose subject is "the PERSISTED zone is the authority" needs the
+   other helper in that file, and needs it for a measured reason.**
+   `src/lib/__tests__/support/club-time-render.tsx` mounts `ClubTimeProvider`
+   with `CLUB_TIME_TEST_ZONE`, deliberately equal to what `APP_TIME_ZONE`
+   resolves to, so that moving 37 suites onto it changed no expected string.
+   The consequence is that a suite on that default **cannot tell the persisted
+   zone from the environment however much it asserts** — measured on #2870, a
+   mutant hook that ignored the provider entirely failed 0 of 460 assertions
+   across 34 such suites, and of one later group's 49 provider-reading
+   components, 46 were blind. Hand-picking `America/Denver` does not fix it
+   either: it stops discriminating, silently, on a developer whose own zone is
+   already Denver.
+
+   `divergentClubZone` takes the DERIVATION and returns the oracle with it,
+   refusing to return at all unless the answer differs from both wrong ones —
+   `APP_TIME_ZONE`'s (what a provider-blind implementation gives) and the host's
+   own resolved zone (what `getFullYear`/`getMonth`/`getDate` give). Those two
+   are different on the CI runner, which resolves `UTC` while `APP_TIME_ZONE`
+   falls back to `Pacific/Auckland`, so checking one is not checking the other.
+
+   ```ts
+   import { divergentClubZone } from "@/lib/__tests__/helpers/club-time-zone";
+
+   const { zone, expected, environmentAnswer, hostAnswer } = divergentClubZone(
+     (z) => clubCalendarDateOf(instant, z),
+   );
+   expect(subjectUnderTest(instant, zone)).toBe(expected);
+   expect(expected).not.toBe(environmentAnswer);
+   expect(expected).not.toBe(hostAnswer);
+   ```
+
+   **Put a CALENDAR-DAY fixture instant in the 10:00-11:00 UTC hour.** Three
+   calendar days exist on earth simultaneously only while the UTC hour is 10
+   (`UTC+14` has turned over and `UTC-11` has not); at every other hour there are
+   two, and both can already be taken — one by `APP_TIME_ZONE`, one by the host —
+   leaving nothing for the helper to pick. Measured on the CI shape, a fixture at
+   21:00 UTC refuses every candidate and the same fixture at 10:30 UTC resolves on
+   the first. A derivation with more possible answers (a wall-clock hour, a
+   formatted time, an instant) works at any hour. A suite deriving the club's
+   TODAY pins its own instant, because the repository's frozen clock is at 00:00
+   UTC. `src/lib/__tests__/calendar-divergence-premise.test.ts` is the worked
+   example, and it also shows how to prove the premise holds on each host shape
+   rather than only the author's.
+
+   **The chooser's own guard has a test, and it needs a mocked environment zone
+   to have one.** `src/lib/__tests__/helpers/club-time-zone.test.ts` is the only
+   place that pins the environment's zone, by mocking the one-export
+   `helpers/environment-club-zone.ts` (it was `APP_TIME_ZONE` in the
+   `src/config/operational.ts` #3567 deleted), and the reason is worth knowing
+   before writing a similar guard: on a machine where `TZ` is unset and the
+   system zone is New Zealand, the host and the environment resolve to the SAME
+   zone, so the two halves of "differ from both rivals" are the same assertion
+   and dropping one changes nothing. Measured on #2870, deleting the host half
+   killed **0 of 124** across every importing suite. The two rivals have to be
+   made to disagree, and the value is read once at module load, so only a module
+   mock moves it.
+
+   **A pin read at module load needs a re-imported graph, not `withTimeZone`.**
+   `withTimeZone` moves the process's zone for the duration of a call, which
+   catches arithmetic evaluated per call — but a module-level
+   `Intl.DateTimeFormat` is built once at import, so a wrong `timeZone` pin on one
+   survives it. `vi.resetModules()` plus a dynamic `import()` under a pinned `TZ`
+   re-evaluates the module under test and catches it; assert inside the block
+   that the zone really moved, or the test proves nothing. Both mechanisms
+   are used together in `calendar-client-club-time.test.ts` and
+   `calendar-recurrence.test.ts`, and a review measured what happens when only one
+   file has the second: the identical wrong pin killed 1 in the file that had it
+   and **0** in the file that did not.
+4. **Do not hand the clock back to the real calendar.** If your suite pins its
+   own instant and wants to undo that, `vi.useRealTimers()` in an `afterEach` is
+   safe — the root `beforeEach` re-freezes before the next test — but never rely
+   on real time being restored, and never call it expecting later tests in the
+   file to see the real date.
+
+   One sharp edge if you do **both**: the re-freeze restores the **default**
+   instant, not your pin. A suite that pins once in a `beforeAll` and also hands
+   the clock back therefore keeps its instant only until the first handback —
+   every test after that silently runs at 1 July 2026. Pin in a `beforeEach`
+   instead when your suite does both.
+5. **Measuring how long something took? `Date.now()` is no longer a stopwatch.**
+   Under the freeze it is a constant, so `Date.now() - before` is always `0` —
+   which makes an "it waited long enough" assertion fail and, far worse, makes an
+   "it did NOT wait" assertion pass vacuously. Use the shared helper:
+
+   ```ts
+   import { realElapsedMs } from "@/lib/__tests__/helpers/clock";
+
+   const before = process.hrtime.bigint();
+   await shouldNotHaveWaited();
+   expect(realElapsedMs(before)).toBeLessThan(20);
+   ```
+
+   `pnpm run lint` reports a `Date.now()` stopwatch or deadline in a Vitest
+   file (`test-clock/no-date-now-elapsed`, #4462): `Date.now()` measured against
+   an earlier `Date.now()` reading held inline or in a plain variable.
+
+   `process.hrtime.bigint()` is monotonic, so neither the freeze nor the canary's
+   libfaketime shim touches it. `performance.now()` also stays real, but it is
+   only safe when **the code under test does not read it too** — otherwise a
+   suite that later installs blanket fake timers moves the guard and its test
+   together and the assertion passes without anything having waited.
+   `member-guest-probe-guard.test.ts` measures its privacy timing floor with
+   `process.hrtime.bigint()` for exactly that reason: the guard itself reads
+   `performance.now()`, so the test deliberately measures with a different API.
+
+   A stopwatch is for "it did not wait", never for "real work was fast
+   enough": runner speed varies, so that bound fails busy CI (#5213). To prove
+   a real-PostgreSQL transaction body fits its budget, run that body on the
+   production budget constant (`LOCK1_HOLDER_TRANSACTION_BUDGET`) and assert
+   it commits: Prisma rolls back a body that outruns `timeout`. The proof
+   covers only the work the test puts in the transaction. The 40-child group
+   settle case in `booking-ledger-journal.realdb.test.ts` proves the 40 R01
+   postings fit, not the whole settle, which also upserts payments, flips each
+   child to PAID and reconciles beds in the same budget (#5350). Its failure
+   message reports the time to start, the wait for lock(1) and the body, and
+   names any other backend holding lock(1) as it began to wait (through
+   `onTestFailed` when Vitest's own timeout ends the test first: in a local
+   probe on Prisma 7.10.1, `timeout` did not interrupt a blocked lock wait);
+   keep those diagnostics out of the verdict.
+6. **Remember the environment's zone follows `process.env.TZ`.** The seed
+   reader (`club-time-zone-env.ts`) answers `TZ || NEXT_PUBLIC_TZ ||
+   "Pacific/Auckland"` whenever no zone is stored — which is every unit test
+   that does not mock the stored zone. Setting `TZ=UTC` to simulate the CI runner
+   therefore also moves such a suite's *club* zone to UTC, so a timezone bug can
+   silently pass. To reproduce a UTC runner with an NZ club, supply
+   `"Pacific/Auckland"` as the club's zone explicitly as well.
+
+   **Do not set `TZ` from Git Bash — it is a silent no-op, and this advice used
+   to send you straight into it.** Measured independently by three lanes on epic
+   #2988 and re-measured on #2991: Git Bash on Windows drops any `TZ` value
+   containing a `/`, so the variable arrives as `undefined` and the process keeps
+   the machine's own zone.
+
+   ```
+   $ TZ=UTC node -e "console.log(process.env.TZ)"              # UTC
+   $ TZ=America/Denver node -e "console.log(process.env.TZ)"   # undefined
+   $ export TZ=America/Denver; node -e "console.log(process.env.TZ)"  # undefined
+   ```
+
+   That is the worst possible shape: the zone with no slash works, so the lever
+   looks live, and every zone that would actually discriminate is dropped. A
+   matrix built on it reports six rows and measures one. `MSYS_NO_PATHCONV`,
+   `MSYS2_ARG_CONV_EXCL` and a leading `//` were all tried and none of them
+   helps.
+
+   **The levers that do work.** From PowerShell, `$env:TZ = "America/Denver"`
+   propagates correctly, so a whole-process run under one zone is available there.
+   In-process — which is what a matrix wants — assign `process.env.TZ`, through
+   `withTimeZone`/`withTimeZoneAsync` (rule 7 below), and use
+   `vi.resetModules()` plus a dynamic `import()` for anything frozen at module
+   load. `host-process-zone-matrix.test.ts` and
+   `browser-viewer-zone-matrix.test.ts` are the worked examples, and each asserts
+   its rows really diverge before asserting anything else.
+
+   **Since CT-1 (#2989) that is true of the seed and NOT of a stored club
+   timezone**, and the difference is the whole point of the change. The
+   club's civil time is the persisted `ClubTimeSettings.timeZone`, read
+   through `getClubTimeZone()` (`src/lib/club-time-zone-settings.ts`), and
+   `process.env.TZ` cannot move it once a row exists — `INV-CONFIG-002`. So a
+   suite covering club-time behaviour sets the persisted value; since #3567
+   there is no environment constant left for a display call site to read. If you are writing a test that
+   proves the database beats the environment, **prove the environment read is
+   live in the same file**: assert that with no persisted row the reader really
+   does return the environment's zone. Without that leg the first assertion
+   cannot tell a real precedence rule from an environment read that never
+   happens — the same vacuous-pass shape rule 5 warns about for `Date.now()`.
+7. **Restoring `process.env.TZ` is never a bare `delete` (#2485).** Node only
+   re-derives its resolved timezone when `process.env.TZ` is *assigned*;
+   deleting the variable removes it from the environment but leaves the
+   last-assigned zone cached, so a suite that pins a zone and deletes it on the
+   way out leaks that zone into whichever suite the runner schedules next in
+   the same worker. Use the shared helper instead of ad-hoc save/restore code:
+
+   ```ts
+   import { captureHostTimeZone } from "@/lib/__tests__/helpers/timezone";
+
+   const hostTimeZone = captureHostTimeZone();
+
+   afterEach(() => {
+     hostTimeZone.restore();
+   });
+   ```
+
+   For a single pinned call, `withTimeZone`/`withTimeZoneAsync` (same module)
+   wrap the capture-set-run-restore sequence. `captureHostTimeZone()` must run
+   BEFORE anything in the file assigns `process.env.TZ` — module top level, or
+   the top of a `describe` block, both of which run before any hook or test
+   body. See `src/lib/__tests__/helpers/timezone.ts` for the full mechanism and
+   `src/lib/__tests__/helpers/timezone.test.ts` for a proof the leak is real
+   and that the helper closes it.
+
+## Opting a file out
+
+A file that genuinely needs the real wall clock calls the shared helper once at
+module top level, with a reason:
+
+```ts
+import { optOutOfFrozenClock } from "@/lib/__tests__/helpers/clock";
+
+optOutOfFrozenClock("measures real elapsed time across the retry backoff");
+```
+
+The call hands the real clock back on the spot. One honest limitation: ES module
+imports are hoisted, so the file's own imports still evaluate under the freeze —
+if a module-level constant in your import graph must see the real clock, read it
+inside a test instead.
+
+The reason is required — an empty one throws — and the file must also be added
+to the allowlist in
+[`../src/lib/__tests__/frozen-test-clock.test.ts`](../src/lib/__tests__/frozen-test-clock.test.ts),
+which pins both the exact list of opted-out files and their count. That contract
+test is what keeps the opt-out honest: widening it is always a deliberate diff a
+reviewer sees, never a quiet default. It scans **every** module under the
+collected roots, not only files named `*.test.ts` — the opt-out's effect is
+module state, so a call in a shared helper would otherwise switch the freeze off
+for every suite importing it without appearing in the allowlist at all.
+
+Before adding one, check that you actually need the **real** date rather than a
+**different** one — case 3 above needs no opt-out at all. A file that mixes
+real-time and frozen-time tests gets split into two files rather than opted out
+wholesale.
+
+`frozen-test-clock-opt-out.test.ts` is the one standing entry: it exists so the
+opt-out path is itself exercised, and asserts only that its clock advances —
+never what the date is.
+
+## The rollover canary
+
+The freeze is not airtight by construction: a file can opt out, and code can
+reach a date through a path the freeze does not cover. So
+`.github/workflows/clock-rollover-canary.yml` re-runs the whole unit suite with
+the machine's **real** clock wound forward by **a day, a month and a year**, as
+three parallel matrix jobs, and **fails when the suite fails** under the shifted
+clock (after `--retry=2`).
+
+Two limits worth knowing. It does not compare results against a baseline run, so
+a test that changes fail→pass is not reported; and the retry, which exists to
+absorb libfaketime's slowdown, means only a repeatable failure is reported — a
+date dependence that surfaces on one ordering in three can be retried green. A
+test that really reaches the real calendar fails on every attempt, because the
+clock is shifted for the whole run, so the retry does not soften that signal.
+
+The acceptance criterion in plain English: winding the real system clock forward
+by a year must not break the suite. A properly frozen test cannot notice the
+canary at all — it still sees 1 July 2026. What notices is anything that escaped
+the freeze, which is exactly the population that will go red on its own one day.
+
+The shift uses [libfaketime](https://github.com/wolfcw/libfaketime) rather than
+setting the runner's system clock: no VM-wide side effects, no fight with NTP
+resync, and `FAKETIME_DONT_FAKE_MONOTONIC=1` leaves monotonic clocks real so
+timers, awaited promises and `performance.now()` behave normally. A dedicated
+step proves the shift actually reaches Node's `Date` before the suite runs,
+because a canary whose clock shift silently failed would report green while
+checking nothing.
+
+- It runs on **pushes to `main`** and on a **nightly schedule** (14:00 UTC =
+  02:00 NZST), plus manual `workflow_dispatch`.
+- It **fails loudly** there, and writes a job summary explaining that the
+  triggering commit is almost certainly not the cause.
+- It is **never a pull-request check** (owner decision, 2 August 2026). The
+  workflow has no `pull_request` trigger, so it cannot become a required check
+  and cannot block unrelated work on a problem that is, by construction, not
+  urgent yet.
+
+A red canary means some test still reaches the real calendar. Fix the test so it
+reads the frozen clock; do not opt the file out.
+
+**It runs the UNIT suite only, and that blind spot has already cost a red
+`main`.** The browser suite has no frozen clock — see the next section — so on
+31 August 2026 the canary passed on the very commit whose `Playwright E2E` job
+was failing on a month rollover (#3221). `libfaketime` cannot close that gap by
+itself either: it shifts ONE process, and the app the browser suite drives is a
+**container**, which reads the host kernel clock. Shifting only the Playwright
+process would move the runner away from the app, which is the bug rather than a
+test of it. The browser suite's own wound-forward run is
+`.github/workflows/e2e-rollover-proof.yml`, described below.
+
+Reproduce a canary job locally on Linux:
+
+```bash
+sudo apt-get install -y faketime
+# -f is required: without it the offset is parsed by `date -d`, which rejects it.
+# The raised timeouts and the retry are the libfaketime tax — every clock call
+# and every subprocess spawn goes through the LD_PRELOAD shim. A test that really
+# reaches the real calendar fails on every retry, so this does not soften the
+# signal; only a slowness flake passes.
+FAKETIME_DONT_FAKE_MONOTONIC=1 faketime -f '+366d' \
+  pnpm test --testTimeout=30000 --hookTimeout=30000 --retry=2
+```
+
+### Any workflow that runs the suite must check out full git history
+
+Part of the unit suite shells out to `git` against **this repository's own
+commits**. `scripts/ci/check-doc-index-integrity.test.mjs` is the clearest case:
+it builds a real `pull_request` payload out of `HEAD^1` and `origin/main` so the
+doc-index CLI is exercised against commits that exist rather than against a
+fixture. `actions/checkout` clones at depth 1 by default, and a depth-1 clone has
+neither — no second commit, and no remote-tracking `origin/main`.
+
+When that happens the tests fail with a raw
+`fatal: ambiguous argument 'HEAD^1': unknown revision or path not in the working
+tree`, several frames inside a helper, naming nothing that points at the
+checkout. So the failure reads as a bug in whatever commit triggered it.
+
+It has happened. The canary ran the suite on a depth-1 clone while `verify`
+checked out in full, so the breakage passed all eight required checks, merged,
+and reddened `main` — once per clock offset in the matrix (#2907). Nothing then
+stopped the two diverging again, and the divergence is invisible everywhere
+anyone would look: the canary has no `pull_request` trigger, so no PR check sees
+it, and a developer's clone has full history exactly like `ci.yml`, so a local
+run cannot see it either.
+
+`pnpm run ci:workflowcheck` (`scripts/ci/check-workflow-suite-checkout-depth.mjs`,
+a step in the `verify` job) is what keeps them matched. It parses
+`.github/workflows/*.yml`, works out from the parsed shell command which jobs run
+the **whole** suite — wrapped invocations included, which is why the canary's
+`faketime -f '${{ matrix.offset }}' pnpm test …` counts — and fails when such a
+job has no `actions/checkout` step with `fetch-depth: 0`. A job that runs only
+**targeted** files (`pnpm exec vitest run <path>`) needs full history only when one of
+those files reads the repository's own history, which is why `migration-drift`
+and `data-migration-verification` are correct checking out shallow.
+
+The fix when it fails is `fetch-depth: 0` on that job's checkout step. It is
+**not** making the test skip when history is missing: a test that quietly
+disappears in one workflow is how this whole class of gap hides, and the
+surviving workflow's green then certifies nothing about it (#2907, #2909).
+
+### Moving the frozen instant locally
+
+Separately from the canary, two environment variables move the **frozen** instant
+itself. They are a local diagnostic — the canary does not use them, because
+moving the frozen date tests something else entirely (whether fixtures survive a
+different "today") and would fail suites that are perfectly correct.
+
+| Variable | Meaning |
+| --- | --- |
+| `TEST_CLOCK_OFFSET_DAYS` | Whole days added to the frozen instant. May be negative. |
+| `TEST_CLOCK_ISO` | An absolute ISO-8601 instant replacing the frozen one entirely. |
+
+```bash
+# Reproduce a specific rollover — this is the date #2443 predicted would break
+# the two subscription-gate suites, and it does.
+TEST_CLOCK_ISO=2026-12-02T00:00:00.000Z pnpm exec vitest run \
+  src/lib/__tests__/phase2-guest-subscription.test.ts
+```
+
+A malformed value fails the run rather than falling back to the frozen instant —
+falling back would report green while checking something other than what you
+asked for, which is the same vacuous-pass failure this whole convention exists to
+prevent.
+
+## The browser suite's clock discipline (it is NOT frozen)
+
+Plain English: the Playwright suite runs against a real clock, on purpose. What
+it is not allowed to do is ask the **machine** what day it is. It asks the
+**club**.
+
+Everything above this heading is about the unit suite. `vitest.clock-setup.ts`
+never runs for a browser spec, there is no `optOutOfFrozenClock` there, and
+`page.clock` is not used. That is a decision, not an omission (#3221):
+
+- The stack the suite drives is real. The app derives its civil date server-side
+  through `club-time` from the persisted `ClubTimeSettings.timeZone`, and the
+  E2E seed fills that from `TZ=Pacific/Auckland` in `docker-compose.yml`. The
+  seeded fixtures are **relative to the real today** by design (#2117, because
+  fixed seed dates rotted CI red). Pinning only the browser would put the browser
+  in one time and the server and seed in another — a new disagreement, not a
+  removed one.
+- The runner and the browser sit in **UTC** while the club sits in **NZ**, and
+  keeping them apart is load-bearing: it is what makes the suite prove
+  continuously that the app never reads the *browser's* clock. That was a live
+  defect (CT-4, #2870 — a member booking from London at 10am New Zealand time saw
+  yesterday as "today"), and a browser pinned to club time would be blind to it.
+
+### The rule
+
+**Every relative fixture date a browser spec derives comes from the club's
+day captured for that prepared E2E stack**, which is `E2E_TODAY_NZ` /
+`relDateOnly` in [`../prisma/e2e-fixtures.ts`](../prisma/e2e-fixtures.ts).
+`scripts/e2e-stack.sh prepare` captures it before seeding; `run` reads the same
+ignored date file and exports `E2E_FIXTURE_TODAY_NZ` to Playwright. Without a
+shared date, a run crossing club midnight can move a Monday-aligned fixture a
+whole week between the seed and spec (#3702). Direct imports without the
+environment variable read the current club date through `Intl` with an explicit
+zone. Date arithmetic is `shiftDateOnly` from the same module. A spec
+that calls `new Date()` and reads `getFullYear()`/`getMonth()`/`getDate()` off it
+is reading the **runner's** calendar, which is a different day from the club's for
+roughly the last twelve hours of every UTC day — and on the last day of a month,
+a different **month**.
+
+That is what reddened `main` at 2026-08-31T14:30Z, green on the same commit that
+morning: `admin-retroactive-booking.spec.ts` told the booking calendar it was
+already showing August while the app had correctly opened on September. It was
+the fifth clock-rollover incident here (#2426, #2401, #2443, #2479 were the four
+unit-side ones that bought the frozen clock).
+
+### What enforces it
+
+| Guard | What it holds |
+| --- | --- |
+| [`e2e-club-day-census.test.ts`](../src/lib/__tests__/e2e-club-day-census.test.ts) | The **structural** half. Sweeps every `.ts` under `e2e/`: no argument-less `new Date()` outside a counted allowlist of *instant* writes, no local-zone `getFullYear`/`getMonth`/`getDate`/`getDay`, no hand-rolled `setUTCDate` arithmetic, and the one clock read still names its zone. |
+| [`e2e-club-day-boundary.test.ts`](../src/lib/__tests__/e2e-club-day-boundary.test.ts) | The **behavioural** half. Re-imports the E2E date space with the clock parked at the instant that failed, plus a year boundary and both NZ daylight-saving switches, under **two** host zones — because a single-zone check passes vacuously on a laptop already in New Zealand. |
+| [`e2e-calendar-navigation.test.ts`](../src/lib/__tests__/e2e-calendar-navigation.test.ts) | That `walkCalendarToMonth` still derives its own direction from the month the calendar is showing, and that the retroactive spec's hop bound stays tight enough to be a real check. |
+
+All three are **disk-scanning**: they read `e2e/` from the filesystem, so they
+have no import edge to the files they scan and `pnpm run test:related` can never
+select them from a diff. Run them by name when a change touches `e2e/`.
+
+### The walk reads the calendar rather than being told
+
+`walkCalendarToMonth` (`e2e/helpers/calendar-navigation.ts`) used to take a
+`direction` its caller computed from the date it believed the calendar had opened
+on. A caller can only get that right by guessing the club's day, so the argument
+could only ever be wrong; it is gone. The walk reads the displayed month heading,
+hops the way it needs to, and waits for the heading to change before reading it
+again.
+
+What that removed — the old assertion that the caller's expectation was *right* —
+now lives in `maxHops`. A caller that believes it is at most one month away
+passes `maxHops: 1`, and a walk that needs four fails naming both the month it
+could not reach and the one it is stuck on. **Keep the bound tight**: it is the
+only remaining check on the caller's belief.
+
+### Proving it, rather than arguing it
+
+[`.github/workflows/e2e-rollover-proof.yml`](../.github/workflows/e2e-rollover-proof.yml)
+sets the **runner VM's** clock into the hazard window — a chosen instant, or the
+next month-end at 14:30 UTC — and runs the date-bearing browser specs against a
+stack started under that clock. The whole VM moves, so the app container, the
+database seed and the Playwright process stay on one clock; that is why it cannot
+be a `libfaketime` job like the unit canary.
+
+It runs **weekly (Sundays, 15:20 UTC), plus once on the 27th of each month**, and
+can be dispatched by hand at any time (owner decision, 2 September 2026, #3238).
+It was dispatch-only until then, while it was unproven; it now has clean runs
+behind it. It has no `pull_request` trigger and must never gain one — that is what
+keeps it from ever becoming a required check and blocking unrelated work on a
+clock this repository does not control.
+
+**The parked instant does not vary between runs.** The job always targets the end
+of the *current* UTC month at 14:30Z, so every scheduled run within a month parks
+at the same instant; what changes between them is the **code**. So the schedule
+buys "tell me a newly-merged spec has this defect, before a real rollover does" —
+not more instants. That is why weekly is enough and nightly would mostly re-prove
+the same thing. The run on the 27th exists because weekly alone can miss the last
+few days of a month, which is exactly when missing it is expensive.
+
+The day-to-day protection remains the three guards above, which run on every pull
+request and catch the defect on the change that introduces it. This job only ever
+sees what escapes all three.
+
+#### What the proof does not cover, and why it cannot
+
+**The payment specs are held out of the shifted run.** Moving the whole VM moves
+the app container with it, and the app then makes a real outbound call to
+`api.stripe.com` while a spec drives it. Stripe's certificate is not valid a
+month from now, so Node refuses the handshake with `CERT_HAS_EXPIRED`, the
+payment intent is never created, the Payment Element never mounts, and the spec
+times out waiting for an iframe that was never going to appear. **No clock shift
+can fix that** — the certificate is not ours to reissue — and a job whose normal
+state is red is a job nobody reads, so the specs come out of the run instead
+(#3227, owner decision 2 September 2026).
+
+Two things follow, and both are costs rather than details:
+
+- The **payment journeys are never exercised under a shifted clock.** They are
+  covered by `Playwright E2E` on every pull request, at the real date.
+- A spec is held out **whole**, so any non-payment test sharing its file goes
+  with it. Today that is the first three tests of
+  `locked-out-pickup-and-pay.spec.ts`, which are date-bearing. The alternative —
+  skipping individual tests from inside the Stripe helper — was rejected because
+  it puts a new false-green surface into the helper that the *required* E2E
+  checks also load.
+
+The held-out list is **derived from the imports**, exactly as the `date-bearing`
+scope is: it is every spec importing `e2e/helpers/stripe`, so a third payment
+spec is covered the day somebody writes it and there is no list to go stale. The
+job prints what it held out, refuses to run if that set is empty or larger than a
+quarter of the suite, and — because a run that narrowed further than it said
+would report green while proving very little — lists the tests twice, once with
+the exclusion and once without, and fails unless the difference is exactly the
+files it named and the unexcluded listing is the size the scope accounts for.
+
+The exclusion is applied by `testIgnore` in
+[`../playwright.config.ts`](../playwright.config.ts), reading `E2E_EXCLUDE_SPECS`,
+and **not** by a file argument on the command line. It cannot be a file argument:
+Playwright runs a project's *dependencies* in full, ignoring the filter, so naming
+`pre-setup/` (which depends on `chromium`) pulls the whole chromium project back
+in and the exclusion evaporates. `testIgnore` decides what is in a project at all,
+before any filtering. The variable is unset in CI and on a laptop, so every
+ordinary run is unchanged.
+
+## Asserting that a recovery alert holds focus
+
+The other convention that is load-bearing rather than stylistic, for the same
+reason as the frozen clock: written the obvious way, the assertion reports green
+or red on something other than what it claims to check.
+
+Admin, member and public surfaces render a **permanently mounted** `role="alert"`
+that a failed action populates and then takes focus, so a keyboard or
+screen-reader user is not left on a control that has just been re-enabled while
+the explanation appears elsewhere on the page. Nearly all use
+`src/components/focused-action-error.tsx` (grep for `<FocusedActionError` for
+the current list); `policy-exception-requests-panel.tsx` and `roster-editor.tsx`
+call the same failure primitive directly through `useActionAttention`. Since #2934 every one of them focuses and scrolls through
+`src/hooks/use-scroll-to-feedback.ts` — see "Attention after an action" below.
+A component that holds its own failure takes the message and the counter that
+re-fires an identical repeat from `useActionFailure`
+(`src/hooks/use-action-failure.ts`); test a repeat by failing twice with the
+same message and asserting the alert holds focus each time.
+
+Assert that contract with the shared helper, never by hand:
+
+```ts
+import { expectRecoveryAlertToHoldFocus } from "@/lib/__tests__/helpers/focus";
+
+fireEvent.click(screen.getByRole("button", { name: "Confirm Booking" }));
+await waitFor(() => expect(alert).toHaveTextContent(RETRY_MESSAGE));
+await expectRecoveryAlertToHoldFocus(alert);
+```
+
+### Why not by hand
+
+Both obvious spellings are wrong, and this repository shipped both before #2635.
+
+**A synchronous `expect(document.activeElement).toBe(alert)`** taken straight
+after a `waitFor` on the alert's text passes only by luck. The component focuses
+in a passive effect, which React flushes in a Scheduler task *after* the commit
+that puts the message in the DOM. Measured on this stack: at the
+mutation-observer checkpoint where `waitFor`'s callback first succeeds, focus had
+landed in **0 of 30 runs**, arriving exactly one event-loop turn later. The
+assertion survived only because React Testing Library's `asyncWrapper` happens to
+drain one `setTimeout(0)` before handing control back — a one-turn margin inside
+a library internal that nothing guarantees. A loaded CI runner is enough to lose
+it, and `main` went intermittently red on a commit that passed on a rerun of the
+identical SHA.
+
+**A bare `await waitFor(() => expect(document.activeElement).toBe(alert))`** is
+not the fix either. `waitFor` resolves on the first poll where the condition
+holds, so focus that lands and is then stolen by a later commit passes it — a
+weaker guarantee than the one being claimed. #2618 relaxed the member-facing
+waitlist card to this spelling to dodge the race above, and an earlier review
+recorded that as a finding rather than a fix.
+
+`expectRecoveryAlertToHoldFocus` asserts both halves: it waits for focus to
+arrive, then settles every pending render and effect and re-asserts
+synchronously. So it depends on no ordering between React's flush and the test
+runner's drain, and it fails if the focus does not stay.
+
+### The related trap: `findByRole("alert")` on a permanently mounted alert
+
+Because the live region is mounted **empty** from the start,
+`await screen.findByRole("alert")` matches it immediately and waits for nothing.
+Any text assertion on the next line inherits the same one-turn margin. Wait for
+the text, not the element:
+
+```ts
+const alert = await screen.findByRole("alert");
+await waitFor(() => expect(alert).toHaveTextContent("Payment Error"));
+```
+
+### Wait for the loaded state, not a container that is also the loading state
+
+The same one-turn margin catches a wait for a container that a component
+renders both while it loads and after. `ManualRefundTaskQueue` shows its
+`manual-refund-task-queue` card while `tasks === null`, so
+`waitFor(() => screen.getByTestId("manual-refund-task-queue"))` passes on its
+first check, and the rows the next line reads exist only if the fetch landed
+inside Testing Library's single drain. A loaded runner lost that race on `main`
+(#5357) and on a pull request (#5430), each time with the card holding only
+"Loading…". Wait for the loading state to end instead. For this queue, call
+`waitForManualRefundQueueLoaded()` from
+`src/lib/__tests__/support/manual-refund-task-queue-loaded.ts` straight after
+`render`. It first checks that "Loading…" is on screen, so it cannot pass
+without waiting if that copy changes.
+
+### Do not make the component's effect a layout effect
+
+It looks like the tidy fix — focus in the same commit as the message, no window
+at all — and it regresses the surfaces that raise their failure from inside a
+closing dialog, to exactly the outcome the component exists to prevent. Radix's
+focus scope traps focus inside an open dialog and releases it from a *passive*
+effect cleanup, restoring focus to whatever was focused when the dialog opened.
+Those surfaces batch "close the dialog" and "record the failure" into one commit,
+so a layout effect focuses the alert while the closing dialog's content is still
+mounted: the trap steals it back and the release then hands focus to the control
+that opened the dialog — or to `<body>` under a synthetic click, which does not
+focus its button. `focused-action-error-focus-contract.test.tsx` pins this
+deliberately; so, incidentally, does `deletion-requests-client.test.tsx`.
+
+## Attention after an action: one primitive, and how to test a call site
+
+Where the admin's attention goes after an action — a failure, an editor they
+opened, a save that changed the screen — is decided once, in
+`src/hooks/use-scroll-to-feedback.ts` (#2934). **The rule itself is written out
+in that module's docblock and nowhere else**: which primitive each outcome uses,
+why the reveal key is a required argument, what reduced motion does, and what
+the census does and does not hold. This section is about TESTING a call site,
+and deliberately does not restate it.
+
+Testing a call site is the same four assertions each time, and each is
+discriminated by a named test in the tree already:
+
+- **Failure**: `expectRecoveryAlertToHoldFocus(alert)` above — the element the
+  surface anchors, which is the populated box rather than a permanently mounted
+  wrapper when the two differ (`refusal-reload-order.test.tsx`).
+- **Reveal**: `expectRevealed(spy, region)` from the same helper file, with the
+  spy from `installScrollIntoViewSpy()` — the region holds focus, it is what was
+  scrolled, and the total count is what the assertion pins. Then re-render the
+  open editor (toggle a control) and assert the count did not move
+  (`allocation-preferences-section.test.tsx`). Find the region by its ROLE and
+  NAME, not by reading `document.activeElement`: a reveal target that announces
+  only "group" is the defect, and `getByRole("region", { name })` is what fails
+  when the name goes missing. Do not hand-roll the spy — jsdom implements no
+  layout, so `Element.prototype.scrollIntoView` does not exist, and three files
+  had written the same fixture out verbatim before it moved to the helper. A
+  staged section's Edit reveals on its own (#4115), so there press Edit as a
+  keyboard user does and `expectToHoldFocus` its first field — the one the edit
+  enabled, not a control that was already live
+  (`group-discount-section.test.tsx`, `list-editor-focus-return.test.tsx`).
+- **Success**: `document.activeElement` is the page or card whose top was
+  positioned at, and it contains the confirmation
+  (`lodge-capacity-card.test.tsx`). A card below the top of its scroll container
+  is REVEALED rather than reached by scrolling that container to zero, so assert
+  `scrollIntoView` on the card there and `scrollTo` on the container only for a
+  page wrapper (`use-scroll-to-feedback.test.ts`). A surface whose success closes
+  a Radix dialog cannot assert focus at all — the dialog's focus release wins, by
+  design, and the scroll still happens — so assert the scroll there.
+- **Return** (applies to staged sections — `useSectionEditState`, or
+  `useEditorFocusReturn` for a list whose row editor is its own component — and
+  to a list row's direct write, `useRowActionFocusReturn`): operate Save, Cancel
+  or the action as a keyboard user does — `focus()` the control, then click it —
+  and `expectToHoldFocus(target)` from the same helper file, finding the
+  re-rendered target by role and name
+  (`use-section-edit-state.test.tsx`, `allocation-preferences-section.test.tsx`,
+  `list-editor-focus-return.test.tsx`; a row's direct write in
+  `row-action-focus-return.test.tsx`). jsdom never drops focus from a control
+  that becomes disabled, so a failed-save return is tested by blurring to the
+  page inside the save, as a browser would (#4087); jsdom will not blur a
+  DISABLED control either, so park focus on a throwaway control and remove it
+  (#4116).
+
+`admin-attention-primitive-contract.test.ts` is the census that keeps the admin
+tree and the member `/book` wizard (#4945) routed through the module: a direct
+`scrollIntoView` / `scrollTo`, or a focus deferred to `requestAnimationFrame`,
+fails it, and its exclusions are listed beside the primitive in
+`DIRECT_SCROLL_EXCLUSIONS`, each with the exact number of direct scrolls it
+covers, so a second scroll in an excluded file fails too. A bare effect-driven
+`.focus()` passes it, which is a stated limit rather than an oversight — the
+module says why, and names the four surfaces that still hand-roll their
+attention. It scans the tree from disk, so `pnpm run test:related` cannot reach
+it; run it by name when a censused file gains a scroll or a focus.
+
+## A fake store applies `where` through one evaluator
+
+A fake `prisma.model.findMany({ where })` has to answer the way PostgreSQL
+would, or the test driving it passes for a reason unrelated to its claim: a
+`where` clause the double silently skips makes a "not related" test green while
+the production query relates the two rows. The one home for that interpretation
+is
+[`src/lib/__tests__/support/prisma-where.ts`](../src/lib/__tests__/support/prisma-where.ts)
+— `matchesWhere(row, where)` — and a suite that needs a fake store imports it
+rather than writing its own (#3434 retired nine hand-rolled copies, each
+supporting a different slice of the grammar). It models the scalar operators,
+`AND`/`OR`/`NOT`, the to-one and to-many relation filters and a compound-unique
+key — `startsWith` and `contains` as the unescaped `LIKE` Prisma sends, so `_`
+and `%` are wildcards and a backslash escapes, as `exactPrefix` relies on (#4165;
+`audit-query-exact-prefix.realdb.test.ts` checks it against PostgreSQL) — and it **throws**, naming the operator and the column, on anything it does
+not — including a column the fake row never carried, which is how a
+`storeMember` fixture one self-relation column short of the merge's sweep was
+found. Teach it a new operator in that file, with a case in
+`prisma-where.test.ts`, never in the suite that needed it; a store that
+resolves relations through foreign keys or a model spec passes the `relation`
+and `column` options instead of forking the evaluator (the booking-evidence
+double is the worked example).
+
+## A mutation probe is a change you have to undo
+
+`AGENTS.md` requires every new guard to be mutation-verified: break the thing
+the guard exists to catch, confirm the suite goes red, **then restore the
+mutation and re-run**. The restore is the half that gets skipped, and a probe
+left in the tree is a shipped defect wearing a green suite — the suite is green
+precisely because the guard is still working on code you no longer meant to
+ship.
+
+Two traps make the restore less reliable than it looks:
+
+- **Check the restore against the repository, not against your own backup.**
+  `git diff` before committing is the only check that cannot agree with itself.
+  A hash comparison against a copy you made is satisfied by a probe that never
+  landed at all, which is the same vacuous pass the frozen-clock section is
+  about.
+- **On Windows, prove the probe landed where you think.** .NET's working
+  directory is not PowerShell's: `[IO.File]::ReadAllText("AGENTS.md")` after a
+  `Set-Location` into a worktree reads and writes the file of the **original**
+  directory, so a probe run from a worktree can silently mutate — or, worse,
+  no-op against — a different checkout. Use absolute paths, and assert the
+  mutated text actually differs before you run the suite.
+
+## A shell-out suite fails on Windows for a reason that is not load
+
+Four suites prove a real `bash` gate by running it against a throwaway fixture:
+`review-findings-contracts.test.ts`, `blue-green-ledger-lint.test.ts`,
+`data-migration-verification-gate.test.ts` and
+`adult-member-hosting-coverage-migration.test.ts`.
+
+For a long time this section said the first of those was **load-sensitive** and
+told you to re-run it alone. That was wrong, and it is worth knowing why,
+because a wrong diagnosis that suggests an action is more expensive than no
+diagnosis at all: three separate lanes in one session each re-established that
+the red suite was not theirs, and each threw the reasoning away. Re-running can
+never help, because load was never involved.
+
+The measured cause (#2886) is that on Windows `bash` is
+`C:\Windows\System32\bash.exe` — **WSL**, not Git Bash — and two things then
+fail deterministically, on a clean tree, with the suite run alone:
+
+1. A drive-letter fixture path does not exist inside WSL's filesystem
+   namespace, so the gate reported `Migration SQL file not found: C:/Users/…`.
+   Flipping the separators does not help; only a path **relative to the `cwd`
+   the script is spawned with** resolves under both WSL and Git Bash.
+2. Variables put on `spawnSync`'s `env` option do not cross into WSL at all.
+   The gate saw them unset and fell back to its production defaults — so a test
+   pointing the validator at a fixture ledger was silently running it against
+   the repository's real `docs/BLUE_GREEN_MIGRATION_SAFETY.tsv`. That one failed
+   without any error message, which is the more dangerous of the two.
+
+Both are fixed centrally in `src/lib/__tests__/helpers/bash-fixture-path.ts`,
+which carries the measurements. **Use `bashFixturePath` and `bashGateArgs` for
+gate scripts, and `bashToolArgs` for a POSIX tool**. A same-volume Windows path
+becomes relative; a cross-volume one is translated by the selected shell's
+`wslpath` or `cygpath` and fails clearly if neither exists. On Linux and CI the
+gate invocation is equivalent to what these suites did before, which was checked
+by running both shapes over the same fixtures inside `node:24-bookworm` and
+comparing status, stdout and stderr.
+
+Two things this does *not* cover, so that the list stays honest:
+
+- A POSIX tool must run through `bashToolArgs`, not as a native Windows command.
+  The awk/TypeScript splitter-agreement case does exactly that: stock Windows
+  has no `awk.exe`, but its WSL bash has `/usr/bin/awk`, so the comparison stays
+  mandatory on Windows, Linux and CI. A missing shell-side tool is a real red,
+  never a capability skip or a `status: null` that a weak assertion could miss.
+- These suites do carry generous **inline** per-test timeouts, written as the
+  third argument to each `it(...)`, and an inline timeout does win over
+  `--testTimeout`. That is a real fact about editing them
+  (`./helpers/migration-gate-timeouts.ts` holds the budgets and the reasoning) —
+  it was simply never the reason they were failing.
+
+### A test that launches a process needs its own budget (#3083)
+
+The previous bullet is the general rule, and it applies outside the migration
+gates. `src/lib/__tests__/env-delivery-census.test.ts` renders the Compose
+stacks by running `docker compose config` for real, and it inherited the 5,000ms
+`testTimeout` — a default chosen for in-process work, not for a fork. It went
+red on #3081 with `Test timed out in 5000ms` while the same suite passed on two
+other pull requests minutes earlier at the same base, which is the "a different
+one fails each run" signature of a budget rather than a defect.
+
+So an `it()` that shells out carries an inline timeout, measured and reasoned
+where it is written. `COMPOSE_RENDER_TIMEOUT_MS` in that file is 30,000ms
+against a ~200ms idle render, because contention is the whole variable: the same
+render measured 530ms with 24 running at once and 2,104ms with 72, on a 20-core
+host. Like the migration-gate budgets, it is a **hang-catcher, not a pass mark**
+— on CI these finish in well under a second, so the number never decides a pull
+request.
+
+Raise it per test, never globally. `vitest.setup.ts` states `testTimeout` is
+5,000ms and calibrates the 4,000ms RTL window to sit a clear second below it, so
+a global change falsifies a documented constant in another file — and it would
+let thousands of ordinary tests hang six times as long to buy headroom for six.
+
+### A test that reads the whole tree needs its own budget too (#5439)
+
+The same rule covers a census that reads every file under `src/` (or `scripts/`,
+`e2e/`) synchronously. The club-time kernel census's whole-tree case, which
+reads and comment-strips more than 1,000 files, took 2,802ms on an otherwise
+idle 2-CPU sandbox (measured 22 November 2026, vitest 5.1.0, Node 24). A loaded
+CI shard is slower, so under the 5,000ms default it failed on fine code on #5429.
+
+So a case that walks the tree states a shared budget from
+[`src/test/census-timeout.ts`](../src/test/census-timeout.ts), never a local
+literal: `CENSUS_TIMEOUT_MS` (90,000ms) for reading and stripping files,
+`AST_CENSUS_TIMEOUT_MS` (180,000ms) for a full TypeScript parse through
+`scanAuditWriterCensus()`. Pass it as the `it` timeout or a
+`describe(..., { timeout })` option. When several cases scan the same tree,
+read it once (a `beforeAll` under the same budget, or a cached helper) rather
+than once per case. Never loosen an assertion or add a retry to make the scan
+fit.
+
+With a cached helper, whichever case runs first pays the whole read, and under
+`-t` or `.only` that can be any of them. So every case that can trigger the
+first read carries the budget, or the `describe` or file holding them does
+(`vi.setConfig({ testTimeout: CENSUS_TIMEOUT_MS })` after the imports). A case's
+own timeout overrides its `describe`'s, so don't leave a smaller literal on a
+case inside a budgeted `describe`. Prefer the narrowest scope that covers the
+readers: a file-wide budget also lets that file's unrelated tests hang longer.
+
+A walk at module or `describe` scope runs while Vitest collects the file, which
+has no timeout, so the walk itself needs no budget; the cases that then read
+the walked files still do.
+
+[`src/lib/__tests__/census-timeout-coverage.test.ts`](../src/lib/__tests__/census-timeout-coverage.test.ts)
+enforces this. It names the known whole-tree readers (the `support/` source
+helpers, `scanAuditWriterCensus`, the file-size budget's `scanRepository` and
+the quality report's `main`, `git ls-files src`, `src/**` globs and recursive
+directory reads of `src`, `src/lib` or `src/app`) and fails on a test file that
+calls one without importing `CENSUS_TIMEOUT_MS` or `AST_CENSUS_TIMEOUT_MS`. A
+`vi.setConfig({ testTimeout })` counts only when it sets one of those
+constants: a file-wide local literal is not a budget, whatever its size. Its
+short, commented no-budget list holds only fixture-only matches.
+
+## Census tests and the merge hazard
+
+A third convention that is load-bearing rather than stylistic, for the same
+reason as the two above: written the obvious way, this reports green on
+something other than what it claims.
+
+A **census** is a test that pins how many call sites of a given shape exist —
+every writer that can strand a booking, every `toLocaleDateString` escape, every
+`ViewOnlyActionButton` opt-out. It is one of the strongest guards here, because
+it fails the moment somebody adds a call site nobody classified.
+
+It also carries a merge hazard no CI check can see. Two branches each add one
+call site. Each bumps the census literal from `6` to `7` — the same line, the
+same value — so git merges them with **no conflict**. Both were green alone, the
+merged suite is green, and `main` now asserts `7` where the truth is `8`. The
+next real addition sails through a census that has stopped counting anything.
+
+So:
+
+1. **Re-derive the count; never increment it.** Run the census against the tree
+   in front of you and record what it reports. Never take the number you started
+   with and add your own branch's additions to it.
+2. **Re-derive it after every merge into your branch, and once more before
+   flipping the PR ready.** Those are the only moments the merged tree exists.
+3. **If the number moved for a reason you did not cause, the hazard has fired**
+   — check the other branch's entries too. A wrong total usually means a wrong
+   *classification*, not just arithmetic: something named that is not really a
+   member of the set, or a real one missing. Commit `5a5e4e748` (#2649) found a
+   census claiming "at least nine other producers" that was really six, with two
+   of the named ones refuted outright.
+4. **Prefer a census that enumerates over one that only counts, and publish no
+   total (#5211).** List one entry per line, sorted, with nothing else on the
+   line: two branches adding different entries then merge cleanly AND the merged
+   list is exactly right, which a bare integer never is. Do not pin the length
+   of a list that ordinary feature work grows, and do not quote a total in a
+   comment or document; each is a shared line every lane edits. Pin a number
+   only as a review gate on a small set that changes when someone makes a
+   decision, and say so beside it.
+
+The audit-writer and view-only censuses work this way. A new audit write site
+regenerates `scripts/audit/audit-write-sites.ts` with
+`pnpm run audit:census --write`, which adds that site's line; review it,
+because the line states the category the row is filed under. Each line also
+carries the site's action and the reviewed records that name it, and the census
+compares per function by sink and action, naming every attribute that
+changed, so its failure says NEW, REMOVED, REMOVED+NEW,
+RENUMBERED (ordinals shifted by an earlier addition; nobody's readership
+changed), RECLASSIFIED, SINK MOVED or REVIEW RECORD CHANGED. Two sites in one
+function sharing an action are told apart only by order. The ledger is
+`merge=union`: two lanes whose lines sort together merge cleanly, and the cases
+union cannot get right fail loudly rather than silently. Two lanes appending to
+the SAME function both write `<fn>#1`; with different actions union keeps both
+lines, a repeated key that the census names (and `tsc` refuses), and with the
+identical action and category git merges the identical line and the census
+fails on the missing `#2`. Either way, regenerate on the merged tree, which is
+why the census must run on the composed tree before merging. A new
+`ViewOnlyActionButton` under a section banner needs no entry; one that keeps its
+own per-button reason adds or updates its file's line in `KEEPS_OWN_REASON` in
+`view-only-banner-contract.test.ts`. Neither census has a total to re-measure,
+and each refuses one coming back in its documents.
+
+Censuses reading balanced call arguments or object bodies share
+[`balancedBrackets`](../src/lib/__tests__/support/balanced-brackets.ts).
+It returns original text, the inclusive closing offset and top-level comma-separated
+parts, using the shared literal masker so comments and quoted brackets cannot
+end a region early. An invalid opener or unclosed region fails the scan. Its
+sibling `expressionAt` reads a value that has no opener, up to its first top-level
+comma or the bracket closing the object that holds it.
+
+Two rules follow from the scan throwing rather than skipping:
+
+- **Find call sites over masked text.** Run the call-site regex over
+  `blankLiterals(source)` and hand the same text in as `structure`, so a call named
+  in a comment or string is not a call site. A hit inside a comment or string has
+  no opening bracket, and the reader throws on it. Read the arguments from the
+  original `source`, which keeps its string contents.
+- **Pass already-masked code as `structure`.** When the code has been through
+  `blankLiterals`, `blankLiteralsWithSpans` or `stripCommentsAndStrings`, pass it
+  as both `source` and `structure`. Masking twice is unsafe: a blanked regex has
+  lost its closing slash. `structure` must be the same length as `source`, and the
+  scan fails if it is not.
+
+### Running the fast censuses on a composed tree
+
+`pnpm run ci:fast-censuses` runs the tree-wide censuses that compositions have
+actually broken, plus `docs:indexcheck` and `quality:budget`, against whatever
+tree is checked out, in under a minute. The set and the reason for each entry
+live in one place, `scripts/ci/run-fast-censuses.mjs`. It regenerates the Prisma
+client first and supplies inert values for the variables these suites need only
+to import, so it runs in a fresh worktree with no `.env`.
+
+Run it at the moments step 2 above names: **after merging `origin/main` into
+your branch, and before you push or flip a pull request ready.** It catches the
+20 Sep 2026 shape — #3526, #3520 and #3522 each published the `stripComments`
+importer count against a base `main` had already left, and three green pull
+requests made a red `main` — while the composed tree is still on your machine.
+On a child of an epic, pass `--base origin/epic/<n>-<slug>` so invariant
+retention judges against the branch you will merge into. The file-size ratchet
+inside it ignores `--base` and always judges against `origin/main`, as PR CI
+does, so an allowance `main` already landed stays spent (#4831).
+The automated sync passes the exact pre-sync epic SHA. With an explicit base,
+the runner clears inherited GitHub event identity only for its diagnostic
+`docs:indexcheck` child; ordinary CI keeps its authoritative PR/push baseline.
+
+It is a convenience for a lane and the gate `epic-branch-sync.yml` applies
+before it lets a sync land (#3513, [`agents/EPIC_PLAYBOOK.md`](agents/EPIC_PLAYBOOK.md)).
+It is **not** a required check, it does not select the censuses a particular
+diff can reach (the next subsection does), and it never replaces `verify`. Add a
+suite to its list when a composition has broken one; leave out the
+load-sensitive suites listed under "Suites that time out under load and pass
+alone", which `scripts/ci/run-fast-censuses.test.mjs` enforces.
+
+### Selecting the censuses a change can reach
+
+A census reads source from disk, so it has no import edge to what it scans and
+`pnpm run test:related` can never select it from a diff — `AGENTS.md` says so, and
+says the class stays CI-caught by design. A lane that wants to catch one *before*
+CI has to pick the set by grep, and **grepping for the paths your diff changed
+under-selects**. #2958 measured how (#3323).
+
+That lane split an oversized route page into twenty modules and derived its set
+three ways: tests naming the route path, tests rooted at `src`, and tests walking
+a directory. All three missed
+[`additional-payment-card-gate.test.ts`](../src/components/__tests__/additional-payment-card-gate.test.ts),
+and CI failed on it. Two reasons, both general:
+
+- **The path can be in the file without being on any line of it.** That census
+  composed its target segment by segment — `join(process.cwd(), "src", "app",
+  "(authenticated)", "bookings", "[id]", "page.tsx")` — across seven lines, so a
+  line-oriented grep for `(authenticated)/bookings/[id]` matched nothing. Read
+  each candidate **whole-file** instead; the same fix finds a `join(` whose
+  `process.cwd()` sits on the next line, which a one-line
+  `join(process.cwd(), "src")` pattern skips.
+- **A census is named after the rule it polices, not after the file that rule
+  currently lives in.** This one is named for `AdditionalPaymentCard`, a
+  component that predates the change entirely, so no grep for the new modules or
+  their exports would have found it either. Add an arm that selects every
+  disk-reading test naming **any component the changed surface renders**.
+
+And when you move a census's target, **widen the census to the directory rather
+than re-pointing it at the new file**. The one that failed here named a single
+file and checked only the *first* render site — while the surface was one file
+those were the same sentence, and after a split they are not. It now walks the
+route directory and asserts the guard on every site it finds, with a vacuity
+check so an empty scan fails rather than passes. A count is not the only thing a
+merge or a move can quietly disarm; a hard-coded path is the other.
+
+### A worked example of binding the walk: the money-box guard
+
+[`money-number-input-guard.test.ts`](../src/lib/__tests__/money-number-input-guard.test.ts)
+is in this family and is worth knowing about **before** you trip it, because it
+polices markup rather than a call site. `INV-MONEY-003` says a box someone types
+dollars into is `type="text"` with `inputMode="decimal"` through
+[`MoneyInput`](../src/components/ui/money-input.tsx), never `type="number"`, and
+this guard is the mechanical half of that rule. It walks every non-test `.tsx`
+under `src/` with the TypeScript parser, decides from each `type="number"`
+control's own `id`, `value`, `placeholder` and bound label whether it holds
+money, and fails naming the file and line. The seventy-three legitimate count,
+percentage and duration boxes stay numeric; that discrimination, not the
+detection, is the deliverable.
+
+Two things it does differently from the censuses above, both deliberate:
+
+- **It binds the walk by NAME, not by a total.** `jsxSourceFiles()` reaching
+  "more than 200 files" was true of a walk that had stopped reading two thirds
+  of a 627-file tree, and one directory name added to the scanner's skip list is
+  all that takes. The suite instead asserts the walk reached every subtree in
+  `REQUIRED_SCANNED_SUBTREES`, so a skipped one fails saying which. That is
+  strictly stronger than a total against the mutation that matters, and it does
+  not have to be re-measured by every lane that adds an admin page — which a
+  pinned control count would, making it exactly the merge hazard above.
+- **It proves itself against the tree BEFORE the change that added it.** The
+  seven boxes #2932 converted are in the suite verbatim as they stood, and each
+  must still be flagged after every helper, state variable and prop name in it
+  has been renamed away. A guard that only shows the tree is quiet today cannot
+  tell you whether it would have caught the defect it was written for.
+
+Like every disk-scanning test here it has no import edge to the `.tsx` files it
+reads, so `pnpm run test:related` cannot select it from a diff. Run it by name
+when a change adds or edits a numeric input.
+
+### The lock(1) transaction-budget census
+
+[`lock1-transaction-budget-census.test.ts`](../src/lib/__tests__/lock1-transaction-budget-census.test.ts)
+polices `INV-LOCK-006`. It starts from the INV-LOCK-003 site list, follows each
+`pg_advisory_xact_lock(1)` wait out through named helpers to the transaction that
+opens it, and fails on an opener whose options are not the shared budget, a
+plain alias of it, or an
+`INV-LOCK-006 exception:` comment with a reason. Like the others it enumerates
+rather than counts, and it fails if the reader finds too few openers to be
+reading at all. It reads source from disk, so run it by name when a change adds a
+lock(1) site, a helper that takes the key, or a transaction that calls one; it is
+in `ci:fast-censuses` because a lock(1) site landing on `main` can make a green
+branch red.
+
+### Suites that time out under load and pass alone
+
+Running the whole suite natively on Windows was measured and rejected as the
+local gate (`AGENTS.md` → "Per-issue pipeline" leaves the full suite to CI) because a few suites hit vitest's
+5,000ms `testTimeout` under parallel load and pass the moment they run alone —
+a gate that red-lights the test it exists to protect is not a gate. The same
+suites can go red inside a by-name batch of disk-scanning censuses, which is
+how a lane meets them. This is the one home for that list (`INV-SSOT`);
+`AGENTS.md` points here and carries no copy. It exists so that a lane seeing
+one of these go red locally classifies it as environmental instead of spending
+a diagnosis on a defect that is not there — or, worse, loosening a census to
+make it pass. A list that is incomplete reads as complete, which is why the
+first entry below was added (#3395) rather than left to be rediscovered.
+
+**A suite is in this class only when both of these hold**, and an entry that
+cannot show both is a claim rather than evidence:
+
+1. The failure text is vitest's own `Test timed out in Nms` — the per-test
+   budget, 5,000ms unless the `it()` or its `describe` carries an inline one.
+   Nothing else qualifies. A suite that fails on an **assertion** is never in this class,
+   whatever the machine: `page-content-starter-backfill.test.ts` failed on
+   Windows on an assertion, because it split a migration path on `/`, which
+   was a real defect and a different class (it reads the path through
+   `toPosix` since #5407), and #2886 removed two suites that had been excused as
+   "load-sensitive" when they were failing deterministically on Windows for
+   real reasons (the shell-out section above).
+2. An isolated re-run of that one file — `pnpm exec vitest run <path>` — passes.
+
+When both hold: record the red as environmental in your evidence, naming the
+suite and the isolated re-run that passed, and move on. Do not raise
+`testTimeout` globally — "A test that launches a process needs its own budget"
+above says why — and do not touch the census. A suite that keeps grazing the
+limit under an ordinary batch is a candidate for an inline per-test budget,
+measured and reasoned where it is written; that is a change with its own issue.
+
+**The entries.** Every one carries a figure measured on this repository, not an
+inherited assertion. Isolated means `pnpm exec vitest run <that file>`; "under load"
+means one vitest invocation over a by-name batch of every test file that reads
+the tree from disk, on a machine doing nothing else. Measured 19 September 2026
+on #3395 at `706a80a91` (vitest 4.1.11, Node 24, a 20-core Windows 11 host)
+across two batches: 244 files that read `src/` through `process.cwd()`, which
+ran 5,014 tests in 204s; and the 303 files that call `readFile`/`readdir` at
+all, which ran 7,040 tests in 172s. Re-measure rather than copy when you add or
+re-verify an entry.
+
+- [`src/lib/__tests__/client-server-boundary-census.test.ts`](../src/lib/__tests__/client-server-boundary-census.test.ts)
+  — isolated 2.55s wall, 1.59s in tests, 5 passed. Under load its transitive
+  walk ("has no path from any client module to prisma, auth, or a Node
+  built-in") ran for **4,472ms** and **4,330ms** in the two batches, within
+  530ms of the budget each time. The orchestrator saw that test exceed 5,000ms
+  on 19 September 2026 in three separate lanes (the #3497, #3500 and #3467
+  branches), and pass alone each time.
+- [`src/app/__tests__/public-page-content-published-contract.test.ts`](../src/app/__tests__/public-page-content-published-contract.test.ts)
+  — isolated 865ms wall, 476ms in tests, 1 passed. It was absent from the
+  244-file batch (it walks from `__dirname`, not `process.cwd()`); in the
+  303-file batch its one test ran for **3,488ms**, seven times its isolated
+  figure.
+- [`src/components/__tests__/booking-no-emails-ui-contract.test.ts`](../src/components/__tests__/booking-no-emails-ui-contract.test.ts)
+  — isolated 1.04s wall, 404ms in tests, 11 passed. **Not reproduced here:**
+  its slowest test took 518ms and 626ms in the two batches, nowhere near the
+  budget. It is carried over from the earlier `AGENTS.md` list on that list's
+  unmeasured observation, and stays because a suite that has timed out under
+  load once is still one to re-run alone before diagnosing. The next lane that
+  measures it and finds the same should remove it rather than let the list
+  assert something it cannot show.
+- [`src/lib/__tests__/identity-ordering-census.test.ts`](../src/lib/__tests__/identity-ordering-census.test.ts)
+  — isolated 2.45s wall, 1.99s in tests, 5 passed; its slowest test, "reaches
+  the comparator by ONE import specifier", ran **1,073ms** alone. Under the
+  smaller batch below it **timed out**, so this entry records a red rather than
+  a margin.
+- [`src/lib/__tests__/in-progress-edit-sold-price-census.test.ts`](../src/lib/__tests__/in-progress-edit-sold-price-census.test.ts)
+  — isolated 5.23s wall, 3.84s in tests, 15 passed; its slowest test, "keeps
+  that mapper the only production season mapping", ran **2,589ms** alone, over
+  half the budget with the machine otherwise idle. Under the smaller batch it
+  **timed out**. This is the entry closest to being a real per-test budget
+  problem rather than a load artefact, so its tree-reading tests carry a
+  budget: an inline 30,000ms from #5407, and since #5439 the shared
+  `CENSUS_TIMEOUT_MS` on each of their `describe` blocks.
+- [`src/lib/__tests__/hut-leader-change-last-night.test.tsx`](../src/lib/__tests__/hut-leader-change-last-night.test.tsx)
+  — measured 13 October 2026 (vitest 5.0.3, Node 24, WSL2): run alone its
+  first test, which absorbs the Hut Leaders page's first jsdom render, took
+  427ms on an idle machine and 1,914ms beside two other lanes' builds. In CI's
+  `Test shard (2/4)` the file took 6,873ms and its first test hit "Test timed
+  out in 5000ms", twice on PR #4077's head `31e771fde` and once on PR #4063;
+  it passed alone each time. **The timeout hid an ordering bug**, the case the
+  section above warns about: with the budget raised, CI showed RTL's own
+  "Unable to find … Sam Stayer". The page clears the picked dates when its
+  lodge scope settles, and the test typed them before the lodge list loaded,
+  so on a slow runner they were wiped and no member was ever fetched. A 400ms
+  delay on the mocked lodge list reproduces it locally every time. The suite
+  now waits for the settled scope before typing (#4085), and keeps the
+  30,000ms `describe` budget for the full-page render itself.
+
+Four more suites, and two cases of a fifth, got an inline 30,000ms budget
+in #5407 (measured 22 November 2026 on an in-use 20-core Windows 11 host,
+vitest 5.1.0, Node 24, with other lanes running). Lanes sharing that host
+saw each time out at 5,000ms, and an isolated `pnpm exec vitest run <file>`
+on it did too, so these are not "pass alone" entries: the budget is the fix,
+not a classification. Each loops or walks `src/`, and its 5s default measured
+only that the host was busy. Since #5439 the cases that walk the tree carry
+the shared `CENSUS_TIMEOUT_MS` (90,000ms) instead; the loops keep 30,000ms.
+
+- [`src/lib/__tests__/cli-server-only-reach-census.test.ts`](../src/lib/__tests__/cli-server-only-reach-census.test.ts)
+  — the "no static or dynamic path to `next/headers`" walk timed out at 5,000ms;
+  it now carries `CENSUS_TIMEOUT_MS`.
+- [`src/lib/__tests__/app-currency-import-census.test.ts`](../src/lib/__tests__/app-currency-import-census.test.ts)
+  — the "none of the four retired names" scan timed out at 5,000ms; it now
+  carries `CENSUS_TIMEOUT_MS`.
+- [`src/lib/__tests__/auth-session-max-age.test.ts`](../src/lib/__tests__/auth-session-max-age.test.ts)
+  — the hourly-refresh loops (one handler round trip per simulated hour, up to
+  722 for the 720-hour cap) timed out at 5,000ms.
+- [`src/lib/__tests__/bed-allocation-lock-topology-contract.test.ts`](../src/lib/__tests__/bed-allocation-lock-topology-contract.test.ts)
+  — its two whole-of-`src/` cases (the member-key restore census and the
+  `Booking.lodgeId` writer scan) timed out at 5,000ms; both now carry
+  `CENSUS_TIMEOUT_MS`.
+- [`src/lib/__tests__/admin-hubs-registry.test.ts`](../src/lib/__tests__/admin-hubs-registry.test.ts)
+  — three tree-reading or grid-wide cases ("reproduces canOpenAdminPath for every
+  permission grid", "are linked from nowhere in the code", and the reviewed-importers
+  scan) timed out at 5,000ms. The two that read the tree ("linked from nowhere",
+  and the reviewed-importers scan over `src/`, `scripts/`, `e2e/` and `prisma/`)
+  carry `CENSUS_TIMEOUT_MS` since #5439. The permission-grid loop reads no files
+  and keeps its inline 30,000ms.
+
+Four more carry a budget on one case each since #5407, after lanes on
+that host saw them time out at 5,000ms in batches and pass alone. Measured
+23 November 2026 alone on the same host while other lanes ran, each slow case
+took the time below and every other case in its file under 700ms. The first
+three are route suites whose first case to call the route pays for loading its
+module graph (no module reset, so later cases do not) and carry an inline
+30,000ms; the fourth walks `src/` and carries the shared `CENSUS_TIMEOUT_MS`
+since #5439.
+
+- [`src/lib/__tests__/guests-add-notify-choice.test.ts`](../src/lib/__tests__/guests-add-notify-choice.test.ts)
+  — "emails the member and records no notify field on a member self-add
+  without the flag", 3,556ms alone.
+- [`src/lib/__tests__/phase8b-booking-mods.test.ts`](../src/lib/__tests__/phase8b-booking-mods.test.ts)
+  — "returns 401 for unauthenticated requests", 2,721ms alone; the route's
+  import in `beforeEach` took 0ms, so the cost is the handler's first call.
+- [`src/lib/__tests__/fix-mod-payment.test.ts`](../src/lib/__tests__/fix-mod-payment.test.ts)
+  — "stores the itemised lines behind the delta", 2,251ms alone.
+- [`src/app/api/bookings/[id]/__tests__/modify-quote-planner-stay-range-parity.test.ts`](../src/app/api/bookings/[id]/__tests__/modify-quote-planner-stay-range-parity.test.ts)
+  — "the resolver's rules live in one file, with only known callers", 1,331ms
+  alone.
+
+One more carries a 60,000ms budget on a whole `describe` since #5407: each of
+its ten cases builds a scratch repository and runs the deploy's release-tag
+guard, a run of `git` and `bash` spawns whose cost is the host's process
+start-up, not the test.
+
+- [`src/lib/__tests__/deploy-release-tag-guard-script-contract.test.ts`](../src/lib/__tests__/deploy-release-tag-guard-script-contract.test.ts)
+  — "refuses a lightweight vX.Y.Z tag" timed out at 5,000ms in a 47-file
+  by-name batch on 24 November 2026 and took 870ms alone; the slowest case
+  alone took 1,207ms.
+
+A second suite carries the same 60,000ms budget, on each `describe` whose
+cases build a throwaway repository (a bare origin, a seed and a clone) and run
+the release script, since #5472.
+
+- [`scripts/release/cut-release.test.mjs`](../scripts/release/cut-release.test.mjs)
+  — "prints the whole plan in a dry run and changes nothing" timed out at
+  5,000ms on a CI runner on 24 November 2026, in the push build of `main`, with
+  no assertion failing. Run alone on a busy Windows host on 25 November 2026,
+  thirteen of its repository cases exceeded 5,000ms and the slowest took
+  6,369ms.
+
+Two suites named with these are deliberately not listed.
+`reshaped-club-day-seams-contract.test.ts` timed out with them on its two
+tree-reading cases (909ms and 751ms alone) and carries the shared
+`CENSUS_TIMEOUT_MS` on its `describe` since #5439, but it runs in
+`pnpm run ci:fast-censuses`, and a suite listed in this section is kept out of
+that run (`run-fast-censuses.test.mjs`); with the budget it no longer needs
+to be. `deploy-email-transport-env-contract.test.ts` spawns `bash` and every
+case that does already carries its own budget (60,000ms, or 240,000ms for
+the provider matrix); alone on that host it took 195s, its matrix 95s and no
+other case over 9.4s, so nothing in it runs on the 5,000ms default.
+
+Of the entries above, the two 2026-09-19 batches covered the first five; they
+produced no timeout, so their figures show how close each suite runs to the
+budget under a batch of that size, not a red. The reds came later, on 20
+September 2026 at `6ca8f179d`, from a smaller and therefore harsher-per-file
+batch: the 141 files vitest selects for the filters `census`, `contract` and
+`guard`, 2,068 tests in 220s, run beside nothing else. All three of
+`client-server-boundary-census`, `identity-ordering-census` and
+`in-progress-edit-sold-price-census` timed out in that one run and all three
+passed alone immediately afterwards. That is the evidence of the limit being
+crossed; a lane running any such batch beside another lane's tests, a build, or
+a typecheck is where it will be crossed again.
+
+### Knip on a Windows host reports two unused exports
+
+Measured under #5407: on unchanged `main`,
+`pnpm run knip` reports `setStripeClientForTests` and `resetStripeClientForTests`
+as unused exports, and CI's Linux run passes. Two test files reach them through
+the `@/` alias: `src/test/providers/provider-transports.test.ts` (static import)
+and `src/test/providers/stripe-webhook-round-trip.realdb.test.ts` (dynamic
+import). `tsconfig.json` excludes every test file. On that host knip credits
+neither, and leaves `@/` unresolved for a test file outside a `__tests__`
+directory;
+lifting the test exclusions from a copy of `tsconfig.json` clears both lines.
+`knip.jsonc` cannot carry the fix: its `tsConfig` is a command-line flag, CI runs
+`pnpm exec knip`, and a `paths` entry did not change the result. Classify the two
+lines as environmental. Do not delete the exports or edit `knip.jsonc` to silence
+them, and take the verdict from CI. The same run suggests removing `awk`,
+`pg_dump` and `gunzip` from `ignoreBinaries`; those are hints, they do not fail
+the run, and their cause is not established, so leave the entries in place.
+
+## The shared race harness: declare the environment role per suite, and put it back
+
+The real-PostgreSQL race harness (`concurrency-lock-races.realdb.test.ts`)
+imports some forty suites into one vitest file, so whatever one suite leaves in
+`process.env` is there for every suite after it. A suite that drives a Xero or
+email path should still say what installation it is (`INV-CONFIG-003`): left
+unset, the role resolves UNKNOWN and the containment gates refuse, which is the
+safe default and the wrong premise for a disposable test database.
+
+Use `declareEnvironmentRoleForSuite("non-production")` from
+`src/lib/__tests__/helpers/environment-role.ts` in the suite's `beforeAll`,
+call the handle's `restore()` in a `finally` in its `afterAll`, and add a
+describe after the suite that asserts the variable equals the handle's
+`before` again. #4013 does all three in
+`credit-only-card-allocation.realdb.test.ts`. Do not use
+`declareEnvironmentRole` (`vi.stubEnv`) here: nothing unstubs it until the
+whole file ends, and `vi.unstubAllEnvs()` would undo every other suite's stubs
+too. The helper accepts only `non-production`: a shared harness never
+declares itself the live site, and never weakens the production containment
+gate to make a suite pass.
+
+The harness checks this for every suite at once (#4107). It imports
+`src/lib/__tests__/support/race-harness-env-guard.ts` first, which snapshots
+`process.env` before any suite's hooks run, and its `afterAll` runs last. A
+variable left changed, added or removed by any suite fails the run, naming the
+variable. The one exemption is `DATABASE_URL` pointed at the race database,
+which every suite sets on purpose. It checks the end state, so a later
+suite's blanket restore could hide an earlier leak: put back only the variable
+your suite changed.
+
+The shared database has the same ownership rule for Xero work (#4234).
+`support/race-harness-outbox-guard.ts` checks after all suite teardown that no
+`PENDING` operations remain, using its own guarded disposable connection.
+Clean operations by the suite's exact owned booking, payment, modification or
+task ids before deleting those fixtures; an operation's scalar `localId` is not
+a foreign key and survives deleting its payment.
+
+An end-state check alone could miss a leak that a later processor consumed.
+Every suite calling the global outbox processor must therefore call
+`assertNoForeignPendingXeroOperations(prisma, ownedLocalIds)` before processing
+or temporarily parking work. Pending rows owned by that suite are legitimate
+inside its tests; foreign rows fail with their ids and queue types. Park only
+the suite's own other rows when a test selects one operation, and restore those
+exact ids in `finally`. Never delete foreign rows, park the whole queue or age
+a row to make it win the processor's oldest-first scan. The guard reports
+leakage; it does not clean it up.
+
+Wait for owned asynchronous enqueues before that cleanup. #3750's real batch
+writer starts its Xero leg without awaiting it; deleting operations first let
+the leg finish after its modification was gone. Its fixture forwards to the
+real enqueue unchanged, captures the returned promises and drains them before
+collecting modification ids for teardown, then restores the forwarding spy.
+
+A declared role is not a fix for a path a suite should never reach. #4013's H1
+case reached the remainder-note mint because its credit lots tied on the
+frozen clock; the cure was an explicit fixture chronology and a regression that
+names the path (`INV-PAY-127`), not a declaration that let the mint go further.
+
+### Proving provider calls run outside transactions
+
+Use `openClientTransactionsElsewhere` from
+`src/lib/__tests__/support/open-client-transactions.ts` at the fake provider
+callback. It checks other client backends in the disposable database, allowing
+up to one second for in-flight work to settle. A transaction awaiting that
+callback cannot commit during the probe and still fails. A nonzero result logs
+`pid`, `query`, `xact_start` and `application_name` for diagnosis (#4695).
+The intentionally held webhook connection can be excluded by its application
+name; PostgreSQL background workers are always excluded. Do not filter to a
+process: the file lock below already serialises suites, and a connection left
+behind by an earlier suite must remain visible.
+
+### Realdb files take turns on the race database
+
+Running several `*.realdb.test.ts` files in one `vitest run` used to fail
+intermittently, while every file passed alone (#4367). They share one
+database. Trigger DDL takes table-level locks, the global Xero outbox
+processor and the ownership guard see other files' rows, and some cases scan
+whole tables. The first local run of the 27 Xero and refund files in parallel
+failed 6 tests in 2 files.
+
+When `RUN_CONCURRENCY_RACE_TESTS=1` and `CONCURRENCY_RACE_DATABASE_URL` is
+set, `vitest.setup.ts` makes each realdb file hold one session advisory lock,
+`(4367, 1)`, from its first hook through its teardown. The files then run one
+at a time whatever the worker count; importing and collecting them still overlap.
+The same 27 files then passed twice in a row. The lock lives in
+`src/lib/__tests__/support/realdb-file-serialisation.ts`. One `aroundAll`
+holds it, so a root `afterAll` that throws still releases it, and the wait has
+no hook timeout. A waiting file polls `pg_try_advisory_lock` instead of
+blocking, because several suites' barriers count ungranted advisory rows in
+`pg_locks`. Realdb files on another database, such as
+`data-migration-verification`, take the race lock too when the race env is
+on. Expect a batch of realdb files to
+take as long as running them one after another. Inside one file the old rules
+still apply: a suite owns its own fixtures and queued work.
+
+CI runs every one of these files in the `realdb-all` job,
+`Real-PostgreSQL suites (all)` (#4458), in one `vitest run` on one Postgres
+service, with `RUN_CONCURRENCY_RACE_TESTS=1`. It blocks a merge through the
+required `verify` check, whose same-attempt poll fails unless this job succeeded
+(#4907); it is not a branch-protection context of its own.
+The file list is `scripts/ci/realdb-files.mjs`: every `*.realdb.test.*` file
+under `src/` minus `scripts/ci/realdb-quarantine.txt`, which names a suite that
+is red for a known reason, or cannot share the process, with its issue or PR.
+Add a realdb file and it joins the job with no edit. `realdb-ci-coverage-census.test.ts` fails when a file is
+neither run nor quarantined, when the job stops setting
+`RUN_CONCURRENCY_RACE_TESTS=1`, when any job `needs:` it or it gains a
+job-level `if:` or `needs:`, or when anything but `verify`'s poll names it. The
+job points `DATA_MIGRATION_VERIFICATION_DATABASE_URL` at the same race service
+(those three suites create scratch databases of their own), and its last step,
+`scripts/ci/check-realdb-ran.mjs`, reads Vitest's JSON report and fails when a
+listed file is missing from it, passed no test, or skipped any: a suite whose
+gate is unset skips green otherwise. The seed suite
+(`booking-ledger-history-seed`) is quarantined because
+`scripts/booking-ledger-seed-gate.sh` runs it against a database of its own. The
+per-file steps in `migration-drift` and `data-migration-verification` stay: they
+report sooner, inside their own required checks. A flaky suite now blocks every
+pull request, so quarantine it with its issue rather than loosening the no-skip
+check.
+
+## Mocking a money seam: never in a test that asserts its money
+
+The rule is `INV-OPS-015` ([`invariants/operations.md`](invariants/operations.md));
+the seams and what each decides are `MONEY_SEAMS` in
+`src/lib/__tests__/money-seam-mock-census.test.ts`, which fails the build on an
+offender. To keep a seam real while stubbing its neighbours, spread the real
+module (`...((await importOriginal()) as typeof import("…"))`) and answer the
+seam's own reads truthfully: a ledger read that returns `[]` while the fixture
+carries a live ask is the #543 shape, and the census cannot see it.
+
+## Mocking `requireAdmin`: reference the helper, never wrap it
+
+A fourth convention in the same family — written the obvious way, a suite that
+mocks the admin guard reports green on something other than what it claims.
+
+`src/lib/__tests__/helpers/require-admin-mock.ts` is the shared `requireAdmin`
+stand-in. Wire it in as a **bare reference**, from an `async` factory:
+
+```ts
+vi.mock("@/lib/session-guards", async () => ({
+  requireAdmin: (await import("./helpers/require-admin-mock"))
+    .evaluateRequireAdminMock,
+  requireActiveSessionUser: mocks.requireActiveSessionUser,
+}));
+```
+
+Not as a wrapper. A route tells the guard which area and level it needs by
+passing `{ permission: { area, level } }`, and the helper can only honour that if
+the value reaches it. An arrow that takes no parameter throws it away, the helper
+falls back to `hasAdminPortalAccess` — "is this person in the admin portal at
+all", a check the real guard has never performed — and **every per-area
+assertion in that file becomes vacuous**. A `lodge:view` route and a
+`lodge:edit` route stop being distinguishable.
+
+That is not hypothetical. It was found (#2921) when a suite passed a mutation its
+author had just written it to catch, and the sweep that followed found 50 more
+files in the same state. The bare reference is preferred over "remember to
+forward `options`" for one reason: every wrapper is a place the argument can be
+dropped again, and the reference has no argument to drop. Keep a wrapper only
+where one is load-bearing — a `vi.fn()` spy whose implementation is installed
+later — and forward its own first parameter:
+
+```ts
+mockRequireAdmin.mockImplementation(async (options) =>
+  (await import("./helpers/require-admin-mock")).evaluateRequireAdminMock(
+    options,
+  ),
+);
+```
+
+Two controls enforce this, and they are complementary rather than redundant:
+
+- the helper's parameter is **required** (it accepts `undefined`, because a route
+  that passes no options is legitimate), so a bare `evaluateRequireAdminMock()`
+  is a compile error that `pnpm run typecheck` catches;
+- `require-admin-mock-forwarding-contract.test.ts` parses every test file that
+  mentions the helper and fails on the shapes the type system cannot see —
+  `evaluateRequireAdminMock({})` compiles cleanly and is just as inert. It reads
+  `src/` from disk, so it has no import edge to the suites it scans and
+  `pnpm run test:related` will not select it. Run it directly.
+
+### Prove the gate, not the guard
+
+Forwarding makes the gates live; it does not exercise them. Before #2921 almost
+every admin suite signed in as `ADMIN` (which holds `edit` on every area) or
+`USER` (which holds nothing), and a pair of fixtures like that can only ever
+answer "is this person an admin at all".
+
+`helpers/admin-area-gate-sessions.ts` carries the role fixtures for asserting the
+real thing. Pin **both halves** of a requirement, plus one admission so a gate
+broken shut is not mistaken for a gate that works:
+
+- a view-only admin must be refused by an `:edit` route and admitted by a
+  `:view` one — that pins the **level**;
+- an admin with no access to the area at all must be refused outright — that
+  pins the **area**, and it is the half that catches a route re-pointed at the
+  `overview` catch-all;
+- a role holding exactly the declared permission must get through.
+
+Denials need no other setup: the guard answers before the handler touches the
+database, so assert the status *and* that the write mock was never called.
+
+The area half is worth the extra assertion. On fork PR #2949 three routes were
+moved from `{ area: "finance", level: "edit" }` to
+`{ area: "overview", level: "view" }` — a real privilege downgrade on
+money-moving routes — and 83 tests still passed. Reproduced on this tree against
+`main`'s pre-sweep suites, the same downgrade left all 32 of their tests green;
+with the sweep and these fixtures in place it fails six assertions.
+
+### The larger surface this does not cover
+
+Two limits, stated rather than implied:
+
+1. **A route that passes no explicit `permission` is still tested as "is this an
+   admin at all".** The real guard falls back to `getAdminRouteRequirement()`
+   keyed on the request path; a unit test calls the handler directly, so there is
+   no path for the mock to resolve. 170 of 287 `/api/admin` routes pass an
+   explicit literal and are covered; the rest resolve by prefix and are not.
+   `admin-route-area-matrix.test.ts` pins that prefix map separately.
+2. **188 test files mock `@/lib/session-guards` without this helper at all**,
+   typically resolving `requireAdmin` straight to `{ ok: true, session }`. Those
+   bypass the permission check entirely rather than degrading it, and neither
+   control above says anything about them.
+
+### The guard itself: `admin-route-authorization-proof.test.ts`
+
+Both limits above have the same shape — the mock stands where the guard should
+be — and no amount of care inside a mocked suite closes it. `#2975` added the
+suite that does not mock it. It discovers every admin page and every
+`/api/admin` route **from disk**, then puts each one to the real `requireAdmin`
+and the real `guardAdminLayout`, through the same `x-pathname` /
+`x-request-method` headers `src/proxy.ts` stamps on a real request, for sixteen
+access-role grids: fourteen single-area holders (seven areas at `view`, seven at
+`edit`), a Full Admin and a plain member. A deactivated Full Admin is built
+inside the one test that needs it and is a seventeenth.
+
+**What it measures is the gate that actually runs, which took two attempts.**
+A route's authorization has two definitions: the path-to-area map, and the
+`permission` literal the handler passes `requireAdmin`, which is the one that
+wins where a handler passes it — around 170 of the ~300 `/api/admin` routes do.
+The first cut called a bare `requireAdmin()` for every route and therefore
+measured the map everywhere and the real gate nowhere, which made it assert
+things that were false: that a finance-only grid is refused every admin API
+route outside Finance (`POST /api/admin/members/[id]/joining-fee/preview` is
+gated `finance:view` and answers it), and that a `support:view` grid is admitted
+to `/api/admin/club-time-zone` (it passes `permission: false` and admits only a
+Full Admin). Each sweep now reads the handler's own literal out of its source
+and hands it to the guard.
+
+Read its arrangement before adding to it, because the parts are deliberately not
+interchangeable:
+
+- the **sweeps** compute what they expect from `getAdminRouteRequirement` and
+  from those same literals, so they prove the guard honours the permission it is
+  given and consults the map when it is given none, and that `view` never buys
+  `edit` — and they are explicitly incapable of catching a map or a literal that
+  is wrong;
+- the **reviewed divergence table** is what catches a wrong literal. Every place
+  a handler's own `permission` disagrees with the map is listed with the reason
+  it is intended, and the list is asserted equal to what is on disk in both
+  directions — a new divergence fails, and a stale entry fails. This is the
+  control that catches the #2949 shape, where three routes were re-gated from
+  `finance:edit` to `overview:view` **in the route source** and 83 tests still
+  passed;
+- the **anchor table** is the second opinion about the map, hand-written for that
+  reason: it names which area a handful of unmistakable routes belong to, and a
+  seeded wrong mapping contradicts it by name. It lives in
+  `helpers/admin-route-area-anchors.ts` and `admin-route-area-matrix.test.ts`
+  asserts its frozen snapshot agrees with it, so the same reviewed fact cannot be
+  stated two ways. It is drift-guarded against the enumeration, so it cannot rot
+  into a list of routes that no longer exist;
+- the **floors** (`toBeGreaterThan`) exist because a broken walk would otherwise
+  make every sweep pass by covering nothing — verified by pointing the walk at a
+  directory that does not exist, which reddens five assertions rather than none.
+
+Two limits it states rather than implies. It measures the **admission** gate, so
+a handler that narrows further after `requireAdmin` — the config-transfer
+wrapper's second `isFullAdmin` check — is stricter in production than reported;
+narrowing only removes callers, so its refusals are sound and its admissions mean
+"reached the handler". And a handler shape the source reader cannot resolve is a
+**hard failure** rather than a fall back to path inference, because a reader that
+degraded silently would reintroduce the blindness it exists to remove.
+
+It reads `src/` from disk for the enumeration, so like the forwarding contract
+above it has no import edge to the routes it covers and `pnpm run test:related`
+will not select it. **Run it by name when you touch admin authorization, the
+route-to-area map, or either guard.**
+
+### It does NOT replace your route's own authorization fixtures
+
+Writing a per-route suite still obliges you to pin your route's own gate with
+`helpers/admin-area-gate-sessions.ts`, exactly as "Prove the gate, not the guard"
+above says. This suite proves the guard enforces what it is given and that no
+route's own literal diverges from the map unreviewed; your route suite proves the
+handler asks for the right thing in the first place, at the level of a single
+assertion a reviewer can read next to the code.
+
+That division is the #2949 control, and dropping either half reopens it. The
+downgrade there was made in the route source, and the suites that caught it were
+per-route area fixtures. The divergence table would now catch that particular
+shape as well — any edit to a literal that currently disagrees with the map, and
+any edit that starts disagreeing with it, is red — but it can only see the
+**admission** gate. A route that admits at `finance:view` and re-checks
+`finance:edit` inside the handler before it writes (`POST
+/api/admin/xero/member-grouping` is the live example) has its real write gate in
+the handler body, where nothing in this file looks. Weaken *that* check and this
+suite stays green in every one of its 24 tests. Your route's own fixtures are the
+only thing standing there.

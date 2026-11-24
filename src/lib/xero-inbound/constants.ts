@@ -1,0 +1,15 @@
+
+
+export const BOOKING_SCOPED_OUTBOUND_MODELS = ["Booking", "BookingModification"] as const;
+
+export const MEMBERSHIP_SYNC_CURSOR_RESOURCE = "MEMBERSHIP_INVOICE_SYNC";
+export const CONTACT_SYNC_CURSOR_RESOURCE = "CONTACT_SYNC";
+/** #4531: when links pending a deleted-payment check were last re-checked. */
+export const DELETED_PAYMENT_RECHECK_CURSOR_RESOURCE = "DELETED_PAYMENT_RECHECK";
+export const DEFAULT_XERO_SYNC_SCOPE = "default";
+export const DEFAULT_XERO_SYNC_SCOPE_PREFIX = "season:";
+export const DEFAULT_XERO_INBOUND_BATCH_SIZE = 10;
+export const DEFAULT_XERO_INBOUND_MAX_BATCHES = 5;
+export const DEFAULT_XERO_INBOUND_FAILED_RETRY_BACKOFF_MS = 15 * 60 * 1000;
+export const DEFAULT_CONTACT_RECONCILE_MIN_INTERVAL_MS = 15 * 60 * 1000;
+export const DEFAULT_MEMBERSHIP_RECONCILE_MIN_INTERVAL_MS = 5 * 60 * 1000;

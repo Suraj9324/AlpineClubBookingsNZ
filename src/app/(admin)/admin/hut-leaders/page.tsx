@@ -1,0 +1,1492 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { AdminPageHeader } from "@/components/admin/admin-page-header";
+import { AdminDataTable } from "@/components/admin/admin-data-table";
+import { AdminLoadError } from "@/components/admin/admin-load-error";
+import { ADMIN_LOAD_FAILED_ERROR, ADMIN_LOAD_NETWORK_ERROR } from "@/lib/admin-query-error";
+import {
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  BedDouble,
+  Trash2,
+  UserCheck,
+  CalendarDays,
+  KeyRound,
+  Undo2,
+  Home,
+} from "lucide-react";
+import { useClubTime } from "@/components/club-time-provider";
+import { calendarMonthOf } from "@/lib/club-time";
+// ZONE-FREE UTC date-only arithmetic, kept on the adapter deliberately. Every
+// value below is a `yyyy-MM-dd` lodge night with no timezone in it, and these
+// three helpers only add days and re-encode — they read no clock and no zone,
+// so CT-4 (#2870) has nothing to correct in them. They stay because
+// `calculateOverlapDays` (in `src/lib`, a different lane's file) takes `Date`
+// arguments; converting this screen to `CalendarDate` end to end means changing
+// that signature, which is reported on #2870 rather than half-done here. The
+// CLOCK reads are what CT-4 moved: they now come from the club's persisted zone.
+import {
+  addDaysDateOnly,
+  formatDateOnly,
+  parseDateOnly,
+} from "@/lib/date-only";
+import { calculateOverlapDays } from "@/lib/hut-leader-overlap";
+import { LodgeSelect, useLodgeOptions } from "@/components/lodge-select";
+import { LodgeScopeStatusNotice } from "@/components/admin/lodge-options-status";
+import { deriveSettledLodgeOptionScope } from "@/lib/lodge-option-scope";
+import { useClubIdentity } from "@/components/club-identity-provider";
+import { useAdminAreaEditAccess } from "@/hooks/use-admin-area-edit-access";
+import {
+  ADMIN_FORBIDDEN_SAVE_REASON,
+  AdminViewOnlySectionBanner,
+  ViewOnlyActionButton,
+} from "@/components/admin/view-only-action";
+import type {
+  CalendarOverlayValue,
+  CalendarTone,
+} from "@/components/admin/occupancy-calendar";
+import type { PickedMember } from "@/components/admin/member-picker";
+import {
+  AssignmentForm,
+  type AssignmentSummary,
+  type AssignmentTarget,
+  type EligibleMember,
+  type HutLeaderFormError,
+} from "./_components/assignment-form";
+import { CustodianBedPicker } from "./_components/custodian-bed-picker";
+import {
+  buildLeaderCalendarOverlay,
+  coveredNightsByDate,
+} from "./_components/leader-calendar-overlay";
+import type { HutLeaderOnNight } from "@/lib/hut-leader-handover";
+import { notifyAdminQueueChanged } from "@/lib/admin-queue-events";
+import {
+  apiErrorMessageFromBody,
+  apiErrorMessageFromResponse,
+  readApiObjectOrEmpty,
+} from "@/lib/api-error-message";
+import type {
+  HutLeaderAssignment,
+  UnassignedDate,
+} from "./_components/hut-leaders-page-types";
+
+// Compute the last inclusive day of a "YYYY-MM" month.
+function monthBounds(monthKey: string) {
+  const start = parseDateOnly(`${monthKey}-01`);
+  // Sliced at the fixed `YYYY-MM` offsets rather than split: the two halves
+  // read as `number` where a destructured split hands back lookups the
+  // compiler must treat as possibly absent (#2801).
+  const year = Number(monthKey.slice(0, 4));
+  const month = Number(monthKey.slice(5, 7));
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const endExclusive = parseDateOnly(
+    `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`,
+  );
+  return { start, end: addDaysDateOnly(endExclusive, -1) };
+}
+
+export default function HutLeadersPage() {
+  const { hutLeaderLabel } = useClubIdentity();
+  // Hut-leader assignments are lodge config; the write routes enforce
+  // lodge:edit, so a lodge:view admin sees this screen read-only (#1940).
+  const canEdit = useAdminAreaEditAccess("lodge");
+  const [assignments, setAssignments] = useState<HutLeaderAssignment[]>([]);
+  const [eligibleMembers, setEligibleMembers] = useState<EligibleMember[]>([]);
+  const [unassignedDates, setUnassignedDates] = useState<UnassignedDate[]>([]);
+  const [loading, setLoading] = useState(true);
+  // #4961: why each read failed, or null. A failed read used to render as "No
+  // assignments yet" and as no amber card, which reads as "every night is
+  // covered". Written only for the lodge that asked, like the data itself.
+  const [assignmentsLoadError, setAssignmentsLoadError] = useState<string | null>(null);
+  const [unassignedLoadError, setUnassignedLoadError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [loadingMembers, setLoadingMembers] = useState(false);
+  const [resettingPinId, setResettingPinId] = useState<string | null>(null);
+  const [pinMessage, setPinMessage] = useState<{
+    memberName: string;
+    pin: string;
+    emailSent: boolean;
+  } | null>(null);
+
+  const [selection, setSelection] = useState({ startDate: "", endDate: "" });
+  const [target, setTarget] = useState<AssignmentTarget | null>(null);
+  // #2286: the optional custodian bed hold. null = "No bed — role only", the
+  // default and the pre-#2286 behaviour.
+  const [selectedBedId, setSelectedBedId] = useState<string | null>(null);
+  const [isCustodian, setIsCustodian] = useState(false); // #3817 custodian tick
+  // #3817: no "Hold a bed" while bed allocation is off (Release bed stays).
+  const [bedAllocationOn, setBedAllocationOn] = useState(false);
+  // Set when the server answered CUSTODIAN_OVER_CAPACITY_CONFIRM_REQUIRED: the
+  // hold is legitimate but tips the lodge past its ceiling on these nights, so
+  // the admin re-confirms rather than discovering it later (#1668 precedent).
+  //
+  // `confirm` is the action to re-run with the override — a NEW assignment from
+  // the form, or a bed CHANGE on an existing row (both PUT and POST can answer
+  // this), so the card asks the question once for either.
+  //
+  // `bookings` (#2286 review M5) are live bookings over those nights that the
+  // per-night figures do NOT count (the #177 override-settle blind spot):
+  // informational, but the admin is accepting an over-capacity night, so they
+  // must know the true total could be higher.
+  const [overCapacity, setOverCapacity] = useState<{
+    nights: Array<{ date: string; occupiedBeds: number; capacity: number }>;
+    bookings: Array<{
+      id: string;
+      memberName: string;
+      checkIn: string;
+      checkOut: string;
+      guestCount: number;
+      status: string;
+    }>;
+    /** #3817: false when only the custodian tick is in play (no bed). */
+    holdsBed: boolean;
+    confirm: () => void;
+  } | null>(null);
+  // Set when the server answered CUSTODIAN_OVERLAPS_WHOLE_LODGE_HOLD (#2698).
+  //
+  // The ordering case: the bed being held sits inside nights an EXISTING
+  // whole-lodge hold already covers, so holding it narrows somebody else's sole
+  // occupancy. The owner's rule is that this is never done silently — the
+  // officer sees the nights and chooses. Accept re-sends with
+  // `amendOverlappingHolds: true` and the server writes both facts in one
+  // transaction; Cancel sends nothing at all, so neither state changes.
+  //
+  // `amendments` names only the holding bookings' ids and the nights: the
+  // officer is deciding about bed-nights, and nothing about who is staying
+  // leaves the server (INV-PRIV).
+  //
+  // Shared by the create form and the inline bed change, exactly like the
+  // over-capacity card above — both POST and PUT can answer this.
+  const [holdAmendment, setHoldAmendment] = useState<{
+    nights: string[];
+    amendments: Array<{ bookingId: string; nights: string[] }>;
+    /** #3817: false when only the custodian tick is in play (no bed). */
+    holdsBed: boolean;
+    accept: () => void;
+  } | null>(null);
+  // Which assignment's bed is being changed inline in the table (#2286 review
+  // M7). One at a time: the picker re-reads availability for that row's dates.
+  const [bedEditAssignmentId, setBedEditAssignmentId] = useState<string | null>(
+    null,
+  );
+  const [savingBedForId, setSavingBedForId] = useState<string | null>(null);
+  // The server's advisory note after a save: a minor custodian is never named
+  // on the lodge TV, and (#3821) school nights this leader's kind does not cover.
+  const [advisoryNote, setAdvisoryNote] = useState<string | null>(
+    null,
+  );
+  const [error, setError] = useState<HutLeaderFormError | null>(null);
+  // Lodge context for new assignments; LodgeSelect renders nothing (and
+  // reports the sole lodge) while fewer than two lodges exist (ADR-002).
+  const {
+    lodges,
+    loading: lodgesLoading,
+    failed: lodgeOptionsFailed,
+    forbidden: lodgeOptionsForbidden,
+    reload: reloadLodgeOptions,
+  } = useLodgeOptions("admin");
+  const [lodgeId, setLodgeId] = useState<string | null>(null);
+  const showLodgeColumn = lodges.length > 1;
+  /*
+    #2701: a FAILED lodge list is not "a club with no lodges", but until now the
+    two were the same empty array here. LodgeSelect renders nothing below two
+    options (ADR-002) and normalises the selection to null, and an omitted
+    lodgeId is resolved server-side to the club's DEFAULT lodge.
+
+    On this page that lands in two places, and both are writes: the POST files
+    the assignment (and the club's kiosk PIN with it) against the default lodge,
+    and the bed picker offers the DEFAULT lodge's beds — so "hold a bed" would
+    take a real bed out of the bookable pool at a property nobody chose. Neither
+    is offered while the list has failed.
+
+    The assignments table and coverage calendar are club-wide reads, but they
+    stay stopped too: no downstream state is trustworthy until the selector's
+    lodge universe has settled.
+  */
+  const lodgeScope = deriveSettledLodgeOptionScope({
+    lodges,
+    selectedLodgeId: lodgeId,
+    loading: lodgesLoading,
+    failed: lodgeOptionsFailed,
+    forbidden: lodgeOptionsForbidden,
+  });
+  const scopedLodgeId = lodgeScope.kind === "lodge" ? lodgeScope.lodgeId : null;
+  const lodgeScopeReady = scopedLodgeId !== null;
+  const activeLodgeIdRef = useRef<string | null>(scopedLodgeId);
+  useEffect(() => {
+    activeLodgeIdRef.current = scopedLodgeId;
+  }, [scopedLodgeId]);
+
+  // The over-capacity question appears below the form after a declined save, so
+  // it takes focus when it arrives (#2286 review M6) — otherwise a keyboard or
+  // screen-reader admin has no idea a second step is waiting further down.
+  const overCapacityCardRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (overCapacity) overCapacityCardRef.current?.focus();
+  }, [overCapacity]);
+
+  // #2698: the same treatment for the whole-lodge-hold amendment question. It
+  // arrives the same way (a save the server declined to complete) and must be
+  // announced and focused for the same reason.
+  const holdAmendmentCardRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (holdAmendment) holdAmendmentCardRef.current?.focus();
+  }, [holdAmendment]);
+
+  const clubTime = useClubTime();
+  const [visibleMonthKey, setVisibleMonthKey] = useState(() =>
+    calendarMonthOf(clubTime.today()),
+  );
+  // Windowed "needs a leader" dates and occupied nights, keyed by visible month.
+  const [redDatesByMonth, setRedDatesByMonth] = useState<Record<string, string[]>>({});
+  const [guestNightsByMonth, setGuestNightsByMonth] = useState<
+    Record<string, Set<string>>
+  >({});
+  // Who validly covers each night (assigned AND staying, #3818), keyed by
+  // visible month; each month's map reaches back to the night before its 1st.
+  const [coveredNightsByMonth, setCoveredNightsByMonth] = useState<
+    Record<string, Map<string, readonly HutLeaderOnNight[]>>
+  >({});
+
+  const fetchAssignments = useCallback(async () => {
+    if (!lodgeScopeReady) {
+      setAssignments([]);
+      setAssignmentsLoadError(null);
+      setLoading(false);
+      return;
+    }
+    const requestedLodgeId = scopedLodgeId;
+    const failed = (message: string) => {
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      setAssignments([]);
+      setAssignmentsLoadError(message);
+    };
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/admin/hut-leaders?lodgeId=${encodeURIComponent(requestedLodgeId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (activeLodgeIdRef.current === requestedLodgeId) {
+          setAssignments(Array.isArray(data?.assignments) ? data.assignments : []);
+          setBedAllocationOn(data?.bedAllocationEnabled === true);
+          setAssignmentsLoadError(null);
+        }
+      } else {
+        failed(await apiErrorMessageFromResponse(res, ADMIN_LOAD_FAILED_ERROR));
+      }
+    } catch {
+      failed(ADMIN_LOAD_NETWORK_ERROR);
+    } finally {
+      if (activeLodgeIdRef.current === requestedLodgeId) setLoading(false);
+    }
+  }, [lodgeScopeReady, scopedLodgeId]);
+
+  // Default lookahead window — feeds the amber "Upcoming nights with no … staying" card.
+  // Intentionally the un-windowed variant so that card is byte-for-byte unchanged.
+  const fetchUnassignedDates = useCallback(async () => {
+    if (!lodgeScopeReady) {
+      setUnassignedDates([]);
+      setUnassignedLoadError(null);
+      return;
+    }
+    const requestedLodgeId = scopedLodgeId;
+    const failed = (message: string) => {
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      setUnassignedDates([]);
+      setUnassignedLoadError(message);
+    };
+    try {
+      const res = await fetch(`/api/admin/hut-leaders/unassigned-dates?lodgeId=${encodeURIComponent(requestedLodgeId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (activeLodgeIdRef.current === requestedLodgeId) {
+          setUnassignedDates(
+            Array.isArray(data?.unassignedDates) ? data.unassignedDates : [],
+          );
+          setUnassignedLoadError(null);
+        }
+      } else {
+        failed(await apiErrorMessageFromResponse(res, ADMIN_LOAD_FAILED_ERROR));
+      }
+    } catch {
+      failed(ADMIN_LOAD_NETWORK_ERROR);
+    }
+  }, [lodgeScopeReady, scopedLodgeId]);
+
+  // Per-month overlay data: red (needs-leader) nights via the windowed variant,
+  // and occupied nights (for violet fill-vs-ring emphasis) via the occupancy API.
+  const refreshOverlay = useCallback(async (monthKey: string) => {
+    if (!lodgeScopeReady) return;
+    const requestedLodgeId = scopedLodgeId;
+    try {
+      const res = await fetch(
+        `/api/admin/hut-leaders/unassigned-dates?month=${monthKey}&lodgeId=${encodeURIComponent(requestedLodgeId)}`,
+      );
+      if (res.ok) {
+        const data: {
+          unassignedDates?: UnassignedDate[];
+          coveredNights?: Array<{ date: string; leaders: HutLeaderOnNight[] }>;
+        } = await res.json();
+        // Map EAGERLY, here, inside the try — never inside the state updater.
+        // React invokes an updater closure later, during render, where this
+        // function's own `catch` can no longer see it: an unexpected body then
+        // escaped as an unhandled error and took the page down instead of
+        // degrading a "non-essential overlay". Tolerate the shape as well, for
+        // the same reason the picker does (#2286 review).
+        const dates = Array.isArray(data?.unassignedDates)
+          ? data.unassignedDates.map((d) => d.date)
+          : [];
+        const covered = coveredNightsByDate(
+          Array.isArray(data?.coveredNights) ? data.coveredNights : [],
+        );
+        if (activeLodgeIdRef.current === requestedLodgeId) {
+          setRedDatesByMonth((prev) => ({ ...prev, [monthKey]: dates }));
+          setCoveredNightsByMonth((prev) => ({ ...prev, [monthKey]: covered }));
+        }
+      }
+    } catch {
+      // Non-essential overlay, and deliberately left silent (#4961 decision): a
+      // month whose read fails simply gets no red or covered shading. The
+      // authoritative "are the upcoming nights covered?" answer is the amber
+      // card (or its "could not be checked" error) from fetchUnassignedDates,
+      // which does say when it failed. Saying it here too would put one outage
+      // in two places for a month the officer has only scrolled to.
+    }
+    try {
+      const res = await fetch(`/api/admin/occupancy?month=${monthKey}&lodgeId=${encodeURIComponent(requestedLodgeId)}`);
+      if (res.ok) {
+        const data: { nights?: Array<{ date: string; guestCount: number }> } =
+          await res.json();
+        const guestNights = new Set(
+          (data.nights ?? [])
+            .filter((n) => n.guestCount > 0)
+            .map((n) => n.date),
+        );
+        if (activeLodgeIdRef.current === requestedLodgeId) {
+          setGuestNightsByMonth((prev) => ({ ...prev, [monthKey]: guestNights }));
+        }
+      }
+    } catch {
+      // non-essential overlay
+    }
+  }, [lodgeScopeReady, scopedLodgeId]);
+
+  const handleVisibleMonthChange = useCallback(
+    (monthKey: string) => {
+      setVisibleMonthKey(monthKey);
+      fetchAssignments();
+      refreshOverlay(monthKey);
+    },
+    [fetchAssignments, refreshOverlay],
+  );
+
+  useEffect(() => {
+    // State is labelled by the selected lodge but keyed only by month/member in
+    // memory. Clear it synchronously with a scope change; response fences below
+    // prevent a late Lodge A request from repopulating the Lodge B workspace.
+    setAssignments([]);
+    setUnassignedDates([]);
+    setAssignmentsLoadError(null);
+    setUnassignedLoadError(null);
+    setEligibleMembers([]);
+    setRedDatesByMonth({});
+    setGuestNightsByMonth({});
+    setCoveredNightsByMonth({});
+    setSelection({ startDate: "", endDate: "" });
+    setTarget(null);
+    setIsCustodian(false);
+    setSelectedBedId(null);
+    setOverCapacity(null);
+    setError(null);
+    setAdvisoryNote(null);
+    setPinMessage(null);
+    setCreating(false);
+    setSavingBedForId(null);
+    setResettingPinId(null);
+  }, [scopedLodgeId]);
+
+  useEffect(() => {
+    fetchAssignments();
+    fetchUnassignedDates();
+  }, [fetchAssignments, fetchUnassignedDates]);
+
+  // Fetch eligible members whenever the picked range changes.
+  useEffect(() => {
+    if (
+      !lodgeScopeReady ||
+      !selection.startDate ||
+      !selection.endDate ||
+      selection.startDate > selection.endDate
+    ) {
+      setEligibleMembers([]);
+      return;
+    }
+
+    let cancelled = false;
+    setLoadingMembers(true);
+
+    fetch(
+      `/api/admin/hut-leaders/eligible-members?startDate=${selection.startDate}&endDate=${selection.endDate}&lodgeId=${encodeURIComponent(scopedLodgeId)}`,
+    )
+      .then((res) => (res.ok ? res.json() : Promise.reject()))
+      .then((data) => {
+        if (!cancelled) {
+          setEligibleMembers(Array.isArray(data?.members) ? data.members : []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setEligibleMembers([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingMembers(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selection.startDate, selection.endDate, lodgeScopeReady, scopedLodgeId]);
+
+  // Step 1 — picking new nights always drops any selected target.
+  function handlePickNights(next: { startDate: string; endDate: string }) {
+    if (!lodgeScopeReady) return;
+    setSelection(next);
+    setTarget(null);
+    setIsCustodian(false); // the tick belongs to one member's pick (#3817)
+  }
+
+  // Step 2a — a suggestion adopts the member's conflict-free suggested range.
+  function handleSelectEligible(member: EligibleMember) {
+    if (!lodgeScopeReady) return;
+    setSelection({
+      startDate: member.suggestedStartDate,
+      endDate: member.suggestedEndDate,
+    });
+    setTarget({
+      memberId: member.id,
+      memberName: `${member.firstName} ${member.lastName}`,
+    });
+    setIsCustodian(false);
+    setError(null);
+  }
+
+  // #3817: adopt the last night stayed the server named. Unlike picking new
+  // nights, this keeps the chosen member — only the end date was wrong.
+  function handleChangeLastNight(endDate: string) {
+    if (!lodgeScopeReady) return;
+    setSelection((current) => ({ ...current, endDate }));
+    setError(null);
+  }
+
+  // Step 2b — any member (including a no-booking custodian) keeps the picked range.
+  function handleSelectAnyMember(member: PickedMember) {
+    if (!lodgeScopeReady) return;
+    setTarget({
+      memberId: member.id,
+      memberName: `${member.firstName} ${member.lastName}`,
+    });
+    setIsCustodian(false);
+    setError(null);
+  }
+
+  async function handleConfirm(
+    confirmOverCapacity = false,
+    amendOverlappingHolds = false,
+  ) {
+    if (!target || !selection.startDate || !selection.endDate) return;
+    // #2701: the Confirm button is already disabled in this state; this is the
+    // defence behind it, because a pending over-capacity card re-invokes this
+    // through a captured closure rather than through the button.
+    if (!scopedLodgeId) return;
+    const requestedLodgeId = scopedLodgeId;
+    setError(null);
+    setCreating(true);
+    try {
+      const res = await fetch("/api/admin/hut-leaders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          memberId: target.memberId,
+          startDate: selection.startDate,
+          endDate: selection.endDate,
+          lodgeId: requestedLodgeId,
+          // #2286: omitted entirely for a role-only assignment, so the request
+          // is byte-for-byte what it was before this feature.
+          ...(selectedBedId ? { bedId: selectedBedId } : {}),
+          ...(isCustodian ? { isCustodian: true } : {}),
+          ...(confirmOverCapacity ? { confirmOverCapacity: true } : {}),
+          // #2698: sent ONLY after the officer has accepted on the card below.
+          // Its absence is the decline, which is why it is omitted rather than
+          // sent as false.
+          ...(amendOverlappingHolds ? { amendOverlappingHolds: true } : {}),
+        }),
+      });
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      if (!res.ok) {
+        if (res.status === 403) {
+          setError({
+            message: ADMIN_FORBIDDEN_SAVE_REASON,
+            memberId: target.memberId,
+          });
+          return;
+        }
+        // A refusal is not always JSON: an HTML error page reads as no body,
+        // and falls through to this screen's own sentence (ALP-589).
+        const data = (await readApiObjectOrEmpty(res)) as {
+          code?: unknown;
+          nightDetails?: NonNullable<typeof overCapacity>["nights"];
+          nonHoldingBookings?: unknown;
+          nights?: NonNullable<typeof holdAmendment>["nights"];
+          amendments?: unknown;
+          lastNightStayed?: unknown;
+        };
+        // #2286 warn-and-confirm: not a failure, a question. Keep the form
+        // exactly as it is and show the nights so the admin decides.
+        if (data.code === "CUSTODIAN_OVER_CAPACITY_CONFIRM_REQUIRED") {
+          // One question on screen at a time (#2698 review L1-F4): two live
+          // `role="alert"` cards is two assertive announcements, and the stale
+          // one's primary button re-sends the request that just failed.
+          setHoldAmendment(null);
+          setOverCapacity({
+            nights: data.nightDetails ?? [],
+            bookings: Array.isArray(data.nonHoldingBookings)
+              ? data.nonHoldingBookings
+              : [],
+            holdsBed: selectedBedId !== null,
+            confirm: () => void handleConfirm(true, amendOverlappingHolds),
+          });
+          return;
+        }
+        // #2698 ordering case: also a question, not a failure. Keep the form as
+        // it is and show which nights leave the existing hold's sole occupancy.
+        if (data.code === "CUSTODIAN_OVERLAPS_WHOLE_LODGE_HOLD") {
+          // The over-capacity card is the one this replaces: the server checks
+          // capacity first, so accepting it is what lets the request reach the
+          // ordering question at all (#2698 review L1-F4).
+          setOverCapacity(null);
+          setHoldAmendment({
+            nights: data.nights ?? [],
+            amendments: Array.isArray(data.amendments) ? data.amendments : [],
+            holdsBed: selectedBedId !== null,
+            accept: () => void handleConfirm(confirmOverCapacity, true),
+          });
+          return;
+        }
+        setError({
+          message: apiErrorMessageFromBody(data, "Failed to create"),
+          memberId: target.memberId,
+          // #3817: the stay refusal names the last night stayed from the start
+          // date; the form offers it as the corrected end.
+          correctedEndDate:
+            data.code === "HUT_LEADER_NIGHTS_NOT_STAYED" &&
+            typeof data.lastNightStayed === "string"
+              ? data.lastNightStayed
+              : null,
+        });
+        return;
+      }
+      // The minor-custodian privacy note is advisory: a body that cannot be
+      // parsed must not turn a successful assignment into an error.
+      const created = await res.json().catch(() => null);
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      // #3821: the school-nights warning shares the advisory note.
+      setAdvisoryNote([created?.minorCustodianWarning, created?.schoolNightsWarning].filter(Boolean).join(" ") || null);
+      setSelection({ startDate: "", endDate: "" });
+      setTarget(null);
+      setSelectedBedId(null);
+      setIsCustodian(false);
+      setOverCapacity(null);
+      setHoldAmendment(null);
+      fetchAssignments();
+      // The Needs Attention hut-leader badge counts these nights (#4962).
+      notifyAdminQueueChanged();
+      fetchUnassignedDates();
+      refreshOverlay(visibleMonthKey);
+    } catch {
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      setError({ message: "Failed to create", memberId: target.memberId });
+    } finally {
+      if (activeLodgeIdRef.current === requestedLodgeId) setCreating(false);
+    }
+  }
+
+  /**
+   * Set, change or RELEASE the bed an existing assignment holds (#2286 review
+   * M7) — `PUT /api/admin/hut-leaders/[id]` with the route's three-state
+   * `bedId`: a string sets it, explicit `null` clears it.
+   *
+   * This is what makes every "clear the bed first" refusal elsewhere in the app
+   * actionable: before it, a hold could only be removed by DELETING the whole
+   * assignment, which also destroyed the coverage record and the kiosk PIN — and
+   * a hold on a cron-created assignment had no admin control at all.
+   */
+  async function handleSaveRow(
+    assignment: HutLeaderAssignment,
+    // #3817: a row edit is the bed (three-state, as above) OR the custodian
+    // tick, so an officer can mark an existing row Custodian before releasing
+    // its bed. Either goes through the same over-capacity and hold questions.
+    patch: { bedId: string | null } | { isCustodian: boolean },
+    confirmOverCapacity = false,
+    amendOverlappingHolds = false,
+  ) {
+    if (!scopedLodgeId) return;
+    const requestedLodgeId = scopedLodgeId;
+    // Is a bed in play once this edit lands? Words the confirm cards (#3817).
+    const holdsBed = "bedId" in patch ? patch.bedId !== null : Boolean(assignment.bedId);
+    setError(null);
+    setSavingBedForId(assignment.id);
+    try {
+      const res = await fetch(`/api/admin/hut-leaders/${assignment.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        // `bedId` is sent EXPLICITLY, including as null: omitting it means
+        // "leave the bed alone" to the route, which is the one thing a release
+        // must not do.
+        body: JSON.stringify({
+          ...patch,
+          ...(confirmOverCapacity ? { confirmOverCapacity: true } : {}),
+          // #2698: sent only after an explicit acceptance; absent is decline.
+          ...(amendOverlappingHolds ? { amendOverlappingHolds: true } : {}),
+        }),
+      });
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      if (!res.ok) {
+        if (res.status === 403) {
+          setError({ message: ADMIN_FORBIDDEN_SAVE_REASON, memberId: null });
+          return;
+        }
+        const data = await res.json().catch(() => null);
+        if (data?.code === "CUSTODIAN_OVER_CAPACITY_CONFIRM_REQUIRED") {
+          // One question on screen at a time (#2698 review L1-F4).
+          setHoldAmendment(null);
+          setOverCapacity({
+            nights: data.nightDetails ?? [],
+            bookings: Array.isArray(data.nonHoldingBookings)
+              ? data.nonHoldingBookings
+              : [],
+            holdsBed,
+            confirm: () =>
+              void handleSaveRow(
+                assignment,
+                patch,
+                true,
+                amendOverlappingHolds,
+              ),
+          });
+          return;
+        }
+        if (data?.code === "CUSTODIAN_OVERLAPS_WHOLE_LODGE_HOLD") {
+          // Dismiss the over-capacity card this one replaces (#2698 review
+          // L1-F4): it was already accepted to get here, and its button would
+          // re-send the request that just failed.
+          setOverCapacity(null);
+          setHoldAmendment({
+            nights: data.nights ?? [],
+            amendments: Array.isArray(data.amendments) ? data.amendments : [],
+            holdsBed,
+            accept: () =>
+              void handleSaveRow(
+                assignment,
+                patch,
+                confirmOverCapacity,
+                true,
+              ),
+          });
+          return;
+        }
+        setError({
+          message: data?.error || "Failed to update the assignment",
+          memberId: null,
+        });
+        return;
+      }
+      // #3821: the edit answers the create's school-nights advisory too, shown
+      // in the same note. Advisory: an unparseable body is no warning.
+      const saved = await res.json().catch(() => null);
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      setAdvisoryNote(
+        typeof saved?.schoolNightsWarning === "string" ? saved.schoolNightsWarning : null,
+      );
+      setBedEditAssignmentId(null);
+      setOverCapacity(null);
+      setHoldAmendment(null);
+      fetchAssignments();
+      // A held bed is presence (#3818, INV-DATE-031), so setting or releasing
+      // one changes which nights are covered: the amber list must move with
+      // the calendar, as it does after a create or a delete.
+      notifyAdminQueueChanged();
+      fetchUnassignedDates();
+      refreshOverlay(visibleMonthKey);
+    } finally {
+      if (activeLodgeIdRef.current === requestedLodgeId) {
+        setSavingBedForId(null);
+      }
+    }
+  }
+
+  async function handleDelete(id: string) {
+    if (!scopedLodgeId) return;
+    const requestedLodgeId = scopedLodgeId;
+    if (!confirm(`Delete this ${hutLeaderLabel.toLowerCase()} assignment?`)) return;
+    const res = await fetch(`/api/admin/hut-leaders/${id}`, { method: "DELETE" });
+    if (activeLodgeIdRef.current !== requestedLodgeId) return;
+    if (res.ok) {
+      setError(null);
+      fetchAssignments();
+      notifyAdminQueueChanged();
+      fetchUnassignedDates();
+      refreshOverlay(visibleMonthKey);
+      return;
+    }
+    if (res.status === 403) {
+      setError({ message: ADMIN_FORBIDDEN_SAVE_REASON, memberId: null });
+      return;
+    }
+    // Every other refusal, said out loud (#2698 review A-2). The delete gained
+    // a 409 — the row moved lodges while the key was being taken — and this
+    // handler used to fall off the end for anything that was not 403, so the
+    // officer clicked Delete, the row stayed, and nothing on the page said why.
+    // The server's own sentence is preferred; the fallback covers a body that
+    // is missing or unparseable.
+    const data = await res.json().catch(() => null);
+    setError({
+      message:
+        data?.error ||
+        `Failed to delete this ${hutLeaderLabel.toLowerCase()} assignment. Reload and try again.`,
+      memberId: null,
+    });
+  }
+
+  async function handleResetPin(assignment: HutLeaderAssignment) {
+    if (!scopedLodgeId) return;
+    const requestedLodgeId = scopedLodgeId;
+    if (
+      !confirm(
+        `Generate a new kiosk PIN for ${assignment.memberName}? Their existing PIN will stop working.`,
+      )
+    ) {
+      return;
+    }
+
+    setError(null);
+    setPinMessage(null);
+    setResettingPinId(assignment.id);
+    try {
+      const res = await fetch(`/api/admin/hut-leaders/${assignment.id}/pin`, {
+        method: "POST",
+      });
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      if (!res.ok) {
+        setError({
+          message:
+            res.status === 403
+              ? ADMIN_FORBIDDEN_SAVE_REASON
+              : await apiErrorMessageFromResponse(res, "Failed to reset PIN"),
+          memberId: null,
+        });
+        return;
+      }
+      const data = await res.json();
+
+      setPinMessage({
+        memberName: assignment.memberName,
+        pin: data.pin,
+        emailSent: Boolean(data.emailSent),
+      });
+      fetchAssignments();
+    } catch {
+      if (activeLodgeIdRef.current !== requestedLodgeId) return;
+      setError({ message: "Failed to reset PIN", memberId: null });
+    } finally {
+      if (activeLodgeIdRef.current === requestedLodgeId) {
+        setResettingPinId(null);
+      }
+    }
+  }
+
+  function handleAssignForDate(date: string) {
+    if (!lodgeScopeReady) return;
+    setSelection({ startDate: date, endDate: date });
+    setTarget(null);
+    setIsCustodian(false);
+  }
+
+  // ---- Calendar overlay (red: no leader tonight; violet: covered) ----------
+  // Painted from the server's presence-aware cover (#3818): a night shows a
+  // leader only when that leader is assigned AND staying, and a changeover day
+  // shows "AM · … until midday" / "PM · … from midday". The derivation is
+  // `buildLeaderCalendarOverlay`, kept out of this file so it is testable alone.
+  const overlayByDate = useMemo<Record<string, CalendarOverlayValue>>(() => {
+    const { start: monthStart, end: monthEnd } = monthBounds(visibleMonthKey);
+    return buildLeaderCalendarOverlay({
+      monthStart,
+      monthEnd,
+      coveredNights: coveredNightsByMonth[visibleMonthKey] ?? new Map(),
+      redDates: redDatesByMonth[visibleMonthKey] ?? [],
+      guestNights: guestNightsByMonth[visibleMonthKey],
+      hutLeaderLabel,
+    });
+  }, [coveredNightsByMonth, redDatesByMonth, guestNightsByMonth, visibleMonthKey, hutLeaderLabel]);
+
+  const overlayLegend = useMemo<Array<{ tone: CalendarTone; label: string }>>(
+    () => [
+      { tone: "violet", label: `${hutLeaderLabel} staying` },
+      { tone: "red", label: `Guests, no ${hutLeaderLabel.toLowerCase()} staying` },
+    ],
+    [hutLeaderLabel],
+  );
+
+  // ---- Step-3 summary + client-side conflict preview -----------------------
+  const summary = useMemo<AssignmentSummary | null>(() => {
+    if (!target || !selection.startDate || !selection.endDate) return null;
+    if (selection.startDate > selection.endDate) return null;
+
+    const start = parseDateOnly(selection.startDate);
+    const end = parseDateOnly(selection.endDate);
+    const nights =
+      Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
+
+    // Fills: how many currently-red nights this range would cover. Uses every
+    // month of red data we have loaded so a cross-month range still counts.
+    const redSet = new Set(Object.values(redDatesByMonth).flat());
+    let fills = 0;
+    for (
+      let day = start;
+      day.getTime() <= end.getTime();
+      day = addDaysDateOnly(day, 1)
+    ) {
+      if (redSet.has(formatDateOnly(day))) fills++;
+    }
+
+    // Conflicts: same calculateOverlapDays the POST route uses (no logic drift).
+    // >1 day overlap with any existing assignment blocks the assignment.
+    const conflicts = assignments
+      .map((a) => ({
+        name: a.memberName,
+        startDate: a.startDate,
+        endDate: a.endDate,
+        days: calculateOverlapDays(
+          start,
+          end,
+          parseDateOnly(a.startDate),
+          parseDateOnly(a.endDate),
+        ),
+      }))
+      .filter((c) => c.days > 1);
+
+    return {
+      name: target.memberName,
+      startDate: selection.startDate,
+      endDate: selection.endDate,
+      nights,
+      fills,
+      conflicts,
+      // #4961: a failed assignments read leaves `assignments` empty, so the
+      // overlap check above finds nothing. Say so in the preview rather than
+      // let "no warning" read as "no clash"; the POST route still re-checks.
+      overlapCheckUnavailable: Boolean(assignmentsLoadError),
+    };
+  }, [target, selection.startDate, selection.endDate, assignments, assignmentsLoadError, redDatesByMonth]);
+
+  // The club's day decides whether a coverage block reads as active or past —
+  // not the build's `NEXT_PUBLIC_TZ`, which is fixed at compile time rather than
+  // read from the club's persisted setting, and which falls back to
+  // `Pacific/Auckland` for every viewer on a deployment that sets only `TZ`.
+  // Either way a block could read finished a day early (CT-4, #2870;
+  // INV-CONFIG-002).
+  const today: string = clubTime.today();
+
+  /*
+    #2160: the view-only explanation lives here, once, at the top of the section —
+    announced on arrival and ahead of the controls it explains — instead of on
+    each disabled button below. The `role="status"` wrapper is permanently
+    mounted so the live region is registered in the accessibility tree before its
+    content appears; a region injected already-populated is silently dropped by
+    some screen-reader/browser pairings. It sits OUTSIDE the `space-y-*` stack so
+    the empty wrapper an edit-capable admin gets costs no layout.
+  */
+  const viewOnlyBanner = (
+    <AdminViewOnlySectionBanner canEdit={canEdit} className="mb-6">
+      Your admin role can view {hutLeaderLabel.toLowerCase()} assignments but
+      cannot change them. Lodge edit access is required.
+    </AdminViewOnlySectionBanner>
+  );
+
+  return (
+    <div>
+      {viewOnlyBanner}
+      <div className="space-y-6">
+      <AdminPageHeader
+        title={`${hutLeaderLabel} Assignments`}
+        description={`Paint the calendar: assign a member as ${hutLeaderLabel.toLowerCase()} for the nights that need cover.`}
+      />
+
+      <div className="max-w-xs">
+        <LodgeSelect
+          lodges={lodges}
+          value={lodgeId}
+          onChange={setLodgeId}
+          loading={lodgesLoading}
+          deferDefaultSelection={lodgeOptionsFailed || lodgeOptionsForbidden}
+        />
+      </div>
+
+      {/* #2701: say the lodge list failed, above the form whose lodge picker it
+          silently removed. */}
+      <LodgeScopeStatusNotice
+        scope={lodgeScope}
+        onRetry={reloadLodgeOptions}
+        what={`${hutLeaderLabel.toLowerCase()} assignments for a particular lodge`}
+      />
+
+      {lodgeScopeReady ? (
+        <>
+      {/*
+        Page-level (more prominent than a form-scoped banner): reset-PIN errors
+        originate in the assignments table, so a form banner would never show
+        them. This guarantees every error — create, reset-PIN — is visible
+        without scrolling.
+      */}
+      {lodgeScopeReady && error && (
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="rounded-md border border-danger/20 bg-danger-muted px-4 py-3 text-sm text-danger"
+        >
+          {error.message}
+        </div>
+      )}
+
+      {/* #4961: a failed check is said, never shown as no card — no card
+          means every upcoming night is covered. */}
+      {lodgeScopeReady && unassignedLoadError ? (
+        <AdminLoadError
+          title={`Upcoming nights with no ${hutLeaderLabel.toLowerCase()} staying could not be checked`}
+          message={unassignedLoadError}
+          onRetry={fetchUnassignedDates}
+          data-testid="hut-leaders-unassigned-load-error"
+        />
+      ) : null}
+
+      {lodgeScopeReady && !unassignedLoadError && unassignedDates.length > 0 && (
+        <Card className="border-warning/20 bg-warning-muted">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base text-warning">
+              <CalendarDays className="h-5 w-5" />
+              Upcoming nights with no {hutLeaderLabel.toLowerCase()} staying ({unassignedDates.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3">
+              {unassignedDates.map((d) => (
+                <div
+                  key={`${d.date}|${d.lodgeId ?? ""}`}
+                  className="flex items-center justify-between rounded-lg border border-warning/20 bg-card px-3 py-2 text-card-foreground"
+                >
+                  <div>
+                    <p className="text-sm font-medium text-foreground">{d.date}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {d.bookingCount} booking{d.bookingCount !== 1 ? "s" : ""},{" "}
+                      {d.guestCount} guest{d.guestCount !== 1 ? "s" : ""}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleAssignForDate(d.date)}
+                    className="text-xs"
+                  >
+                    Assign
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {lodgeScopeReady ? <AssignmentForm
+        hutLeaderLabel={hutLeaderLabel}
+        lodgeId={scopedLodgeId}
+        selectedStartDate={selection.startDate}
+        selectedEndDate={selection.endDate}
+        onPickNights={handlePickNights}
+        onVisibleMonthChange={handleVisibleMonthChange}
+        overlayByDate={overlayByDate}
+        overlayLegend={overlayLegend}
+        eligibleMembers={eligibleMembers}
+        loadingMembers={loadingMembers}
+        target={target}
+        onSelectEligible={handleSelectEligible}
+        onSelectAnyMember={handleSelectAnyMember}
+        onClearTarget={() => { setTarget(null); setIsCustodian(false); }}
+        summary={summary}
+        creating={creating}
+        error={error}
+        onConfirm={() => void handleConfirm()}
+        onChangeLastNight={handleChangeLastNight}
+        isCustodian={isCustodian}
+        onCustodianChange={(next) => { setIsCustodian(next); setError(null); }}
+        /*
+          #2701: this prop is the form's "may the Confirm write proceed" gate
+          (its only other use, the form's own banner, is suppressed just below),
+          so an unresolved lodge closes it exactly as a lodge:view role does.
+          The table's own row controls below keep the plain `canEdit` — deleting
+          an assignment or resetting a kiosk PIN needs no lodge.
+        */
+        canEdit={canEdit}
+        // #2160: the page banner above already states view-only access for this
+        // whole surface, including the assignments table below, so the form must
+        // not repeat it — both are unconditional, so every view-only lodge admin
+        // would otherwise meet the same sentence twice in two live regions.
+        renderViewOnlyBanner={false}
+        lodgeSelector={null}
+        /*
+          #2701: not rendered at all while the lodge is unresolved, because the
+          picker's `available-beds` lookup is the lodge-keyed fetch on this page
+          — with no lodgeId the route answers with the DEFAULT lodge's beds, and
+          a picker offering another property's beds is worse than none.
+        */
+        bedPicker={
+          bedAllocationOn && (
+            <CustodianBedPicker
+              lodgeId={scopedLodgeId}
+              startDate={selection.startDate}
+              endDate={selection.endDate}
+              value={selectedBedId}
+              onChange={(bedId) => {
+                setSelectedBedId(bedId);
+                // A changed bed invalidates any pending over-capacity answer.
+                setOverCapacity(null);
+              }}
+              canEdit={canEdit}
+            />
+          )
+        }
+      /> : null}
+
+      {overCapacity && overCapacity.nights.length > 0 && (
+        /*
+          #2160/#1549 convention on this page: anything the admin MUST read
+          before acting is announced, not merely rendered. This card is a
+          question — it appears after a save the server declined to complete —
+          so it is a `role="alert"` live region AND takes focus, otherwise a
+          screen-reader or keyboard admin presses Confirm, hears nothing, and
+          has no idea a second step appeared further down the page.
+        */
+        <Card
+          className="border-warning/20 bg-warning-muted"
+          role="alert"
+          aria-live="assertive"
+          tabIndex={-1}
+          ref={overCapacityCardRef}
+          data-testid="custodian-over-capacity-confirm"
+        >
+          <CardContent className="space-y-3 p-4">
+            <p className="text-sm font-medium text-warning">
+              {overCapacity.holdsBed
+                ? "Holding that bed puts the lodge over capacity"
+                : "Counting this custodian puts the lodge over capacity"}
+            </p>
+            <ul className="space-y-1 text-sm text-foreground">
+              {overCapacity.nights.map((night) => (
+                <li key={night.date}>
+                  {night.date}: {night.occupiedBeds} people for {night.capacity}{" "}
+                  bed{night.capacity === 1 ? "" : "s"}
+                </li>
+              ))}
+            </ul>
+            {overCapacity.bookings.length > 0 && (
+              /*
+                #2286 review M5 (the #177 blind spot). The figures above count
+                only capacity-HOLDING bookings, so an overridden booking that
+                will settle onto these very nights adds nothing to them. Naming
+                it here is the difference between an honest confirmation and one
+                that understates what the admin is accepting.
+              */
+              <div className="space-y-1" data-testid="custodian-over-capacity-bookings">
+                <p className="text-sm font-medium text-warning">
+                  Not counted above — these live bookings can still take those
+                  nights:
+                </p>
+                <ul className="space-y-1 text-sm text-foreground">
+                  {overCapacity.bookings.map((booking) => (
+                    <li key={booking.id}>
+                      {booking.memberName} · {booking.checkIn} → {booking.checkOut}{" "}
+                      · {booking.guestCount} guest
+                      {booking.guestCount === 1 ? "" : "s"} · {booking.status}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <p className="text-xs text-muted-foreground">
+              The {hutLeaderLabel.toLowerCase()} genuinely sleeps in the lodge,
+              so this can be correct — confirm only if you know those nights
+              work.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {/*
+                Defence in depth: the write route enforces lodge:edit, and this
+                card is only reachable from a save a view-only admin cannot
+                start — but every write control on this page goes through
+                ViewOnlyActionButton, and an exception is the thing a later
+                refactor copies.
+              */}
+              <ViewOnlyActionButton
+                canEdit={canEdit}
+                describeReason={false}
+                type="button"
+                onClick={overCapacity.confirm}
+                disabled={creating || savingBedForId !== null}
+              >
+                {creating || savingBedForId ? "Saving..." : "Confirm anyway"}
+              </ViewOnlyActionButton>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setOverCapacity(null)}
+              >
+                Cancel
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {holdAmendment && holdAmendment.nights.length > 0 && (
+        /*
+          #2698 — the ordering case. A custodian bed hold over nights an
+          existing whole-lodge hold already covers narrows that booking's sole
+          occupancy, and the owner's rule (9 Aug 2026) is that this is never
+          done silently: the officer is shown the nights and chooses.
+
+          Announced and focused for the same reason as the over-capacity card
+          above: it appears after a save the server declined to complete, so a
+          keyboard or screen-reader admin must not be left wondering why
+          nothing happened.
+        */
+        <Card
+          className="border-warning/20 bg-warning-muted"
+          role="alert"
+          aria-live="assertive"
+          tabIndex={-1}
+          ref={holdAmendmentCardRef}
+          data-testid="custodian-hold-amendment-confirm"
+        >
+          <CardContent className="space-y-3 p-4">
+            <p className="text-sm font-medium text-warning">
+              The lodge is exclusively held on some of those nights
+            </p>
+            <p className="text-sm text-foreground">
+              Another booking has the whole lodge to itself on the nights below.
+              {holdAmendment.holdsBed
+                ? ` Holding this bed for the ${hutLeaderLabel.toLowerCase()} takes that one bed out of their sole occupancy on those nights`
+                : ` Counting the ${hutLeaderLabel.toLowerCase()} as a custodian (lives on site) takes one space out of their sole occupancy on those nights`}
+              {" "}— every other bed, their dates and what they pay stay exactly
+              as they are.
+            </p>
+            <ul className="space-y-1 text-sm text-foreground">
+              {holdAmendment.nights.map((night) => (
+                <li key={night}>{night}</li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              Accept and both changes are made together, as one recorded action.
+              Cancel and nothing changes at all — neither the assignment nor the
+              other booking.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {/*
+                Defence in depth, exactly as the over-capacity card: the write
+                route enforces lodge:edit and this card is only reachable from a
+                save a view-only admin cannot start, but every write control on
+                this page goes through ViewOnlyActionButton.
+              */}
+              <ViewOnlyActionButton
+                canEdit={canEdit}
+                describeReason={false}
+                type="button"
+                onClick={holdAmendment.accept}
+                disabled={creating || savingBedForId !== null}
+              >
+                {creating || savingBedForId
+                  ? "Saving..."
+                  : holdAmendment.holdsBed
+                    ? "Accept and hold the bed"
+                    : "Accept and save"}
+              </ViewOnlyActionButton>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setHoldAmendment(null)}
+              >
+                Cancel
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {advisoryNote && (
+        <Card className="border-info/20 bg-info-muted">
+          <CardContent className="flex items-center justify-between gap-3 p-4">
+            <p className="text-sm text-info">{advisoryNote}</p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setAdvisoryNote(null)}
+            >
+              Dismiss
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {pinMessage && (
+        <Card className="border-info/20 bg-info-muted">
+          <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-medium text-info">
+                New kiosk PIN for {pinMessage.memberName}
+              </p>
+              <p className="mt-1 font-mono text-2xl font-semibold tracking-[0.25em] text-foreground">
+                {pinMessage.pin}
+              </p>
+              <p className="mt-1 text-xs text-info">
+                This PIN is shown once.{" "}
+                {pinMessage.emailSent
+                  ? `It has also been emailed to the ${hutLeaderLabel.toLowerCase()}.`
+                  : "Email delivery failed, so provide it directly."}
+              </p>
+            </div>
+            <Button type="button" variant="outline" onClick={() => setPinMessage(null)}>
+              Dismiss
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* #4961: "Loading..." never replaces a load error. Try again's own re-read
+          sets `loading`, and swapping the error for "Loading..." would unmount
+          its button and drop the keyboard focus on it. The error clears only
+          when a read succeeds. */}
+      {loading && !assignmentsLoadError ? (
+        <div className="rounded-lg border border-border bg-card p-6 text-center text-muted-foreground">
+          Loading...
+        </div>
+      ) : assignmentsLoadError ? (
+        <AdminLoadError
+          title={`${hutLeaderLabel} assignments could not be loaded`}
+          message={assignmentsLoadError}
+          onRetry={fetchAssignments}
+          data-testid="hut-leaders-assignments-load-error"
+        />
+      ) : assignments.length === 0 ? (
+        <div className="rounded-lg border border-border bg-card p-6 text-center text-muted-foreground">
+          No {hutLeaderLabel.toLowerCase()} assignments yet.
+        </div>
+      ) : (
+        <AdminDataTable>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Member</TableHead>
+              {showLodgeColumn && <TableHead>Lodge</TableHead>}
+              <TableHead>Start</TableHead>
+              <TableHead>Last night</TableHead>
+              {/* #2286: which bed (if any) this assignment holds. */}
+              <TableHead>Bed held</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {assignments.map((a) => {
+              const isActive = a.startDate <= today && a.endDate >= today;
+              const isPast = a.endDate < today;
+              return (
+                <TableRow key={a.id}>
+                  <TableCell>
+                    <div className="flex items-center gap-2">
+                      <UserCheck className="h-4 w-4 text-muted-foreground" />
+                      <div>
+                        <div className="font-medium">
+                          {a.memberName}
+                          {a.isCustodian ? <Badge variant="outline" className="ml-2">Custodian</Badge> : null}
+                        </div>
+                        <div className="text-xs text-muted-foreground">{a.memberEmail}</div>
+                      </div>
+                    </div>
+                  </TableCell>
+                  {showLodgeColumn && <TableCell>{a.lodgeName ?? "—"}</TableCell>}
+                  <TableCell>{a.startDate}</TableCell>
+                  <TableCell>{a.endDate}</TableCell>
+                  <TableCell>
+                    {a.bedName ? (
+                      <span className="text-sm">
+                        {a.bedRoomName ? `${a.bedRoomName} · ` : ""}
+                        {a.bedName}
+                      </span>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">
+                        Role only
+                      </span>
+                    )}
+                    {/*
+                      #2286 review M7: the bed is editable in place, including on
+                      an assignment the auto-assign cron created — which
+                      previously had no bed control at all. Selecting a bed PUTs
+                      straight away; "No bed — role only" releases it.
+                    */}
+                    {bedEditAssignmentId === a.id ? (
+                      <div className="mt-2" data-testid={`bed-picker-${a.id}`}>
+                        <CustodianBedPicker
+                          lodgeId={a.lodgeId}
+                          startDate={a.startDate}
+                          endDate={a.endDate}
+                          assignmentId={a.id}
+                          value={a.bedId}
+                          onChange={(bedId) => void handleSaveRow(a, { bedId })}
+                          canEdit={canEdit && savingBedForId !== a.id}
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="mt-1 text-xs"
+                          onClick={() => setBedEditAssignmentId(null)}
+                        >
+                          Done
+                        </Button>
+                      </div>
+                    ) : null}
+                  </TableCell>
+                  <TableCell>
+                    {isActive ? (
+                      <Badge className="border-success/20 bg-success-muted text-success">Active</Badge>
+                    ) : isPast ? (
+                      <Badge variant="secondary">Past</Badge>
+                    ) : (
+                      <Badge className="border-info/20 bg-info-muted text-info">Upcoming</Badge>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex justify-end gap-1">
+                      {/*
+                        #2286 review M7. Two separate controls on purpose:
+                        RELEASE is the one every "clear the bed first" message
+                        elsewhere in the app tells the admin to use, so it is one
+                        click and is never buried inside a picker. It stays
+                        available even with the bedAllocation module off — a
+                        hold created while it was on still occupies a real bed,
+                        and the route's clear branch is deliberately
+                        module-check-free so it can always be undone.
+                      */}
+                      {a.bedId ? (
+                        <ViewOnlyActionButton
+                          canEdit={canEdit}
+                          describeReason={false}
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => void handleSaveRow(a, { bedId: null })}
+                          disabled={savingBedForId === a.id}
+                          className="text-muted-foreground hover:bg-muted hover:text-foreground"
+                          title="Release the bed (keep the assignment)"
+                        >
+                          <Undo2 className="h-4 w-4" />
+                          <span className="sr-only">Release bed</span>
+                        </ViewOnlyActionButton>
+                      ) : null}
+                      {/*
+                        #3821: a school teacher's row never holds a bed — a held
+                        bed is a custodian occupancy, and the server refuses it.
+                        Release bed above stays, for an older row that has one.
+                      */}
+                      {bedAllocationOn && a.source !== "SCHOOL_BOOKING" ? <ViewOnlyActionButton
+                        canEdit={canEdit}
+                        describeReason={false}
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setBedEditAssignmentId((current) =>
+                            current === a.id ? null : a.id,
+                          )
+                        }
+                        disabled={savingBedForId === a.id}
+                        className="text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title={a.bedId ? "Change the bed held" : "Hold a bed"}
+                      >
+                        <BedDouble className="h-4 w-4" />
+                        <span className="sr-only">
+                          {a.bedId ? "Change bed" : "Hold a bed"}
+                        </span>
+                      </ViewOnlyActionButton> : null}
+                      {/*
+                        #3817: convert an existing row to or from Custodian
+                        (lives on site). Unticking a row that has no bed and no
+                        stay is refused by the server, like Release bed. A
+                        school teacher's row is never a custodian (#3821).
+                      */}
+                      {a.source !== "SCHOOL_BOOKING" ? <ViewOnlyActionButton
+                        canEdit={canEdit}
+                        describeReason={false}
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void handleSaveRow(a, { isCustodian: !a.isCustodian })}
+                        disabled={savingBedForId === a.id}
+                        aria-pressed={Boolean(a.isCustodian)}
+                        className="text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title={a.isCustodian ? "Custodian (lives on site): untick" : "Mark as custodian (lives on site)"}
+                      >
+                        <Home className="h-4 w-4" />
+                        {/* One label; aria-pressed carries the state. */}
+                        <span className="sr-only">Custodian (lives on site)</span>
+                      </ViewOnlyActionButton> : null}
+                      <ViewOnlyActionButton
+                        canEdit={canEdit}
+                        describeReason={false}
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleResetPin(a)}
+                        disabled={resettingPinId === a.id}
+                        className="text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title="Reset kiosk PIN"
+                      >
+                        <KeyRound className="h-4 w-4" />
+                        <span className="sr-only">Reset kiosk PIN</span>
+                      </ViewOnlyActionButton>
+                      <ViewOnlyActionButton
+                        canEdit={canEdit}
+                        describeReason={false}
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleDelete(a.id)}
+                        className="text-danger hover:bg-danger-muted hover:text-danger"
+                        title="Delete assignment"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        <span className="sr-only">Delete assignment</span>
+                      </ViewOnlyActionButton>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </AdminDataTable>
+      )}
+        </>
+      ) : null}
+      </div>
+    </div>
+  );
+}

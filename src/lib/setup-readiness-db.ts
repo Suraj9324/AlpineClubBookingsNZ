@@ -1,0 +1,665 @@
+import { z } from "zod";
+import { decodeRawRows } from "@/lib/raw-sql-rows";
+import type { PrismaClient } from "@prisma/client";
+import type { DatabaseRoleSnapshot } from "@/lib/setup-readiness-database-role";
+import { readClubModuleSettingsRecord } from "@/config/modules";
+import { readXeroConnection } from "@/lib/xero-connection";
+import { prisma } from "@/lib/prisma";
+import { CLUB_TIME_SETTINGS_ID } from "@/lib/club-time-zone";
+import { resolveEnvironmentRole } from "@/lib/environment-role";
+import { readWithheldApplicationEmail } from "@/lib/environment-safety-withheld";
+import {
+  getDefaultLodgeCapacity,
+  getLodgeCapacityStatus,
+} from "@/lib/lodge-capacity";
+import { isLodgeSetUpForBookings } from "@/lib/lodge-booking-readiness";
+import { BOOKABLE_AGE_TIER_VALUES } from "@/lib/age-tier-schema";
+import { clubToday, dateOnlyInstantOf } from "@/lib/club-time";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import { CLUB_FORMAT_SETTINGS_ID } from "@/lib/club-format";
+import { resolveStoredClubFormat } from "@/lib/club-format-env";
+import { clubChargeCurrencyCode } from "@/lib/stripe-charge-currency";
+import {
+  computeMembershipTypeRateGaps,
+  formatMembershipTypeRateGap,
+  selectTypesRequiringHutRates,
+} from "@/lib/membership-type-rate-coverage";
+import {
+  MEMBERSHIP_TYPE_BOOKING_BEHAVIOR_LABELS,
+  canonicalKeyResolvedRateHolderBookingBehavior,
+} from "@/lib/membership-types";
+import { type SetupDatabaseSnapshot } from "@/lib/setup-readiness";
+import { tallyDataKeyUsage, type DataKeyUsageSnapshot } from "@/lib/setup-readiness-data-keys";
+import { ringKeyedDataExists } from "@/lib/data-encryption-legacy-write-guard";
+import { codeHashKeyId, twoFactorSecretKeyId } from "@/lib/two-factor-key-format";
+import { collapseHutFeeColumns } from "@/lib/public-hut-fee-columns";
+import { getXeroTokenReadability } from "@/lib/xero-token-store";
+import { getStripeSetupState } from "@/lib/stripe-config";
+import {
+  ACCOUNT_MAPPING_FALLBACK_KEYS,
+  ACCOUNT_MAPPING_KEYS_ASKING_WHILE_UNSET,
+  describeMappingOwnWhileUnset,
+  isCodeExplicitlyConfigured,
+  MAPPING_LABELS,
+  type AccountMappingKey,
+} from "@/lib/xero-account-mapping-keys";
+
+/**
+ * The mapping keys that are asking to be decided while they are unset
+ * (`INV-INT-021`), in two kinds the checklist must NOT conflate: one working
+ * off another key's mapping (`ACCOUNT_MAPPING_FALLBACK_KEYS`, "using a
+ * fallback"), and one that declares what the system does without it and has
+ * no fallback (#3529: its own `whileUnset` sentence). Both straight off the
+ * registry, so a new key of either kind is surfaced without anybody
+ * remembering to add it — and a key of the second kind is never described as
+ * falling back, which its registry entry says it does not.
+ */
+const ACCOUNT_MAPPING_KEYS_ASKING = ACCOUNT_MAPPING_KEYS_ASKING_WHILE_UNSET;
+const ACCOUNT_MAPPING_KEYS_WITH_FALLBACK = Object.keys(
+  ACCOUNT_MAPPING_FALLBACK_KEYS,
+) as AccountMappingKey[];
+
+/**
+ * The sentinel a failed `ClubTimeSettings` read resolves to, so "the read did
+ * not answer" stays distinguishable from "there is no row" all the way to the
+ * readiness check. A symbol rather than a string or a null, so no value the
+ * database could hold is able to impersonate it.
+ */
+const CLUB_TIME_SETTINGS_UNREADABLE: unique symbol = Symbol(
+  "club-time-settings-unreadable",
+);
+
+/** What the guarded `ClubTimeSettings` read resolves to: a row, no row, or neither. */
+type ClubTimeSettingsRead =
+  | { timeZone: string }
+  | null
+  | typeof CLUB_TIME_SETTINGS_UNREADABLE;
+
+/**
+ * Build the database half of the setup-readiness snapshot (C8 #1987).
+ *
+ * Extracted from the /admin/setup route so both the admin API and the
+ * `setup:check` CLI resolve DB readiness the same way. Under the DB-first
+ * configuration model the club-config and age-tier gates read this snapshot
+ * (clubIdentityName / configuredCapacity / ageTierSettingCount) rather than
+ * `config/club.json`, so an install configured only in the DB reports as
+ * complete without any file on disk. The club-time-zone gate (CT-1, #2989) reads
+ * `clubTimeZone` here for the same reason — the club's timezone is database
+ * state, never the host's `TZ`.
+ *
+ * The environment-role gate (ENV-SAFETY 1, #3034) is the one entry here that is
+ * not a bare table read: `resolveEnvironmentRole()` combines the deployment's
+ * `APP_ENVIRONMENT_ROLE` declaration with the database safer override, and the
+ * readiness step is handed the resolved answer rather than the raw halves, so
+ * that the checklist and every other consumer cannot disagree about the rule.
+ */
+export async function getSetupDatabaseSnapshot(): Promise<SetupDatabaseSnapshot> {
+  const now = new Date();
+  /*
+    The environment role (ENV-SAFETY 1, #3034), resolved HERE rather than in
+    `setup-readiness.ts` because the resolver reads the database and that module
+    is deliberately synchronous over an injected snapshot. `resolveEnvironmentRole`
+    never throws — an unreadable override resolves UNKNOWN, which is the answer
+    the readiness step then reports — so it needs no `.catch()` of its own and
+    cannot take the whole snapshot down.
+
+    It is deliberately NOT inside the `Promise.all` below: that array is one
+    `prisma.*` call per element and reads as a list of table reads. Putting a
+    composite resolver in it would hide a `process.env` read plus a database read
+    inside something that looks like a thirteenth query.
+  */
+  const environmentRole = await resolveEnvironmentRole();
+  /*
+    The club's today, encoded the way a `@db.Date` column stores it, for the
+    season-scope bound below (`INV-DATE-019`, `INV-CONFIG-002`). Read outside
+    the `Promise.all` for the same reason as the two resolvers around it: it is
+    not a table read, and the season query needs its answer.
+  */
+  const clubTodayDateOnly = dateOnlyInstantOf(
+    clubToday(await readClubTimeZoneOutsideRequest()),
+  );
+  /*
+    How much application email this installation has held back for
+    environment-safety reasons (ENV-SAFETY 1, #3034). Answers
+    `{ available: false }` for every installation today; **#3035** creates the
+    rows and replaces the body of `readWithheldApplicationEmail`. Read here for
+    the same reason as the role above — `setup-readiness.ts` is synchronous over
+    an injected snapshot — and outside the `Promise.all` for the same reason too.
+  */
+  const withheldEmail = await readWithheldApplicationEmail();
+  // #4456: which key each stored row names, for the Data Encryption Key step.
+  // Defensive like the lodge read: a failed count omits the signal (the step
+  // then reports stored data as not checked) rather than failing the snapshot.
+  const dataKeyUsage = await readDataKeyUsage().catch(() => undefined);
+  const databaseRole = await readSetupDatabaseRole().catch(() => undefined);
+  const [
+    adminCount,
+    adminModuleSettings,
+    ageTierSettingCount,
+    seasonCount,
+    cancellationPolicyCount,
+    bookingDefaults,
+    groupDiscount,
+    membershipCancellationSettings,
+    operationalXeroConnection,
+    xeroAccountMappingCount,
+    xeroFallbackMappingRows,
+    xeroHutFeeItemMappingCount,
+    xeroEntranceFeeMappingCount,
+    clubIdentity,
+    emailSettings,
+    lodgeSettings,
+    clubTimeSettings,
+    publicContentSettings,
+  ] = await Promise.all([
+    prisma.member.count({ where: { role: "ADMIN", active: true } }),
+    // The one read of the module row (#2996). This used to spell every module
+    // key by hand — a second copy of MODULE_KEYS that each new module had to be
+    // added to separately, with nothing comparing the two. The raw row is what
+    // this snapshot wants: null here means "never saved", which the
+    // feature-flags step reports as first-install defaults, so the tolerant
+    // loaders that map null to defaults would erase that distinction. The two
+    // audit columns ride along unread — the snapshot type narrows them away.
+    readClubModuleSettingsRecord(prisma),
+    prisma.ageTierSetting.count(),
+    prisma.season.count({ where: { active: true } }),
+    prisma.cancellationPolicy.count(),
+    prisma.bookingDefaults.findUnique({ where: { id: "default" } }),
+    prisma.groupDiscountSetting.findUnique({ where: { id: "default" } }),
+    prisma.membershipCancellationSetting.findUnique({
+      where: { id: "default" },
+      select: {
+        xeroArchiveContactsOnCancellation: true,
+        _count: {
+          select: { xeroContactGroups: true },
+        },
+      },
+    }),
+    readXeroConnection(),
+    prisma.xeroAccountMapping.count({
+      where: {
+        OR: [{ code: { not: null } }, { itemCode: { not: null } }],
+      },
+    }),
+    // #2717, `INV-INT-021`: a mapping key with a registered fallback is asking
+    // to be configured while it is unset, and the mappings step above counts
+    // ANY row with a code — so an upgrading club reads "configured" on the very
+    // day a new key ships. Read the rows, not a count, so the step can name the
+    // key. Codes are compared after normalisation, because blank is not a
+    // choice.
+    prisma.xeroAccountMapping.findMany({
+      where: { key: { in: [...ACCOUNT_MAPPING_KEYS_ASKING] } },
+      select: { key: true, code: true },
+    }),
+    prisma.xeroItemCodeMapping.count({
+      where: {
+        category: "HUT_FEE",
+        itemCode: { not: null },
+      },
+    }),
+    prisma.xeroItemCodeMapping.count({
+      where: {
+        category: "JOINING_FEE",
+        OR: [{ itemCode: { not: null } }, { amountCents: { not: null } }],
+      },
+    }),
+    prisma.clubIdentitySettings.findUnique({
+      where: { id: "default" },
+      select: { name: true },
+    }),
+    prisma.emailMessageSetting.findUnique({
+      where: { id: "default" },
+      select: { clubName: true },
+    }),
+    prisma.lodgeSettings.findUnique({
+      where: { id: "default" },
+      select: { capacity: true },
+    }),
+    // The persisted club timezone (CT-1, #2989). An absent row is the normal
+    // pre-first-boot state, not an error, so a null here simply means "not
+    // stored yet" and the readiness check says so. Validation is NOT done here —
+    // the check itself judges the value, so the snapshot stays a plain report of
+    // what the database holds.
+    //
+    // DEFENSIVE, like `getDefaultLodgeCapacity` and the Xero/Stripe probes below
+    // (#2989 review). This is the newest table in the schema, so it is the one
+    // most likely to be absent on a database a migration has not reached — and
+    // unguarded inside this `Promise.all` that single failure rejects the whole
+    // snapshot, which `/admin/setup` renders as a 500 for every step rather than
+    // as one unread setting. The failure is reported rather than swallowed to
+    // null: "no row yet" carries the remedy "the app records it on the next
+    // start", which is not the remedy for a table that does not exist.
+    prisma.clubTimeSettings
+      .findUnique({
+        where: { id: CLUB_TIME_SETTINGS_ID },
+        select: { timeZone: true },
+      })
+      // Annotated so the sentinel keeps its `unique symbol` type through the
+      // handler: without it the inferred return widens to `symbol` and the
+      // `=== CLUB_TIME_SETTINGS_UNREADABLE` check below stops narrowing.
+      .catch((): ClubTimeSettingsRead => CLUB_TIME_SETTINGS_UNREADABLE),
+    // Public {{hut-fees}} embed opt-in (#2129). Only when this is ON does the
+    // single-rate-column readiness warning below apply.
+    prisma.publicContentSettings.findUnique({
+      where: { id: "default" },
+      select: { hutFees: true },
+    }),
+  ]);
+
+  // Missing-rate readiness (#1930, E4; widened by #2933): every membership type
+  // that OWES hut rates must carry tier-complete rate rows (every bookable age
+  // tier, or a flat all-ages row) for every active or not-yet-ended season, or
+  // bookings for that type × those dates hard-throw at pricing time.
+  //
+  // Which types owe rows, and which seasons are in scope, are `INV-MOD-007` and
+  // are asked exactly once, in `membership-type-rate-coverage.ts`. Both used to
+  // be asked HERE instead, as Prisma filters, and both were wrong in the same
+  // way — a filter that leaves a case out reads like any other narrow query:
+  //
+  //   - `bookingBehavior: "MEMBER_RATE"` silently omitted the built-in
+  //     NON_MEMBER type, which every non-member guest prices from, so the one
+  //     set of missing rates an ordinary public booking hits first was the one
+  //     set nothing warned about (#2933);
+  //   - `isActive: true` omitted an ARCHIVED key-resolved holder, which the
+  //     engine still resolves by key and still prices from.
+  //
+  // So the read is now unfiltered and `selectTypesRequiringHutRates` decides.
+  // The table holds a handful of rows per club.
+  const [
+    membershipTypesForRateGaps,
+    currentAndFutureSeasons,
+    existingTypeSeasonRates,
+    configuredAgeTiers,
+    basedOnAgeTierTypes,
+  ] = await Promise.all([
+    prisma.membershipType.findMany({
+      select: {
+        id: true,
+        name: true,
+        key: true,
+        bookingBehavior: true,
+        isActive: true,
+        ageGroupsApply: true,
+      },
+    }),
+    /*
+      The same season scope the Hut Fees screen judges, asked of the database:
+      active, or not yet ended. `endDate` is a `@db.Date`, so the bound has to
+      be the club's today encoded as the UTC midnight that column round-trips
+      through — `INV-DATE-019` — and NOT a raw `new Date()`. Comparing an
+      instant against a date column excluded a season ending TODAY from midday
+      onwards in a club ahead of Greenwich, which is exactly when tonight is
+      still bookable; the screen included it, and the two surfaces are supposed
+      to be answering one question.
+
+      `readClubTimeZoneOutsideRequest`, not `clubTodayDateOnlyInstant`: this
+      module is imported by `scripts/setup.ts`, and the `server-only` import
+      that the request-scoped reader carries is a bare throw outside a React
+      render — it would kill the `setup:check` CLI at import.
+    */
+    prisma.season.findMany({
+      where: {
+        OR: [{ active: true }, { endDate: { gte: clubTodayDateOnly } }],
+      },
+      select: { id: true, name: true },
+    }),
+    prisma.membershipTypeSeasonRate.findMany({
+      select: { seasonId: true, membershipTypeId: true, ageTier: true },
+    }),
+    // The club's actual configured age tiers (#2009). A club may run a SUBSET
+    // (e.g. CHILD + ADULT only), and only its present tiers are ever priced —
+    // so the rate-gap check must demand rate rows for THOSE tiers, not the full
+    // built-in four, or a valid subset club is falsely told it is missing
+    // INFANT/YOUTH rates. Empty (unconfigured) → the caller passes the four
+    // tiers the runtime would price; the coverage rule takes no default of its
+    // own (#2933).
+    // Also carries subscriptionRequiredForBooking for the #2041
+    // BASED_ON_AGE_TIER soft-check.
+    prisma.ageTierSetting.findMany({
+      select: { tier: true, subscriptionRequiredForBooking: true },
+    }),
+    // #2041 misconfig soft-check: active types deferring their subscription
+    // answer to the age tier.
+    prisma.membershipType.findMany({
+      where: { isActive: true, subscriptionBehavior: "BASED_ON_AGE_TIER" },
+      select: { name: true },
+    }),
+  ]);
+  const bookableAgeTiers = configuredAgeTiers.map((row) => row.tier);
+  // Flag a BASED_ON_AGE_TIER type only when age tiers ARE configured (≥1 row)
+  // yet none require a subscription — then the type can never invoice or lock
+  // anyone. When the table is empty the runtime falls back to defaults (Youth/
+  // Adult require), so it is not a misconfig and we leave the list empty.
+  const anyTierRequiresSubscription = configuredAgeTiers.some(
+    (row) => row.subscriptionRequiredForBooking,
+  );
+  const basedOnAgeTierTypesWithoutSubscribingTier =
+    configuredAgeTiers.length > 0 && !anyTierRequiresSubscription
+      ? basedOnAgeTierTypes.map((type) => type.name)
+      : [];
+  const membershipTypeRateGaps = computeMembershipTypeRateGaps({
+    types: selectTypesRequiringHutRates(membershipTypesForRateGaps),
+    seasons: currentAndFutureSeasons,
+    rateRows: existingTypeSeasonRates,
+    // A club running a SUBSET of the four tiers is judged against its own
+    // subset (#2009); an unconfigured club falls back to the four the runtime
+    // would price.
+    bookableAgeTiers:
+      bookableAgeTiers.length > 0 ? bookableAgeTiers : BOOKABLE_AGE_TIER_VALUES,
+  }).map(formatMembershipTypeRateGap);
+  const keyResolvedRateHolderWarnings = membershipTypesForRateGaps.flatMap(
+    (type) => {
+      const expected = canonicalKeyResolvedRateHolderBookingBehavior(type);
+      if (expected === null) return [];
+      const warnings: string[] = [];
+      if (!type.isActive) {
+        warnings.push(`${type.name} (${type.key}) is archived; Reactivate it.`);
+      }
+      if (type.bookingBehavior !== expected) {
+        warnings.push(
+          `${type.name} (${type.key}) uses ${MEMBERSHIP_TYPE_BOOKING_BEHAVIOR_LABELS[type.bookingBehavior]} for bookings; restore ${MEMBERSHIP_TYPE_BOOKING_BEHAVIOR_LABELS[expected]}.`,
+        );
+      }
+      return warnings;
+    },
+  );
+
+  // Public {{hut-fees}} readiness (#2129): the embed renders one nightly-rate
+  // column per publicly-listed active membership type that carries rate rows
+  // for the season, with identically-priced types collapsed into one shared
+  // column (collapseHutFeeColumns — the same helper the embed itself uses, and
+  // fed in the same order, so the warning cannot disagree with what visitors
+  // see). A season resolving to fewer than two columns publishes a table with
+  // nothing to compare, so it is surfaced on the Seasons And Rates step.
+  //
+  // Two gates, both required. The toggle alone is not enough: a club that
+  // flipped it on while exploring settings, without ever placing the token on a
+  // page, would otherwise carry a permanent amber warning about a page block
+  // that does not exist.
+  const publicHutFeeSingleColumnSeasons: string[] = [];
+  const hutFeesTokenPlaced =
+    publicContentSettings?.hutFees === true &&
+    (await prisma.pageContent.count({
+      // Deliberately loose: the token may be written `{{hut-fees}}`,
+      // `{{ hut-fees: lodge=... }}` or the legacy single-brace form, so match
+      // the name alone. Over-matching (the words in prose) merely keeps the
+      // warning visible, which is the safe direction; under-matching would
+      // silently suppress a real misconfiguration.
+      where: {
+        published: true,
+        contentHtml: { contains: "hut-fees", mode: "insensitive" },
+      },
+    })) > 0;
+  if (hutFeesTokenPlaced) {
+    const publicSeasons = await prisma.season.findMany({
+      // Active seasons of ACTIVE lodges only — exactly the set the embed
+      // renders, so the warning cannot flag a season no visitor can see.
+      where: { active: true, lodge: { active: true } },
+      orderBy: [{ startDate: "asc" }, { name: "asc" }],
+      select: {
+        name: true,
+        lodge: { select: { name: true } },
+        membershipTypeRates: {
+          where: { membershipType: { isActive: true, publiclyListed: true } },
+          // Same ordering as the embed's query. The fold is order-independent
+          // now, but keeping the two queries identical means a future change to
+          // one cannot quietly desynchronise the warning from the page.
+          orderBy: [{ ageTier: "asc" }],
+          select: {
+            ageTier: true,
+            pricePerNightCents: true,
+            membershipType: {
+              select: { id: true, name: true, sortOrder: true, ageGroupsApply: true },
+            },
+          },
+        },
+      },
+    });
+    for (const season of publicSeasons) {
+      const byType = new Map<
+        string,
+        {
+          id: string;
+          name: string;
+          sortOrder: number;
+          ageGroupsApply: boolean;
+          rates: Array<{ ageTier: string | null; pricePerNightCents: number }>;
+        }
+      >();
+      for (const rate of season.membershipTypeRates) {
+        const entry = byType.get(rate.membershipType.id) ?? {
+          ...rate.membershipType,
+          rates: [],
+        };
+        entry.rates.push({
+          ageTier: rate.ageTier,
+          pricePerNightCents: rate.pricePerNightCents,
+        });
+        byType.set(rate.membershipType.id, entry);
+      }
+      if (collapseHutFeeColumns([...byType.values()]).length < 2) {
+        publicHutFeeSingleColumnSeasons.push(
+          `${season.lodge.name} — ${season.name}`,
+        );
+      }
+    }
+  }
+
+  const clubIdentityName =
+    clubIdentity?.name?.trim() || emailSettings?.clubName?.trim() || null;
+
+  // The club's currency row, read once for two answers: the RAW stored code
+  // (the Stripe step blocks on an unusable one, #3567) and the currency cards
+  // are actually charged in (#3633), resolved through the same fallback every
+  // reader uses. Guarded, so an unreadable row is "not stored", not a failed
+  // snapshot.
+  const clubFormatCurrencyCode = await Promise.resolve()
+    .then(() =>
+      prisma.clubFormatSettings.findUnique({
+        where: { id: CLUB_FORMAT_SETTINGS_ID },
+        select: { currencyCode: true },
+      }),
+    )
+    .then((row) => row?.currencyCode ?? null)
+    .catch(() => null);
+
+  // Resolved default-lodge booking capacity (#1982): 0 means the default lodge
+  // has no active beds and no capacity override, so it accepts no bookings — the
+  // club-config readiness check warns on it. Guarded because a pre-seed DB has
+  // no Lodge row (getDefaultLodgeId throws); we then simply omit the signal.
+  let defaultLodgeCapacity: number | null = null;
+  try {
+    defaultLodgeCapacity = await getDefaultLodgeCapacity(prisma);
+  } catch {
+    defaultLodgeCapacity = null;
+  }
+
+  // Every active lodge that cannot take a booking (#3407 review), through the
+  // same resolver every booking path reads. Guarded like the default-lodge read
+  // above: an unreadable lodge list omits the signal rather than sinking the
+  // snapshot.
+  let lodgesNotSetUpForBookings: string[] | undefined;
+  try {
+    const activeLodges = await prisma.lodge.findMany({
+      where: { active: true },
+      select: { id: true, name: true },
+      orderBy: { name: "asc" },
+    });
+    const resolved = await Promise.all(
+      activeLodges.map(async (lodge) => ({
+        name: lodge.name,
+        capacity: (await getLodgeCapacityStatus(lodge.id, prisma)).capacity,
+      })),
+    );
+    lodgesNotSetUpForBookings = resolved
+      .filter((lodge) => !isLodgeSetUpForBookings(lodge.capacity))
+      .map((lodge) => lodge.name);
+  } catch {
+    lodgesNotSetUpForBookings = undefined;
+  }
+
+  // Truthful Xero connection state (#2079, #3806): a connection whose stored
+  // token set is missing, no longer decrypts (an auth-secret change) or names
+  // another organisation must read as "needs reconnect", not "connected". The
+  // readability probe is side-effect-free and never exposes the token value; a
+  // DB/crypto hiccup there must not sink the whole readiness snapshot, so it
+  // fails soft to "not needing re-entry" (the connect/expiry checks still gate
+  // "connected").
+  let operationalXeroNeedsReentry = false;
+  if (operationalXeroConnection) {
+    try {
+      operationalXeroNeedsReentry =
+        // Over the credential-store copy, the only one read since #3806 R2.
+        (await getXeroTokenReadability()) === "unreadable";
+    } catch {
+      operationalXeroNeedsReentry = false;
+    }
+  }
+
+  // DB-only Stripe credential state (#2082): metadata-only set-flags plus GCM
+  // readability. A crypto/DB hiccup here must not sink the whole snapshot, so it
+  // fails soft to "unknown" (all false) — the Stripe check then reports the keys
+  // as not set rather than crashing readiness.
+  let stripeSecretKeySet = false;
+  let stripePublishableKeySet = false;
+  let stripeWebhookSecretSet = false;
+  let stripeNeedsReentry = false;
+  try {
+    const stripeState = await getStripeSetupState();
+    stripeSecretKeySet = stripeState.secretKeySet;
+    stripePublishableKeySet = stripeState.publishableKeySet;
+    stripeWebhookSecretSet = stripeState.webhookSecretSet;
+    stripeNeedsReentry = stripeState.needsReentry;
+  } catch {
+    stripeSecretKeySet = false;
+    stripePublishableKeySet = false;
+    stripeWebhookSecretSet = false;
+    stripeNeedsReentry = false;
+  }
+
+  return {
+    adminCount,
+    adminModuleSettings,
+    ageTierSettingCount,
+    seasonCount,
+    cancellationPolicyCount,
+    bookingDefaultsConfigured: Boolean(bookingDefaults),
+    groupDiscountConfigured: Boolean(groupDiscount),
+    membershipCancellationSettingsConfigured: Boolean(
+      membershipCancellationSettings,
+    ),
+    membershipCancellationXeroGroupCount:
+      membershipCancellationSettings?._count.xeroContactGroups ?? 0,
+    membershipCancellationArchiveContacts: Boolean(
+      membershipCancellationSettings?.xeroArchiveContactsOnCancellation,
+    ),
+    operationalXeroConnected: Boolean(
+      operationalXeroConnection &&
+        operationalXeroConnection.expiresAt > now &&
+        !operationalXeroNeedsReentry,
+    ),
+    operationalXeroNeedsReentry,
+    operationalXeroTokenExpiresAt:
+      operationalXeroConnection?.expiresAt.toISOString() ?? null,
+    stripeSecretKeySet,
+    stripePublishableKeySet,
+    stripeWebhookSecretSet,
+    stripeNeedsReentry,
+    xeroAccountMappingCount,
+    xeroUnsetFallbackMappingLabels: ACCOUNT_MAPPING_KEYS_WITH_FALLBACK.filter(
+      (key) =>
+        !isCodeExplicitlyConfigured(
+          xeroFallbackMappingRows.find((row) => row.key === key) ?? null,
+        ),
+    ).map((key) => MAPPING_LABELS[key] ?? key),
+    xeroUnsetMappingConsequences: ACCOUNT_MAPPING_KEYS_ASKING.flatMap((key) => {
+      const own = describeMappingOwnWhileUnset(key);
+      if (own === null) return [];
+      return isCodeExplicitlyConfigured(
+        xeroFallbackMappingRows.find((row) => row.key === key) ?? null,
+      )
+        ? []
+        : [`${MAPPING_LABELS[key] ?? key}: ${own}`];
+    }),
+    xeroHutFeeItemMappingCount,
+    xeroEntranceFeeMappingCount,
+    membershipTypeRateGaps,
+    keyResolvedRateHolderWarnings,
+    publicHutFeeSingleColumnSeasons,
+    basedOnAgeTierTypesWithoutSubscribingTier,
+    defaultLodgeCapacity,
+    lodgesNotSetUpForBookings,
+    clubIdentityName,
+    configuredCapacity: lodgeSettings?.capacity ?? null,
+    // Reported EXACTLY as stored, not trimmed or blank-collapsed. A row holding
+    // an unusable value must read as "stored but invalid" and not as "not stored
+    // yet": the boot backfill keys on the ROW existing, so it will never replace
+    // a bad value, and telling the operator "the app will store this on the next
+    // boot" would then be untrue.
+    clubTimeZone:
+      clubTimeSettings === CLUB_TIME_SETTINGS_UNREADABLE
+        ? null
+        : (clubTimeSettings?.timeZone ?? null),
+    clubTimeZoneUnreadable: clubTimeSettings === CLUB_TIME_SETTINGS_UNREADABLE,
+    // Raw, like the zone above (#3567 review).
+    clubFormatCurrencyCode,
+    // What cards are charged in, or null when none can be (#3633).
+    clubChargeCurrencyCode: clubChargeCurrencyCode(
+      resolveStoredClubFormat(
+        clubFormatCurrencyCode === null
+          ? null
+          : { currencyCode: clubFormatCurrencyCode },
+      ),
+    ),
+    environmentRole,
+    withheldEmail,
+    dataKeyUsage,
+    databaseRole,
+  };
+}
+
+/**
+ * Stored data by the key each row names (#4456): credential rows grouped by
+ * `secretSource`, and each authenticator secret and unused recovery-code hash
+ * by the key id its format names. Only counts leave this function; the stored
+ * values are read here (as the sign-in path reads them) to see their prefix.
+ */
+async function readDataKeyUsage(): Promise<DataKeyUsageSnapshot> {
+  const [bySource, totpSecrets, recoveryCodes, ringKeyedDataPresent] = await Promise.all([
+    prisma.integrationCredential.groupBy({ by: ["secretSource"], _count: { _all: true } }),
+    prisma.member.findMany({ where: { totpSecret: { not: null } }, select: { totpSecret: true } }),
+    prisma.twoFactorRecoveryCode.findMany({ where: { usedAt: null }, select: { codeHash: true } }),
+    // The writers' own definition of "the ring is missing" (#4456 review).
+    ringKeyedDataExists(prisma),
+  ]);
+  return tallyDataKeyUsage({
+    credentialSources: bySource.map((row) => ({ secretSource: row.secretSource, count: row._count._all })),
+    totpKeyIds: totpSecrets.map((row) => (row.totpSecret ? twoFactorSecretKeyId(row.totpSecret) : null)),
+    recoveryCodeKeyIds: recoveryCodes.map((row) => codeHashKeyId(row.codeHash)),
+    ringKeyedDataPresent,
+  });
+}
+
+const DATABASE_ROLE_ROW = z.object({ name: z.string(), isSuperuser: z.boolean() });
+
+/**
+ * Trust the server's roles and PostgreSQL membership, never the connection
+ * URL's user. Both current_user and session_user count: a superuser login
+ * narrowed by a startup `SET ROLE` (`options=-c role=...`, or a pooler) can
+ * still `RESET ROLE` back to the superuser (#5046 review).
+ */
+export async function readSetupDatabaseRole(
+  db: Pick<PrismaClient, "$queryRaw"> = prisma,
+): Promise<DatabaseRoleSnapshot | undefined> {
+  const rows = await db.$queryRaw`
+    SELECT current_user::text AS name,
+      (r.rolsuper OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles other
+        WHERE other.rolsuper
+          AND (pg_catalog.pg_has_role(current_user, other.oid, 'MEMBER')
+            OR pg_catalog.pg_has_role(session_user, other.oid, 'MEMBER'))
+      )) AS "isSuperuser"
+    FROM pg_catalog.pg_roles r WHERE r.rolname = current_user
+  `;
+  return decodeRawRows(rows, DATABASE_ROLE_ROW, "setup database role")[0];
+}

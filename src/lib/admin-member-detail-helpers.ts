@@ -1,0 +1,386 @@
+import { ADMIN_PAGES, activeAdminHref } from "@/lib/admin-hubs"
+import {
+  shouldDefaultPostalSameAsPhysical,
+  type MemberAddressValues,
+} from "@/lib/member-address"
+import { seasonSelectLabel } from "@/lib/season-label"
+import { formatCents } from "@/lib/utils"
+import type { ClubFormat } from "@/lib/club-format"
+import {
+  type ClubDateFormat,
+  formatStayDateOrNull,
+} from "@/lib/club-time"
+
+export interface AdminActor {
+  id: string
+  firstName: string
+  lastName: string
+}
+
+export interface AuditActor {
+  id: string
+  firstName: string
+  lastName: string
+  email: string
+}
+
+export interface AuditLogEntry {
+  id: string
+  action: string
+  details: string | null
+  createdAt: string
+  actor: AuditActor | null
+}
+
+export interface InviteAuditDetails {
+  recipientEmail?: string
+  recipientName?: string
+  kind?: "invite" | "reset"
+  expiryLabel?: string
+}
+
+export interface ParentLinkSummary {
+  id: string
+  firstName: string
+  lastName: string
+  email: string
+  ageTier: string
+  active: boolean
+  canLogin: boolean
+  inheritEmailFromId?: string | null
+  parentLinkType: "PRIMARY" | "SECONDARY"
+}
+
+export interface PromoCodeBenefitSource {
+  type: "PERCENTAGE" | "FIXED_AMOUNT" | "FREE_NIGHTS" | "FIXED_NIGHTLY_PRICE"
+  percentOff: number | null
+  valueCents: number | null
+  freeNightsPerIndividual: number | null
+  lifetimeFreeNightsCap: number | null
+  fixedNightlyPriceCents?: number | null
+  fixedNightlyMode?: "SET_PRICE" | "CAP_ONLY" | null
+}
+
+// Storage keys are member-agnostic on purpose: an admin's expanded/collapsed
+// choices follow them from one member page to the next. Keys retired by the
+// grouped-layout redesign (subs/bookings/xero/audit) are left stale in
+// localStorage; every group simply starts collapsed on first visit.
+export const collapsibleMemberSections = [
+  "contact",
+  "account",
+  "family",
+  "membership",
+  "finance",
+  "committee",
+  "history",
+  "lifecycle",
+] as const
+export type CollapsibleMemberSection =
+  (typeof collapsibleMemberSections)[number]
+
+export const memberSectionStorageKeys: Record<
+  CollapsibleMemberSection,
+  string
+> = {
+  contact: "admin-member-section:contact",
+  account: "admin-member-section:account",
+  family: "admin-member-section:family",
+  membership: "admin-member-section:membership",
+  finance: "admin-member-section:finance",
+  committee: "admin-member-section:committee",
+  history: "admin-member-section:history",
+  lifecycle: "admin-member-section:lifecycle",
+}
+
+export function isCollapsibleMemberSection(
+  value: string
+): value is CollapsibleMemberSection {
+  return collapsibleMemberSections.includes(value as CollapsibleMemberSection)
+}
+
+/**
+ * The parents a member link names on its way back: Bookings and the Finance
+ * pages. A dynamic page (a Xero record) is left out, so a path beneath it falls
+ * to its static parent.
+ */
+const MEMBER_BACK_PARENTS = ADMIN_PAGES.filter(
+  (page) => (page.id === "bookings" || page.hub === "finance") && !page.oldPath.includes("[")
+)
+
+// The label names the parent surface the back-link returns to; the shared
+// BackLink prepends the ← affordance, so the label stays a bare parent name
+// (no "Back to " prefix, which would duplicate the arrow — #2046). It is that
+// page's registry label (C5 #4802), and `activeAdminHref` reads a moved page's
+// hub path as its old path, so either form names the same parent.
+export function getMemberDetailBackLabel(returnTo: string) {
+  const path = returnTo.split(/[?#]/, 1)[0] ?? returnTo
+  const owner = activeAdminHref(
+    path,
+    MEMBER_BACK_PARENTS.map((page) => page.oldPath)
+  )
+  return MEMBER_BACK_PARENTS.find((page) => page.oldPath === owner)?.label ?? "Members"
+}
+
+export function formatAdminName(admin: AdminActor | null | undefined) {
+  return admin ? `${admin.firstName} ${admin.lastName}` : "Unknown admin"
+}
+
+export function parseInviteAuditDetails(
+  details: string | null
+): InviteAuditDetails | null {
+  if (!details) return null
+
+  try {
+    const parsed = JSON.parse(details) as InviteAuditDetails
+    if (typeof parsed !== "object" || parsed === null) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+export function getAuditActorDisplayName(
+  actor: AuditActor | null | undefined
+) {
+  if (!actor) return "System"
+
+  const fullName = `${actor.firstName} ${actor.lastName}`.trim()
+  return fullName || actor.email || "System"
+}
+
+export function formatMemberAuditLogSummary(
+  log: AuditLogEntry,
+  formattedTimestamp: string
+) {
+  const parsedDetails = parseInviteAuditDetails(log.details)
+  const actorName = getAuditActorDisplayName(log.actor)
+
+  if (
+    log.action === "member.setup-invite-sent" &&
+    parsedDetails?.recipientEmail
+  ) {
+    return `Invited via email to ${parsedDetails.recipientEmail} on ${formattedTimestamp} by ${actorName}`
+  }
+
+  if (
+    log.action === "member.password-reset-sent" &&
+    parsedDetails?.recipientEmail
+  ) {
+    return `Password reset sent to ${parsedDetails.recipientEmail} on ${formattedTimestamp} by ${actorName}`
+  }
+
+  return log.action
+}
+
+export function shouldDefaultLinkSideEffects(ageTier: string) {
+  return ageTier !== "ADULT"
+}
+
+export function parentLinkTypeLabel(type?: "PRIMARY" | "SECONDARY") {
+  return type === "SECONDARY" ? "Second parent" : "Primary parent"
+}
+
+/**
+ * What the parent picker says when its eight slots did not hold everyone who
+ * matched (#2425).
+ *
+ * The wording is the member-guest finder's own truncation sentence
+ * (`MEMBER_GUEST_FIND_COPY.truncated`, #2308), character for character, so the
+ * product says the same thing in the same words wherever a search is cut short.
+ * It is a COPY of that string rather than an import: the member-guest sentence
+ * is load-bearing privacy copy — it must never grow a count, because there the
+ * count would describe members the booker is not being shown — and coupling the
+ * two would let a change made for one surface's reasons silently land on the
+ * other. A test pins the two equal, so they cannot drift apart unnoticed either.
+ *
+ * Note what it does NOT say: no count. Here that is only consistency, not
+ * privacy — an admin may see the whole roll — but "keep typing" is the useful
+ * instruction whether five or five hundred were left out.
+ */
+export const MEMBER_SEARCH_TRUNCATED_HINT = "Keep typing to narrow this down."
+
+export function dedupeParentOptions<T extends { id: string }>(parents: T[]) {
+  const seen = new Set<string>()
+  return parents.filter((parent) => {
+    if (seen.has(parent.id)) return false
+    seen.add(parent.id)
+    return true
+  })
+}
+
+export function formatPromoBenefit(
+  promo: PromoCodeBenefitSource,
+  format: ClubFormat,
+) {
+  if (promo.type === "PERCENTAGE") {
+    return promo.percentOff !== null
+      ? `${promo.percentOff}% off per individual`
+      : "Percentage discount"
+  }
+  if (promo.type === "FIXED_AMOUNT") {
+    return promo.valueCents !== null
+      ? `${formatCents(promo.valueCents, format)} off per individual`
+      : "Fixed discount"
+  }
+  if (promo.type === "FIXED_NIGHTLY_PRICE") {
+    if (promo.fixedNightlyPriceCents == null) {
+      return "Fixed nightly price"
+    }
+    const mode = promo.fixedNightlyMode === "SET_PRICE" ? "set price" : "cap only"
+    return `${formatCents(promo.fixedNightlyPriceCents, format)} per eligible night · ${mode}`
+  }
+  if (promo.freeNightsPerIndividual !== null) {
+    const perBooking = `${promo.freeNightsPerIndividual} free night${promo.freeNightsPerIndividual === 1 ? "" : "s"} per booking`
+    if (promo.lifetimeFreeNightsCap != null) {
+      return `${perBooking} · ${promo.lifetimeFreeNightsCap} lifetime`
+    }
+    return perBooking
+  }
+  return "Free nights"
+}
+
+export type NullableMemberAddress = Record<keyof MemberAddressValues, string | null>
+
+export function memberUsesSamePostalAddress(member: NullableMemberAddress) {
+  return shouldDefaultPostalSameAsPhysical(member)
+}
+
+export function formatMemberPhone(parts: {
+  phoneCountryCode: string | null
+  phoneAreaCode: string | null
+  phoneNumber: string | null
+}) {
+  if (!parts.phoneNumber) return null
+  return [
+    parts.phoneCountryCode ? `+${parts.phoneCountryCode}` : null,
+    parts.phoneAreaCode,
+    parts.phoneNumber,
+  ]
+    .filter(Boolean)
+    .join(" ")
+}
+
+// Collapsed-header preview lines for the member detail groups. Each takes the
+// narrow fields it needs (not MemberDetail — _types.ts imports from this file)
+// and returns a single "a · b · c" line.
+const PREVIEW_SEPARATOR = " · "
+
+function pluralize(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`
+}
+
+export function formatMemberContactPreview(input: {
+  email: string
+  phoneCountryCode: string | null
+  phoneAreaCode: string | null
+  phoneNumber: string | null
+  streetCity: string | null
+}) {
+  return [input.email, formatMemberPhone(input), input.streetCity]
+    .filter(Boolean)
+    .join(PREVIEW_SEPARATOR)
+}
+
+export function formatMemberAccountPreview(input: {
+  canLogin: boolean
+  accessRoleCount: number
+  active: boolean
+}) {
+  return [
+    input.canLogin ? "Can log in" : "No login",
+    input.canLogin ? pluralize(input.accessRoleCount, "role") : null,
+    input.active ? "Active" : "Inactive",
+  ]
+    .filter(Boolean)
+    .join(PREVIEW_SEPARATOR)
+}
+
+export function formatMemberFamilyPreview(input: {
+  parentCount: number
+  dependentCount: number
+  familyGroupCount: number
+}) {
+  const parts = [
+    input.parentCount > 0 ? pluralize(input.parentCount, "parent") : null,
+    input.dependentCount > 0
+      ? pluralize(input.dependentCount, "dependent")
+      : null,
+    input.familyGroupCount > 0
+      ? pluralize(input.familyGroupCount, "family group")
+      : null,
+  ].filter(Boolean)
+  return parts.length > 0 ? parts.join(PREVIEW_SEPARATOR) : "None"
+}
+
+export function formatMemberMembershipPreview(input: {
+  currentSeasonYear: number
+  currentSeasonTypeName: string | null
+  currentSeasonSubscriptionLabel: string | null
+}, format: ClubDateFormat) {
+  const season = seasonSelectLabel(input.currentSeasonYear, format)
+  return [
+    `${season}: ${input.currentSeasonTypeName ?? "No seasonal type set"}`,
+    input.currentSeasonSubscriptionLabel,
+  ]
+    .filter(Boolean)
+    .join(PREVIEW_SEPARATOR)
+}
+
+export function formatMemberFinancePreview(input: {
+  creditBalanceCents: number | null
+  promoCodeCount: number
+  xeroLinked: boolean
+}, format: ClubFormat) {
+  return [
+    input.creditBalanceCents === null
+      ? "Credit —"
+      : `Credit ${formatCents(input.creditBalanceCents, format)}`,
+    input.promoCodeCount > 0
+      ? pluralize(input.promoCodeCount, "promo code")
+      : null,
+    input.xeroLinked ? "Xero linked" : "Not linked to Xero",
+  ]
+    .filter(Boolean)
+    .join(PREVIEW_SEPARATOR)
+}
+
+export function formatMemberCommitteePreview(input: {
+  assignmentCount: number
+}) {
+  return input.assignmentCount > 0
+    ? pluralize(input.assignmentCount, "assignment")
+    : "None"
+}
+
+export function formatMemberHistoryPreview(input: {
+  totalBookings: number
+  lastStay: string | null
+}, format: ClubDateFormat) {
+  return [
+    pluralize(input.totalBookings, "booking"),
+    // `lastStay` is a `@db.Date` CALENDAR DAY, not an instant — see
+    // `formatStayDateOrNull`. The summary strip on the same page renders it
+    // the same way, so the two can no longer name different days.
+    input.lastStay ? `last stay ${formatStayDateOrNull(input.lastStay, format) ?? "—"}` : null,
+  ]
+    .filter(Boolean)
+    .join(PREVIEW_SEPARATOR)
+}
+
+export function formatMemberLifecyclePreview(input: {
+  active: boolean
+  cancelledAt: string | null
+  archivedAt: string | null
+  hasPendingDeleteRequest: boolean
+}) {
+  const status = input.archivedAt
+    ? "Archived"
+    : input.cancelledAt
+      ? "Cancelled"
+      : input.active
+        ? "Active"
+        : "Inactive"
+  return [status, input.hasPendingDeleteRequest ? "delete requested" : null]
+    .filter(Boolean)
+    .join(PREVIEW_SEPARATOR)
+}

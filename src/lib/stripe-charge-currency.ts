@@ -1,0 +1,197 @@
+/**
+ * The currency a card is charged in, and the two refusals every charge makes
+ * before Stripe is called (#3567, owner decisions D1, D3 and D7).
+ *
+ * THE CHARGE CURRENCY IS THE CLUB'S STORED CURRENCY. `createPaymentIntent` and
+ * `chargePaymentMethod` in `stripe.ts` work it out from the club format they
+ * already require, through {@link stripeChargeCurrency}, so what a member is
+ * shown and what their card is charged cannot come from two places. Every
+ * entry point that can end in a charge also calls it straight after resolving
+ * the format — before any claim, ledger row, customer lookup or status write —
+ * so a currency this product cannot charge in is refused while nothing has
+ * happened yet (#3567 review).
+ *
+ * A PURE MODULE, deliberately apart from `stripe.ts`: that file is
+ * `server-only` and holds the SDK client, while this is the rule, which the
+ * demo seed and the entry points share without pulling the SDK in.
+ */
+import type { ClubFormat } from "@/lib/club-format";
+import {
+  canonicalCurrencyCode,
+  currencyHasTwoDecimalPlaces,
+  twoDecimalPlacesRequiredMessage,
+} from "@/lib/club-currency-minor-unit";
+import { formatCents } from "@/lib/utils";
+
+/** The club's currency does not count in hundredths, so no card is charged. */
+export class UnsupportedChargeCurrencyError extends Error {
+  constructor(readonly currencyCode: string) {
+    super(twoDecimalPlacesRequiredMessage(currencyCode));
+    this.name = "UnsupportedChargeCurrencyError";
+  }
+}
+
+/** The amount is below the Stripe minimum this product checks for. */
+export class BelowStripeMinimumError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BelowStripeMinimumError";
+  }
+}
+
+/**
+ * The Stripe `currency` for a charge: the club's code, canonicalised the one
+ * way (`canonicalCurrencyCode`) and lower-cased. Throws
+ * {@link UnsupportedChargeCurrencyError} for a currency without two decimal
+ * places (D3).
+ */
+export function stripeChargeCurrency(format: ClubFormat): string {
+  // D3 as the owner decided: refused at PAYMENT time on the STORED value. The
+  // resolver keeps displaying a fallback so pages still render, and says which
+  // stored code it could not use; no card is charged until an admin fixes it.
+  if (format.unusableStoredCurrency) {
+    throw new UnsupportedChargeCurrencyError(format.unusableStoredCurrency);
+  }
+  const code = canonicalCurrencyCode(format.currencyCode);
+  if (!currencyHasTwoDecimalPlaces(code)) {
+    throw new UnsupportedChargeCurrencyError(code);
+  }
+  return code.toLowerCase();
+}
+
+/**
+ * The club's chargeable currency as an upper-case ISO code — the same rule as
+ * {@link stripeChargeCurrency}, in the case the rest of the app stores codes.
+ * Throws {@link UnsupportedChargeCurrencyError} as that does. The member-money
+ * journal's posting context takes its currency here (#4626), so a club whose
+ * stored currency cannot be charged posts nothing, bank receipts included.
+ */
+export function clubChargeCurrencyCodeOrThrow(format: ClubFormat): string {
+  return stripeChargeCurrency(format).toUpperCase();
+}
+
+/**
+ * The currency a card is charged in, as an upper-case ISO code, or `null` when
+ * no card can be charged at all (a stored currency that is not usable, or one
+ * without two decimal places). The same rule as {@link stripeChargeCurrency},
+ * without the throw, for a surface that only has to SAY which currency cards
+ * are charged in — the Xero base-currency warning (#3633), which compares the
+ * organisation's base currency with this and says nothing when it is `null`.
+ */
+export function clubChargeCurrencyCode(format: ClubFormat): string | null {
+  try {
+    return clubChargeCurrencyCodeOrThrow(format);
+  } catch (error) {
+    if (error instanceof UnsupportedChargeCurrencyError) return null;
+    throw error;
+  }
+}
+
+/**
+ * Stripe's minimum charge for the two-decimal currencies this product charges
+ * in, as 50 of the currency's hundredths (owner decision D7). Stripe's real
+ * minimum varies a little by currency (GBP's is 30p) and Stripe refuses a charge
+ * below its own figure itself, so this only stops the obviously-too-small
+ * amount early with a readable message.
+ */
+export const STRIPE_MINIMUM_AMOUNT_CENTS = 50;
+
+export function refuseBelowStripeMinimum(amountCents: number, format: ClubFormat): void {
+  if (amountCents > 0 && amountCents < STRIPE_MINIMUM_AMOUNT_CENTS) {
+    throw new BelowStripeMinimumError(
+      `Amount ${formatCents(amountCents, format)} is below the Stripe minimum (${formatCents(STRIPE_MINIMUM_AMOUNT_CENTS, format)})`,
+    );
+  }
+}
+
+/**
+ * True for a refusal this product made BEFORE calling Stripe. Nothing was sent,
+ * so no charge can be pending from it: a caller that tracks an attempt treats
+ * it as a definite refusal, never as "Stripe may have charged".
+ */
+export function isLocalChargeRefusal(err: unknown): boolean {
+  return err instanceof UnsupportedChargeCurrencyError || err instanceof BelowStripeMinimumError;
+}
+
+/**
+ * Every refusal this product would make for a charge of `amountCents` before
+ * calling Stripe — the currency (D3) or the minimum (D7) — or `null`. The cron
+ * asks this BEFORE it claims a booking or mints an attempt row, so a charge that
+ * would be refused locally never writes a row at all (#3567 review).
+ */
+export function localChargeRefusal(format: ClubFormat, amountCents: number): Error | null {
+  try {
+    stripeChargeCurrency(format);
+    refuseBelowStripeMinimum(amountCents, format);
+    return null;
+  } catch (err) {
+    if (isLocalChargeRefusal(err)) return err as Error;
+    throw err;
+  }
+}
+
+/**
+ * The entry-point form of the refusal: the error when the club's currency
+ * cannot be charged, or `null` when it can. An entry point calls this straight
+ * after resolving the format and answers before it claims, writes or looks up
+ * anything (#3567 review).
+ */
+export function chargeCurrencyRefusal(format: ClubFormat): UnsupportedChargeCurrencyError | null {
+  try {
+    stripeChargeCurrency(format);
+    return null;
+  } catch (err) {
+    if (err instanceof UnsupportedChargeCurrencyError) return err;
+    throw err;
+  }
+}
+
+/** What an administrator is told when a card charge is refused for the currency. */
+export const UNSUPPORTED_CHARGE_CURRENCY_ADMIN_MESSAGE =
+  "No card was charged: the club's currency does not have two decimal places, and this site can only charge cards in a currency that does. Set a two-decimal currency at Admin → Setup & Configuration → Club Currency & Locale.";
+
+/** What a member is told when the club's currency cannot be charged by card. */
+export const UNSUPPORTED_CHARGE_CURRENCY_MEMBER_MESSAGE =
+  "Card payments are not available for this club's currency at the moment. Nothing was charged. Please contact the club to arrange payment.";
+
+/**
+ * The member refusal as a coded body (#3635), for a route whose client tells
+ * its 409s apart by `code` — the additional-payment card, where a bare 409 used
+ * to read as "already paid".
+ */
+export const UNSUPPORTED_CHARGE_CURRENCY_CODE = "UNSUPPORTED_CHARGE_CURRENCY" as const;
+
+export const UNSUPPORTED_CHARGE_CURRENCY_MEMBER_BODY = Object.freeze({
+  code: UNSUPPORTED_CHARGE_CURRENCY_CODE,
+  error: UNSUPPORTED_CHARGE_CURRENCY_MEMBER_MESSAGE,
+});
+
+/** What a member is told when the amount due is below {@link STRIPE_MINIMUM_AMOUNT_CENTS} (#99). */
+export const BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE =
+  "This amount is too small to pay by card. Nothing was charged. Please contact the club to settle it another way.";
+
+export const BELOW_STRIPE_MINIMUM_CODE = "BELOW_STRIPE_MINIMUM" as const;
+
+/** The below-minimum refusal as a coded body, so a client tells it apart from other 409s. */
+export const BELOW_STRIPE_MINIMUM_MEMBER_BODY = Object.freeze({
+  code: BELOW_STRIPE_MINIMUM_CODE,
+  error: BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE,
+});
+
+/**
+ * What an administrator, or the cron, is told when a saved-card charge is below
+ * the minimum (#101). Nothing was claimed, written or sent to Stripe.
+ */
+export const BELOW_STRIPE_MINIMUM_ADMIN_MESSAGE =
+  "No card was charged: the amount is below the smallest charge Stripe accepts by card. Settle it another way, such as by bank transfer.";
+
+export const BELOW_STRIPE_MINIMUM_ADMIN_BODY = Object.freeze({
+  code: BELOW_STRIPE_MINIMUM_CODE,
+  error: BELOW_STRIPE_MINIMUM_ADMIN_MESSAGE,
+});
+
+export function isBelowStripeMinimum(value: unknown): value is { code: typeof BELOW_STRIPE_MINIMUM_CODE; error: string } {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.code === BELOW_STRIPE_MINIMUM_CODE && typeof candidate.error === "string";
+}

@@ -1,0 +1,169 @@
+// @vitest-environment jsdom
+
+import {
+  CLUB_TIME_TEST_ZONE,
+  render,
+  screen,
+  waitFor,
+} from "@/lib/__tests__/support/club-time-render";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+/*
+  #2930: the calendar no longer reads the club-identity bed count. That figure is
+  ONE lodge's capacity used as the denominator for every lodge, so at a capped or
+  secondary lodge every free-bed count on this grid was computed against the
+  wrong ceiling. The selected lodge's own effective capacity now arrives with the
+  month's availability (`INV-CAP-001`, `INV-CAP-003`), which is why every stub
+  below states `lodgeCapacity` — and why a stub that omits it renders "availability
+  not loaded" rather than silently borrowing another lodge's number.
+*/
+
+import { BookingCalendar } from "@/components/booking-calendar";
+import { bindClubTime, requireClubTimeZone } from "@/lib/club-time";
+import { CLUB_FORMAT_TEST } from "@/lib/__tests__/support/club-format-fixture";
+
+/*
+  A day in the current month that is never in the past: tomorrow, clamped to the
+  month's last day (mirrors booking-calendar-a11y.test.tsx so assertions stay
+  deterministic across any run date).
+
+  "TODAY" HERE IS THE CLUB'S DAY, NOT THE HOST'S (CT-4, #2870).
+
+  `BookingCalendar` opens on the month `clubTime.today()` names, which comes from
+  the `ClubTimeProvider` this harness mounts (`Pacific/Auckland`). Deriving these
+  fixtures from a bare `new Date()` reads the RUNNER's clock instead, and the two
+  agree only while the host is on or east of UTC — which is CI's shape, and is why
+  it looked fine. On a developer machine or container running `TZ=America/Denver`
+  the frozen instant is 30 June there and 1 July at the club, so every fixture
+  below landed in the wrong month and this suite failed against entirely correct
+  code. Same defect, same reasoning and same fix as the header of
+  `admin-booking-calendar.test.tsx`.
+
+  Constructed as a LOCAL date from the club's calendar parts, so every
+  `now.get*()` reader below keeps working unchanged and returns the club's
+  year/month/day in any host zone.
+*/
+const clubToday = bindClubTime(requireClubTimeZone(CLUB_TIME_TEST_ZONE), CLUB_FORMAT_TEST).today();
+const [clubYear, clubMonth, clubDay] = clubToday.split("-").map(Number);
+const now = new Date(clubYear, clubMonth - 1, clubDay);
+const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+const targetDay = Math.min(now.getDate() + 1, lastDay);
+const targetIso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(targetDay).padStart(2, "0")}`;
+
+function targetLabelPrefix() {
+  const date = new Date(now.getFullYear(), now.getMonth(), targetDay);
+  return date.toLocaleDateString(CLUB_FORMAT_TEST.locale, {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function stubAvailability(
+  occupiedOnTarget: number,
+  season?: { name: string; type: string },
+) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        lodgeCapacity: 20, availability: { [targetIso]: occupiedOnTarget },
+        seasons: season ? { [targetIso]: season } : {},
+      }),
+    })),
+  );
+}
+
+async function targetButton() {
+  const prefix = targetLabelPrefix();
+  return waitFor(() =>
+    screen.getByRole("button", {
+      name: (accessibleName: string) => accessibleName.startsWith(prefix),
+    }),
+  );
+}
+
+describe("BookingCalendar token-driven availability heat (#1814)", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("paints a plenty night (>15 free) with the success token and shows the free-bed count", async () => {
+    stubAvailability(2); // 18 of 20 free
+    render(<BookingCalendar onDateSelect={() => {}} />);
+
+    const button = await targetButton();
+    expect(button.className).toContain("bg-success-muted");
+    expect(button.className).toContain("text-success");
+    // The free-bed count is the non-colour signal.
+    expect(button.textContent).toContain("18");
+  });
+
+  it("paints a filling night (6-15 free) with the warning token", async () => {
+    stubAvailability(8); // 12 of 20 free
+    render(<BookingCalendar onDateSelect={() => {}} />);
+
+    const button = await targetButton();
+    expect(button.className).toContain("bg-warning-muted");
+    expect(button.className).toContain("text-warning");
+    expect(button.textContent).toContain("12");
+  });
+
+  it("paints a nearly-full night (1-5 free) with the info step", async () => {
+    stubAvailability(17); // 3 of 20 free
+    render(<BookingCalendar onDateSelect={() => {}} />);
+
+    const button = await targetButton();
+    expect(button.className).toContain("bg-info-muted");
+    expect(button.className).toContain("text-info");
+    expect(button.textContent).toContain("3");
+  });
+
+  it("paints a full night (0 free) with the danger token and a 'Waitlist' label instead of colour alone", async () => {
+    stubAvailability(20); // 0 of 20 free
+    render(<BookingCalendar onDateSelect={() => {}} />);
+
+    const button = await targetButton();
+    expect(button.className).toContain("bg-danger-muted");
+    expect(button.className).toContain("text-danger");
+    // #2930 SUPERSEDES the "Full" wording this line pinned. The heat is
+    // unchanged — a full night is still the danger token and still says so
+    // without relying on colour — but the word is now the ACTION rather than
+    // the state, because since #2930 a member can act on it. "Full" alone was
+    // accurate about a cell that could not be clicked; on a cell that CAN be
+    // clicked it says nothing about what clicking does.
+    expect(button.textContent).toContain("Waitlist");
+  });
+
+  it("still says 'Full' on the admin over-capacity grid, where a full day is not a waitlist", async () => {
+    stubAvailability(20);
+    render(<BookingCalendar onDateSelect={() => {}} allowFullDates />);
+
+    const button = await targetButton();
+    // The admin book-on-behalf boundary (#2930): a full day there is the #1767
+    // over-capacity warn-and-confirm, never the member waitlist, so offering
+    // the member's word for it would name the wrong mechanism.
+    expect(button.textContent).toContain("Full");
+    expect(button.textContent).not.toContain("Waitlist");
+  });
+
+  it("marks the selected check-in with the brand-gold accent, not a heat colour", async () => {
+    stubAvailability(2);
+    render(<BookingCalendar onDateSelect={() => {}} selectedCheckIn={targetIso} />);
+
+    const button = await targetButton();
+    expect(button.className).toContain("!bg-brand-gold");
+    expect(button.className).toContain("!text-brand-charcoal");
+  });
+
+  it("states a season with text as well as a coloured top border", async () => {
+    stubAvailability(2, { name: "Winter 2026", type: "WINTER" });
+    render(<BookingCalendar onDateSelect={() => {}} />);
+
+    const button = await targetButton();
+    expect(button.getAttribute("aria-label")).toContain("Winter 2026 season");
+    expect(button.textContent).toContain("W");
+  });
+});

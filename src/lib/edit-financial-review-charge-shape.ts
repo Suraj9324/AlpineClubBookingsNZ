@@ -1,0 +1,245 @@
+import {
+  LedgerAnchorKind,
+  LedgerLineKind,
+  ManualRefundTaskDirection,
+  ManualRefundTaskKind,
+  ManualRefundTaskStatus,
+  PaymentSource,
+  PaymentTransactionKind,
+  type Prisma,
+} from "@prisma/client";
+
+import { parseEditFinancialReviewContext } from "@/lib/edit-financial-review-context";
+import { buildEditFinancialReviewChargeReason } from "@/lib/payment-recovery-keys";
+
+/**
+ * #3187 (epic #2797): WHICH ROWS AN EDIT-REVIEW CHARGE IS MADE OF, and how they
+ * total — as pure shapes, with no `server-only` above them.
+ *
+ * WHY THIS FILE EXISTS AT ALL, and it is not a stylistic split.
+ * `edit-financial-review-charge-request.ts` is `server-only`: it writes audit
+ * rows and holds the module Prisma client. The booking-vs-Xero repair tool asks
+ * two of the same questions — *which review tasks carry a settled charge share*
+ * and *which ledger row is this edit's combined request* — and that tool runs
+ * from `scripts/xero-booking-repair.ts`, an operator CLI. A CLI that statically
+ * reaches `server-only` THROWS the moment it starts, before it prints anything;
+ * `cli-server-only-reach-census.test.ts` refuses exactly that, and it caught
+ * this import on the first run. The precedent is `payment-recovery-keys.ts`,
+ * split out of `payment-recovery.ts` for the same consumer and the same reason.
+ *
+ * The alternative — the repair tool keeping its own copy of "which rows count as
+ * owed" — is the one thing this must not be. A repair tool auditing an
+ * accounting leg from a second spelling of that leg's own rule is how the two
+ * come to disagree, and it would disagree silently, in a report an operator
+ * trusts (`INV-SSOT`).
+ *
+ * Deliberately NOT in `edit-financial-review-context.ts`, whose own header
+ * commits to importing nothing from `node:`, Prisma, or `@/lib/prisma` so a
+ * client component can hold the parser. These shapes need the Prisma enums.
+ */
+
+/**
+ * WHICH REVIEW TASKS CARRY A SETTLED CHARGE SHARE.
+ *
+ * COMPLETED, `CHARGE_TO_MEMBER`, and carrying an amount: a share that has been
+ * priced by an officer and settled as money owed to the club. Spread beside a
+ * `bookingId` for one booking, or a `bookingId: { in: [...] }` for a repair
+ * sweep.
+ */
+/**
+ * WHICH REVIEW TASKS CARRY A SETTLED SHARE IN EITHER DIRECTION (#3530 stage
+ * 2c): for the Xero document that names each as `Adjustment agreed with
+ * member: <note>`. The charge `where` below IS this one narrowed by direction
+ * - spread, not restated - so the two cannot count a different set of rows.
+ */
+export const editReviewSettledShareTaskWhere = {
+  kind: ManualRefundTaskKind.EDIT_FINANCIAL_REVIEW,
+  status: ManualRefundTaskStatus.COMPLETED,
+  settlementDirection: {
+    in: [ManualRefundTaskDirection.CHARGE_TO_MEMBER, ManualRefundTaskDirection.REFUND_TO_MEMBER],
+  },
+  amountCents: { not: null },
+} as const satisfies Prisma.ManualRefundTaskWhereInput;
+
+export const editReviewChargeShareTaskWhere = {
+  ...editReviewSettledShareTaskWhere,
+  settlementDirection: ManualRefundTaskDirection.CHARGE_TO_MEMBER,
+} as const satisfies Prisma.ManualRefundTaskWhereInput;
+
+export const editReviewSettledShareTaskSelect = {
+  id: true,
+  amountCents: true,
+  settlementDirection: true,
+  note: true,
+  completedAt: true,
+  reviewContext: true,
+} as const satisfies Prisma.ManualRefundTaskSelect;
+
+/**
+ * THE SIGN A SETTLED DIRECTION TAKES as money on the booking - the one
+ * direction-to-number rule (`INV-SSOT-002`): a charge is money owed to the
+ * club (+1, the sign `priceDiffCents` carries for a price increase), a refund
+ * money owed to the member (-1). `dispatchEditReviewXeroSettlement` signs the
+ * figure it dispatches from the route the same way.
+ */
+export function editReviewSettlementSign(direction: ManualRefundTaskDirection): 1 | -1 {
+  return direction === ManualRefundTaskDirection.CHARGE_TO_MEMBER ? 1 : -1;
+}
+
+/**
+ * WHICH LEDGER LINES ARE REVIEWS' HAND-BACKS of a captured payment (#3835,
+ * #3907): the `BANK_REFUND` a review's bank-transfer route posts under its
+ * task. One fragment, read twice: #3835's netting sums what siblings returned
+ * with it (`settledSinceCancellation`, spread beside a `bookingId`), and the
+ * cut-over census matches its snapshot's lines against the same object
+ * (`isEditReviewHandBackLine`). The census also drops a line a later reversal
+ * undid (`liveLines`) from what a hand-back makes, yet still counts its task
+ * as one that refunded the capture, and so never mints (#3913): being the
+ * stricter both ways, it can only flag, never excuse.
+ */
+export function editReviewHandBackLinesWhere(taskIds: string[]) {
+  return {
+    kind: LedgerLineKind.BANK_REFUND,
+    anchorKind: LedgerAnchorKind.REVIEW_TASK,
+    anchorId: { in: taskIds },
+    reversesLineId: null,
+  } as const satisfies Prisma.BookingLedgerLineWhereInput;
+}
+
+/** Is `line` one of `taskId`'s hand-backs, by `editReviewHandBackLinesWhere` itself? */
+export function isEditReviewHandBackLine(
+  line: { kind: string; anchorKind: string; anchorId: string; reversesLineId: string | null },
+  taskId: string,
+): boolean {
+  const where = editReviewHandBackLinesWhere([taskId]);
+  return (
+    line.kind === where.kind &&
+    line.anchorKind === where.anchorKind &&
+    where.anchorId.in.includes(line.anchorId) &&
+    line.reversesLineId === where.reversesLineId
+  );
+}
+
+/** One settled share as a Xero document names it: signed like `priceDiffCents`. */
+export type EditReviewSettledShare = {
+  /** Which task settled it - evidence for a reader of the record, not rendered. */
+  taskId: string;
+  /** +1 money owed to the club (a charge), -1 money owed to the member (a refund). */
+  sign: 1 | -1;
+  /** The share's magnitude, the task's own `amountCents`. */
+  amountCents: number;
+  /** The officer's completion note, trimmed at completion; null when none. */
+  note: string | null;
+};
+
+/**
+ * The settled shares on each anchor, in completion order. A row with no anchor
+ * in its context, no amount, or no direction contributes nothing - a DISMISSED
+ * task never reaches here (the `where` above), and a COMPLETED one always
+ * carries all three. `sumEditReviewChargeSharesByAnchor` below walks the same
+ * rows for the charge total the invoice bills; it stays its own loop because
+ * the repair CLI pins it (#3187), and the two agree by construction on which
+ * rows count (one `where`, one parser).
+ */
+export function editReviewSettledSharesByAnchor(
+  tasks: ReadonlyArray<{
+    id: string;
+    amountCents: number | null;
+    settlementDirection: ManualRefundTaskDirection | null;
+    note: string | null;
+    completedAt: Date | null;
+    reviewContext: unknown;
+  }>,
+): Map<string, EditReviewSettledShare[]> {
+  const byAnchor = new Map<string, EditReviewSettledShare[]>();
+  const ordered = [...tasks].sort(
+    (a, b) => (a.completedAt?.getTime() ?? 0) - (b.completedAt?.getTime() ?? 0),
+  );
+  for (const task of ordered) {
+    const anchor = parseEditFinancialReviewContext(task.reviewContext)?.bookingModificationId;
+    if (!anchor || task.amountCents === null || task.settlementDirection === null) continue;
+    const shares = byAnchor.get(anchor) ?? [];
+    shares.push({
+      taskId: task.id,
+      sign: editReviewSettlementSign(task.settlementDirection),
+      amountCents: task.amountCents,
+      note: task.note,
+    });
+    byAnchor.set(anchor, shares);
+  }
+  return byAnchor;
+}
+
+export const editReviewChargeShareTaskSelect = {
+  id: true,
+  amountCents: true,
+  reviewContext: true,
+} as const satisfies Prisma.ManualRefundTaskSelect;
+
+/** One settled share, as little of it as the sum needs. */
+export type EditReviewChargeShareRow = {
+  amountCents: number | null;
+  reviewContext: unknown;
+};
+
+/**
+ * The settled shares, totalled per edit.
+ *
+ * The arithmetic half of `sumEditReviewChargeSharesCents`, split out so the same
+ * summation serves one anchor and a whole repair sweep. A task whose stored
+ * context is unreadable, or which names no anchor, contributes to NOTHING rather
+ * than to a fallback bucket: `parseEditFinancialReviewContext` returning null
+ * means the evidence cannot be trusted, and quietly attributing that money to
+ * some edit would be the guess this epic exists to refuse.
+ * `editReviewSettledSharesByAnchor` above walks the same rows in both
+ * directions for the Xero document's share lines (#3530); the anchor rule is
+ * the one parser in both.
+ */
+export function sumEditReviewChargeSharesByAnchor(
+  tasks: readonly EditReviewChargeShareRow[],
+): Map<string, number> {
+  const totals = new Map<string, number>();
+  for (const task of tasks) {
+    const anchor = parseEditFinancialReviewContext(task.reviewContext)
+      ?.bookingModificationId;
+    if (!anchor) continue;
+    totals.set(anchor, (totals.get(anchor) ?? 0) + (task.amountCents ?? 0));
+  }
+  return totals;
+}
+
+/**
+ * WHICH LEDGER ROW IS THIS EDIT'S COMBINED CHARGE REQUEST — as three field
+ * equalities, so the question can be asked of the database AND of rows already
+ * in hand without being spelled twice (`INV-SSOT`).
+ *
+ * `findEditReviewChargeRequest` spreads this into a `where`;
+ * `isEditReviewChargeRequestRow` compares a loaded row against it field by
+ * field. #3187 needed the second form: the repair tool already holds every
+ * `PaymentTransaction` on the booking, and re-querying for one it is looking at
+ * would be a second answer to a question this feature already owns.
+ */
+export function editReviewChargeRequestCriteria(bookingModificationId: string) {
+  return {
+    kind: PaymentTransactionKind.ADDITIONAL,
+    source: PaymentSource.STRIPE,
+    reason: buildEditFinancialReviewChargeReason(bookingModificationId),
+  } as const;
+}
+
+/** The same three equalities, asked of a row that is already loaded (#3187). */
+export function isEditReviewChargeRequestRow(
+  row: {
+    kind: PaymentTransactionKind;
+    source: PaymentSource;
+    reason: string | null;
+  },
+  bookingModificationId: string,
+): boolean {
+  const criteria = editReviewChargeRequestCriteria(bookingModificationId);
+  return (
+    row.kind === criteria.kind &&
+    row.source === criteria.source &&
+    row.reason === criteria.reason
+  );
+}

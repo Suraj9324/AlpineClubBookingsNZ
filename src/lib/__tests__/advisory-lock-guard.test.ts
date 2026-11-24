@@ -1,0 +1,2477 @@
+import path from "path";
+import { describe, expect, it } from "vitest";
+
+import { lockCensusSources, maskedSource } from "./support/advisory-lock-source";
+import {
+  collectAdvisoryLockSites,
+  countCodeOccurrences,
+  indexSitesByKey,
+  symbolOfKey,
+} from "./support/advisory-lock-scan";
+import { blankLiterals, blankLiteralsWithSpans, stripComments } from "./support/strip-comments";
+import { CENSUS_TIMEOUT_MS } from "@/test/census-timeout";
+
+// #182 guard (process follow-up to upstream PR #1911 review finding H1): a
+// capacity ADMISSION path must use the per-lodge lock, while global-cohort
+// booking lifecycle and settlement/money transitions use the canonical global
+// pg_advisory_xact_lock(1). A writer that does both takes global first, then
+// per-lodge (#1881). This scan makes a disjoint-key regression a CI failure
+// instead of an upstream review comment.
+//
+// The rule itself is written ONCE, as INV-LOCK-001 (which tier a writer takes),
+// INV-LOCK-002 (acquisition order, and the single mint of the per-lodge key) and
+// INV-LOCK-003 (every Tier-2 site is registered here) in
+// docs/invariants/operations.md. This file does not restate it; it enforces it,
+// and each registry entry below carries only what is specific to ONE site.
+//
+// 1. The canonical global lock(1) is kept in a reviewed PER-SITE registry
+//    (#2722). A new call site must classify the writer using
+//    docs/CONCURRENCY_AND_LOCKING.md: use lock(1) for booking-status/settlement
+//    money, the per-lodge helper for capacity, and both in that order when the
+//    writer composes them. Add the site with its own reason and PR lock-impact
+//    evidence; a bare count told a builder nothing ("expected 3, got 4") and
+//    coupled approval to which file happened to hold the call.
+//
+// 2. The per-lodge key is minted ONLY by acquireLodgeCapacityLock:
+//    hashtextextended must not appear outside src/lib/lodge-capacity-lock.ts,
+//    so an
+//    ad-hoc reconstruction can never drift from the canonical key.
+//
+// Domain-keyed advisory locks (hashtext of a namespaced string) are
+// unrestricted — they are deliberately distinct keyspaces.
+
+const SRC_DIR = path.join(process.cwd(), "src");
+
+
+/**
+ * SITE IDENTITY, and why it survives a file split (the property #2688 needs).
+ *
+ * A site is identified by the SYMBOL that contains it plus an ordinal, never by
+ * its file or its line:
+ *
+ *     performBookingCancellation#3
+ *
+ * A structural split moves a function to another module with its name and its
+ * body intact, so that identity — and the reason attached to it — moves with the
+ * code and needs no edit. A line number would not survive an inserted comment;
+ * a per-file count does not survive the split at all, which is the whole reason
+ * #2722 exists and why it lands before the bed-allocation split.
+ *
+ * Two shapes need more than the bare symbol, and both are handled by deriving a
+ * key the scanner computes rather than by anything the registry asserts:
+ *
+ * - **App Router handlers** are named by the framework, so `POST` is not an
+ *   identity at all — ten route files export one. Their key is the METHOD plus
+ *   the route path, `POST /api/admin/bookings/[id]/exclusive-hold#1`. That is not
+ *   a file-layout accident: the path IS the URL, so a handler cannot move file
+ *   without changing behaviour, and re-registering it is then correct.
+ * - **A colliding library symbol.** Two modules each keep a private
+ *   `acquireGlobalBookingLock`, so `acquireGlobalBookingLock#1` names two sites.
+ *   Those entries use the file-qualified form
+ *   `src/lib/booking-exception-execution.ts::acquireGlobalBookingLock#1`, and the
+ *   guard REFUSES an ambiguous entry rather than silently binding a reason to
+ *   whichever site it found first. The cost is honest and visible: exactly those
+ *   entries are the ones a split has to update.
+ *
+ * The ordinal counts every advisory site in the symbol, not only the Tier-2 ones,
+ * so a registered site that changes tier keeps its key and is reported as a tier
+ * change instead of dissolving into an unrelated stale/unregistered pair.
+ */
+interface RegisteredGlobalLockSite {
+  /** `symbol#n`, `METHOD /route#n`, or `path::symbol#n` where those collide. */
+  readonly site: string;
+  /** Declared tier. Compared against the tier the scanner reads at the site. */
+  readonly tier: "GLOBAL";
+  /** Why THIS site needs the global key: the counterpart or race it excludes. */
+  readonly reason: string;
+  /** The rule this registration is made under. */
+  readonly invariant: (typeof TWO_TIER_LOCK_INVARIANTS)[number];
+}
+
+/** The ids that state the two-tier protocol. See docs/invariants/operations.md. */
+const TWO_TIER_LOCK_INVARIANTS = ["INV-LOCK-001", "INV-LOCK-002", "INV-LOCK-003"] as const;
+
+/**
+ * Every deliberate Tier-2 (`pg_advisory_xact_lock(1)`) site in non-test `src/`,
+ * with the reason that site — not that file — holds the stronger key.
+ *
+ * `INV-LOCK-001` is cited by a site that takes the global key ALONE;
+ * `INV-LOCK-002` by one that composes it with a narrower tier, because for those
+ * the order is half of what makes the site correct.
+ */
+const GLOBAL_LOCK_SITE_REGISTRY: readonly RegisteredGlobalLockSite[] = [
+  {
+    site: "anonymiseFormerMember#1", tier: "GLOBAL", invariant: "INV-LOCK-002",
+    reason: "Retention tests open booking money before erasing identity, excluding capture/cancel/refund; global then member lifecycle and credit, then the Xero Member row fence. Preserves all money and booking references.",
+  },
+  {
+    site: "syncOrganiserExtraInvoiceCash#1", tier: "GLOBAL",
+    reason: "#4299: record supplementary organiser bank-transfer cash against the child's payment and materialise its original combined-invoice share once. Serialises with edits/cancels; takes Payment row after global and re-reads the money. No provider calls in the transaction.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "reserveOrganiserExtraRacedCash#1", tier: "GLOBAL",
+    reason: "#4299: cash that arrived while extra waivers were queued reserves every plan's policy-tiered organiser hand-back and refund note atomically. Each plan's reservation is a delta over the rows re-read under this key, so two waivers of one invoice (or of one plan) never reserve the same raced cash; the scope and occurrence keys back it. Provider calls run outside.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "writeOneBooking#1", tier: "GLOBAL", invariant: "INV-LOCK-002",
+    reason: "#5005: an imported booking is created PAID by the manual settlement body in one transaction, so it joins the settle/cancel cohort, then takes the lodge capacity key and the person-night keys and re-runs every import check under them. One booking per transaction; nothing leaves the app.",
+  },
+  {
+    // The one spelling of the carrying-ask queue's order, taken by the inline
+    // mint, the re-issue's completion and the recovery runner's claim hold.
+    site: "lockAdditionalAskQueue#1",
+    tier: "GLOBAL",
+    reason: "#4442: a new additional ask re-reads the live ask's balance it carries before its row and its supersede's cancel rows commit; global before the Payment row and any recovery-row claim, so a capture of that ask is either seen and refused or owned by the cancel row.",
+    invariant: "INV-LOCK-002",
+  },
+  // ── App Router handlers ───────────────────────────────────────────────────
+  {
+    site: "POST /api/admin/bookings/[id]/confirm-pending-guests#1",
+    tier: "GLOBAL",
+    reason:
+      "Zero-dollar admin confirm flips PENDING to a capacity-holding status, so it joins the cancel/settlement cohort before claiming the lodge tier; without it the flip could resurrect a booking a concurrent cancel had just terminated.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/admin/bookings/[id]/confirm-pending-guests#2",
+    tier: "GLOBAL",
+    reason:
+      "Claim-first PENDING -> CONFIRMED before the Stripe charge (#1418). The claim must exclude the cron's bump and the settlement paths, which serialise on this key, so a successful charge can no longer race a cancel into markBookingPaymentSucceeded's not-payable throw.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/admin/bookings/[id]/exclusive-hold#1",
+    tier: "GLOBAL",
+    reason:
+      "An exclusive whole-lodge hold blocks every bed on its nights, so it excludes cancel and settlement before taking the lodge key; the hold must not be written across a lifecycle transition of the same booking.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "convergeCreditNoteSpentOutsideApp#1",
+    tier: "GLOBAL",
+    reason:
+      "Releasing a booking's applied credit changes what it owes, so the converge (#4219) joins the cancel/capture/refund cohort on the global key before the member's credit-ledger key: a concurrent cancel's restore or a capture must not read the applied credit between the release row and the slice change. Global first, then the member key, as the checklist orders them.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "closeCreditReleaseAsksPaidInXero#1",
+    tier: "GLOBAL",
+    reason:
+      "Closing a released-credit card request because Xero shows its invoice paid (#4253) retires the unpaid request row and writes the bank-cash row that stands in for it, so it joins the cancel/capture/refund cohort on the global key, then the Payment row lock: a concurrent cancel, capture or reduction must not read the request as unpaid after it is fenced, or as paid before the cash row exists. The Stripe cancel runs before the transaction and a succeeded or processing intent is left alone.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "recordReleasePaidInXeroCash#1",
+    tier: "GLOBAL",
+    reason:
+      "Recording the bank-cash row for a released credit that Xero already shows paid (#4253) changes what the booking's ledger says is owed, so it joins the cancel/capture/refund cohort on the global key, then the Payment row lock, and re-computes the unasked amount under both before writing: a concurrent capture or cancel must not read the ledger between the cash row and the request closing.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "POST /api/admin/hut-leaders#1",
+    tier: "GLOBAL",
+    reason:
+      "#2698 ACCEPT path only: a custodian bed hold the officer has explicitly accepted narrows an existing whole-lodge hold's represented bed set (INV-CAP-038), so the amendment must exclude that hold's RELEASE — booking cancel's RELEASE_WHOLE_LODGE_HOLD_UPDATE, which serialises on this key and never on the lodge key — before taking acquireLodgeCapacityLock. Taken only when `amendOverlappingHolds` is in the request AND the write actually involves a bed — a bedless assignment can narrow no hold, so it never joins this cohort — decided before any lock so the order cannot invert; the detect-and-refuse path writes nothing and stays on the lodge key alone.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "applyHutLeaderAssignmentEditUnderLocks#1",
+    tier: "GLOBAL",
+    reason:
+      "#2698 ACCEPT path only, the edit counterpart of the create above: setting or moving a custodian bed hold onto nights an existing whole-lodge hold covers narrows that hold, so the accepted amendment excludes the hold-release cohort before taking the lodge key. Same request-decided gate, same order — `amendAccepted` is settled by PUT /api/admin/hut-leaders/[id] from the request AND from whether the edit leaves a bed held, before this function opens a transaction, so the order cannot invert. An edit that ends bedless narrows nothing and never takes this key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/admin/bookings/[id]/force-confirm#1",
+    tier: "GLOBAL",
+    reason:
+      "Admin force-confirm is a lifecycle transition into a capacity-holding status, so an overbooking override cannot resurrect a booking a concurrent cancel terminated.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/admin/bookings/[id]/return-to-waitlist#1",
+    tier: "GLOBAL",
+    reason:
+      "#2649 admin repair of a stranded zero-dollar waitlist confirm: PAYMENT_PENDING -> WAITLISTED leaves a bed-allocatable status and prunes real BedAllocation rows, so it excludes cancel and settlement before taking the immutable booking-lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "loadPendingReviewUnderEligibilityLocks#1",
+    tier: "GLOBAL",
+    reason:
+      "#2586: approving a flagged live booking can make it roster-eligible while rejecting one must stay ineligible until cancellation. Both decisions share this global -> immutable-lodge prefix before the authoritative re-read and guarded claim; provider work stays outside.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/bookings/[id]/confirm-draft#1",
+    tier: "GLOBAL",
+    reason:
+      "Confirming a draft moves money and claims capacity in one transaction, so the global tier excludes cancel and settlement while the lodge tier serialises the bed claim.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/bookings/[id]/guests#1",
+    tier: "GLOBAL",
+    reason:
+      "Adding guests reprices the booking and claims further beds, so it belongs in both cohorts; the subscription-lockout read is deliberately hoisted out so no provider call runs under the locks.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/bookings/[id]/waitlist-confirm#1",
+    tier: "GLOBAL",
+    reason:
+      "The zero-dollar flip to a capacity-holding status ran wholly unserialised before — no lock, no re-check, a bare id-only update — so it now excludes cancel and settlement here and re-checks capacity under the lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/bookings/[id]/waitlist-confirm#2",
+    tier: "GLOBAL",
+    reason:
+      "#2597 phase-two compensation releases an already-committed offer claim back to WAITLISTED; the release must exclude the same cohort the claim did, or a free booking is stranded with neither a payment path nor an offer.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "PUT /api/lodge/guests/[date]/depart#1",
+    tier: "GLOBAL",
+    reason:
+      "#2586: departure cleanup shares the consent writer's global -> lodge -> roster -> BookingGuest order, so it cannot deadlock by locking the guest tuple before consent decline/expiry reaches the same roster partition.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/payments/charge-saved-method#1",
+    tier: "GLOBAL",
+    reason:
+      "#3267: the saved-card charge claim (PENDING -> CONFIRMED) joins the cancel/settlement cohort before taking the lodge tier, exactly as the cron's resolveHoldWindowUnderLock and the admin confirm-pending-guests charge branch do — and now also writes the charge ATTEMPT row under both, which is the double-charge guard the shared Stripe key used to stand in for (INV-PAY-055). Until #3267 this route charged with no claim at all.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "POST /api/payments/create-payment-intent#1",
+    tier: "GLOBAL",
+    reason:
+      "#2265: the pay transaction is a three-tier writer — booking status, capacity claim and account credit — composing global, then the per-lodge key, then the member credit ledger, matching markBookingPaymentSucceeded. Before this it held no global key at all, so its status writes did not exclude a concurrent cancel.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "attachMintedCardIntent#1",
+    tier: "GLOBAL",
+    reason:
+      "#3638: both card mint doors (create-payment-intent and the /pay/<token> link) attach a freshly minted intent here, re-reading the payment's source and the booking's status under the key the Internet Banking switch holds, so a switch that committed during the mint is refused, and a mint that attached first leaves the switch a different intent from the one it cancelled (INV-PAY-102). Global key alone: no capacity or credit is touched.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "POST /api/payments/switch-to-internet-banking#1",
+    tier: "GLOBAL",
+    reason:
+      "Switching to Internet Banking with holdBedSlots flips the booking to CONFIRMED — a net-new capacity claim and a money side effect — and re-reads under the locks, because the pre-transaction snapshot was read with no lock at all. #4019: re-read the payment source before any switch write; an already-IB payment returns its persisted holds (none once released) without a second PRIMARY or credit spend, even when the booking status did not change, and re-queues the idempotent invoice only after the commit, holding no lock.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "PUT /api/admin/refund-requests/[id]#1",
+    tier: "GLOBAL",
+    reason:
+      "#3827 (INV-PAY-117, INV-PAY-118): a refund appeal's approval caps at the refundable cash NET of the refunds still promised back by bank transfer (an edit's, or an earlier approved appeal's). A hand-back's completion moves the payment's refunded total and closes its task in one commit under this key, and a reopen re-promises one under it, so the cap reads the payment and the open-task sum under the same key, claims the request, plans the card refund and raises the bank-transfer task for the rest in the same transaction - a second approval queues behind it and sees that task. #3956 (INV-PAY-123): on a booking the group organiser paid for by card it instead reads the combined payment's child-refund headroom and reserves the refund debt after the claim, in the same transaction, as every #3653 debt writer does under this key. #4124: the cap also nets the payment's open card refund debts, so after this key it takes the Payment row (lockPaymentForRefundedTotal, INV-LOCK-002's lock(1) -> Payment row order) BEFORE the hand-back, credit, card-debt and payment reads - a cancellation hand-back's completion, every refunded-total writer and the failed-later card refund debt hold that row without this key; no holder of the row takes this key after it. The Stripe refund and Xero note run after the commit.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "PUT /api/admin/refund-requests/[id]#2",
+    tier: "GLOBAL",
+    reason:
+      "#3827 (INV-PAY-118): releasing an approval whose Stripe refund AND recovery enqueue both failed puts the request back to PENDING and deletes the OPEN bank-transfer task the approval raised, in one transaction under the key every reader of the open-task sum and every approval holds, so no approval can size its cap between the two writes. #5191: then the booking row (lockBookingRowForOwnerRead), before the request's claim, as the approval orders them (#4516 review F1), so the withdrawn refund debts read the owner their merged-debtor residue moves to under it. No other advisory key; no provider call.",
+    invariant: "INV-LOCK-001",
+  },
+
+  // ── Bed allocation: inventory, placement and reconciliation ───────────────
+  {
+    site: "updateBedAllocationRoom#1",
+    tier: "GLOBAL",
+    reason:
+      "#2366: a room edit can deactivate or rename rows that a cancellation's allocation prune is removing at the same moment, so inventory writers join the lifecycle cohort before the room's own lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "updateBedAllocationBed#1",
+    tier: "GLOBAL",
+    reason:
+      "A bed edit changes what an allocation points at; joining the lifecycle cohort keeps a retype or deactivate from landing between a cancellation's read and its prune.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "deleteBedAllocationBed#1",
+    tier: "GLOBAL",
+    reason:
+      "Deleting a bed destroys rows the lifecycle reconciler may be rebuilding, so global comes before the bed's immutable lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "deleteBedAllocationRoom#1",
+    tier: "GLOBAL",
+    reason:
+      "Deleting a room destroys every bed under it and the allocations on them, the same rows cancellation prunes, so it takes the lifecycle cohort before the room's lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "runAutoBedAllocation#1",
+    tier: "GLOBAL",
+    reason:
+      "#2593 explicit auto-allocation rebuilds its plan under the locks and writes only that plan, so the global tier keeps a cancellation prune out of the window between the authoritative read and createMany while the lodge tier keeps inventory and placement writers out.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "manuallyAllocateBed#1",
+    tier: "GLOBAL",
+    reason:
+      "Manual placement writes a bed-night cancellation can prune, so it takes global before the bed's immutable lodge key and then delegates to the narrow lock-held implementation.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "moveBedAllocationsSameDate#1",
+    tier: "GLOBAL",
+    reason:
+      "Only the destination bed's immutable lodge key is read before the transaction; every source row, date and bed state is re-read under both tiers, because cancellation owns the global key and prunes the same rows while custodian holds own the lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "manuallyAllocateBedForNights#1",
+    tier: "GLOBAL",
+    reason:
+      "One transaction per night, each taking global then the lodge key, so a multi-night placement cannot interleave with a lifecycle prune on any single night.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "assignBedRange#1",
+    tier: "GLOBAL",
+    reason:
+      "#2286: a range assignment writes all or nothing across its nights and takes global then the lodge key before the custodian scan, so a hold cannot race the scan and the write.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "deleteBedAllocation#1",
+    tier: "GLOBAL",
+    reason:
+      "Removing one allocation row races the lifecycle prune for the same row, so global comes before the allocation's own lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "approveBedAllocations#1",
+    tier: "GLOBAL",
+    reason:
+      "#2594 approval promotes the selected rows and takes the sorted lodge union after the global tier, because a cancellation of any covered booking prunes the very rows being approved.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "reconcileBedAllocationsForBooking#1",
+    tier: "GLOBAL",
+    reason:
+      "#2593: the public reconciler owns the global -> immutable-booking-lodge prefix for callers holding neither tier; every composed caller uses a lock-held seam instead, so the key is minted once for this family.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "acquireFuturePartnerSharedAllocationLocks#1",
+    tier: "GLOBAL",
+    reason:
+      "The partner-shared cleanup prefix takes the global cohort before its sorted lodge set, so a shared-double sweep can never invert the house order against a concurrent cancellation.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "applyBedAllocationMove#1",
+    tier: "GLOBAL",
+    reason:
+      "#2595: a reviewed night/person move serialises with cancellation and every allocation counterpart before taking the sorted lodge union, the member lifecycle/link families and the deterministic allocation row locks.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "applyBedAllocationRemoval#1",
+    tier: "GLOBAL",
+    reason:
+      "#2594: destructive removal applies a reviewed digest, so the global tier excludes cancellation's prune of the same rows before the sorted immutable lodge keys and the allocation row locks.",
+    invariant: "INV-LOCK-002",
+  },
+
+  // ── Booking lifecycle and modification ────────────────────────────────────
+  {
+    site: "runLinkedDateMove#1",
+    tier: "GLOBAL",
+    reason:
+      "#3232's linked move composes TWO batch modifications into one transaction, so it takes the same global key for the same reason a single one does — money and capacity — and takes it here, once, before either call. Both re-enter it as a no-op, which is what fixes the global -> lodge order however the calls are later reordered. One lodge key covers both bookings because the same-owner dependent envelope pins lodgeId to the changed booking's lodge, so no key is ADDED. The roster-date family is the one place where composing two writes does take keys outside a single sorted order — lockRosterDates sorts within a call, and this transaction makes two calls — and it is safe for the reason that helper's docblock states: every multi-key roster writer in the tree holds this global key first, so two such acquisitions can never interleave.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "modifyBookingBatch#1",
+    tier: "GLOBAL",
+    reason:
+      "A batch modification moves money and re-claims capacity. With the per-lodge key alone a concurrent cancel could interleave and both paths compute a refund against the same captured payment, or the modify's status commit could clobber a just-cancelled booking.. #4019: its new whole-lodge zero-cash PAID transition posts the final stored charge through the shared confirmation poster under these same keys (INV-PAY-047), after guest/night writes",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "cancelLinkedProvisionalChildBookings#1",
+    tier: "GLOBAL",
+    reason:
+      "#1881 residual: the linked provisional-child PENDING -> CANCELLED claim must exclude confirm-pending before deciding whether cancellation won, and it takes the child's own lodge key after that.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "withdrawAdditionalPaymentAsk#1",
+    tier: "GLOBAL",
+    reason:
+      "#3528 (INV-ADDPAY-040): retiring an additional-payment request is a settlement-money transition that must exclude the counterparts that settle or supersede the same ask - the capture webhook, the #3340 supersede mint, the manual mark-paid settle and the cancel path's own intent failing - and the fenced updateMany on the exact retired values is the claim. The Stripe cancel runs BEFORE the transaction, so the key is never held across a provider call.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "performBookingCancellation#1",
+    tier: "GLOBAL",
+    reason:
+      "Cancel of an accepted-quote booking shares this key with the accept path, so exactly one wins: the loser observes a non-cancellable status at the under-lock re-read or a zero-count claim and runs no side effect.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "performBookingCancellation#2",
+    tier: "GLOBAL",
+    reason:
+      "#1547: the never-captured branch claims CANCELLED under the key capture and settlement also take, so a cancel can never interleave a capture of the same booking after the SetupIntent teardown.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "performBookingCancellation#3",
+    tier: "GLOBAL",
+    reason:
+      "This branch restores applied credit inside the claim, and restoreCreditFromBooking has no internal replay guard — the global key plus the atomic status flip is what makes the restore exactly-once against a concurrent capture or inbound Xero reconcile.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "performBookingCancellation#4",
+    tier: "GLOBAL",
+    reason:
+      "#1164/D7: the paid-tier cancellation claim sits in the same cohort as capture and the inbound Xero reconcile, and its status flip is this branch's exactly-once guarantee for the guardless credit restore.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "createDraftBooking#1",
+    tier: "GLOBAL",
+    reason:
+      "#2593: creation reconciles allocation state in the same transaction as its status write, so it is a lifecycle writer rather than a capacity-only admission and joins the cohort before the resolved lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "createConfirmedBooking#1",
+    tier: "GLOBAL",
+    reason:
+      "A self-contained confirmed create mints the global key itself; a caller that already holds both tiers passes its transaction in and this site is skipped, so the key is never taken twice or out of order.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "modifyBookingDates#1",
+    tier: "GLOBAL",
+    reason:
+      "A date change refunds or charges and claims capacity for the new range, so it takes the global tier first for mutual exclusion with cancel, settlement and hold-release.. #4019: its new whole-lodge zero-cash PAID transition posts the final stored charge through the shared confirmation poster under these same keys (INV-PAY-047), after guest/night writes",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "adminShiftBookingDates#1",
+    tier: "GLOBAL",
+    reason:
+      "The admin date move claims the new range and can reprice; even a frozen-cent shift takes the global key so its date and status commit cannot clobber a booking a concurrent cancel just terminated.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "hardDeleteDraftBooking#1",
+    tier: "GLOBAL",
+    reason:
+      "Hard delete destroys a draft and its dependents outright, so it joins the lifecycle cohort rather than running against a booking another lifecycle writer is mid-transition on. It takes no capacity tier: a DRAFT owns no allocation rows.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "softDeleteCancelledBookingInTransaction#1",
+    tier: "GLOBAL",
+    reason:
+      "#2593: soft delete reconciles allocations in the same transaction as its status write, so it takes the global cohort before the reconciler's lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "src/lib/booking-exception-execution.ts::acquireGlobalBookingLock#1",
+    tier: "GLOBAL",
+    reason:
+      "#2525: one helper mints the key for BOTH the atomic approve-and-execute and the terminal release (reject/cancel/supersede) of a policy-exception request. Each mutates a provisional capacity reservation and, for a modification approval, composes the canonical money/status transition, so global comes before the frozen lodge key, then (#4853, an existing booking) the booking row before the claim, and the tx-aware service takes the member keys after that.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "approveAndExecuteLockedPeriodChangeRequest#1",
+    tier: "GLOBAL",
+    reason:
+      "#3750: approving a LOCKED_PERIOD change request on a finished stay claims the request and runs the canonical batch modification on the same transaction — a money and booking-status transition that must exclude a concurrent cancel, capture or refund of the same booking, composed with a capacity re-check. Global first, then the booking's immutable lodge key, then (#4845) the booking row before the claim; the tx-aware service re-enters all three and takes the member keys after.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "correctWorkParty#1",
+    tier: "GLOBAL",
+    reason:
+      "Fork triyder/AlpineClubBookingsNZ#119: an officer adds an existing booking to a work party (fork triyder/AlpineClubBookingsNZ#130: or removes it from one; both directions are this one writer, `addBookingToWorkParty` and `removeBookingFromWorkParty` its two entry points) — the canonical batch modification on the same transaction, which moves settlement money (account credit, a refund, or an amount owed) and must exclude a concurrent cancel, capture or refund of the same booking, composed with a capacity re-check on a booking that does not yet hold its beds. Global first, then the booking's immutable lodge key, then (#4845) the booking row before the officer's re-authorisation; the tx-aware service re-enters all three and takes the member keys after. No claim row: two concurrent applies serialise here and the second re-reads a booking that already carries (or no longer carries) the work party and is refused.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "src/lib/booking-exception-request-service.ts::acquireGlobalBookingLock#1",
+    tier: "GLOBAL",
+    reason:
+      "#2525: a HELD modification request holds a provisional capacity reservation, so creating one and releasing it on member cancel or supersede are capacity changes. One helper mints the key for both, matching the approve/terminal paths so the reservation write and delete serialise with every occupancy read.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "removeBookingGuestInTransaction#1",
+    tier: "GLOBAL",
+    reason:
+      "A single-guest removal computes a reduction refund and re-checks capacity, so it excludes cancel, settlement and hold-release before taking the booking's lodge key; the caller opens the transaction, so this is its first lock.. #4019: its new whole-lodge zero-cash PAID transition posts the final stored charge through the shared confirmation poster under these same keys (INV-PAY-047), after guest/night writes",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "lockDeadCardRefundRow#1",
+    tier: "GLOBAL",
+    reason:
+      "#4368 review D (INV-SSOT): the ONE lock(1) of every settlement of a dead card refund row, in card-refund-dead-row-lock.ts - 'Paid another way' (closeCardRefundPaidAnotherWay) and the two no-money settlements, each with its own refusals. 'PAID ANOTHER WAY': #3372 (owner, 7 Oct 2026: 'Count + add close action'): closing a dead card refund as paid another way moves the payment's refundedAmountCents and closes a refund debt in one commit, and every edit, acceptance, paid cancel and refund appeal reads those two separately to size a refund net of what is promised back - under lock(1) the close cannot commit between the two reads. First lock of its transaction, then the operation re-read, then the Payment row (lockPaymentForRefundedTotal, #3924 round 4) BEFORE the payment is read - every refunded-total writer without lock(1) - every Stripe refund recorder, and a cancellation hand-back's completion - takes the Payment row first, so the owed figure cannot move between the read and the allocation, and under it the owed figure is checked against the one the treasurer saw (expectedOwedCents, a 409 when it moved, #3924 round 7) - then, for a late capture's refund only (#3924 round 6), the approval task's row before it reads the capture's Xero receipt; under that row the close also puts a receipt row that failed before reaching Xero from FAILED back to PENDING (status-guarded; a lost claim is re-read, and an officer's resolve or withdrawal of that row is a 409, round 8); one that may already have reached Xero is left FAILED for an officer (round 9). The task row's note-step holders, each in a transaction of its own: the receipt's worker in two - the receipt's link, then the waiting close's note (round 7, C9) - and the same note step run by a change's invoice sent for the capture (round 8, including its retry from its own row, round 9), by the repair tool's QUEUE_PAID_ANOTHER_WAY_REFUND_NOTE action (round 8), and by the nightly credit reconciliation (round 9); none of them holds another lock. Its other holders: the dismissal, reopen and approval claims (the resolution's status-fenced claim, whose dismissal queues the kept receipt under the row it holds; a late capture's task takes no lock(1) there, resolveManualRefundTask#1), and the kept-capture enqueue the repair tool's QUEUE_KEPT_LATE_CAPTURE_INVOICE runs in a transaction of its own; none of them takes lock(1) or the Payment row after the task row. Then the status-guarded claim, the allocation (re-taking the row it holds), and the close's hand-back task and ledger line; the Xero note, or the late capture's receipt, is an outbox row kicked after the commit, so no provider call runs under it. 'NOTHING LEFT OWED' AND 'TRY THE CARD AGAIN': #4368 (owner decision 25 Oct 2026, INV-PAY-149): the one lock(1) of the two no-money settlements of a dead card refund on Stuck States - 'Nothing left owed' (closeCardRefundNothingLeftOwed: the row to SUCCEEDED, naming the later Stripe refund that covers it) and 'Try the card again' (tryDeadCardRefundAgain: the row re-armed with rearmedPaymentRecoveryOperationData for the runner, whose INV-PAY-145 Stripe check runs before any send). Each changes whether a refund debt is open, owed or in flight, which every edit, acceptance, paid cancel and refund appeal reads separately to size a refund net of what is promised back, and each must exclude 'Paid another way' (closeCardRefundPaidAnotherWay#1) on the same row (#4492): all three claim it with the same status-guarded updateMany - dead (deadCardRefundOperationWhere) and on the plan read (onPlanWhere) - under the same keys, so whichever commits second matches nothing and writes nothing. First lock of its transaction, then the row re-read, then the Payment row (lockPaymentForRefundedTotal) BEFORE the payment is read - every refunded-total writer without lock(1), the failed-later writer among them, takes that row first - so the owed figure, the recorded refunds and the payment's other card refund rows cannot move between the read and the claim. Then the claim and the audit row; no money, no journal, no Xero row and no provider call. #4851: the same lock and claim also settle a dead refund out of the group organiser's card - closeGroupCardRefundPaidAnotherWay (accept either-group) and tryOrganiserChildCardRefundAgain (accept organiser-child). No new advisory key. Stripe is read before the transaction.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "lockAndClassify#1",
+    tier: "GLOBAL",
+    reason:
+      "#4162 (owner decisions 17 and 18 Oct 2026, INV-ADDPAY-042): the one lock(1) of every writer of a voided bank-transfer refund note - the nightly follow-up's undo or spare marker (followUpVoidedBankRefundNote), a person's pick of the refund an unmatched note recorded (pickRefundForUnmatchedVoid, the same undo), and a person's answer where nothing can be picked (markUnmatchedBankRefundVoidAnswered). The undo takes the refund back out of the payment's transactions (unwindLocalRefundAllocation), reverses its BANK_REFUND line, recomputes the refunded total (reconcilePaymentAggregates) and raises one open follow-up hand-back in one commit - the settlement money and open hand-backs every edit, acceptance, paid cancel and refund appeal reads separately to size a refund, so under lock(1) it cannot commit between those reads. First lock of its transaction, then the Payment row (lockPaymentForRefundedTotal) BEFORE anything about the payment is read - every refunded-total writer without lock(1) takes that row first - then the note re-classified under both. The claim is the follow-up's unique occurrence key (createMany skipDuplicates), inserted before any money moves; a lost claim moves nothing. A marker takes the link row last and NOWAIT, after the Payment row: the inbound link write and #4161's heal take the link first, so a busy link defers instead of waiting with the Payment row held. The nightly run takes it only for a spare or an undo, classified unlocked first. No provider call, no email, no booking event; refused while report-only for a person.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "claimResolveRecordingRefundNote#1",
+    tier: "GLOBAL",
+    reason:
+      "#4421 (owner decision 26 Oct 2026, INV-INT-028: one note, one refund): 'Resolve by hand' on a FAILED payment refund-note create that names no note of its own records the Xero credit note the officer made, with the resolve - on the row and as the payment's tracked REFUND_CREDIT_NOTE link (writeHandMadeRefundNoteLink, the #4162 answer's own writer). Its counterpart is the #4162 hand-made answer (recordHandMadeRefundNoteLink, inside resolveManualRefundTask#1, which holds lock(1) for its whole transaction): both check that no create row or link here records the note and then record it, on ANY payment, so no per-payment row covers the race and a note-id key would be a new advisory key. Under lock(1) whichever commits second sees the first and refuses with a 409, so a note is recorded once; a second resolve offering the same note queues here too. The #4162 follow-up's order: lock(1) FIRST, then the Payment row (lockPaymentForRefundedTotal) BEFORE the payment's records are read, then the row re-read, a retry of it that ran since the route read it refused (review, concurrency F1), a run that already raised its note or a queued live copy refused (review round 2), the note's create rows and links read one after the other, the status-guarded claim (FAILED, unresolved, no note) and the link row last, through the link funnel - the inbound link write and the heal take only the link row, so no cycle. A lost claim writes nothing; a refusal rolls back the claim. The Xero check (verifyHandMadeRefundNote) runs before the transaction opens and the re-read after the commit, so no provider call is held under it.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "withdrawResolveRecordingRefundNote#1",
+    tier: "GLOBAL",
+    reason:
+      "#4421 (INV-INT-028): the withdrawal of a 'Resolve by hand' that recorded a note, when the route's post-commit check finds a retry of the row running beside the mark (findRetryOverlappingMark). It clears the mark and the note on the row and retires the link the claim wrote, so it un-records the same fact claimResolveRecordingRefundNote#1 records and the #4162 answer reads; it takes the claim's own order - lock(1) FIRST, then the Payment row (lockPaymentForRefundedTotal), the row's guarded updateMany (this mark, this note) and the link row last - so it never interleaves with an answer or another resolve reading those records. No provider call.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "resolveManualRefundTask#1",
+    tier: "GLOBAL",
+    reason:
+      "#3582: an EDIT_FINANCIAL_REVIEW closure posts booking-ledger lines, and whether the booking is confirmed on the ledger must be asked under the key the settle asks it under, or a closure and a first settle could both see 'not yet' and both post. Taken for that task kind, a group organiser's hand-back, a non-cancellation hand-back, a late-capture approval and a journal hand-back (#4516 M4d), as the transaction's first lock — before the booking row (edit review, late-capture approval and journal hand-back), the claim, the payment-row allocation and the re-price's promotion key — so it orders global before anything narrower as every edit door does; the Stripe refund and the Xero leg run after the commit, so it is never held across a provider round trip. Order: global → member-credit (#3791, account-credit route only) → the per-anchor xero-supplementary-invoice key LAST (#3947, owner decision 22 Oct 2026: an invoice-route review charge queues its edit's supplementary invoice in this transaction through enqueueEditReviewChargeInvoiceInTransaction, so the next share, behind it on this key, sees it; only the outbox row is written, the kick runs after the commit, and no holder of that key takes another). #4042: also taken for a group organiser's hand-back, which each later joiner's claim grows under this key while it is OPEN, so a growth and a completion never interleave. #3949 (INV-PAY-137): an edit's or appeal's hand-back on a joiner the organiser paid for by Internet Banking then takes the child's Payment row (lockPaymentForRefundedTotal) before its cap read and holds it to the mirror write - global, then the row.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "lockBookingForBackPost#1",
+    tier: "GLOBAL",
+    reason:
+      "#3583: the operator back-post posts a historical booking's ledger lines on a live database, and asks the same questions the live posters ask under this key — is the booking confirmed on the ledger, which line is live — so a settle, cancel, edit or closure on the same booking either commits before it reads or waits until it commits; without it both could see 'not yet confirmed' and both post. First lock of each booking's transaction, then a 5s lock_timeout bounding every later wait while it is held, the lodge key, the owner read under it (member merge re-points it holding the lodge key), the member credit-ledger keys and the payment and booking rows; no provider is called.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "respondToBookingRequestQuote#1",
+    tier: "GLOBAL",
+    reason:
+      "A member's quote cancel must not overwrite an admin decline that already finalised the request and released its hold. The key orders it against the hold-release and cancel writers, the claim is status-guarded, and taking it before the quote row lock matches decline's order so the two cannot deadlock.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "respondToBookingRequestQuote#2",
+    tier: "GLOBAL",
+    reason:
+      "#3415, superseding #2936's deliberately unfenced message writer: the requester's MODIFY/QUERY branch. A stale message could otherwise re-status an accepted, corrected, declined or cancelled request, re-stamp a quote a correction already SUPERSEDED, or move an accepted request somewhere the stale-hold cron would release its hold. Under this key it re-reads the request and quote, requires the loaded version, QUOTE_SENT, no accepted pointer and a SENT quote, then claims the request on that same version and status before superseding only the still-SENT quote; a lost race returns 409 before either write. Taken alone: it creates no booking and claims no bed.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "respondToBookingRequestQuote#3",
+    tier: "GLOBAL",
+    reason:
+      "#3415, closing #2936: requester acceptance. It replaces the old accept re-arm, a bare update guarded only on the request not being DECLINED/CANCELLED, which let an accept write a retired quote's price and snapshot onto a corrected (VERIFIED) envelope. Under this key it re-reads the SENT quote, the request (QUOTE_SENT, no accepted or converted pointer) and its request-owned AWAITING_REVIEW hold, then claims ACCEPTED on the request (version-fenced) and on the quote in one transaction; either lost claim rolls both back. The key orders it against correction, requester cancel, generic hold-release and the stale-hold cron; officer decline takes no advisory lock and is excluded instead by its status-guarded claim on the same request row — if decline commits first, acceptance's QUOTE_SENT claim updates nothing; if acceptance commits first, decline still claims the now-ACCEPTED request, which an officer may retire. Taken alone: acceptance retains the hold and creates no booking, payment or conversion — officer approval (`approveBookingRequest#1`) converts in its own two-tier transaction — and a matching accepted retry returns read-only before this transaction.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "approveBookingRequest#1",
+    tier: "GLOBAL",
+    reason:
+      "Accepting a request converts a held booking. Hold-release and cancel serialise on this key alone, so with only the per-lodge key a release could cancel the held booking out from under a converting accept. Global first, then the hold's immutable lodge key, then (#4857) the held booking's row before the claim and the guest swap.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "holdBookingRequestSlots#1",
+    tier: "GLOBAL",
+    reason:
+      "#3413: reusing an unnamed-adult hold re-reads its request, booking and exact reservation nights under global then lodge locks, excluding cancellation, correction and accepted naming while validating the quoted beds.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "holdBookingRequestSlots#2",
+    tier: "GLOBAL",
+    reason:
+      "#3413: a SCHOOL quote with unnamed adults creates capacity reservations linked to its AWAITING_REVIEW hold. It takes global before lodge so generic booking cancel, quote cancel, correction and accepted identity resolution cannot release or rewrite that hold across creation. Other holds retain the lodge-only path.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "resolveAcceptedSchoolPendingAdults#1",
+    tier: "GLOBAL",
+    reason:
+      "#3413: naming an accepted adult swaps an anonymous reservation for named guest nights without changing occupied beds. Global then immutable held-booking lodge excludes correction, decline, quote cancel, generic hold release and school approval before the under-lock version/status claim.",
+    invariant: "INV-LOCK-002",
+  },
+
+  // ── Cron claims and releases ──────────────────────────────────────────────
+  {
+    site: "completeBookings#1",
+    tier: "GLOBAL",
+    reason:
+      "#2593: the completion claim can prune allocation rows, so each candidate transaction joins the cohort, re-reads, status-guards the claim and only then calls the lock-held reconciler. Candidate reads stay outside.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "runSavedCardClaimRelease#1",
+    tier: "GLOBAL",
+    reason: "#4993: normal compensation and stale-claim recovery both return CONFIRMED bookings to PENDING and reconcile beds. Global then lodge excludes the webhook's capture/PAID promotion and cancellation; a locked re-read and guarded marker release prevent clobbering either winner.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "resolveHoldWindowUnderLock#1",
+    tier: "GLOBAL",
+    reason:
+      "The hold-window resolution claims a PENDING booking for charge or releases it, so it must exclude cancel and settlement before taking the booking's lodge key; only the lock key is read before the lock.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "releaseSettlementChildren#1",
+    tier: "GLOBAL",
+    reason:
+      "Reverting settlement children races the settle path for the same settlement; both take this key, so the reaper either loses cleanly to a payment that already captured or wins and reverts under the sorted child-lodge keys.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "cancelReapedChildren#1",
+    tier: "GLOBAL",
+    reason:
+      "The second, terminal reap window cancels the reverted children once, on the same settlement key, so a late settle cannot promote a child the reaper is cancelling.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "releaseExpiredQuoteHolds#1",
+    tier: "GLOBAL",
+    reason:
+      "Releasing an expired quote's held booking is a lifecycle transition that prunes allocation rows; the accept path takes the same key, so exactly one of release and accept wins and the loser bails at the under-lock re-read.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "releaseStaleModificationHolds#1",
+    tier: "GLOBAL",
+    reason:
+      "The same fence for a stale modification hold: the release must exclude the accept and cancel writers on this key, and it re-reads under the lock so it only acts while the request still points at that exact hold.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "processWaitlistCronOnce#1",
+    tier: "GLOBAL",
+    reason:
+      "Cancelling a past waitlist entry is a lifecycle transition that can prune allocation state, so each candidate transaction joins the cohort before the entry's own lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+
+  // ── Settlement, refunds and money side effects ────────────────────────────
+  {
+    site: "holdLateCaptureForTreasurerIfRequired#1",
+    tier: "GLOBAL",
+    reason:
+      "#3639 (owner decision 26 Sep 2026): raising the treasurer-approval ManualRefundTask for a late capture is a find-then-create keyed on the payment INTENT, and it must also see the confirm route's #2700 OPEN question for the same capture — which that raise creates under this same key. Two webhook deliveries, or a delivery and a confirm, would otherwise put two tasks on one capture and a treasurer could refund it twice. Same cohort as raiseDeletedBookingModificationRefundTask; takes nothing else and makes no provider call inside.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "raiseDeletedBookingModificationRefundTask#1",
+    tier: "GLOBAL",
+    reason:
+      "#2700: raising the OPEN ManualRefundTask is a find-then-create idempotent on the payment INTENT, not atomic on its own — two simultaneous confirms of one capture would raise two tasks and two operators would refund one payment twice. This is the cohort booking-cancel.ts is already in when IT creates a ManualRefundTask, so it reuses lock(1) rather than minting a keyspace, and takes nothing else.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "recordAutomaticCancelledBookingRefundTask#1",
+    tier: "GLOBAL",
+    reason:
+      "#2760: the webhook's writer became close-or-create, so two Stripe deliveries of one capture — or a delivery racing the raise above — would each find no row and each write one, putting a single refund on the finance card twice. Same key and same cohort as the raise; every Stripe call belongs to the caller and has already returned.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "raiseEditFinancialReviewTask#1",
+    tier: "GLOBAL",
+    reason:
+      "#3030 (epic #2797): raising the OPEN EDIT_FINANCIAL_REVIEW task is a find-then-create on the occurrence key, which is not atomic on its own — two replays of one unpriceable booking edit would each find no row and each write one, and two operators would then hand the same adjustment back twice. Same key and same cohort as the two raisers above, and nothing else: it joins no capacity or member-credit tier. Taken INSIDE the caller's transaction and re-entrant, so #3032's booking-edit path (which already holds lock(1) before the per-lodge key) pays nothing for it. INV-LOCK-002's global-before-per-lodge order is a PRECONDITION ON THE CALLER here rather than a property this site provides: re-taking the first tier is free only for a transaction already at or above it, so a caller holding ONLY a per-lodge capacity key deadlocks against any of the ~40 global-then-lodge writers (Postgres kills one with 40P01). The three services #3032 will wrap all take global first. The unique index on occurrenceKey is belt-and-braces behind this key rather than the primary fence, because a unique violation aborts the surrounding transaction and so cannot be recovered from in place.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "settleGroupBookingOnOrganiserCancel#1",
+    tier: "GLOBAL",
+    reason:
+      "The durable cancellation fence: settle, reaper and cancel all serialise here, so once CANCELLED commits a later settlement apply must refuse to promote children. No provider call happens while the transaction is open.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "settleGroupBookingOnOrganiserCancel#2",
+    tier: "GLOBAL",
+    reason:
+      "#1881: the FAILED claim on an open settlement used to be a bare update gated on a stale in-memory read, taking no lock at all. It now takes the key and status-guards the write, so a settle that captured the organiser's money is never clobbered back to FAILED.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "settleGroupBookingOnOrganiserCancel#3",
+    tier: "GLOBAL",
+    reason: "#4299: freeze organiser bank-transfer child refunds and their extra-invoice waiver/refund debts atomically with the group plan. Inbound cash imports and edit writers take this key; all provider calls run after commit.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "settleGroupBookingOnOrganiserCancel#4",
+    tier: "GLOBAL",
+    reason:
+      "Each child's cancel and its refund credit-note enqueue commit inside one transaction on the settlement cohort's key, and reconcile that child's allocations through the lock-held seam. #4042: on an Internet Banking settlement the same claim books the joiner's share on the organiser's hand-back task (create, grow while OPEN, or a supplementary task once closed), which this key makes single.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "planOrganiserCancelChildRefunds#1",
+    tier: "GLOBAL",
+    reason:
+      "#3653: an organiser cancel freezes one refund debt per paid child and the settlement's plan in one transaction. The headroom it reads - refunds recorded on the combined intent plus child-refund debts still owed - is written by edit doors (which already hold this key) and by the refund recorder below, so the read and the inserts must be one decision on the settlement cohort's key. Provider calls run after commit.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "processOrganiserChildRefundOperation#1",
+    tier: "GLOBAL",
+    reason:
+      "#3653: recording an organiser child's Stripe refund against the combined payment - the refund row, the child's mirror, its Xero note, the settlement status and the debt's close - commits as one unit on the settlement cohort's key, so a concurrent edit or cancel reading the combined headroom sees the debt either owed or recorded, never neither or both. Then the Payment row (`lockPaymentForRefundedTotal`), the order every refunded-total writer takes. The Stripe call has already returned.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "reconcilePendingOrganiserChildRefunds#1",
+    tier: "GLOBAL",
+    reason:
+      "#3653 fix round: taking a failed organiser child refund back out - its refund row, the child's mirror, the settlement status and reopening its debt - is the inverse of the recorder above and commits as one unit on the same key, so a concurrent edit or cancel reading the combined headroom sees the refund either recorded or owed again, never neither. Then the Payment row, the order every refunded-total writer takes. Stripe was read before the transaction opened.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "createGroupSettlementIntent#1",
+    tier: "GLOBAL",
+    reason:
+      "Attaching a freshly minted PaymentIntent must not cross a reap, a failure mark or an organiser cancel of the same group; all of them serialise on this key and the attach re-reads the group status under it.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "createGroupSettlementInvoice#1",
+    tier: "GLOBAL",
+    reason:
+      "Minting the settlement invoice is fenced against the same cohort, so an invoice is never queued for a group another writer has already cancelled.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "commitChildrenToConfirmed#1",
+    tier: "GLOBAL",
+    reason:
+      "Promoting children to CONFIRMED is the settlement's capacity claim: the global tier orders it against reap, fail and refund, and the per-child lodge keys serialise the claim itself.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "settleConfirmedChildrenAndNotify#1",
+    tier: "GLOBAL",
+    reason:
+      "Settlement takes the same key as the reaper, the failed/refunded marks and the organiser-cancel claim, so it can never interleave a reap of the same settlement — the pre-#1881 default-lodge key did not exclude the reaper. Bed reconciliation then takes the complete sorted child-lodge union.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "markGroupSettlementIntentRefunded#1",
+    tier: "GLOBAL",
+    reason:
+      "The refunded mark is a terminal money transition on the settlement, taken on the cohort key so it cannot interleave with a settle or a reap; the intent id is kept so the next attempt mints a fresh key.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "markGroupSettlementIntentFailed#1",
+    tier: "GLOBAL",
+    reason:
+      "The failure mark records a non-success outcome only. The key adds atomicity against a concurrent settle rather than a new veto, and the guarded updateMany fuses the still-non-terminal check with the write.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "releaseOneHold#1",
+    tier: "GLOBAL",
+    reason:
+      "Releasing an expired Internet Banking hold returns beds and clears the invoice with a credit note in one transaction, so it joins the money/status cohort before the lodge and member-credit tiers.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "settleBookingPaymentInTransaction#1",
+    tier: "GLOBAL",
+    reason:
+      "#2262: the ONE settlement body, shared byte-for-byte by the Stripe capture and the admin's manual cash settlement. Without the global key the capture stopped excluding cancel, hold-release and settlement, and the PAID write could resurrect a just-cancelled booking.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "reverseManualBookingPayment#1",
+    tier: "GLOBAL",
+    reason:
+      "Reversing a manual mark-paid moves money and restores PAYMENT_PENDING, which RELEASES capacity, so it takes the same global-before-per-lodge pair as the settlement it undoes.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "syncInternetBankingPaymentsForPaidInvoice#1",
+    tier: "GLOBAL",
+    reason:
+      "Inbound Xero PAID mints local payment state per matched payment, and cancellation and capture take the same key, so a paid-invoice effect cannot land on a booking another writer has just terminated. It is a two-lock composition: the same closure then takes acquireLodgeCapacityLock on the booking's immutable lodge, because flipping an unheld PAYMENT_PENDING booking to PAID is a net-new capacity claim and the global key no longer excludes per-lodge creators. Each payment is fenced in its own short transaction; the provider work has already returned.",
+    invariant: "INV-LOCK-002",
+  },
+
+  // ── Capacity-adjacent writers with their own counterparts ─────────────────
+  {
+    site: "writeRequestedRoom#1",
+    tier: "GLOBAL",
+    reason:
+      "#2594: requested-room editing shares the global cohort with allocation approval and reviewed removal, whose final-approved consequence it must not cross, and locks and re-reads the booking row before its guarded write.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "lockRosterEligibilityMutation#1",
+    tier: "GLOBAL",
+    reason:
+      "#2586: eligibility-validating roster generation, save and confirmation join the booking-writer order before the roster-date key. That closes the initially-empty-partition race without making every booking writer enumerate all possible roster dates.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "respondToMemberGuestConsent#1",
+    tier: "GLOBAL",
+    reason:
+      "#2307: a consent decline reprices the booking, can elect account credit to the owner, AND releases a bed, so it belongs in both cohorts and takes global first; the booking is then re-read under the locks because a deletion can commit between the two.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "expireMemberGuestConsent#1",
+    tier: "GLOBAL",
+    reason:
+      "#2307: a lapse has the same three effects as a decline, and kiosk departure reaches the same guest rows under global -> lodge, so expiry follows the identical order rather than inventing one.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "approveSchoolBookingRequest#1",
+    tier: "GLOBAL",
+    reason:
+      "#2593: both fresh creation and held reuse reconcile bed allocations in this transaction, so the global tier fences cancellation and pruning while the concrete lodge tier serialises the capacity claim.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "correctBookingRequest#1",
+    tier: "GLOBAL",
+    reason:
+      "#2936: the key is what makes the school-record preview re-read inside this transaction a FENCE rather than a snapshot. The correction stores a school name the officer acknowledged as either an existing record or a new one, and `resolveOrCreateSchoolOrganisation` — whose unique-name claim is the approval transaction's hold of this very key — is the only writer of those records. Excluding approval is therefore what lets the re-read promise that no record appeared between the preview and the claim, so the acknowledgement pins an identity instead of describing a stale one. It is NOT what fences the conversion's own write: both approvals claim on `version: request.version` (#1923), so the correction's version bump already loses to a conversion in flight and wins ahead of one. The counterparts that were NOT closed by a version fence, and are reconciled per-writer rather than by this key, are the FOUR quote writers in `booking-request-quotes.ts`, none of which took a lock and all of which fenced only on 'not declined, not cancelled' — a set that a correction's VERIFIED is in: `createBookingRequestQuote` now claims on the request version, `sendBookingRequestQuote` now claims the quote row while it is still DRAFT/SENT, and the accept re-arm in `respondToBookingRequestQuote` took this key itself; #3415 replaced that re-arm with an atomic SENT/QUOTE_SENT -> ACCEPTED claim under this key that retains the hold and never converts (see `respondToBookingRequestQuote#3`). The fourth, that function's MODIFY/QUERY branch, was deliberately left unfenced by #2936; #3415 superseded that too, and it now takes this key and claims the loaded-version QUOTE_SENT request and the SENT quote (see `respondToBookingRequestQuote#2`). An ACCEPTED request is not correctable. This site takes NO per-lodge key: it creates no booking and claims no bed, and the stale hold it releases is cancelled afterwards, outside this transaction, by the shared cancel path that takes both tiers itself.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "approveMemberWholeLodgeRequest#1",
+    tier: "GLOBAL",
+    reason:
+      "Whole-lodge conversion composes a booking lifecycle transition with allocation pruning, so it joins the global cohort before the booking's lodge capacity key; the held reconcile reuses that prefix.. #4019: its new whole-lodge zero-cash PAID transition posts the final stored charge through the shared confirmation poster under these same keys (INV-PAY-047), after guest/night writes",
+    invariant: "INV-LOCK-002",
+  },
+
+  // ── Waitlist ──────────────────────────────────────────────────────────────
+  {
+    site: "confirmCrossLodgeWaitlistOffer#1",
+    tier: "GLOBAL",
+    reason:
+      "The minimum-stay refusal returns the entry to WAITLISTED without consuming the offer, which is a lifecycle transition that must exclude cancel and expiry before taking the entry's lodge key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "confirmCrossLodgeWaitlistOffer#2",
+    tier: "GLOBAL",
+    reason:
+      "#2543: the paid-up-adult refusal fails closed down the same release path, so it takes the same cohort — the member keeps their place instead of the offer being burnt by a racing writer.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "confirmCrossLodgeWaitlistOffer#3",
+    tier: "GLOBAL",
+    reason:
+      "Phase-one validation re-reads the offer under the locks before the cross-lodge claim, so an expiry or a cancel cannot move it between the read and the claim.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "confirmCrossLodgeWaitlistOffer#4",
+    tier: "GLOBAL",
+    reason:
+      "Capacity-exceeded compensation reverts the claim across two lodges, so it takes the global tier once and then both lodge keys in sorted order — a cross-lodge path may never reverse the topology.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "confirmCrossLodgeWaitlistOffer#5",
+    tier: "GLOBAL",
+    reason:
+      "A price mismatch against the quote cancels the fresh booking and refreshes the stored offer; that cancel is a lifecycle transition on the offered lodge and joins the cohort before it.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "confirmCrossLodgeWaitlistOffer#6",
+    tier: "GLOBAL",
+    reason:
+      "Phase three cancels the waitlist entry and links the two bookings, a lifecycle write on the entry's own lodge that must not cross a concurrent expiry.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "processWaitlistForDates#1",
+    tier: "GLOBAL",
+    reason:
+      "The offer sweep moves waitlisted bookings to WAITLIST_OFFERED across every candidate lodge, so it takes the global tier once and then each affected lodge key; the subscription-lockout read is resolved before the transaction so no provider call runs under them.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "revertSameLodgeOfferToWaitlisted#1",
+    tier: "GLOBAL",
+    reason:
+      "Reverting an offer must not undo an expiry or cancel that already moved the booking on, so it joins the cohort and its restore is status-guarded on WAITLIST_OFFERED.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "confirmWaitlistOffer#1",
+    tier: "GLOBAL",
+    reason:
+      "Confirming an offer claims beds and moves the booking into a payment path, so it excludes cancel and settlement before the lodge key it re-checks capacity under.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "restartWaitlistOfferWindow#1",
+    tier: "GLOBAL",
+    reason:
+      "#5433 owner decision D2: the owed offer notice's sweep restarts an offer's window just before it sends the offer email the first attempt never sent. It moves only waitlistOfferExpiresAt, and must exclude every writer of the offer's lifecycle - expireStaleOffers' revert, the confirm, the revert after a refused confirm, the past-date cancel, the offer pass and the admin force-confirm and return to the waitlist - all of which take this key, so it joins them, then takes the booking's own lodge key as the expiry and the confirm do. It re-reads under both and claims with an updateMany guarded on WAITLIST_OFFERED, the offer's waitlistOfferedAt and its original deadline (the window it was offered with), so each offer restarts at most once; a lost claim sends nothing. No settings read, no provider call, no new key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "expireStaleOffers#1",
+    tier: "GLOBAL",
+    reason:
+      "Expiry reverts stale offers to WAITLISTED and reconciles their bed allocations, so it takes the global tier before each offer's own lodge key and a concurrent confirm cannot be expired mid-claim. The re-offers run after commit, each in its own processWaitlistForDates transaction (#5410).",
+    invariant: "INV-LOCK-002",
+  },
+
+  // ── Xero group-settlement invoicing ───────────────────────────────────────
+  {
+    site: "createXeroInvoiceForGroupSettlement#1",
+    tier: "GLOBAL",
+    reason:
+      "The initial fence stops a queued operation from starting provider work after organiser cancellation has already committed; cancellation owns the same key. The provider call itself stays outside the transaction.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "runGroupInvoiceEmailFence#1",
+    tier: "GLOBAL",
+    reason:
+      "The email gate re-reads the settlement under the same fence, so an invoice for a group cancelled in the meantime, or one the settlement no longer points at (#3642), is never emailed. #4919: the fence transaction was split out of finishGroupSettlementInvoiceEmail unchanged; it is still that function's only lock(1) site.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "releaseUninvoiceableGroupSettlement#1",
+    tier: "GLOBAL",
+    reason:
+      "#3642: a bound settlement whose joiners' stored prices cannot make its invoice is FAILED to release the binding; the guarded update must serialise with the settle, card-attach, reaper and create-worker writers of the same settlement, which all take this key.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "bindCreatedGroupSettlementInvoice#1",
+    tier: "GLOBAL",
+    reason:
+      "The post-create fence (moved out of createXeroInvoiceForGroupSettlement by #3642): after the provider call returns it decides create-versus-cancel and create-versus-release under the key the cancellation, the reaper and the settle paths take, binding the invoice with its active link or abandoning it on arrival.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "setGroupBookingJoinStatus#1",
+    tier: "GLOBAL",
+    reason:
+      "#3672 review: an organiser's close or reopen re-reads the group's status under the key the organiser-pays cancel fence writes CANCELLED under, and writes OPEN or CLOSED only with a not-CANCELLED guard, so a reopen racing the cancel can never overwrite the CANCELLED that the paid apply, the reaper and the payer switch rely on.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "releaseJoinersLeftBehindPaidSettlements#1",
+    tier: "GLOBAL",
+    reason:
+      "#3672: the reaper's self-heal moves a paid group's left-behind organiser-settled joiners to member-pays; it re-reads the group and settlement under the key the paid apply, the group cancel and the booking create (which re-decides a joiner's payer) take, so a cancel or a refund racing it wins.",
+    invariant: "INV-LOCK-001",
+  },
+
+  // ── Putting a dismissed money task back on the queue ──────────────────
+  {
+    site: "reopenInTransaction#1",
+    tier: "GLOBAL",
+    reason:
+      "DISMISSED -> OPEN re-arms assertNoPendingEditFinancialReview RETROACTIVELY, against money-affecting edits already in flight - unlike the closure it mirrors, which only relaxes that fence. Unlocked, an edit that read the fence while the task was dismissed can settle a credit under its own modification while the reopen commits, leaving an OPEN task whose context still points at the earlier anchor and whose completion credits the member twice. It makes no provider call, so the bounded exception that keeps resolveManualRefundTask lock-free does not apply. #4124: an approved appeal's task is measured by the appeal's ceiling, which nets the payment's open card refund debts, so for that task it takes the Payment row (lockPaymentForRefundedTotal) after this key and before the ceiling's reads, as the approval does. #4343: an EDIT_FINANCIAL_REVIEW is refused before the claim, so that kind cannot re-arm the fence; every other dismissed kind still can. #5197: the core both reopenManualRefundTask (an officer) and reopenHandBackAfterLateWin (a lost Stripe dispute later won; every lock wait bounded by lock_timeout) run. A dispute-loss hand-back takes its booking row (lockBookingRowForOwnerRead) right after the task read, re-reads the task, then its Payment row: exactly its Dismiss and Reduce order (this key, booking row, Payment row), so the restored R05, which reads its debtor under the booking row, adds no Payment -> booking edge. The late win's (dispute, task) marker is written with the claim. No provider call; no new key.",
+    invariant: "INV-LOCK-001",
+  },
+  // ── A Stripe dispute event reporting a dispute WON (#5197) ──
+  {
+    site: "applyEvent#1",
+    tier: "GLOBAL",
+    reason:
+      "#5197: a WON event takes this key, bounded by lock_timeout (a timeout writes nothing and the webhook answers 500, so Stripe redelivers), before the StripeDispute row lock, so a move from LOST to WON is serialised with every Dismiss (resolveManualRefundTask) and Reduce (reduceDisputedHandBack) of a dispute-loss hand-back, which decide under this key on the disputes as recorded: the officer reads WON and is refused, or commits first and the late win, after this transaction commits, finds the task dismissed or reduced and reopens or names it. Nothing else in the transaction: the dispute row only, no booking, Payment or Member row. Other dispute events take no advisory key.",
+    invariant: "INV-LOCK-001",
+  },
+  // ── Reducing a disputed card payment's hand-back by a dispute lost for part of it ──
+  {
+    site: "reduceDisputedHandBack#1",
+    tier: "GLOBAL",
+    reason:
+      "#4516 (owner decision, 15 Nov 2026, comment 6893252570): reducing a disputed card payment's hand-back lowers the task's amountCents, which every edit, acceptance, paid cancel and refund appeal reads beside refundedAmountCents to size a refund net of what is still promised back (refundableCashNetOfOpenHandBacks), and it must exclude that hand-back's completion and dismissal, which take this key first. The same order as that dismissal: this key, then the booking row (lockBookingRowForOwnerRead), the task re-read, then the Payment row and the booking's disputes re-read (decideJournalHandBackDismissal), then the claim guarded on status OPEN and the amount read, then the journal's part withdrawal (under the Payment row) and the audit row. A lost claim writes nothing. No provider call; no new key.",
+    invariant: "INV-LOCK-002",
+  },
+  {
+    site: "editReviewHeadlineRebase#1",
+    tier: "GLOBAL",
+    reason:
+      "#4343 (D5): the one-off headline re-base rewrites the booking's four money columns, which the cancellation cap and the bank-amount check read, so it takes the global settlement key first, re-reads the booking, and compare-and-sets through the closure's re-base. No provider call, no lodge key, no second advisory key. A miss rolls that booking back.",
+    invariant: "INV-LOCK-001",
+  },
+  {
+    site: "updateGroupHandBackAlertRecord#1",
+    tier: "GLOBAL",
+    reason:
+      "#4042: the one writer of a group organiser hand-back's alert record outside the claim that grows the task - the lease a run claims before it sends, its release after a send that reached nobody, and the record of a send. Every group-cancel claim rewrites the same reviewContext under this key when it grows the task, and two runs (the cancel and the reaper's sweep, or two replicas) can each try to send; taking the key and re-reading makes the lease single and stops any write dropping another's fields. Held only for a read and an update; the email is sent after the claim's transaction commits, never inside it.",
+    invariant: "INV-LOCK-001",
+  },
+];
+
+const SCOPED_ADVISORY_LOCK_INVENTORY: Record<string, number> = {
+  // #1936: the join-request review and group-create approve transactions take
+  // member-lifecycle:{memberId} for the pre-existing member being linked, so
+  // FamilyGroupMember writes serialize with the application-approval mapping
+  // transaction's in-any-family-group collision guard (a FamilyGroupMember
+  // insert does not bump Member.updatedAt, so the preview token alone cannot
+  // catch the race). Single-lock holders; composition and counterpart analysis
+  // in docs/CONCURRENCY_AND_LOCKING.md.
+  // #3291 moves existing-member parent approval onto the shared lifecycle
+  // helper and then the shared partner helper. The one remaining raw site is
+  // the requester's separate lifecycle transition; the shared mints below are
+  // each counted once at their authority module.
+  "src/lib/admin-family-group-requests-service.ts": 1,
+  // #2586: every roster-date writer calls the shared helper; the key is minted
+  // once here and writer participation is pinned by roster-lock-contract.test.
+  "src/lib/roster-lock.ts": 1,
+  // #2364/#2596: lockAdultMemberHostingPolicySet takes the single blocking global
+  // adult-member-hosting-policy-set key before any read by an admin CRUD write
+  // or a configuration import, and the migration's BEFORE STATEMENT trigger
+  // takes the same key ahead of any tuple lock so operator DML joins the same
+  // order. TWO since #2722: the drain's fail-fast `pg_try_advisory_xact_lock`
+  // helper lives in this file too, and used to be exempt because the census
+  // matched only the blocking spelling. That exemption was a detection hole, not
+  // a decision — the same blindness would have hidden a fail-fast acquisition of
+  // the GLOBAL key — so both spellings are now scanned and both are counted.
+  // Config import, member merge and drain compose the key only in the documented
+  // forward order; no counterpart reverses it. Counterpart analysis in
+  // docs/CONCURRENCY_AND_LOCKING.md.
+  "src/lib/adult-member-hosting-policy-set.ts": 2,
+  // #2596: after the hosting policy-set key, the drain takes sorted
+  // member-lifecycle keys for claimed owner + actor before Member rows and the
+  // exact payload refresh. Merge takes those keys before relation moves. No
+  // lifecycle participant takes the policy key and the drain never locks the
+  // queue row, so there is no reverse policy or queue -> Member edge.
+  "src/lib/adult-member-hosting-coverage-drain.ts": 1,
+  // Same-owner hosting coverage (#2576 §9). `lockHostingCoverageOwner` takes
+  // `pg_advisory_xact_lock(hashtext('hosting-coverage-owner'), hashtext(<Booking.memberId>))`
+  // — a NEW keyspace in its own namespace, keyed on the booking OWNER.
+  //
+  // WHY IT EXISTS. `SAME_BOOKING_OWNER` makes one booking's compliance a function of
+  // ANOTHER booking's rows. When #2576 introduced this key, confirmed creation used
+  // lodge while cancellation used global, leaving the named race open. #2593 later
+  // made the allocation-participating confirmed-create and cancellation paths compose
+  // global → lodge. The owner key remains required because participant/member/queue
+  // producers do not all share those tiers and the invariant is cross-booking and
+  // per-owner. Same reasoning that gave `lockBookingMemberNights` its own family: a
+  // per-member invariant cannot be serialised by a per-lodge key alone.
+  //
+  // COMPOSITION AND ORDER. Taken LAST among the application locks a caller composes:
+  // after `pg_advisory_xact_lock(1)`, `acquireLodgeCapacityLock`, roster-date locks,
+  // `lockBookingMemberNights` and member-credit locks wherever those families apply.
+  // The #2586-aware modification order is therefore global → lodge → roster-date →
+  // applicable member keys → coverage-owner; paths that do not use roster or member
+  // keys simply omit those tiers. Several owners are acquired in SORTED order, the
+  // same discipline the member-night lock uses. Postgres advisory locks are re-entrant
+  // per session, so the evaluator and the settle step taking the same owner key inside
+  // one transaction costs nothing. Callers resolve the lodge policy first and skip the
+  // lock entirely unless the lodge has the scope enabled, so no unrelated write is
+  // serialised per member. ONE site: every acquisition in the tree goes through this
+  // helper. TWO since #2722, for the reason given under the hosting policy set
+  // above: the fail-fast `tryLockHostingCoverageOwners` sibling is the second
+  // spelling of the same key and is now counted rather than invisible.
+  // Counterpart analysis and compatibility evidence in
+  // docs/CONCURRENCY_AND_LOCKING.md → "Same-owner coverage takes a per-owner key".
+  //
+  // STILL TWO AFTER #3039 MINTED A SECOND FAMILY HERE — the per-TRIP
+  // `pg_advisory_xact_lock(hashtext('hosting-coverage-group'), hashtext(<GroupBooking.id>))`,
+  // in both the blocking and the fail-fast spelling. The count did not go to four
+  // because the two families differ in exactly two facts, the namespace constant and
+  // the decode label, so both go through ONE blocking primitive
+  // (`lockCoverageKeys`) and ONE fail-fast primitive (`tryLockCoverageKeys`)
+  // parameterised on those (`INV-SSOT-001`). Two statements in the file, both counted,
+  // both scanned — and a family that drifted to the session-scoped
+  // `pg_advisory_lock(` spelling is now impossible to introduce for one family alone.
+  //
+  // WHY A SECOND FAMILY AT ALL. `SAME_GROUP_TRIP` (#3038) makes one booking's
+  // compliance a function of a booking on ANOTHER ACCOUNT. The owner key is
+  // `Booking.memberId` — the dependent's own account — so two writers changing two
+  // bookings in one trip hold two DIFFERENT owner keys and are not serialised by
+  // them at all; at READ COMMITTED each can then observe a state the other has
+  // already invalidated. Not the lodge key either: one lodge holds many unrelated
+  // trips and a lodge-wide key would serialise all of them. The trip is the
+  // contention domain, so the trip is the key (`INV-LOCK-001`).
+  //
+  // ORDER. It sits IMMEDIATELY ABOVE the coverage-owner key and below everything
+  // else: global → lodge → roster-date → applicable member keys → participant
+  // `Member` rows → coverage-GROUP → coverage-owner. Group before owner because the
+  // trip's membership is what decides WHICH owners the fan-out will name, so the
+  // owner set is not even known until this key is held. That makes the owner key's
+  // former "always last" the second of the last two, and every statement of the old
+  // form has been rewritten rather than left standing.
+  //
+  // COUNTERPART, AND WHY NO NEW WAIT-GRAPH EDGE APPEARS. Every acquisition tries the
+  // key with `pg_try_advisory_xact_lock` before the blocking form and rolls the whole
+  // outer transaction back on a conflict — the same protocol #2597 applied to
+  // repeated owner-key acquisition, and necessary here rather than merely prudent:
+  // one transaction can reconcile a booking in one trip and then inspect a
+  // same-owner dependent that sits in ANOTHER trip, so sorting inside one call
+  // cannot order keys discovered in two. Callers resolve the lodge policy first and
+  // take nothing unless `SAME_GROUP_TRIP` is on and the booking is in a trip.
+  // Counterpart analysis in docs/CONCURRENCY_AND_LOCKING.md → "Group Trip coverage
+  // takes a per-trip key, above the owner key".
+  "src/lib/adult-member-hosting-coverage-lock.ts": 2,
+  // AI Diagnostics budget reserve (AID-2, #2371). Both writers take the SAME
+  // per-month key `pg_advisory_xact_lock(hashtext('diagnostics-budget-reserve'),
+  // hashtext(<month>))`: `reserveDiagnosticsBudget` (the guarded spend claim) and
+  // `settleDiagnosticsRoundtrip` (books the actual cost), so reserve and settle
+  // are mutually exclusive per month and every reserve sees a consistent
+  // settled+reserved sum. It is a NEW, isolated keyspace: keyed by calendar month
+  // only, taken by no other writer, and each site takes only this one key (never
+  // a second lock), so it forms no lock-ordering cycle and has no interaction with
+  // the global booking/money lock(1), the per-lodge capacity key, or any other
+  // scoped key above — the keyspaces are disjoint. Provider calls run OUTSIDE the
+  // locked transaction. Counterpart analysis and compatibility evidence in
+  // docs/CONCURRENCY_AND_LOCKING.md → "Composition: diagnostics budget reserve
+  // (AID-2, #2371)".
+  "src/lib/ai-diagnostics-usage.ts": 2,
+  "src/lib/authoritative-fees.ts": 1,
+  // #2095: claimBackupRun takes the singleton backup:run-lock key for the
+  // milliseconds of the reap/check/insert claim transaction only (the dump
+  // itself runs outside any transaction), so cron and run-now backups
+  // serialise across containers. Single-lock holder, no composition with any
+  // booking/money/lifecycle key; counterpart analysis in
+  // docs/CONCURRENCY_AND_LOCKING.md.
+  "src/lib/backup-run.ts": 1,
+  "src/lib/booking-member-night-conflicts.ts": 1,
+  // #calendar-recurring: lockCalendarSeries takes calendar-series:{seriesId} for
+  // the milliseconds of a whole-series regenerate/propagate/collapse/delete so
+  // two concurrent editors can't interleave a delete-and-regenerate and
+  // duplicate/drop occurrences. Single-lock holder; its own keyspace, composed
+  // with no booking/money/capacity/lifecycle key (calendar rows only). #5148:
+  // `lockWorkPartyCalendar` (calendar-work-party-entries.ts) calls the same
+  // helper with a calendar-series:work-party:{workPartyEventId} key, adding no
+  // raw lock site. Its holders (create's and Add to calendar's own
+  // transaction, the work-party edit, the work-party delete) each take it
+  // first, before any row, and hold no other advisory key
+  // (docs/CONCURRENCY_AND_LOCKING.md, the calendar-series row).
+  "src/lib/calendar-service.ts": 1,
+  "src/lib/config-transfer-lock.ts": 1,
+  // TWO: the blocking `acquireLodgeCapacityLock`, and `tryAcquireLodgeCapacityLock`
+  // (#4876). The try form is the same per-lodge key and never waits. Member merge
+  // calls it for a lodge that appeared while a participant attempt was rolled
+  // back, after member-lifecycle keys are already held; a miss is the existing
+  // partner-share lodge 409, not a wait, so it adds no lodge-after-member edge.
+  "src/lib/lodge-capacity-lock.ts": 2,
+  "src/lib/member-credit.ts": 1,
+  "src/lib/member-lifecycle-actions.ts": 2,
+  // #2593: one canonical helper mints member-lifecycle:{memberId}; it
+  // de-duplicates and sorts ids before acquisition. Deletion, bulk update,
+  // member-detail, seasonal-assignment and MCP approval writers call this helper instead
+  // of reconstructing the scoped key at their individual call sites.
+  "src/lib/member-lifecycle-lock.ts": 1,
+  // #2363: every minimum-stay policy writer takes the one global policy-set
+  // key before reading/planning. The migration's BEFORE STATEMENT trigger
+  // takes the exact same key for draining old-colour INSERT/UPDATE/DELETE before
+  // PostgreSQL reaches tuple locks. Config import orders its existing singleton
+  // first, then this key; live CRUD takes only this key.
+  "src/lib/minimum-stay-policy-set.ts": 1,
+  // #1937/#2596/#3291: executeMemberMerge first calls the shared hosting policy-set
+  // helper, then — since #2595 — the merge-only partner-share prefix helper
+  // (`acquireMemberMergePartnerSharedLodgeLocks`: every affected lodge capacity
+  // key, sorted, and NO global cohort key), then takes the two
+  // member-lifecycle keys through their shared helper, and finally the canonical
+  // member-partner-link keys through `member-partner-lock.ts` — because merge
+  // re-points partner links AND reads them to decide which future shared
+  // doubles step 3b deletes. All three added tiers come from helpers that own
+  // their own raw sites
+  // (adult-member-hosting-policy-set.ts, bed-allocation-lifecycle.ts +
+  // lodge-capacity-lock.ts, member-partner-lock.ts) — merge mints no new key of
+  // its own. Merge therefore has no raw scoped site of its own. This order
+  // serialises policy enumeration before relation moves,
+  // keeps the fixed lodge -> member order for the #2595 shared-double
+  // reconciliation, matches the reviewed move's member-lifecycle ->
+  // member-partner-link order so no new wait-graph edge appears, and
+  // excludes every delete/archive/merge touching either member. Merge is
+  // deliberately absent from GLOBAL_LOCK_SITE_REGISTRY above:
+  // `member-merge-execute.test.ts` pins that it takes no `lock(1)` at all.
+  // #2595: the partner-link service and reviewed move service share this one
+  // canonical sorted member-partner-link lock mint.
+  "src/lib/member-partner-lock.ts": 1,
+  // #2148: reconcileSubscriptionBillingExceptions takes the SAME
+  // membership-subscription-billing:{seasonYear} key as
+  // confirmSubscriptionBillingPreview (no new key), so refresh-reconciliation
+  // and confirm serialise; counterpart analysis in
+  // docs/CONCURRENCY_AND_LOCKING.md, compatibility evidence in PR #2158.
+  // #5190: the key is now minted once in lockSubscriptionBillingSeason, which
+  // those two and the liability clear-up (clearStaleNotRequiredRows, a
+  // single-lock holder) call, so the clear-up serialises with confirm.
+  "src/lib/subscription-billing-season-lock.ts": 1,
+  // #5190: the liability-rule key, minted once. The seasonal-assignment
+  // reconcile takes it SHARED (last, after lock(1)/lodge/member); the
+  // liability clear-up (run by the settings save and after a config import)
+  // takes it EXCLUSIVE, always after the billing season key, so a lock(1)
+  // holder never waits behind a billing confirm.
+  "src/lib/subscription-liability-rule-lock.ts": 2,
+  // #1936/#3291: the two pre-existing membership-application locks
+  // (application id + applicant email) remain local. Approval mapping now
+  // takes its complete sorted lifecycle set through member-lifecycle-lock.ts,
+  // followed by the complete partner set through member-partner-lock.ts.
+  // Those shared mints are counted at their authority modules.
+  "src/lib/nomination.ts": 2,
+  "src/lib/xero-contacts.ts": 2,
+  /*
+    #3367 — the CONTACT-HOME key,
+    `pg_advisory_xact_lock(hashtext('xero-contact-home:<contactId>'))`.
+    INV-INT-018, minted once in `lockXeroContactHome` and taken by all four
+    writers that link a Xero contact id to a local record.
+
+    WHY IT EXISTS. Since #3366 two columns can hold one Xero contact id —
+    `Member.xeroContactId` and `Organisation.xeroContactId` — each unique within
+    its own table, with no constraint able to span the two. The refusal that
+    keeps them exclusive is a READ of the other table, and a read cannot see an
+    uncommitted concurrent link, so without a key scoped to the CONTACT rather
+    than to either record two writers can both pass the check and both write.
+    Exactly the reasoning that gave the member-night lock its own family: an
+    invariant across two records cannot be serialised by either record's key.
+
+    COMPOSITION AND ORDER — and the rule is NOT "taken last".
+
+    An earlier revision of this entry said it was taken last and that nothing
+    else was acquired while it was held. That was false, and it described a
+    reachable DEADLOCK. `takeXeroContactFromSchoolsOwnMember` takes a `Member`
+    ROW lock — it clears the holder's `xeroContactId` — while holding this key;
+    the two member-side linkers took the row lock FIRST and then waited for this
+    key. Wait graph: the credit-note path on a school's earlier booking against
+    the new booking's invoice, which is the pair `xero-contact-home.ts` calls
+    reachable on purpose. Postgres resolves it by aborting one with `40P01`.
+
+    THE REAL RULE: the contact-home key is the OUTER lock relative to any
+    `Member` row lock. Each writer takes its own entity ADVISORY key first —
+    `hashtext(<memberId>)` in `findOrCreateXeroContact`'s phase 2, the
+    per-organisation key below in the organisation resolve — then THIS key, and
+    only then may it touch a `Member` row, whether by `SELECT … FOR UPDATE`
+    (`lockMemberForXeroContactLink`, `lockMemberForManualXeroContactLink`) or by
+    an `update`. Every participant therefore reaches a member row with the
+    contact key already held, and the cycle cannot form.
+
+    No provider call runs inside the holding transaction (the F7/#1355 property
+    this area was restructured for).
+
+    ONE site: every acquisition in the tree goes through the helper. Counterpart
+    analysis in docs/CONCURRENCY_AND_LOCKING.md; the rule itself is
+    docs/invariants/integrations.md → INV-INT-018.
+  */
+  "src/lib/xero-contact-home.ts": 1,
+  /*
+    #3367 — the per-organisation contact key,
+    `pg_advisory_xact_lock(hashtext('xero-organisation-contact:<organisationId>'))`.
+    A NEW keyspace, in its own namespace, keyed on the club's `Organisation`.
+
+    It is this path's equivalent of the member key `findOrCreateXeroContact`
+    takes: it serialises two resolutions of the SAME school so the phase-2
+    re-read-then-write cannot interleave and produce two links. Taken FIRST, with
+    the contact-home key immediately after it, so the whole family acquires in
+    one direction. No counterpart reverses that order, because this is the only
+    writer of `Organisation.xeroContactId`.
+
+    #5245: still ONE site. The mint moved into `lockOrganisationXeroContact`,
+    which the resolve's phase 2 and the officer's school contact details edit
+    (`updateSchoolOrganisationContact`) both call. The edit takes this key alone
+    — no contact-home key, no Member row — so it adds no edge to the order.
+  */
+  "src/lib/organisation-xero-contacts.ts": 1,
+  // #3170: `enqueueXeroSupplementaryInvoiceOperation` takes
+  // `pg_advisory_xact_lock(hashtext('xero-supplementary-invoice'), hashtext(<anchor>))`
+  // - a NEW keyspace in its own namespace, keyed on the `BookingModification`
+  // the invoice corrects.
+  //
+  // STILL ONE SITE AFTER #3193, and the count is the interesting part. The
+  // second ask - a review share's own small invoice, raised when the change's
+  // invoice had already gone out without it - reaches the SAME statement through
+  // `enqueueXeroSecondSupplementaryInvoiceOperation`, which is a named wrapper
+  // over this enqueue rather than a second copy of its link-check ->
+  // queued-check -> write. So there is still exactly one place that decides
+  // whether an ask already has an invoice going out, which is the property
+  // #3170 was fixing; a second locked decision elsewhere would be the same
+  // defect wearing a different anchor. The KEYSPACE widens rather than the site
+  // count: the anchor is now the `BookingModification` OR the `ManualRefundTask`
+  // whose share the invoice bills. Two anchors never contend, and a second ask
+  // is invisible to every read scoped to the change - which is what stops the
+  // change's own restate raising a $30 follow-on to the $230 combined total on
+  // top of an invoice already with the member.
+  //
+  // WHY IT EXISTS. The owner's 30 Aug 2026 decision makes two review settlements
+  // of ONE booking edit contribute to one combined total, and the Xero leg has to
+  // move with it. Deciding "does this edit already have a supplementary invoice
+  // going out?" was a check-then-create, and the check deduped on a
+  // `correlationKey` BUILT FROM THE AMOUNT - so two concurrent settlements at
+  // $200 and $30 matched nothing of each other's, queued two operations and sent
+  // the member two invoices for one edit. The active `SUPPLEMENTARY_INVOICE` link
+  // fences nothing before the first invoice exists, so the lock is what makes
+  // "one invoice per edit" true rather than asserted.
+  //
+  // COUNTERPARTS AND ORDER. No holder of it takes any other key, so it is always
+  // the LAST key of its transaction; since #3947 (option 2) one caller composes
+  // it - the review-charge completion's invoice route, inside its lock(1)
+  // transaction, last (`resolveManualRefundTask#1` above). Every other caller
+  // arrives holding nothing, and no counterpart writer takes it. TWO callers, and "every caller is
+  // post-commit" was not one of them: the edit-settlement callers reach it
+  // post-commit through a fire-and-forget `queueXeroBookingEditSettlement`, while
+  // the booking-vs-Xero repair pass (`xero-booking-repair-passes.ts`,
+  // `QUEUE_SUPPLEMENTARY_INVOICE`) calls it DIRECTLY. The no-cycle conclusion
+  // stands for a stronger reason than the one first written down: that pass is an
+  // operator-driven admin/CLI action which opens no transaction of its own and
+  // holds no advisory lock, so it too arrives holding nothing. Held for the
+  // milliseconds of the link-check -> queued-check -> raise-or-create transaction;
+  // the Xero round trip happens later, in the outbox worker, entirely outside it.
+  // Inventory row and stated residual in docs/CONCURRENCY_AND_LOCKING.md; the
+  // serialisation itself is proven against real PostgreSQL by
+  // `edit-financial-review-races.realdb.test.ts`.
+  //
+  // #4930 (`INV-SSOT-008`): the enqueue and `lockSupplementaryInvoiceAnchor`
+  // moved, verbatim, out of `xero-operation-outbox.ts` into their own module so
+  // the outbox stops closing an import loop. Same statement, key, callers and
+  // transaction client; only the file changed.
+  "src/lib/xero-supplementary-invoice-enqueue.ts": 1,
+  //
+  // #3641 (`INV-PAY-104`): the ONE site is now `lockSupplementaryInvoiceAnchor`,
+  // which both the enqueue and the late-capture re-queue
+  // (`xero-supplementary-invoice-late-capture.ts`,
+  // `requeueRetiredSupplementaryInvoiceOperation`) call, so the two cannot drift
+  // onto different keys. The re-queue takes it on a reaper-retired operation's
+  // anchor for covered-check -> link-check -> queued-check -> revive, so a
+  // revived invoice and a fresh enqueue can never both go out (forced against
+  // real PostgreSQL in `edit-financial-review-races.realdb.test.ts`). Its
+  // callers (the Stripe webhook's additional-payment handler, the
+  // confirm-modification-payment route, the waiting-invoice reaper) hold no
+  // transaction or other advisory lock there, and no provider call runs inside.
+  // #3953 (`INV-PAY-139`): the change-capture receipt's enqueue
+  // (`additional-capture-receipt-enqueue.ts`) calls the same helper on the
+  // change its capture pays for (else the booking), holding nothing, for
+  // find-by-key -> create of one outbox row; and its worker's planning gate
+  // (`passPlanningGate`) calls it on the booking, holding nothing, for
+  // check-stamp -> stamp, with every Xero call after it commits. Round 6: its
+  // plan store (on the change, else the booking) and its unsent-invoice switch
+  // (on that invoice's anchor) each take it alone in a short transaction of
+  // their own, and the supplementary enqueue reads the anchor's receipts under
+  // it (`anchorCaptureHasReceipt`). Round 7: where the booking has a change
+  // capture no change can be read from, that enqueue takes it on the booking
+  // and then on its anchor - the one fixed order, booking -> change; no holder
+  // of a change's key takes a booking's. Round 8: the late-capture re-queue's
+  // revive asks the same receipt check under its anchor lock and revives
+  // unpaid where it holds. Round 9: that booking-first key is taken only for
+  // an invoice naming no capture, and an officer's inline Retry of a change's
+  // invoice re-asks under the change's key alone, in its own short
+  // transaction, before its Xero call. No new raw site, no new key.
+  // #4324 (`INV-PAY-144`): the keep's decision for a kept change capture
+  // (`planKeptLateCaptureXeroRecord`) takes it on the change (else the
+  // booking) AFTER the approval task's row - the dismissal's claim, or the
+  // repair tool's own `lockKeptLateCaptureTask` - and as its last lock; the
+  // approval's settlement takes it the same way (`lockKeptCaptureAnchor`),
+  // after the approval's claim and before its first outbox write; a
+  // paid-another-way close takes it after lock(1), the Payment row and the
+  // task row, inside its plan, so a change capture's record is read and its
+  // kept-capture invoice queued under it; and the receipt's worker, where its
+  // unlocked read finds the capture no longer kept, decides again in a short
+  // transaction under it before any Xero call - in every case its plan store
+  // reads the task again under it and closes the row there if no longer kept.
+  // 4384-R2: a #3980 gap invoice's enqueue takes it on every change its
+  // amount bills, sorted, never the booking's, before asking whether a kept
+  // capture's own invoice bills any of them. Same site, no new key.
+  // Task row -> anchor, never the reverse. No new raw site, no new key.
+  // #4382: that decision re-queues a reaper-retired change invoice
+  // (`STALE_WAITING_PAYMENT`) on the anchor it already holds, the same
+  // guarded `CANCELLED` + code -> `PENDING` update the late-capture re-queue
+  // writes, without taking the lock again. The release still takes the lock,
+  // for the webhook, the confirm route and the reaper. #5220: on that same
+  // held key the decision also queues the revived invoice's receipt where it
+  // goes out unpaid (the receipt's enqueue re-taking it) and stamps a refusal
+  // `STALE_WAITING_PAYMENT_CAPTURED` with the release's guarded claim; the
+  // officer's email follows the commit. Same site, no new key, same order.
+  // #3403 (`INV-PAY-140`): the superseded-invoice move
+  // (`superseded-ask-invoice-carry.ts`) calls the same helper on each change
+  // whose waiting invoice it re-points at the request carrying its balance,
+  // and on that carrier's own key (its change, else the booking - booking
+  // first, else the two changes sorted), one short transaction per change
+  // holding nothing else; its return (`superseded-ask-invoice-return.ts`)
+  // takes it on one change alone, inside a kept capture's release. Their
+  // callers (the supersede's cancel step, the minters after their cancels, an
+  // edit's Xero leg, the reaper, the release) hold nothing there. Still no new
+  // raw site, no new key.
+  // #4299 S1 (`INV-PAY-148`): the enqueue refuses, under this key, a change
+  // whose organiser extra a waiver retired whole before it was raised, and
+  // the organiser create re-asks in a short transaction holding this key
+  // alone, from the outbox worker or an officer's retry holding nothing,
+  // before its Xero call. Same helper, no new raw site, no new key.
+};
+
+// Every entry here is now a LOCK-ONLY statement (#2289): it selects a constant,
+// runs through `$executeRaw`, and its result is never read. The data each one
+// protects is read back through the Prisma model under that same lock, so no row
+// lock in this repository doubles as an unchecked-cast read. The one raw
+// statement whose result IS read (`rate-limit.ts`) takes no lock and goes
+// through `decodeRawRows`. `raw-sql-shape-guard.test.ts` holds that line.
+const ROW_LOCK_SITE_INVENTORY: Record<string, number> = {
+  // The room bunk-group writer and #2594 allocation approval each use one
+  // lock-only row statement. Reviewed removal locks its selected/causal rows,
+  // and requested-room editing locks the booking before its authoritative
+  // approval check and guarded update.
+  //
+  // These two were one entry of 2 against `admin-bed-allocation.ts` until #2688
+  // split that file. Both moved WHOLE, inside their enclosing functions, to the
+  // module that owns their concern — the count is unchanged and neither site
+  // changed strength, order or counterpart. Note that this inventory is keyed by
+  // FILE, unlike the Tier-2 registry above, so a structural move re-keys it even
+  // when nothing about the lock moves; #2722 converted the advisory census to
+  // per-site identity and deliberately left this one per-file.
+  "src/lib/bed-allocation-approval.ts": 1,
+  "src/lib/bed-allocation-bunk-pairing.ts": 1,
+  // #4162: a voided bank-transfer refund note's marker takes its link row
+  // `FOR UPDATE NOWAIT` after lock(1) and the Payment row
+  // (`writeBankRefundVoidMarker`); the link-first writers (the inbound link
+  // write, #4161's heal) never wait on it, and a busy link defers the note.
+  "src/lib/bank-refund-void-follow-up.ts": 1,
+  // #2595 reviewed moves lock every selected/destination/old-bed counterpart
+  // tuple after the advisory tiers and before their authoritative re-read.
+  "src/lib/bed-allocation-move.ts": 1,
+  "src/lib/bed-allocation-removal.ts": 1,
+  "src/lib/requested-room-write.ts": 1,
+  // Promo usage caps (#2299): `lockPromoCodeRowsForUpdate` takes a
+  // `SELECT 1 … FOR UPDATE` on the promo row for the modification paths,
+  // which can now RELEASE a cap slot as well as take one. One raw statement
+  // serves all four of them — the batch-modification path calls it directly
+  // (it may lock two codes for a swap), and adding guests / changing dates /
+  // removing guests reach it through `lockAndRefreshPromoCodeUsage`, which also
+  // re-reads `currentRedemptions` under the lock. That wrapper has four call
+  // sites, not three: the batch path also calls it on its no-swap reprice
+  // branch, where the lock is already held and the refreshed counter is the
+  // point. Since #3827 booking creation takes the SAME statement too: it used
+  // to lock its own row by the mutable `code` in booking-create-promo.ts, and
+  // now resolves ids unlocked, locks them here in sorted order and re-reads by
+  // id, so a two-code create orders its rows like every other writer. (#2289:
+  // the read was always typed — a raw `SELECT *` cast is what once silently
+  // disabled a redemption cap and a FREE_NIGHTS discount.) Ids are sorted and locked one
+  // statement at a time so a promo swap (outgoing + incoming code in one
+  // transaction) can never build a lock cycle with another swap; callers hold
+  // the per-lodge capacity lock first, so the order stays lodge -> promo row.
+  // A CONSTANT is selected and the result discarded — a lock, never a read. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Narrow row- and table-lock protocols".
+  "src/lib/promo.ts": 1,
+  // Site-style save (#2322) locks the ClubTheme singleton
+  // (`SELECT 1 … FOR UPDATE`) so concurrent saves serialise and never
+  // both delete the same replaced LOGO blob. Order: ClubTheme row -> MediaImage.
+  // Singleton-keyed; no advisory lock; disjoint from booking/money writers. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Club-theme logo writer".
+  "src/lib/club-theme.ts": 1,
+  // Per-account password throttle (#4609, INV-AUTH): `claimPasswordAttempt`
+  // ensures the account's `LoginThrottle` row, then locks it
+  // (`SELECT 1 … FOR UPDATE`) before the read-decide-count, so parallel guesses
+  // queue and a burst at the end of a wait admits one. Keyed on an immutable
+  // HMAC id; no advisory key, never composed with another lock, no provider
+  // call, and the password compare runs after commit. A row lost between the
+  // ensure and the lock (a clear or the idle sweep) is ensured and locked once
+  // more. See docs/CONCURRENCY_AND_LOCKING.md -> "Login throttle claim".
+  "src/lib/login-throttle.ts": 1,
+  // #3029 C3: the held-party dietary rebuild locks the booking's guest rows
+  // (`SELECT 1 … FOR UPDATE`, id order) before reading the values it carries,
+  // so a concurrent single-row admin edit is read or refused, never lost.
+  // Order: global -> lodge (held by the approval) -> BookingGuest rows. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Held-party guest rows before a dietary
+  // rebuild".
+  "src/lib/booking-guest-row-lock.ts": 1,
+  // #3583: the booking-ledger back-post locks the booking's payment row and then
+  // the booking row (`SELECT 1 … FOR NO KEY UPDATE`, both), after lock(1), the
+  // lodge key and the member credit-ledger keys. Payment first, as the card-
+  // refund writer takes it. See docs/CONCURRENCY_AND_LOCKING.md ->
+  // "Booking-ledger back-post".
+  "src/lib/booking-ledger-back-post.ts": 2,
+  // #4627 (Ledger M3b): the journal adapter takes the booking row
+  // (`SELECT 1 … FOR NO KEY UPDATE`) before it reads the owner it posts as the
+  // receivable's debtor. The M3 doors have already UPDATEd that row in the same
+  // transaction, after lock(1) and its lodge key, so this adds no edge; member
+  // merge's owner move is its counterpart. #4516 (M4c review F1): the one
+  // statement, `lockBookingRowForOwnerRead`, is also taken by an approved refund
+  // appeal right after its lock(1), before the Payment row and the request's
+  // claim (which writes no booking row), so a merge (owner move, then the
+  // request's member) cannot hold the row it waits on. W1's capture-return R05
+  // reads its owner without it, defensively (round 2: W1 holds the Payment row
+  // there, so the booking row would add a Payment -> booking edge; since #4823 a
+  // merge never waits for a Payment row). #4840: a manual settle takes it right
+  // after its lodge key, before it names its officer on the Payment row (that FK
+  // takes KEY SHARE on the Member row a merge locks FOR UPDATE after holding the
+  // booking row). An edit review's closure (`manual-refund-task-resolution.ts`,
+  // whose own raw statement this replaced) takes it right after lock(1), before
+  // its full task re-read, its claim naming the officer (`completedByMemberId`)
+  // and any credit write naming the owner (#4627). #4845: a locked-period
+  // change-request approval takes it right after its lodge key, before its claim
+  // names the officer and holds the request row merge re-points. #4857: a held booking-request approval
+  // (`booking-request.ts`) takes it on the hold right after its lodge key, before its claim and the guest swap
+  // whose member links take key shares. See docs/CONCURRENCY_AND_LOCKING.md -> "The M3b
+  // booking doors and member merge's journal transfer", the M4c paragraph and
+  // "A booking writer takes the booking row before a Member key share".
+  // #4845: that one statement now lives in `booking-row-lock.ts`, outside the journal boundary, so a lock-only
+  // caller names no journal module; `doors` re-exports it and `booking-posting.ts` imports it.
+  // #4853: a policy-exception approval on an existing booking takes it right after its lodge key, before its claim.
+  // #5197: the reopen of a dispute-loss hand-back (an officer's, or a late win's) takes it right after lock(1) and
+  // the task read, before its Payment row and its restored R05: the order of that hand-back's Dismiss and Reduce.
+  "src/lib/booking-row-lock.ts": 1,
+  // #4691 (Ledger M4a): an application batch, a refund reservation and a release
+  // take the booking's Payment row (`SELECT 1 … FOR NO KEY UPDATE`) before they
+  // read caps. No advisory key. A caller that already holds the row adds nothing.
+  // Charges and reversals that apply nothing do not take it, so the M3 doors
+  // gain no edge. #4516 (M4b): receipt collections take it, and the CHARGE
+  // successor a member merge once posted is now posted only under it, by the new
+  // owner's first collection. Merge posts no successor; it re-points one Payment
+  // column (`manuallyMarkedPaidByMemberId`), never waiting for the row (#4823,
+  // counted under member-merge-payment-attribution.ts). #4516 (M4c): it is also taken by every refund
+  // writer: R05 at the edit doors (after their booking row), an appeal (after its
+  // booking row, before its claim) and its `release_claim` (after the request's
+  // row and its task), a late capture's approval and keep (before the task's
+  // claim, review F2), the reservation step's own short transaction, the cash
+  // writer and "Paid another way". See docs/CONCURRENCY_AND_LOCKING.md ->
+  // "Member-money applications and refund reservations" and the M4c paragraph.
+  "src/lib/member-money/internal/application-read.ts": 1,
+  // #4525 (Ledger M13): the capture-receipt recorder takes the capture's PaymentTransaction
+  // row (`SELECT 1 … FOR NO KEY UPDATE`, by its unique intent) in a short transaction of its
+  // own holding nothing else, so two receipts of one capture plan in turn. No advisory key.
+  // See docs/CONCURRENCY_AND_LOCKING.md -> "Capture-receipt manifest".
+  "src/lib/member-money/internal/capture-receipt-manifest.ts": 1,
+  // #4823: member merge re-points `Payment.manuallyMarkedPaidByMemberId` with one
+  // sorted `SELECT 1 … ORDER BY "id" FOR NO KEY UPDATE NOWAIT` over every row
+  // naming the duplicate, then the update. Merge takes no lock(1) and holds
+  // booking rows from its owner move on; lock(1) writers take a booking's Payment
+  // row before its booking row (a card settle, the back-post) and after it (the
+  // edit doors, an edit review), so no waiting position is acyclic and merge
+  // never waits: a held row refuses the merge (409). Taken
+  // after merge's sorted Member FOR UPDATE, so the set cannot grow. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Member merge never waits for a Payment row".
+  "src/lib/member-merge-payment-attribution.ts": 1,
+  // #4850: member hard-delete locks, in id order, the booking rows naming the
+  // member (`SELECT 1 … WHERE "id" IN (…) ORDER BY "id" FOR NO KEY UPDATE`)
+  // BEFORE its Member-row Xero fence, so its ON DELETE SET NULL on Booking's
+  // actor columns updates only rows it already holds: booking row, then Member,
+  // the order merge and every booking writer take. The set is re-read under the
+  // fence and a late booking refuses the delete (409). The second statement, under
+  // the fence, takes the Payment rows naming the member `ORDER BY "id" FOR NO KEY
+  // UPDATE NOWAIT`, as merge does (#4823): Payment-first writers (a card settle,
+  // the back-post) would otherwise meet the booking rows the delete already
+  // holds; a held row refuses it (409). See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "A booking writer takes the booking row before a Member key share".
+  "src/lib/member-delete-booking-rows.ts": 2,
+  // #3635 (review outbox F1/F4): the kept-late-capture enqueue and the
+  // worker's send-time decision lock the #3639 approval task's row
+  // (`SELECT 1 … FOR UPDATE`), the row the dismissal, reopen and approval
+  // claims write. No advisory key; the dismissal's claim already holds the row.
+  // #4324: the keep's decision (`planKeptLateCaptureXeroRecord`, dismissal and
+  // repair) takes it first and the change's supplementary-invoice anchor after.
+  // See docs/CONCURRENCY_AND_LOCKING.md -> "Kept late-capture task row".
+  "src/lib/xero-kept-late-capture-invoice.ts": 1,
+  // Member-photo upload (POST) and remove (DELETE) each lock the member row
+  // (`SELECT 1 … FOR UPDATE`) so concurrent replace/remove
+  // serialise and never orphan a MEMBER_PHOTO blob. Member-id keyed; no
+  // advisory lock; disjoint from booking/money writers. See
+  // docs/CONCURRENCY_AND_LOCKING.md → "Member photo writer".
+  "src/app/api/members/[id]/photo/route.ts": 2,
+  // Central lodge link writer (triyder/AlpineClubBookingsNZ#62, #4262 review): `saveCentralLodgeLinks`,
+  // shared by the lodge's Central lodge card PUT and the setup page's link
+  // step, takes the settings row (`lockServerNzSettings`, counted under
+  // servernz-settings.ts) and re-checks the owned list under it, then locks
+  // each `Lodge` row it saves in id order (`SELECT 1 … FOR UPDATE`, the one
+  // statement counted here), re-reads the link it replaces, writes the new one
+  // and its `LODGE_CENTRAL_LINK_UPDATED` audit row on the same client.
+  // Settings -> Lodge is the Other lodges download's own order, so no
+  // inversion. No advisory key; disjoint from booking/money writers. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Central lodge link writer".
+  "src/lib/central-lodge-link.ts": 1,
+  // Alpine Central Server connection/recorder (#4366, #4436): `lockServerNzSettings`
+  // locks the singleton settings row (`SELECT 1 … FOR UPDATE`) so
+  // `recordServerVersionIfCurrent` re-reads the connection (address and API-key
+  // credential version) under it before it records the server's answer; a
+  // connection change and request capture now take the same fence before
+  // touching credentials (settings -> credential -> audit). No advisory key;
+  // disjoint from booking/money writers. See docs/CONCURRENCY_AND_LOCKING.md ->
+  // "Alpine Central Server connection and version recorder".
+  // Other lodges download writes (triyder/AlpineClubBookingsNZ#64, triyder/AlpineClubBookingsNZ#69; #4262
+  // review): the same one statement, reached through the same fence
+  // (`withCurrentServerNzConnection` / `serverNzAnswerWriter`), takes the
+  // settings row before EVERY write the download makes from an answer (hides
+  // and unlinks, each merge write, the record step) and re-reads the address
+  // and credential version under it, so an answer from a connection replaced
+  // in flight writes nothing. Order: settings -> credential read -> OtherLodge/
+  // Amenity/Lodge rows -> audit. No advisory key; disjoint from booking/money
+  // writers. See docs/CONCURRENCY_AND_LOCKING.md -> "Owned-lodge list writer,
+  // and every Other lodges download write".
+  // #4470, two more participants of the same one statement, no new lock: the
+  // key save compares the address its page showed under the connection fence
+  // (settings -> credential -> audit, as before), and a push registration
+  // stores its secret through the answer fence (settings -> credential read ->
+  // push-secret write -> audit). The address move removes that secret in its
+  // own fenced transaction. The answer recorders take a `ServerNzAnswerTx`
+  // that only the answer fence mints.
+  "src/lib/servernz-settings.ts": 1,
+  // Message-board mirror (#4586): inside the page's answer fence (settings row
+  // first, counted under servernz-settings.ts), `lockMirroredPost` locks the
+  // `ClubPost` row a server post id names (`SELECT 1 … FOR UPDATE`, the one
+  // statement counted here) and re-reads it, so create-or-update and a
+  // tombstone are decided under the lock. Order: settings -> ClubPost ->
+  // ClubPostImage, the post-before-images order the admin removal (its
+  // status-guarded claim) and retention (its cascade) also follow. No advisory
+  // key; disjoint from booking/money writers. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Message-board posts and their images".
+  "src/lib/club-post-mirror.ts": 1,
+  // Message-board retention (#4588): each batch of expired posts is locked
+  // (`SELECT 1 … WHERE "id" IN (…) ORDER BY "id" FOR UPDATE`, the one statement
+  // counted here) before their images are read and the posts deleted, so no
+  // writer adds an image row the batch did not list. Order: ClubPost rows (id
+  // order) -> ClubPostImage rows by cascade. The share stamp below also takes
+  // its two posts in id order. Member merge (an `updateMany` of
+  // `authorMemberId`) and member deletion (`SetNull`) update many posts in
+  // scan order; a deadlock with a batch is detected and one side aborted, as
+  // with the single `deleteMany` before #4588. No advisory key. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Message-board posts and their images".
+  "src/lib/club-post-retention.ts": 1,
+  // Message-board share stamp (#4588): under the settings row
+  // (`lockServerNzSettings`, counted under servernz-settings.ts), when the
+  // mirror already copied our own post back, it locks our post and that copy
+  // (`SELECT 1 … WHERE "id" IN (…, …) ORDER BY "id" FOR UPDATE`, the one
+  // statement counted here), deletes the copy and stamps our post. Order:
+  // settings -> ClubPost rows (id order) -> ClubPostImage by cascade, the
+  // mirror's and retention's order. No advisory key.
+  "src/lib/club-post-sharing.ts": 1,
+  // Adult-member-hosting queue participants (#2597): the shared helper mints
+  // one reviewed `FOR UPDATE` protocol for member merge over master, loser and
+  // every planned ancillary owner, plus the shared standing-subject barrier
+  // that excludes a late BookingGuest FK `KEY SHARE` for every member-standing
+  // fan-out. Ordinary seams use the separate sorted `FOR KEY SHARE NOWAIT`
+  // protocol in this helper. It issues the runtime exact-participant proofs
+  // consumed by queue writes.
+  // FOUR since #2623 T9(d) counted every strength, not two: the two `FOR UPDATE`
+  // statements above plus the two `FOR KEY SHARE` ones that were inventoried
+  // nowhere — the ordinary seams' sorted NOWAIT acquisition, and the
+  // booking-request hold's blocking lock over its exact linked-member snapshot.
+  // SIX since #4855: merge's participant lock never waits for one Member row
+  // while holding another. Each attempt is one sorted `FOR UPDATE SKIP LOCKED`
+  // in a savepoint; on a partial count a row-by-row `SKIP LOCKED` probe finds
+  // the first row it skipped (the fifth statement), which is waited for ALONE
+  // (`FOR UPDATE`, the sixth) under a savepoint-scoped `lock_timeout` of what
+  // is left of the 10s budget, then released, and the attempt retried. The bound still lands
+  // on the same stable retry (#2623 T6).
+  // Still SIX after #4860: the booking statements the same attempt runs live in
+  // `member-merge-booking-lock.ts` (next entry), called from this wrapper.
+  "src/lib/adult-member-hosting-queue-participants.ts": 6,
+  // #4860: the attempt try-locks the captured loser bookings before it re-points
+  // `Booking.member`. Three statements, no new advisory key: one sorted
+  // `FOR NO KEY UPDATE SKIP LOCKED` over that set, a row-by-row `SKIP LOCKED`
+  // probe for the first id it skipped, and a single-booking `FOR NO KEY UPDATE`
+  // under its own savepoint after the attempt has been rolled back. NO KEY, the
+  // `memberId` update's own strength, so a child insert's FK `KEY SHARE` on the
+  // booking is not blocked (#5004). A shortfall waits for that
+  // one booking while holding no rows, on the same 10s budget as the Member
+  // waits. See docs/CONCURRENCY_AND_LOCKING.md → "Merge never holds one of the
+  // duplicate's bookings while waiting for another (#4860)".
+  "src/lib/member-merge-booking-lock.ts": 3,
+  // The hosting coverage drain locks the claimed owner and FK-less actor
+  // `FOR KEY SHARE` after their sorted member-lifecycle keys and before the exact
+  // typed queue refresh, so merge cannot re-point an identity between the claim
+  // snapshot and the work. One statement, executed once per claimed id.
+  // See docs/CONCURRENCY_AND_LOCKING.md → "Adult-member-hosting queue
+  // participant fencing".
+  "src/lib/adult-member-hosting-coverage-drain.ts": 1,
+  // Incident promotion locks the reconciliation's actor `FOR KEY SHARE` so a
+  // present actor cannot be hard-deleted between the existence check and the
+  // incident FK write; a zero-match degrades to anonymous officer attribution
+  // rather than failing a poison item. Order: policy-set → this row.
+  "src/lib/adult-member-hosting-review.ts": 1,
+  // The Xero member-scoped CREATE and UPDATE reservations each take the target
+  // `Member FOR KEY SHARE` in a short transaction, read the payload back through
+  // Prisma under it, and commit the `RUNNING` operation before any provider call.
+  // Merge and account deletion take the conflicting `FOR UPDATE` on the same row
+  // and re-check the reservation, so one side always loses cleanly and Xero never
+  // sits inside a long transaction.
+  // See docs/CONCURRENCY_AND_LOCKING.md -> "Xero contact writers".
+  "src/lib/xero-contacts.ts": 2,
+  // Member-scoped Xero contact writes (#2597) share one `FOR UPDATE` protocol
+  // for canonical CONTACT-link completion. Account deletion and member merge
+  // take the same Member row before teardown, while CREATE/UPDATE reservations
+  // use the separate `FOR KEY SHARE` protocol inventoried by their source tests.
+  // See docs/CONCURRENCY_AND_LOCKING.md -> "Xero contact writers".
+  "src/lib/xero-contact-create-recovery.ts": 1,
+  // Releasing a started deletion approval (#2627) locks the exact
+  // `DeletionRequest` row (`SELECT 1 … FOR UPDATE`) and reads the claim's
+  // previous holder and note back through the Prisma model under it, because
+  // the transition destroys that attribution and its audit entry — written in
+  // the same transaction, awaited — is the only surviving record of it. Reading
+  // the holder outside the lock would be an ABA guess. The guarded
+  // `APPROVAL_IN_PROGRESS -> PENDING` `updateMany` is retained under the lock,
+  // so the winner protocol every transition on this row shares is unchanged.
+  // Request-id keyed on an immutable cuid; no advisory lock. Counterparts are
+  // the other two transitions on the same row — an approval finalising inside
+  // the anonymisation transaction (which also holds the target `Member FOR
+  // UPDATE` via the Xero fence; the release takes only this row, so no cycle)
+  // and an ordinary rejection. See docs/CONCURRENCY_AND_LOCKING.md ->
+  // "Approve, reject and release of one `DeletionRequest`".
+  "src/lib/deletion-request-decision.ts": 1,
+  // #4618: `lockMemberFactorRow`, one `SELECT 1 FROM "Member" … FOR UPDATE` on the
+  // member whose second factors are written. Taken first by the officer factor
+  // reset (route and break-glass command), by every enrolment writer
+  // (`assertEnrolmentNotSuperseded`) and by `deletePasskey`, then re-read. No
+  // advisory key, never after another row lock in those transactions. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Second-factor member row".
+  "src/lib/officer-factor-reset.ts": 1,
+  // #3640 (delta review, D1): `lockPaymentForRefundedTotal` takes the Payment
+  // row `FOR NO KEY UPDATE` FIRST in every writer of the transaction refund
+  // mirror - the card-refund writer, `applyLocalRefundAllocation`, and the
+  // cancel claim before its #1491 fold - so the order is Payment row -> refund
+  // rows -> transaction row -> PaymentRecoveryOperation (#4104: a refund seen
+  // failing after it counted is kept owed last) everywhere. NO KEY strength so a `PaymentRefund`
+  // insert's FK check (`FOR KEY SHARE`) is not blocked. Keyed on an immutable
+  // cuid; taken after `lock(1)` where the caller holds it. #4217: the same one
+  // statement is also taken first by `reconcilePaymentAggregates` (before it
+  // reads), by the five ledger-row writers that end in it (upsert, the raise,
+  // the bank receipt, mark succeeded / failed - before their first row write),
+  // and, through the helper, by the reduction's retire, the saved-card settle,
+  // the Stripe settle, the Internet Banking settle, and (review F1) the
+  // recovery runner's claim hold, the re-issue door, the increase's
+  // fold-close and the manual-payment reversal, each before the recovery row;
+  // still one site, no new key. #3949: also by a group child's Internet Banking
+  // hand-back route (after its completion's lock(1), before the cap read and
+  // the mirror write) and the organiser cancel's recovery replay (no lock(1),
+  // before it reads whether the plan's share is written). #4516 (M4c review F2):
+  // and by a late capture's approval or keep (`prepareLateCaptureDecision`) before
+  // its task's claim. #4516 (M4d): that resolution holds lock(1) and the booking
+  // row first, so this Payment row is after them; so does a cancellation
+  // hand-back's completion (`lockCancellationHandBackBeforeClaim`) and (owner
+  // decisions 15 Nov 2026) the dismissal of a card shortfall's part to check or
+  // a disputed card payment's hand-back, a cancellation's or (owner decision,
+  // 18 Nov 2026) a dispute-held edit's (`decideJournalHandBackDismissal`, which
+  // then re-reads the booking's disputes and the payment's tasks), whose R05 withdrawal after the claim
+  // re-takes it. The order a "Paid another way" close takes
+  // the Payment row and that task's row in; #4824: an approval's plan
+  // (`planLateCaptureApprovalRefund`) takes it first, before it reads what the
+  // capture holds; #4838: so does a #2700 hand-back's still-owed check
+  // (`assertLateCaptureHandBackStillOwed`, no lock(1)), before its claim.
+  // #4368: and by a dead card refund's "Nothing left owed" and
+  // "Try the card again" (`lockDeadCardRefundRow`), after their lock(1) and
+  // before the payment is read, as "Paid another way" takes it. #4851: and by
+  // `closeGroupCardRefundPaidAnotherWay` and `tryOrganiserChildCardRefundAgain`,
+  // the same helper, no new key. #4879: and by the edit review's card arm
+  // (`chooseEditReviewSettlementRoute` through `planEditReviewCardRefund`),
+  // after its lock(1), booking row and the
+  // owner's member-credit key, before it reads the superseded-capture hold-back
+  // and plans; its still-owed preview takes no row lock; no new key.
+  // Order: lock(1) -> lodge -> member credit -> Payment -> refund, recovery and
+  // transaction rows. See docs/CONCURRENCY_AND_LOCKING.md -> the #3640
+  // paragraph and its #4217 sequel.
+  // #4449: the helper is also taken by the inbound credit-note sync's
+  // allocation write for a modification note on the one bank-transfer payment
+  // of its invoice (`writeCurrentCreditNoteAllocation`, no lock(1), lodge or
+  // member key), before its allocation row, so the Internet Banking settle
+  // (lock(1) -> lodge -> member -> this row) and the write serialise here.
+  // #4279: and by a refund-note repair's completion that adopts its note as the
+  // payment's pointer (`completeAdoptingCanonicalRefundNote`, a retry claim's own
+  // transaction, no lock(1)), FIRST, before the operation row's guarded claim,
+  // the pointer and the links - the create's record order. No new key.
+  "src/lib/payment-transactions.ts": 1,
+  // #4161 / #4192: the nightly link cleanup's refund-note heal takes two
+  // lock-only statements: the one `XeroObjectLink` row it is about to re-write
+  // (`SELECT 1 … FOR UPDATE`), then its Payment row
+  // (`SELECT 1 … FOR NO KEY UPDATE NOWAIT`), and re-reads both through Prisma
+  // under them. Order: link, then Payment - the #2901 repair apply's order.
+  // Two writers take Payment first (the refund-note create's record, and the
+  // outbox enqueue's existing-note branch inside a group cancel or an edit
+  // review), so the Payment lock never waits: 55P03 defers the heal with no
+  // write. Keyed on immutable cuids; no advisory lock. See
+  // docs/CONCURRENCY_AND_LOCKING.md -> "Refund-note link heal (#4161)".
+  "src/lib/xero-hardening-canonical-links.ts": 2,
+  // #4195, #4223 (`keepStoredRefundNoteVoid`): every refund-note link write,
+  // either role (the payment's own notes and a refund request's), first reserves
+  // an inactive identity row with createMany(skipDuplicates), then locks
+  // its own `XeroObjectLink` row (`SELECT 1 … FOR UPDATE`, the heal's
+  // statement) inside the link write's transaction, then re-reads it through
+  // Prisma, so an inbound void that committed meanwhile is kept under a write
+  // naming no status or (#4288) an older live one, including a competing first
+  // insertion; two live readings are ordered by Xero's UpdatedDateUTC on the
+  // row already locked, so #4288 adds no lock. Existing rows
+  // are untouched by reservation; a new identity row rolls back with the write.
+  // Order, on every write except an explicit refund-credit-note void: own
+  // link row, then any sibling note the canonical rule retires. That void
+  // takes the Payment row first, then its own link (#4200), through
+  // `lockPaymentForRefundedTotal` in the link funnel — the create's order.
+  // A kept void tries Payment without waiting (the xero-sync entry below).
+  // Keyed on the link's immutable unique key; no advisory lock. See docs/CONCURRENCY_AND_LOCKING.md ->
+  // "Refund-note link writes racing a void (#4195, #4223)".
+  "src/lib/xero-refund-note-status.ts": 1,
+  // #4223, #4288: after keeping a stored void, pointer maintenance tries the
+  // immutable Payment row FOR NO KEY UPDATE SKIP LOCKED. A Payment-first enqueue
+  // may be waiting for this link, so a writer whose void was kept (status-less
+  // or an older live reading) must never wait back on it.
+  // A busy Payment defers only pointer cleanup to #4161; the mirror stays
+  // inactive with its metadata. Own-held Payment rows remain eligible.
+  // #4200: an explicit void (the caller names VOIDED or DELETED on a
+  // REFUND_CREDIT_NOTE) takes that Payment row first, through
+  // `lockPaymentForRefundedTotal`, before this write locks the link. That
+  // statement stays the one site in payment-transactions.ts; this file still
+  // has only the SKIP LOCKED probe.
+  "src/lib/xero-sync.ts": 1,
+  // #4447: recording an allocation the reading still lists, and turning off
+  // one it no longer lists, each lock that one XeroObjectLink row, re-read its
+  // stamp, then write through the link funnel in the same transaction. A
+  // still-listed invoice reserves a missing row first; a removal does not. No
+  // advisory key. #4449: a modification note's write on the one bank-transfer
+  // payment of its invoice takes that Payment row FIRST, through
+  // `lockPaymentForRefundedTotal` (still the one statement in
+  // payment-transactions.ts), then this row, and decides the payment's
+  // refunded total under both with a guarded claim; no writer takes an
+  // allocation row and then a Payment row. Pinned below ("keeps the credit-note
+  // allocation write on ..."). See docs/CONCURRENCY_AND_LOCKING.md, "An
+  // allocation Xero no longer lists (#4447)" and "The allocation write decides
+  // a bank-transfer total (#4449)".
+  "src/lib/xero-inbound/retire-unlisted-credit-note-allocations.ts": 1,
+  // #4911 (`INV-PAY-154`): a dispute event locks its own StripeDispute row
+  // (`SELECT 1 … FOR NO KEY UPDATE`), re-reads it and merges the event, so two
+  // deliveries of one dispute serialise. It holds no other lock and no advisory
+  // key; the refund and cancel doors only read the row. See
+  // docs/CONCURRENCY_AND_LOCKING.md, "A Stripe dispute's record (#4911)".
+  "src/lib/stripe-dispute.ts": 1,
+};
+
+const CAPACITY_LOCK_MINT = "src/lib/lodge-capacity-lock.ts";
+
+/**
+ * Every raw row-lock strength PostgreSQL offers, not just `FOR UPDATE` (#2623
+ * T9(d)).
+ *
+ * The inventory used to match the literal `FOR UPDATE`, so the six non-test
+ * `FOR KEY SHARE` statements this repository ships — the hosting queue
+ * participant fence, the booking-request linked-member hold, the coverage drain's
+ * claimed-identity lock, the hosting actor lock and the two Xero contact
+ * reservations — appeared in NO counted inventory at all. They were exempt from
+ * the "lock raw, read typed" rule in `raw-sql-shape-guard.test.ts` for the same
+ * reason until that rule was widened. Nothing escaped: all six select a constant
+ * through `$executeRaw`. But a seventh written as `$queryRaw` projecting columns
+ * would have passed every gate — the exact #2289 failure mode.
+ *
+ * The two weaker modes are listed even though nothing uses them today, because
+ * the point of a census is that a NEW site has to be classified rather than
+ * merely written.
+ */
+const ROW_LOCK_STRENGTHS = /FOR (?:UPDATE|KEY SHARE|NO KEY UPDATE|SHARE)/g;
+
+describe("advisory lock guard (#182 / H1 regression class)", { timeout: CENSUS_TIMEOUT_MS }, () => {
+  const sources = lockCensusSources(SRC_DIR);
+
+  it("keeps every canonical global pg_advisory_xact_lock(1) site in the reviewed per-site registry", () => {
+    const sites = collectAdvisoryLockSites(sources);
+    const byKey = indexSitesByKey(sites);
+    const problems: string[] = [];
+
+    // A registry that lists one site twice cannot be a census of anything.
+    const registrations = new Map<string, number>();
+    for (const entry of GLOBAL_LOCK_SITE_REGISTRY) {
+      registrations.set(entry.site, (registrations.get(entry.site) ?? 0) + 1);
+      if (!TWO_TIER_LOCK_INVARIANTS.includes(entry.invariant)) {
+        problems.push(
+          `BAD INVARIANT: "${entry.site}" cites ${entry.invariant}, which is not one of ${TWO_TIER_LOCK_INVARIANTS.join(", ")}.`,
+        );
+      }
+      if (entry.reason.trim().length < 40) {
+        problems.push(
+          `THIN REASON: "${entry.site}" has no usable reason. Name the counterpart writer or the race that makes the narrow tier insufficient.`,
+        );
+      }
+    }
+    for (const [site, count] of registrations) {
+      if (count > 1) {
+        problems.push(
+          `DUPLICATE ENTRY: "${site}" is registered ${count} times. One site, one entry — two reasons for one call site means neither can be trusted.`,
+        );
+      }
+    }
+
+    // Symbols whose site population is in question: an unregistered or
+    // unclassifiable site, or an entry that no longer resolves cleanly. Every one
+    // of them puts EVERY entry for that symbol in doubt — see the ordinal-shift
+    // note below.
+    const unsettledSymbols = new Set<string>();
+
+    // Resolve every entry to exactly one live site.
+    const claimedBy = new Map<string, string[]>();
+    for (const entry of GLOBAL_LOCK_SITE_REGISTRY) {
+      const matches = byKey.get(entry.site) ?? [];
+      if (matches.length === 0) {
+        unsettledSymbols.add(symbolOfKey(entry.site));
+        problems.push(
+          `STALE ENTRY: "${entry.site}" matches no advisory-lock site. The call was removed or renamed — delete the entry, or re-point it at the symbol that now holds the lock. A registry entry approving nothing is worse than no entry.`,
+        );
+        continue;
+      }
+      if (matches.length > 1) {
+        unsettledSymbols.add(symbolOfKey(entry.site));
+        problems.push(
+          `AMBIGUOUS ENTRY: "${entry.site}" matches ${matches.length} sites (${matches
+            .map((match) => `${match.rel}:${match.line}`)
+            .join(
+              ", ",
+            )}). Use the file-qualified form so one reason binds to one call: ${matches
+            .map((match) => `"${match.qualifiedKey}"`)
+            .join(" / ")}.`,
+        );
+        continue;
+      }
+      const site = matches[0];
+      if (!site) continue;
+      if (site.tier !== entry.tier) {
+        unsettledSymbols.add(symbolOfKey(entry.site));
+        problems.push(
+          `TIER CHANGED: "${entry.site}" is registered as ${entry.tier} but ${site.rel}:${site.line} now takes a ${site.tier} key. Re-classify the writer before updating the registry — a tier change is a lock-topology change, not an edit.`,
+        );
+      }
+      const claims = claimedBy.get(site.qualifiedKey);
+      if (claims) claims.push(entry.site);
+      else claimedBy.set(site.qualifiedKey, [entry.site]);
+    }
+    for (const [qualifiedKey, claims] of claimedBy) {
+      if (claims.length > 1) {
+        problems.push(
+          `DUPLICATE COVERAGE: ${qualifiedKey} is claimed by ${claims.length} entries (${claims
+            .map((claim) => `"${claim}"`)
+            .join(", ")}).`,
+        );
+      }
+    }
+
+    // Closed world: every Tier-2 acquisition must be one somebody approved, and
+    // an acquisition nobody can classify is held to the same standard.
+    for (const site of sites) {
+      if (site.tier === "SCOPED") continue;
+      if (site.tier === "UNCLASSIFIED") {
+        unsettledSymbols.add(symbolOfKey(site.key));
+        unsettledSymbols.add(symbolOfKey(site.qualifiedKey));
+        problems.push(
+          `UNCLASSIFIABLE lock argument: ${site.rel}:${site.line} in ${site.symbol} takes an advisory lock whose first argument this scan cannot read. It is treated as Tier 2 until a human says otherwise — write the key as the literal 1, or as hashtext(...)/hashtextextended(...), or classify it here explicitly. It is deliberately NOT counted as scoped.`,
+        );
+        continue;
+      }
+      if (claimedBy.has(site.qualifiedKey)) continue;
+      unsettledSymbols.add(symbolOfKey(site.key));
+      unsettledSymbols.add(symbolOfKey(site.qualifiedKey));
+      const suggested =
+        (byKey.get(site.key) ?? []).length === 1 ? site.key : site.qualifiedKey;
+      problems.push(
+        `UNREGISTERED Tier-2 site: ${site.rel}:${site.line} takes the global advisory key inside ${site.symbol}. Add { site: "${suggested}", tier: "GLOBAL", reason: "<which counterpart or race needs the global key>", invariant: "INV-LOCK-001" if this transaction takes the global key ALONE, or "INV-LOCK-002" if it also takes a scoped key such as acquireLodgeCapacityLock }.`,
+      );
+    }
+
+    // THE ORDINAL SHIFT (#2688's hazard), in both directions. An ordinal is
+    // stable only while the symbol's site population is. Insert a lock ahead of
+    // existing ones and the report names the LAST call as unregistered; delete an
+    // early one and it reports the TAIL as stale — and in both cases the entries
+    // in between now describe calls they no longer match, silently, so doing
+    // exactly what the message says re-approves them under the wrong reasons, or
+    // deletes the wrong reason. Whenever a symbol's population is in question —
+    // from either side, an unresolved site or an unresolved entry — every entry
+    // for that symbol is named and has to be re-read.
+    for (const unsettled of unsettledSymbols) {
+      const affected = GLOBAL_LOCK_SITE_REGISTRY.filter(
+        (entry) => symbolOfKey(entry.site) === unsettled,
+      );
+      if (affected.length === 0) continue;
+      const population = sites.filter(
+        (site) => symbolOfKey(site.key) === unsettled || symbolOfKey(site.qualifiedKey) === unsettled,
+      ).length;
+      problems.push(
+        `ORDINAL SHIFT — RE-VERIFY EVERY ENTRY FOR "${unsettled}": it now holds ${population} advisory site(s), so the ordinals may have moved under the ${affected.length} existing entr${affected.length === 1 ? "y" : "ies"} (${affected
+          .map((entry) => `"${entry.site}"`)
+          .join(
+            ", ",
+          )}). Re-read each against the call it now names before adding or deleting one — renumbering is silent, and a reason bound to the wrong call is worse than no reason.`,
+      );
+    }
+
+    expect(
+      problems,
+      "The canonical global pg_advisory_xact_lock(1) census failed (INV-LOCK-001, " +
+        "INV-LOCK-002, INV-LOCK-003). Classify the writer using " +
+        "docs/CONCURRENCY_AND_LOCKING.md: global-cohort lifecycle and settlement " +
+        "money uses this canonical global key; capacity uses " +
+        "acquireLodgeCapacityLock(tx, lodgeId); a writer doing both takes global " +
+        "first, then per-lodge. Register the SITE with its own reason and PR " +
+        "lock-impact evidence — never a bare count.",
+    ).toEqual([]);
+  });
+
+  it("keeps every scoped advisory-lock family inside the reviewed inventory", () => {
+    // Derived from the SAME scan as the Tier-2 census, not from an independent
+    // substring count. The two disagreeing is what let a `pg_try_` acquisition of
+    // the global key fall between them: the tier test read it as scoped, and the
+    // substring count could not see it at all because
+    // `pg_try_advisory_xact_lock(` does not contain `pg_advisory_xact_lock(`.
+    const found: Record<string, number> = {};
+    for (const site of collectAdvisoryLockSites(sources)) {
+      if (site.tier !== "SCOPED") continue;
+      found[site.rel] = (found[site.rel] ?? 0) + 1;
+    }
+
+    expect(
+      found,
+      "Scoped advisory-lock sites changed. Reconcile the key, counterpart " +
+        "writers, and acquisition order in docs/CONCURRENCY_AND_LOCKING.md, " +
+        "then update this inventory with PR compatibility evidence.",
+    ).toEqual(SCOPED_ADVISORY_LOCK_INVENTORY);
+  });
+
+  it("keeps whole-cycle session advisory claims in their explicit inventory", () => {
+    const found: Record<string, number> = {};
+    for (const { rel, text } of sources) {
+      const count = countCodeOccurrences(text, /pg_(?:try_)?advisory_lock\(/g);
+      if (count > 0) found[rel] = count;
+    }
+    // #4432: one dedicated autocommit connection, outside every domain
+    // transaction; scheduled inbound, HTTP cron and the whole-club button
+    // exclude one another. Connection death recovers the claim, without a
+    // lease expiry admitting another live cycle. INV-LOCK-001/002/003.
+    expect(found).toEqual({ "src/lib/cron-run-claim.ts": 1 });
+  });
+
+  it("keeps every SELECT row-lock protocol inside the reviewed inventory", () => {
+    const found: Record<string, number> = {};
+    for (const { rel, text } of sources) {
+      const count = countCodeOccurrences(text, ROW_LOCK_STRENGTHS);
+      if (count > 0) found[rel] = count;
+    }
+
+    expect(
+      found,
+      "Row-lock sites changed. Every strength counts (#2623 T9(d)): FOR " +
+        "UPDATE, FOR NO KEY UPDATE, FOR SHARE and FOR KEY SHARE. Inventory " +
+        "their counterpart writers and order against advisory and row locks " +
+        "in docs/CONCURRENCY_AND_LOCKING.md.",
+    ).toEqual(ROW_LOCK_SITE_INVENTORY);
+  });
+
+  // #4279 (INV-LOCK-002, INV-LOCK-003): a completion that adopts a refund note
+  // as the payment's pointer takes the Payment row before the operation row's
+  // claim, adopts only after the claim wins, and writes its links after that.
+  // Only that completion shape takes the row; every other keeps its transaction.
+  it("keeps a refund-note repair's adopting completion on Payment row -> guarded claim -> pointer -> links", () => {
+    const text = (rel: string) => stripComments(sources.find((source) => source.rel === rel)?.text ?? "");
+    const inOrder = (body: string, markers: string[]) => {
+      const at = markers.map((marker) => body.indexOf(marker));
+      markers.forEach((marker, i) => expect(at[i], `${marker} is missing`).toBeGreaterThanOrEqual(0));
+      for (let i = 1; i < at.length; i += 1) {
+        expect(at[i], `${markers[i]} must follow ${markers[i - 1]}`).toBeGreaterThan(at[i - 1]);
+      }
+    };
+    const adoptionModule = text("src/lib/xero-refund-note-adoption.ts");
+    const adopting = adoptionModule.slice(adoptionModule.indexOf("export async function completeAdoptingCanonicalRefundNote<"));
+    inOrder(adopting, ["options?.store || !options?.retryClaim", "db.$transaction(", "lockPaymentForRefundedTotal(tx, adoption.paymentId)", "complete(tx)", "}, PAYMENT_ROW_WAIT_TRANSACTION_OPTIONS);"]);
+    expect(adopting).not.toMatch(/pg_advisory|acquireLodgeCapacityLock|lockMemberCreditLedger/);
+    const sync = text("src/lib/xero-sync.ts");
+    const complete = sync.slice(sync.indexOf("export async function completeXeroSyncOperation("));
+    inOrder(complete, [
+      "tx.xeroSyncOperation.updateMany({ where: { id: operationId, ...guard }, data })",
+      "if (claimed.count === 0)",
+      "adoptCanonicalRefundNote(completion.canonicalRefundNote, tx)",
+      "for (const link of completion.extraLinks ?? []) {",
+      "completeAdoptingCanonicalRefundNote(prisma, completion.canonicalRefundNote, options, completeWithClient)",
+      ": await prisma.$transaction(completeWithClient)",
+    ]);
+  });
+
+  // #4449 (INV-LOCK-002, INV-LOCK-003): the credit-note allocation write is a
+  // refunded-total writer with no advisory key. It must take the Payment row
+  // before the allocation row (#4200's "Payment first"), re-read the payment
+  // under it, claim with a guarded updateMany, and send no alert inside.
+  it("keeps the credit-note allocation write on Payment row -> allocation row -> re-read -> guarded claim", () => {
+    const raw = sources.find(({ rel }) => rel === "src/lib/xero-inbound/retire-unlisted-credit-note-allocations.ts")?.text;
+    expect(raw).toBeDefined();
+    const text = stripComments(raw ?? "");
+    const between = (start: string, end: string) => {
+      const from = text.indexOf(start);
+      const to = text.indexOf(end, from + start.length);
+      expect(from, `${start} is missing`).toBeGreaterThanOrEqual(0);
+      expect(to, `${end} is missing after ${start}`).toBeGreaterThan(from);
+      return text.slice(from, to);
+    };
+    const inOrder = (body: string, markers: string[]) => {
+      const at = markers.map((marker) => body.indexOf(marker));
+      markers.forEach((marker, i) => expect(at[i], `${marker} is missing`).toBeGreaterThanOrEqual(0));
+      for (let i = 1; i < at.length; i += 1) {
+        expect(at[i], `${markers[i]} must follow ${markers[i - 1]}`).toBeGreaterThan(at[i - 1]);
+      }
+    };
+
+    expect(text).not.toMatch(/pg_advisory|acquireLodgeCapacityLock|lockMemberCreditLedger/);
+    const write = between("export async function writeCurrentCreditNoteAllocation(", "async function writeLockedAllocation(");
+    inOrder(write, [
+      "prisma.$transaction(",
+      "lockPaymentForRefundedTotal(tx, payment.id)",
+      "writeLockedAllocation(tx, link, readingAt)",
+      "decideBankTransferRefundedTotal(tx, payment, written)",
+      "PAYMENT_ROW_WAIT_TRANSACTION_OPTIONS",
+    ]);
+    expect(write).not.toMatch(/sendBankTransferFloorAlert|sendFloorAlerts|getClubFormat|notifyXeroSyncError/);
+    inOrder(between("async function writeLockedAllocation(", "async function decideBankTransferRefundedTotal("), [
+      "tx.xeroObjectLink.createMany(",
+      "FOR UPDATE",
+      "tx.xeroObjectLink.findUnique(",
+      "upsertXeroObjectLink(link, { store: tx })",
+    ]);
+    // #4449 review: re-read under the lock, the one payment of the invoice re-counted there, the
+    // shared columns step, and a claim on the row as re-read that also moves updatedAt.
+    const decide = between("async function decideBankTransferRefundedTotal(", "async function bankTransferPaymentIdsByInvoiceId(");
+    inOrder(decide, [
+      "tx.payment.findUnique(",
+      "tx.payment.count({ where: { xeroInvoiceId: target.invoiceId } })",
+      "decideLinkedRefundedTotalCents(tx, [payment])",
+      "decideXeroRefundedColumns(tx,",
+      "tx.payment.updateMany(",
+      "claimed.count !== 1",
+    ]);
+    expect(decide).toContain("status: payment.status, refundedAmountCents: payment.refundedAmountCents, updatedAt: payment.updatedAt");
+    expect(decide).not.toMatch(/tx\.payment\.update\(|sendBankTransferFloorAlert|notifyXeroSyncError/);
+    // The floor alerts go out after every write's commit, outside any transaction: additions and removals.
+    const afterTheWrites = ["bankTransferPaymentIdsByInvoiceId(", "writeCurrentCreditNoteAllocation(", "decidedPaymentOf(link, byInvoiceId)", "holdOrCollect(floorAlert, input.heldFloorAlerts, floorAlerts)", "sendFloorAlerts(floorAlerts)"];
+    inOrder(between("export async function writeCurrentCreditNoteAllocations(", "export async function retireUnlistedCreditNoteAllocations("), afterTheWrites);
+    inOrder(text.slice(text.indexOf("export async function retireUnlistedCreditNoteAllocations(")), afterTheWrites);
+    // #4449 verify, low 2: the sync holds the writes' and removals' alerts and sends them after its recount, outside any transaction.
+    const sync = stripComments(sources.find(({ rel }) => rel === "src/lib/xero-inbound/credit-note.ts")?.text ?? "");
+    inOrder(sync, [
+      "await withHeldFloorAlerts(async (held) => {",
+      "writeCurrentCreditNoteAllocations(allocationLinks, { isModificationNote, heldFloorAlerts: held.alerts })",
+      "heldFloorAlerts: held.alerts,",
+      "held.recountedPaymentIds = new Set([...directPaymentIds, ...modificationRefundAmountsByPaymentId.keys()])",
+      "repairRefundedPaymentBusinessState(",
+      "return { refundedPaymentRepair, voidedMirrorAuditLinks };",
+    ]);
+    // The held alerts are sent in a finally, so a failed sync still sends them.
+    inOrder(text, ["export async function withHeldFloorAlerts<T>(", "try {", "return await run(held);", "} finally {", "sendFloorAlertsNotRecounted(held.alerts, held.recountedPaymentIds)"]);
+  });
+
+  it("keeps school held-reuse on global -> lodge -> re-read -> guarded claim", () => {
+    const school = sources.find(
+      ({ rel }) => rel === "src/lib/school-booking-request.ts",
+    )?.text;
+    expect(school).toBeDefined();
+
+    const approvalStart =
+      school?.indexOf("export async function approveSchoolBookingRequest") ?? -1;
+    const approvalEnd =
+      school?.indexOf("export type MemberWholeLodgeApprovalOverride") ?? -1;
+    const approval = school?.slice(approvalStart, approvalEnd) ?? "";
+    // #5398: the pre-transaction held-lodge read is the shared helper's call.
+    const locator = approval.indexOf("const heldApproval = await findHeldApprovalLodge(request)");
+    const transaction = approval.indexOf("conversion = await prisma.$transaction");
+    const globalLock = approval.indexOf("pg_advisory_xact_lock(1)");
+    const heldKey = approval.indexOf("expectedHeldLodgeId!", globalLock);
+    const lodgeLock = approval.indexOf("acquireLodgeCapacityLock(tx, bookingLodgeId)");
+    const requestReread = approval.indexOf(
+      "const lockedRequest = await tx.bookingRequest.findUnique",
+    );
+    const heldReread = approval.indexOf("held = await tx.booking.findUnique");
+    const heldClaim = approval.indexOf("const heldClaim = await tx.booking.updateMany");
+    const firstSideEffect = approval.indexOf(
+      "const guestCreates = await buildApprovalGuestCreates",
+    );
+
+    for (const marker of [
+      locator,
+      transaction,
+      globalLock,
+      heldKey,
+      lodgeLock,
+      requestReread,
+      heldReread,
+      heldClaim,
+      firstSideEffect,
+    ]) {
+      expect(marker).toBeGreaterThanOrEqual(0);
+    }
+    expect(approval.match(/pg_advisory_xact_lock\(1\)/g) ?? []).toHaveLength(1);
+    expect(locator).toBeLessThan(transaction);
+    expect(transaction).toBeLessThan(globalLock);
+    expect(globalLock).toBeLessThan(heldKey);
+    expect(heldKey).toBeLessThan(lodgeLock);
+    expect(globalLock).toBeLessThan(lodgeLock);
+    expect(lodgeLock).toBeLessThan(requestReread);
+    expect(requestReread).toBeLessThan(heldReread);
+    expect(heldReread).toBeLessThan(heldClaim);
+    expect(heldClaim).toBeLessThan(firstSideEffect);
+    expect(approval).toContain("if (heldClaim.count === 0)");
+    expect(approval).toContain("request.lodgeId !== held.lodgeId");
+    expect(approval).toContain("lodgeId: conversion.lodgeId");
+  });
+
+  // #5398: both approvals' held-lodge read lives once, in booking-request-approval-shared.ts.
+  // It reads only the lock key, on the root client: the census above places its
+  // call before each `$transaction`, so it never runs under either lock.
+  it("keeps the shared held-lodge read a single root-client lodge lookup", () => {
+    const shared = sources.find(
+      ({ rel }) => rel === "src/lib/booking-request-approval-shared.ts",
+    )?.text ?? "";
+    const start = shared.indexOf("export async function findHeldApprovalLodge(");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = shared.slice(start, shared.indexOf("\n}\n", start));
+    expect(body).toContain("await prisma.booking.findUnique({");
+    expect(body).toContain("select: { lodgeId: true },");
+    expect(body).not.toMatch(/\btx\b|\$transaction|pg_advisory/);
+
+    // Closed world: the only callers are the two approvals whose order the
+    // tests beside this one check. A third caller, perhaps inside a locked
+    // transaction, fails here until its placement is reviewed.
+    const callers = sources.flatMap(({ rel, text }) => {
+      const code = stripComments(text);
+      return [...code.matchAll(/\bfindHeldApprovalLodge\(/g)]
+        .filter((match) => !code.slice(Math.max(0, (match.index ?? 0) - 30), match.index).includes("function "))
+        .map((match) => {
+          const before = code.slice(0, match.index);
+          const owner = [...before.matchAll(/export async function (\w+)/g)].at(-1)?.[1];
+          return `${rel}::${owner}`;
+        });
+    });
+    expect(callers.sort()).toEqual([
+      "src/lib/booking-request.ts::approveBookingRequest",
+      "src/lib/school-booking-request.ts::approveSchoolBookingRequest",
+    ]);
+  });
+
+  it("binds generic held conversion to the immutable held-booking lodge", () => {
+    const generic = sources.find(
+      ({ rel }) => rel === "src/lib/booking-request.ts",
+    )?.text;
+    expect(generic).toBeDefined();
+
+    const approval =
+      generic?.slice(
+        generic.indexOf("export async function approveBookingRequest"),
+      ) ?? "";
+    // #5398: the pre-transaction held-lodge read is the shared helper's call.
+    const locator = approval.indexOf("const heldApproval = await findHeldApprovalLodge(request)");
+    const transaction = approval.indexOf("conversion = await prisma.$transaction");
+    const globalLock = approval.indexOf("pg_advisory_xact_lock(1)", transaction);
+    const heldKey = approval.indexOf("expectedHeldLodgeId!", globalLock);
+    const lodgeLock = approval.indexOf("acquireLodgeCapacityLock(tx, requestLodgeId)");
+    const requestReread = approval.indexOf(
+      "const lockedRequest = await tx.bookingRequest.findUnique",
+    );
+    const heldReread = approval.indexOf("held = await tx.booking.findUnique");
+    const guardedConversion = approval.indexOf("const converted = await tx.booking.updateMany");
+
+    for (const marker of [
+      locator,
+      transaction,
+      globalLock,
+      heldKey,
+      lodgeLock,
+      requestReread,
+      heldReread,
+      guardedConversion,
+    ]) {
+      expect(marker).toBeGreaterThanOrEqual(0);
+    }
+    expect(locator).toBeLessThan(transaction);
+    expect(globalLock).toBeLessThan(heldKey);
+    expect(heldKey).toBeLessThan(lodgeLock);
+    expect(lodgeLock).toBeLessThan(requestReread);
+    expect(requestReread).toBeLessThan(heldReread);
+    expect(heldReread).toBeLessThan(guardedConversion);
+    expect(approval).toContain("request.lodgeId !== held.lodgeId");
+    expect(approval).toContain("lodgeId: conversion.lodgeId");
+  });
+
+  it("mints the per-lodge capacity key only in lodge-capacity-lock.ts", () => {
+    const offenders = sources
+      .filter(({ rel }) => rel !== CAPACITY_LOCK_MINT)
+      .filter(({ text }) => countCodeOccurrences(text, "hashtextextended") > 0)
+      .map(({ rel }) => rel);
+
+    expect(
+      offenders,
+      "hashtextextended found outside src/lib/lodge-capacity-lock.ts. The per-lodge " +
+        "capacity key must only be constructed by acquireLodgeCapacityLock so " +
+        "every participant provably shares one key — call the helper instead " +
+        "of rebuilding the expression (INV-LOCK-002)."
+    ).toEqual([]);
+  });
+});
+
+/*
+  THE MASKING RULE ITSELF, PINNED (#3196).
+
+  This census used to own the last private comment scanner in the tree, and the
+  reason it kept one was real: it hunts raw SQL, which lives inside string
+  literals, while the prose it must ignore lives inside string literals too.
+  Blanking everything hides the evidence; blanking nothing counts a sentence
+  describing `FOR UPDATE` as a lock. #3196 moved the lexing to the shared
+  `blankLiteralsWithSpans` and kept only the CHOICE here — which is a policy
+  about SQL, and belongs to the census rather than to a general-purpose helper.
+
+  These cases are what make that move checkable. Each is a shape the retired
+  line-local scanner got WRONG or could only get right by accident, and every
+  one of them is stated as behaviour rather than as a count, so a future edit to
+  `holdsRawStatement` fails here and not four inventories away.
+*/
+describe("the masking rule (#3196, INV-SSOT-004)", () => {
+  const rowLocks = (source: string): number =>
+    countCodeOccurrences(source, ROW_LOCK_STRENGTHS);
+
+  it("counts a raw statement in a backtick template", () => {
+    expect(
+      rowLocks("await tx.$executeRaw`SELECT 1 FROM x FOR UPDATE`;"),
+    ).toBe(1);
+  });
+
+  it("counts a raw statement in a double-quoted literal, because $executeRawUnsafe takes one", () => {
+    // #2623 F7. `const SQL = "SELECT … FOR UPDATE"` reaches the database, and a
+    // masker that suppressed every double-quoted literal would score it ZERO and
+    // drop a real lock out of the census silently.
+    expect(rowLocks('const SQL = "SELECT 1 FROM x FOR UPDATE";')).toBe(1);
+  });
+
+  it("does not count PROSE about a statement in a double-quoted literal", () => {
+    // #2623 T9(d), live in `adult-member-hosting-queue-participants.ts`.
+    expect(
+      rowLocks('throw new Error("never issued without its FOR KEY SHARE lock");'),
+    ).toBe(0);
+  });
+
+  it("does not count a TRAILING comment, which the retired scanner never dropped", () => {
+    // The private scanner decided comment-ness from the START of a line, so a
+    // comment after code was read as code. Both of the next two cases scored 1
+    // before #3196 and are the clearest evidence the swap changed the instrument.
+    expect(rowLocks("const x = 1; // takes the row FOR UPDATE first")).toBe(0);
+  });
+
+  it("does not count a block-comment body line that has no leading star", () => {
+    expect(rowLocks("/*\n  the merge takes it FOR UPDATE\n*/\nconst x = 1;")).toBe(0);
+  });
+
+  it("is not blinded by a regex literal containing a quote", () => {
+    // THE #3155 DEFECT, which #3180 found LIVE in a sibling census where it hid a
+    // real database write five hundred lines below the regex. `xero-contacts.ts`
+    // writes `.replace(/"/g, "")` AND takes two scoped advisory locks after it,
+    // so this census only ever escaped that fate by being line-local — which is
+    // an accident of a limitation, not a defence.
+    const source = [
+      'const q = input.fullName.replace(/"/g, "");',
+      "await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;",
+      'const sql = "SELECT 1 FROM x FOR UPDATE";',
+    ].join("\n");
+
+    expect(rowLocks(source)).toBe(1);
+    const sites = collectAdvisoryLockSites([{ rel: "src/lib/probe.ts", text: source }]);
+    expect(sites.map((site) => site.tier)).toEqual(["GLOBAL"]);
+  });
+
+  it("counts a raw statement in a SINGLE-quoted literal too", () => {
+    // The rule is quote-agnostic because the blanker reports both quotes as
+    // `kind: "string"`. Pinned because the prose above was for a while written
+    // as if only the double-quoted spelling were in scope, and a reader who
+    // believed that would think `$executeRawUnsafe('SELECT … FOR UPDATE')` went
+    // uncounted. It does not.
+    expect(rowLocks("const SQL = 'SELECT 1 FROM x FOR UPDATE';")).toBe(1);
+    expect(rowLocks("throw new Error('never issued without its FOR KEY SHARE lock');")).toBe(0);
+  });
+
+  it("does not count a needle that only appears inside a regex", () => {
+    // A pattern is not a statement. `blankLiteralsWithSpans` reports the regex
+    // body as its own kind and `holdsRawStatement` refuses it.
+    expect(rowLocks('const re = /FOR UPDATE/;')).toBe(0);
+  });
+
+  /*
+    THE MODULE CONTRACT THIS CENSUS RESTS ON, asserted here rather than assumed.
+    Restoring a span only leaves line numbers and columns intact because a span
+    is exactly as long as the spaces standing in for it. If that ever stopped
+    being true, every line number this census reports would drift and nothing
+    else in the tree would notice.
+  */
+  it("restores spans without moving a single offset", () => {
+    const source = [
+      "/* a docblock naming FOR UPDATE */",
+      'const message = "prose about FOR KEY SHARE";',
+      "const sql = `SELECT 1 FROM x FOR UPDATE`;",
+      'const re = /"/g;',
+      "await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`; // trailing",
+    ].join("\n");
+
+    const { code, spans } = blankLiteralsWithSpans(source);
+    expect(code).toBe(blankLiterals(source));
+    expect(code.length).toBe(source.length);
+    expect(maskedSource(source).length).toBe(source.length);
+
+    // Restoring EVERY span must reproduce the file byte for byte: that is what
+    // says the spans are the complete account of what was blanked.
+    const pieces: string[] = [];
+    let cursor = 0;
+    for (const span of spans) {
+      expect(span.start).toBeGreaterThanOrEqual(cursor);
+      pieces.push(code.slice(cursor, span.start), source.slice(span.start, span.end));
+      cursor = span.end;
+    }
+    pieces.push(code.slice(cursor));
+    expect(pieces.join("")).toBe(source);
+  });
+
+  /*
+    A SPAN NEVER ENDS PAST THE SOURCE — the other half of the contract the
+    restore above rests on, and the half that used to be breakable.
+    `blankTemplateLiteral` and `endOfRegexLiteral` each step TWO characters over
+    an escape, so a file whose last character is a backslash left the cursor one
+    PAST the end and reported a span addressing a character that does not exist.
+    Slicing survived it, because both slices clamp on their own — which is
+    precisely why it needs a test: it was invisible to `maskedSource` and would
+    have surfaced only in a caller doing ARITHMETIC on `end`.
+  */
+  it("never reports a span that ends past the end of the source", () => {
+    const sources = [
+      "`ab\\", // an unterminated template whose last character escapes
+      "const re = /a\\", // the same shape in a regex literal
+      'const s = "ab\\', // the string branch, which has always clamped
+      "/* an unterminated block comment",
+      "// an unterminated line comment",
+    ];
+
+    for (const source of sources) {
+      const { code, spans } = blankLiteralsWithSpans(source);
+      expect(code.length, source).toBe(source.length);
+
+      for (const span of spans) {
+        expect(
+          span.end,
+          `${JSON.stringify(source)} reported a ${span.kind} span ending at ${span.end}, outside a ${source.length}-character source. A span addresses the ORIGINAL text, so a caller may do arithmetic on it and not only slice with it.`,
+        ).toBeLessThanOrEqual(source.length);
+        expect(span.start, JSON.stringify(source)).toBeLessThanOrEqual(span.end);
+      }
+    }
+  });
+
+  it("keeps a lock site on the line it is written on", () => {
+    const source = [
+      "// a comment",
+      "/* a block\n   comment */",
+      'const label = "prose";',
+      "await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;",
+    ].join("\n");
+    const sites = collectAdvisoryLockSites([{ rel: "src/lib/probe.ts", text: source }]);
+    expect(sites).toHaveLength(1);
+    expect(sites[0]?.line).toBe(source.split("\n").findIndex((line) => line.includes("pg_advisory")) + 1);
+  });
+});

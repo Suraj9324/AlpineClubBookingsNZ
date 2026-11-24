@@ -1,0 +1,1057 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { editDoorBooking, editDoorGuest } from "./support/edit-door-booking";
+import { ApiError } from "@/lib/api-error";
+import {
+  InsufficientCapacityError,
+  OverCapacityConfirmationRequiredError,
+  WholeLodgeHoldBlockedError,
+} from "@/lib/over-capacity-confirmation";
+
+const h = vi.hoisted(() => ({
+  checkCapacityForGuestRanges: vi.fn(),
+  checkCapacityForPartnerSharedAdmission: vi.fn(),
+}));
+
+// Keep the real OverCapacityConfirmationRequiredError + overCapacityNights so the
+// thrown class is the genuine one; only stub the DB-backed capacity queries.
+vi.mock("@/lib/capacity", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/capacity");
+  return {
+    ...actual,
+    checkCapacityForGuestRanges: h.checkCapacityForGuestRanges,
+    checkCapacityForPartnerSharedAdmission: h.checkCapacityForPartnerSharedAdmission,
+  };
+});
+
+vi.mock("@/lib/membership-type-policy", () => ({
+  assertMembershipTypeBookingAllowed: vi.fn().mockResolvedValue(undefined),
+  resolveGuestRateMembershipTypes: vi
+    .fn()
+    .mockImplementation((_tx: unknown, { guests }: { guests: unknown[] }) =>
+      Promise.resolve(guests),
+    ),
+  MembershipTypeBookingPolicyError: class extends Error {},
+  priceBookingGuestsWithMembershipTypePolicy: vi.fn(),
+}));
+
+vi.mock("@/lib/prisma", () => ({ prisma: {} }));
+vi.mock("@/lib/logger", () => ({
+  default: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
+}));
+
+import { calculateModifiedPricing } from "@/lib/booking-modify-plan";
+import { eachDateOnlyInRange } from "@/lib/date-only";
+import {
+  resolveGuestRateMembershipTypes,
+  priceBookingGuestsWithMembershipTypePolicy,
+} from "@/lib/membership-type-policy";
+
+const D = (s: string) => new Date(`${s}T00:00:00.000Z`);
+
+/** The pricing result. Since #4317 every edit prices, so this is the result. */
+async function pricedPricing(
+  ...args: Parameters<typeof calculateModifiedPricing>
+) {
+  return calculateModifiedPricing(...args);
+}
+
+function baseArgs() {
+  const guest = editDoorGuest({
+    id: "g1",
+    ageTier: "ADULT",
+    isMember: true,
+    memberId: "m1",
+    stayStart: D("2026-09-10"),
+    stayEnd: D("2026-09-13"),
+    priceCents: 30000,
+    // #3166: three stored night rows that reconcile to the strand's total, so
+    // this CAPACITY fixture is judged on capacity. Without them the strand has
+    // no readable sold-price history at all and every case here would park for
+    // financial review instead — which is the new rule working, not a bed
+    // question. The reconciling shape is the one the suite means to describe.
+    nights: [
+      { stayDate: D("2026-09-10"), priceCents: 10000, priceSource: "SOLD" },
+      { stayDate: D("2026-09-11"), priceCents: 10000, priceSource: "SOLD" },
+      { stayDate: D("2026-09-12"), priceCents: 10000, priceSource: "SOLD" },
+    ],
+  });
+  const booking = editDoorBooking({
+    id: "b1",
+    memberId: "m1",
+    lodgeId: "lodge-1",
+    checkIn: D("2026-09-10"),
+    checkOut: D("2026-09-13"),
+    totalPriceCents: 30000,
+    discountCents: 0,
+    promoAdjustmentCents: 0,
+    finalPriceCents: 30000,
+    guests: [guest],
+  });
+
+  return {
+    booking,
+    bookingId: "b1",
+    isInProgressEdit: false,
+    editableFrom: null,
+    newCheckIn: D("2026-09-10"),
+    newCheckOut: D("2026-09-13"),
+    normalizedAddGuests: undefined,
+    removeGuestIds: undefined,
+    guestsForPricing: [
+      {
+        bookingGuestId: "g1",
+        ageTier: "ADULT" as const,
+        isMember: true,
+        memberId: "m1",
+        stayStart: D("2026-09-10"),
+        stayEnd: D("2026-09-13"),
+      },
+    ],
+    skipBookingLifecycleRules: false,
+    seasonRateData: [],
+  };
+}
+
+const OVER_CAPACITY = {
+  available: false,
+  minAvailable: -1,
+  nightDetails: [{ date: D("2026-09-11"), occupiedBeds: 30, availableBeds: -1 }],
+};
+
+// A whole-lodge-held night (ADR-001, issue #118): unavailable, but availableBeds
+// is pinned to 0 (never negative) and flagged wholeLodgeHeld — exactly what
+// checkCapacityForGuestRanges now returns for a night held by another booking.
+const WHOLE_LODGE_HELD = {
+  available: false,
+  minAvailable: 0,
+  nightDetails: [
+    {
+      date: D("2026-09-11"),
+      occupiedBeds: 5,
+      availableBeds: 0,
+      wholeLodgeHeld: true,
+    },
+  ],
+};
+
+// #2756: `calculateModifiedPricing` now reads the club's group-discount setting
+// once, up front, and hands the same config to whichever pricing path runs — so
+// every double for it has to carry that row. `null` is a club that has NOT
+// switched the discount on, which is every case in this file: these cases are
+// about capacity ranges and per-night prices, and they must all come out exactly
+// where they came out before the discount reached this planner.
+const NO_DISCOUNT_TX = {
+  groupDiscountSetting: { findUnique: async () => null },
+} as never;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("calculateModifiedPricing capacity (issue #1668)", () => {
+  it("throws the existing 400 for a non-admin over-capacity edit", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(OVER_CAPACITY);
+
+    await expect(
+      calculateModifiedPricing(NO_DISCOUNT_TX, {
+        ...baseArgs(),
+        adminOverride: false,
+      }),
+    ).rejects.toMatchObject({
+      // #3232: THE CLASS IS THE ASSERTION, not decoration on top of the message.
+      // The member's linked move decides its "there are not beds for both" arm by
+      // asking this refusal what kind of refusal it is, and this is the only
+      // capacity refusal a member can ever receive — the two over-capacity classes
+      // below are raised on the admin-override path only. While this was a bare
+      // `ApiError` the arm was unreachable and a full lodge refused the member
+      // with nothing to do about it. The other half of the pair lives in
+      // `booking-linked-date-move-service.test.ts` ("the arm a full lodge
+      // reaches"); neither half is meaningful alone, so do not delete one.
+      constructor: InsufficientCapacityError,
+      status: 400,
+      message: "Not enough beds available for these changes",
+    });
+  });
+
+  it("throws OverCapacityConfirmationRequiredError for an admin override without confirm", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(OVER_CAPACITY);
+
+    await expect(
+      calculateModifiedPricing(NO_DISCOUNT_TX, {
+        ...baseArgs(),
+        adminOverride: true,
+        confirmOverCapacity: false,
+      }),
+    ).rejects.toBeInstanceOf(OverCapacityConfirmationRequiredError);
+  });
+
+  it("member parity: a held night throws the SAME 400 as a full lodge for a non-admin edit (no exclusive signal)", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(WHOLE_LODGE_HELD);
+
+    await expect(
+      calculateModifiedPricing(NO_DISCOUNT_TX, {
+        ...baseArgs(),
+        adminOverride: false,
+      }),
+    ).rejects.toMatchObject({
+      constructor: InsufficientCapacityError,
+      status: 400,
+      message: "Not enough beds available for these changes",
+    });
+  });
+
+  it("held night unconfirmed admin override still routes through OverCapacityConfirmationRequiredError (member-parity confirm prompt, empty confirmable list)", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(WHOLE_LODGE_HELD);
+
+    await expect(
+      calculateModifiedPricing(NO_DISCOUNT_TX, {
+        ...baseArgs(),
+        adminOverride: true,
+        confirmOverCapacity: false,
+      }),
+    ).rejects.toBeInstanceOf(OverCapacityConfirmationRequiredError);
+  });
+
+  it("override NON-BYPASS: a CONFIRMED admin over-capacity override onto a held night throws WholeLodgeHoldBlockedError and does not proceed (decision 5)", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(WHOLE_LODGE_HELD);
+
+    let thrown: unknown;
+    try {
+      await pricedPricing(NO_DISCOUNT_TX, {
+        ...baseArgs(),
+        adminOverride: true,
+        confirmOverCapacity: true,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(WholeLodgeHoldBlockedError);
+    expect((thrown as WholeLodgeHoldBlockedError).blockedNights).toEqual([
+      "2026-09-11",
+    ]);
+  });
+
+  it("proceeds with capacityOverridden: true for a confirmed admin override", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(OVER_CAPACITY);
+    vi.mocked(resolveGuestRateMembershipTypes).mockImplementation(
+      ((_tx: unknown, { guests }: { guests: unknown[] }) =>
+        Promise.resolve(guests)) as never,
+    );
+    const breakdown = {
+      totalPriceCents: 32000,
+      guests: [
+        {
+          priceCents: 32000,
+          perNightCents: [16000, 16000],
+          nightDates: [D("2026-09-10"), D("2026-09-11")],
+        },
+      ],
+    };
+    vi.mocked(priceBookingGuestsWithMembershipTypePolicy).mockResolvedValue(
+      breakdown as never,
+    );
+    const tx = {
+      groupDiscountSetting: { findUnique: vi.fn().mockResolvedValue(null) },
+    } as never;
+
+    const result = await pricedPricing(tx, {
+      ...baseArgs(),
+      adminOverride: true,
+      confirmOverCapacity: true,
+    });
+
+    expect(result.capacityOverridden).toBe(true);
+    expect(result.newTotalPriceCents).toBe(32000);
+  });
+});
+
+// #2029: the in-progress capacity check must cover the genuinely-new check-out-day
+// night the widened edit window opened. These drive the REAL plan
+// (buildInProgressGuestRangePlan) through calculateModifiedPricing with the
+// capacity resolvers mocked, so a wrong range start (editableFrom instead of the
+// corrected anchor) leaves the new night invisible and the assertions fail.
+describe("calculateModifiedPricing in-progress check-out-day capacity (#2029)", () => {
+  const MEMBER_TYPE = "type-member";
+  const RATE = 5000;
+  const SEASON = [
+    {
+      seasonId: "s1",
+      startDate: D("2026-08-01"),
+      endDate: D("2026-08-31"),
+      rates: [{ ageTier: "ADULT", membershipTypeId: MEMBER_TYPE, pricePerNightCents: RATE }],
+    },
+  ];
+  const AVAILABLE = { available: true, minAvailable: 5, nightDetails: [] };
+  const FULL = {
+    available: false,
+    minAvailable: -1,
+    nightDetails: [{ date: D("2026-08-24"), occupiedBeds: 30, availableBeds: -1 }],
+  };
+
+  function existingGuest(stayStart: string, stayEnd: string, priceCents: number) {
+    return editDoorGuest({
+      id: "g1",
+      ageTier: "ADULT",
+      isMember: true,
+      memberId: "m1",
+      rateMembershipTypeId: MEMBER_TYPE,
+      stayStart: D(stayStart),
+      stayEnd: D(stayEnd),
+      // #2736: the real query (`LoadedBookingForModify`) always includes the
+      // guest's `BookingGuestNight` rows, so this double supplies them too —
+      // without them these cases would only ever exercise the envelope FALLBACK
+      // and quietly stop covering the branch production actually takes. They are
+      // the envelope expanded, because this guest's stay is contiguous.
+      //
+      // #3031: with their SOLD PRICE. The plan prices an edit from the stored
+      // rows and refuses to invent an amount when they do not reconcile to the
+      // guest total, so a row without a price is now the unpriceable case rather
+      // than a fixture detail. This stay is contiguous at one rate, so the rows
+      // reconcile and every expectation is unchanged.
+      nights: (() => {
+        const dates = eachDateOnlyInRange(D(stayStart), D(stayEnd));
+        // INTEGER cents, remainder on the first night. A float division puts a
+        // fraction of a cent on every row, so the reconciliation the plan
+        // applies would rest on floating point rather than on the integer
+        // arithmetic the column actually holds (INV-MONEY-001).
+        const base = Math.floor(priceCents / dates.length);
+        const remainder = priceCents - base * dates.length;
+        return dates.map((stayDate, index) => ({
+          stayDate,
+          priceCents: index === 0 ? base + remainder : base,
+          priceSource: "SOLD" as const,
+        }));
+      })(),
+      priceCents,
+    });
+  }
+
+  function inProgressArgs(opts: {
+    editableFrom: string;
+    newCheckOut: string;
+    guestStayStart?: string;
+    guestStayEnd?: string;
+    guestPriceCents?: number;
+    partnerSharedGuests?: Array<{ memberId: string; partnerMemberId: string }>;
+  }) {
+    const gStart = opts.guestStayStart ?? "2026-08-20";
+    const gEnd = opts.guestStayEnd ?? "2026-08-24";
+    const price = opts.guestPriceCents ?? 4 * RATE;
+    const guest = existingGuest(gStart, gEnd, price);
+    return {
+      booking: editDoorBooking({
+        id: "b1",
+        memberId: "m1",
+        lodgeId: "lodge-1",
+        checkIn: D("2026-08-20"),
+        checkOut: D(gEnd),
+        totalPriceCents: price,
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        finalPriceCents: price,
+        guests: [guest],
+      }),
+      bookingId: "b1",
+      isInProgressEdit: true,
+      editableFrom: D(opts.editableFrom),
+      newCheckIn: D("2026-08-20"),
+      newCheckOut: D(opts.newCheckOut),
+      normalizedAddGuests: undefined,
+      removeGuestIds: undefined,
+      guestsForPricing: [
+        {
+          bookingGuestId: "g1",
+          ageTier: "ADULT" as const,
+          isMember: true,
+          memberId: "m1",
+          stayStart: D(gStart),
+          stayEnd: D(opts.newCheckOut),
+        },
+      ],
+      skipBookingLifecycleRules: false,
+      seasonRateData: SEASON as never,
+      partnerSharedGuests: opts.partnerSharedGuests ?? [],
+    };
+  }
+
+  it("(a) rejects a check-out-day +1 extension into a FULL night with the normal capacity error", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(FULL);
+
+    await expect(
+      calculateModifiedPricing(NO_DISCOUNT_TX, {
+        ...inProgressArgs({ editableFrom: "2026-08-25", newCheckOut: "2026-08-25" }),
+      }),
+    ).rejects.toMatchObject({
+      constructor: InsufficientCapacityError,
+      status: 400,
+      message: "Not enough beds available for these changes",
+    });
+
+    // The resolver was asked about the check-out-day night (08-24), via both the
+    // window start and a guest range that covers it.
+    const call = h.checkCapacityForGuestRanges.mock.calls[0];
+    expect(call[1]).toEqual(D("2026-08-24")); // rangeStart
+    const ranges = call[3] as Array<{ stayStart: Date; stayEnd: Date }>;
+    expect(ranges).toEqual([
+      expect.objectContaining({ stayStart: D("2026-08-24"), stayEnd: D("2026-08-25") }),
+    ]);
+  });
+
+  it("(b) succeeds when the check-out-day night has capacity, checking that night", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const result = await pricedPricing(NO_DISCOUNT_TX, {
+      ...inProgressArgs({ editableFrom: "2026-08-25", newCheckOut: "2026-08-25" }),
+    });
+
+    // Charged exactly the one new night (ties to the pricing suite).
+    expect(result.newTotalPriceCents).toBe(4 * RATE + RATE);
+    expect(h.checkCapacityForGuestRanges.mock.calls[0][1]).toEqual(D("2026-08-24"));
+  });
+
+  it("(c) mid-stay extension checks from editableFrom (regression pin — unchanged)", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    await pricedPricing(NO_DISCOUNT_TX, {
+      ...inProgressArgs({ editableFrom: "2026-08-22", newCheckOut: "2026-08-26" }),
+    });
+
+    const call = h.checkCapacityForGuestRanges.mock.calls[0];
+    expect(call[1]).toEqual(D("2026-08-22")); // == editableFrom, not lowered
+    const ranges = call[3] as Array<{ stayStart: Date }>;
+    expect(ranges[0].stayStart).toEqual(D("2026-08-22"));
+  });
+
+  it("(d) partner-shared path checks the check-out-day night and rejects when full", async () => {
+    h.checkCapacityForPartnerSharedAdmission.mockResolvedValue({
+      available: false,
+      reason: "No partner-shared slot available on 2026-08-24",
+      minAvailable: -1,
+      nightDetails: [],
+    });
+
+    await expect(
+      calculateModifiedPricing(NO_DISCOUNT_TX, {
+        ...inProgressArgs({
+          editableFrom: "2026-08-25",
+          newCheckOut: "2026-08-25",
+          partnerSharedGuests: [{ memberId: "m1", partnerMemberId: "m2" }],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      constructor: ApiError,
+      status: 400,
+      message: "No partner-shared slot available on 2026-08-24",
+    });
+
+    expect(h.checkCapacityForPartnerSharedAdmission.mock.calls[0][1]).toEqual(
+      D("2026-08-24"),
+    );
+  });
+
+  it("(e) a future-dated partial-range guest never consumes capacity before arrival (#713)", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    // Guest occupies [08-22, 08-24); editableFrom is 08-21 (they arrive later).
+    await pricedPricing(NO_DISCOUNT_TX, {
+      ...inProgressArgs({
+        editableFrom: "2026-08-21",
+        newCheckOut: "2026-08-26",
+        guestStayStart: "2026-08-22",
+        guestStayEnd: "2026-08-24",
+        guestPriceCents: 2 * RATE,
+      }),
+    });
+
+    const ranges = h.checkCapacityForGuestRanges.mock.calls[0][3] as Array<{
+      stayStart: Date;
+    }>;
+    // Their checked range starts at their own arrival (08-22), never earlier —
+    // no phantom bed consumed on 08-21.
+    expect(ranges[0].stayStart).toEqual(D("2026-08-22"));
+  });
+});
+
+// #2736: the per-night breakdown an in-progress edit hands to `applyGuestChanges`
+// is what gets written back as `BookingGuestNight` rows, so it decides which
+// nights the guest is recorded as holding after the edit — and therefore which
+// nights the bed board, the roster and every later edit's locked prices see. It
+// used to be built by expanding the plan's envelope, which silently filled a
+// sparse guest's gap. These drive the REAL plan through `calculateModifiedPricing`.
+describe("calculateModifiedPricing in-progress per-night breakdown (#2736)", () => {
+  const MEMBER_TYPE = "type-member";
+  const RATE = 5000;
+  const SEASON = [
+    {
+      seasonId: "s1",
+      startDate: D("2026-08-01"),
+      endDate: D("2026-08-31"),
+      rates: [
+        { ageTier: "ADULT", membershipTypeId: MEMBER_TYPE, pricePerNightCents: RATE },
+      ],
+    },
+  ];
+  const AVAILABLE = { available: true, minAvailable: 5, nightDetails: [] };
+
+  /** Nights 08-20 and 08-22 — home on the 21st. */
+  function sparseArgs(perNightCents: number) {
+    const guest = editDoorGuest({
+      id: "g1",
+      ageTier: "ADULT",
+      isMember: true,
+      memberId: "m1",
+      rateMembershipTypeId: MEMBER_TYPE,
+      stayStart: D("2026-08-20"),
+      stayEnd: D("2026-08-23"),
+      // #3031: the two nights carry what they were sold for, and `priceCents`
+      // is their sum. `sparseArgs` takes the PER-NIGHT amount now rather than a
+      // total, because a total that does not reconcile with the rows is the
+      // unpriceable case and no longer a fixture that prices.
+      nights: [
+        { stayDate: D("2026-08-20"), priceCents: perNightCents, priceSource: "SOLD" },
+        { stayDate: D("2026-08-22"), priceCents: perNightCents, priceSource: "SOLD" },
+      ],
+      priceCents: 2 * perNightCents,
+    });
+    return {
+      booking: editDoorBooking({
+        id: "b1",
+        memberId: "m1",
+        lodgeId: "lodge-1",
+        checkIn: D("2026-08-20"),
+        checkOut: D("2026-08-23"),
+        totalPriceCents: 2 * perNightCents,
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        finalPriceCents: 2 * perNightCents,
+        guests: [guest],
+      }),
+      bookingId: "b1",
+      isInProgressEdit: true,
+      editableFrom: D("2026-08-21"),
+      newCheckIn: D("2026-08-20"),
+      newCheckOut: D("2026-08-25"),
+      normalizedAddGuests: undefined,
+      removeGuestIds: undefined,
+      guestsForPricing: [
+        {
+          bookingGuestId: "g1",
+          ageTier: "ADULT" as const,
+          isMember: true,
+          memberId: "m1",
+          stayStart: D("2026-08-20"),
+          stayEnd: D("2026-08-25"),
+        },
+      ],
+      skipBookingLifecycleRules: false,
+      seasonRateData: SEASON as never,
+      partnerSharedGuests: [],
+    };
+  }
+
+  it("writes back the gap, not a continuous run", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const result = await pricedPricing(NO_DISCOUNT_TX, sparseArgs(RATE));
+
+    // 20 and 22 kept, 21 still an absence, 23 and 24 bought by the extension.
+    expect(result.priceBreakdown.guests[0].nightDates).toEqual([
+      D("2026-08-20"),
+      D("2026-08-22"),
+      D("2026-08-23"),
+      D("2026-08-24"),
+    ]);
+    expect(result.newTotalPriceCents).toBe(4 * RATE);
+  });
+
+  it("T9: prices a total the stored rows cannot account for by an even split of it (R3, #4317)", async () => {
+    // A guest whose stored rows say 2 x $50 while their stored total says
+    // $10.01. #3031 refused this and #3170 parked it; #4317 values it by R3:
+    // the $10.01 split over the two nights held, the leftover cent on the
+    // earlier one — $5.01 and $5.00. The extension buys the 23rd and 24th at
+    // $50 each. Those values are what the rows become, so they reconcile.
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const drifted = sparseArgs(RATE);
+    const result = await pricedPricing(NO_DISCOUNT_TX, {
+      ...drifted,
+      booking: editDoorBooking({
+        ...drifted.booking,
+        // The headline agrees with the guest's stored $10.01, as every writer
+        // stores them; a gap between the two is carried forward (review H1).
+        totalPriceCents: 1001,
+        finalPriceCents: 1001,
+        guests: [{ ...drifted.booking.guests[0], priceCents: 1001 }],
+      }),
+    });
+
+    expect(result.priceBreakdown.guests[0].nightDates).toEqual([
+      D("2026-08-20"),
+      D("2026-08-22"),
+      D("2026-08-23"),
+      D("2026-08-24"),
+    ]);
+    expect(result.priceBreakdown.guests[0].perNightCents).toEqual([501, 500, RATE, RATE]);
+    expect(result.priceBreakdown.guests[0].priceCents).toBe(1001 + 2 * RATE);
+    expect(result.newTotalPriceCents).toBe(1001 + 2 * RATE);
+  });
+
+  it("still checks capacity for that edit, and refuses when the beds are not there", async () => {
+    // Beds are not money: the drifted strand prices (above), and the plan's
+    // ranges are what the capacity resolver is asked about.
+    h.checkCapacityForGuestRanges.mockResolvedValue(OVER_CAPACITY);
+
+    const drifted = sparseArgs(RATE);
+    await expect(
+      calculateModifiedPricing(NO_DISCOUNT_TX, {
+        ...drifted,
+        booking: editDoorBooking({
+          ...drifted.booking,
+          guests: [{ ...drifted.booking.guests[0], priceCents: 1001 }],
+        }),
+      }),
+    ).rejects.toThrow(/Not enough beds available/);
+
+    /*
+      The control, and it is what makes the assertion above mean something: the
+      capacity resolver was asked about THE PLAN's ranges, not the envelope's.
+      A call count alone does not say that, so the ARGUMENTS are pinned. Two
+      things distinguish the plan's ranges from the envelope's:
+        - the range starts at `editableFrom`, not at the booking's check-in, so
+          nights already spent are not re-checked (#2029's capacityRangeStart);
+        - the range carries an EXPLICIT night set, so the sparse guest's gap at
+          08-21 is not silently occupied and #2029's check-out-day extension
+          night IS.
+    */
+    expect(h.checkCapacityForGuestRanges).toHaveBeenCalledTimes(1);
+    const [lodgeId, rangeStart, rangeEnd, proposed] =
+      h.checkCapacityForGuestRanges.mock.calls[0];
+    expect(lodgeId).toBe("lodge-1");
+    // The envelope start a reverted planner would pass is 2026-08-20, so pinning
+    // the start to 08-21 already excludes it - a second, negative assertion of
+    // the same fact adds nothing but a line to keep in step.
+    expect(rangeStart).toEqual(D("2026-08-21"));
+    expect(rangeEnd).toEqual(D("2026-08-25"));
+    expect(proposed).toEqual([
+      {
+        stayStart: D("2026-08-21"),
+        stayEnd: D("2026-08-25"),
+        // 08-21 is the guest's gap and is absent; 08-24 is the extension's
+        // newly-occupied night and is present.
+        nights: [D("2026-08-22"), D("2026-08-23"), D("2026-08-24")],
+        memberId: "m1",
+      },
+    ]);
+  });
+});
+
+// #2743: an edit sells only the nights it creates. The sparse suite asserts that
+// on the PLAN's return value; this asserts it on what the writer is actually
+// handed, which is a different array. `applyGuestChanges` → `syncGuestNights`
+// consumes `priceBreakdown.guests[].nightDates`, matched POSITIONALLY over
+// `proposedExistingGuests`, and re-derives the stored `BookingGuest.stayStart` /
+// `stayEnd` from the first and last of those dates rather than from the plan's
+// own envelope. So a plan that is right and a breakdown that is wrong would
+// still write the wrong rows and reserve the wrong beds. These cases drive the
+// REAL plan through `calculateModifiedPricing` and read the breakdown.
+describe("calculateModifiedPricing in-progress departed guest (#2743)", () => {
+  const MEMBER_TYPE = "type-member";
+  const RATE = 5000;
+  const SEASON = [
+    {
+      seasonId: "s1",
+      startDate: D("2026-08-01"),
+      endDate: D("2026-08-31"),
+      rates: [
+        { ageTier: "ADULT", membershipTypeId: MEMBER_TYPE, pricePerNightCents: RATE },
+      ],
+    },
+  ];
+  const AVAILABLE = { available: true, minAvailable: 5, nightDetails: [] };
+
+  /** A guest built from the nights they hold, the way the writer derives them. */
+  function guestOf(id: string, memberId: string, nights: string[]) {
+    const sorted = [...nights].sort();
+    return editDoorGuest({
+      id,
+      ageTier: "ADULT",
+      isMember: true,
+      memberId,
+      rateMembershipTypeId: MEMBER_TYPE,
+      stayStart: D(sorted[0]),
+      stayEnd: D(
+        new Date(D(sorted[sorted.length - 1]).getTime() + 86_400_000)
+          .toISOString()
+          .slice(0, 10),
+      ),
+      // #3031: with their sold price, so the rows reconcile to the total below.
+      nights: sorted.map((stayDate) => ({
+        stayDate: D(stayDate),
+        priceCents: RATE,
+        priceSource: "SOLD" as const,
+      })),
+      priceCents: sorted.length * RATE,
+    });
+  }
+
+  /**
+   * Booking 18 → 23 Aug. `g1` went home after the 19th; `g2` is there for the
+   * whole run. It is the 21st, so the edit window opens on the 22nd.
+   */
+  function departedGuestArgs(newCheckOut: string) {
+    const gone = guestOf("g1", "m1", ["2026-08-18", "2026-08-19"]);
+    const present = guestOf("g2", "m2", [
+      "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22",
+    ]);
+    const totalPriceCents = gone.priceCents + present.priceCents;
+    return {
+      booking: editDoorBooking({
+        id: "b1",
+        memberId: "m1",
+        lodgeId: "lodge-1",
+        checkIn: D("2026-08-18"),
+        checkOut: D("2026-08-23"),
+        totalPriceCents,
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        finalPriceCents: totalPriceCents,
+        guests: [gone, present],
+      }),
+      bookingId: "b1",
+      isInProgressEdit: true,
+      editableFrom: D("2026-08-22"),
+      newCheckIn: D("2026-08-18"),
+      newCheckOut: D(newCheckOut),
+      normalizedAddGuests: undefined,
+      removeGuestIds: undefined,
+      guestsForPricing: [
+        {
+          bookingGuestId: "g1",
+          ageTier: "ADULT" as const,
+          isMember: true,
+          memberId: "m1",
+          stayStart: D("2026-08-18"),
+          stayEnd: D(newCheckOut),
+        },
+        {
+          bookingGuestId: "g2",
+          ageTier: "ADULT" as const,
+          isMember: true,
+          memberId: "m2",
+          stayStart: D("2026-08-18"),
+          stayEnd: D(newCheckOut),
+        },
+      ],
+      skipBookingLifecycleRules: false,
+      seasonRateData: SEASON as never,
+      partnerSharedGuests: [],
+    };
+  }
+
+  it("hands the writer only the departed guest's own nights, and moves no money", async () => {
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const result = await pricedPricing(
+      NO_DISCOUNT_TX,
+      departedGuestArgs("2026-08-23"),
+    );
+    const [gone, present] = result.priceBreakdown.guests;
+
+    // The rows the writer will persist, and the envelope it re-derives from
+    // them: the 18th and the 19th, full stop. Before #2743 this array was the
+    // 18th to the 22nd and the member was billed three nights for somebody who
+    // had gone home.
+    expect(gone.nightDates).toEqual([D("2026-08-18"), D("2026-08-19")]);
+    expect(gone.priceCents).toBe(2 * RATE);
+    expect(gone.perNightCents.reduce<number>((a, b) => a + (b ?? Number.NaN), 0)).toBe(gone.priceCents);
+    // The guest who is actually there is untouched.
+    expect(present.nightDates).toEqual([
+      D("2026-08-18"), D("2026-08-19"), D("2026-08-20"), D("2026-08-21"),
+      D("2026-08-22"),
+    ]);
+    expect(result.newTotalPriceCents).toBe(7 * RATE);
+  });
+
+  it("still gives them the nights an extension genuinely creates, as a second run with the gap intact", async () => {
+    // The accepted residual, measured on the writer's own array rather than on
+    // the plan: extending to the 25th admits the departed guest for the two
+    // nights past the OLD check-out and nothing between. The stored envelope
+    // that gets re-derived from this is 18 Aug → 25 Aug with two nights of
+    // absence inside it — which is why the bed board reads the night rows and
+    // never the envelope (INV-DATE-012, INV-MOD-025).
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const result = await pricedPricing(
+      NO_DISCOUNT_TX,
+      departedGuestArgs("2026-08-25"),
+    );
+    const [gone] = result.priceBreakdown.guests;
+
+    expect(gone.nightDates).toEqual([
+      D("2026-08-18"),
+      D("2026-08-19"),
+      // the 20th, 21st and 22nd are NOT theirs
+      D("2026-08-23"),
+      D("2026-08-24"),
+    ]);
+    expect(gone.priceCents).toBe(4 * RATE);
+  });
+});
+
+describe("calculateModifiedPricing in-progress per-night prices (#2744)", () => {
+  const MEMBER_TYPE = "type-member";
+  const LOW = 5000;
+  const HIGH = 9000;
+  const SEASONS = [
+    {
+      seasonId: "s-low",
+      startDate: D("2026-08-01"),
+      endDate: D("2026-08-22"),
+      rates: [
+        { ageTier: "ADULT", membershipTypeId: MEMBER_TYPE, pricePerNightCents: LOW },
+      ],
+    },
+    {
+      seasonId: "s-high",
+      startDate: D("2026-08-23"),
+      endDate: D("2026-09-30"),
+      rates: [
+        { ageTier: "ADULT", membershipTypeId: MEMBER_TYPE, pricePerNightCents: HIGH },
+      ],
+    },
+  ];
+  const AVAILABLE = { available: true, minAvailable: 5, nightDetails: [] };
+
+  /**
+   * The guest from the issue: nights 08-20 and 08-22, both bought at LOW, with
+   * the rows recording it. The edit extends the check-out to the 25th, so the
+   * 23rd and 24th are bought now at HIGH.
+   */
+  function args({ withCompanion = false }: { withCompanion?: boolean } = {}) {
+    const guest = editDoorGuest({
+      id: "g1",
+      ageTier: "ADULT",
+      isMember: true,
+      memberId: "m1",
+      rateMembershipTypeId: MEMBER_TYPE,
+      stayStart: D("2026-08-20"),
+      stayEnd: D("2026-08-23"),
+      nights: [
+        { stayDate: D("2026-08-20"), priceCents: LOW, priceSource: "SOLD" },
+        { stayDate: D("2026-08-22"), priceCents: LOW, priceSource: "SOLD" },
+      ],
+      priceCents: 2 * LOW,
+    });
+    // A second guest on the whole run, so taking g1 off does not leave the
+    // booking with future nights nobody holds (which the plan refuses, #2736).
+    const companion = editDoorGuest({
+      ...guest,
+      id: "g2",
+      memberId: "m2",
+      nights: [
+        { stayDate: D("2026-08-20"), priceCents: LOW, priceSource: "SOLD" },
+        { stayDate: D("2026-08-21"), priceCents: LOW, priceSource: "SOLD" },
+        { stayDate: D("2026-08-22"), priceCents: LOW, priceSource: "SOLD" },
+      ],
+      priceCents: 3 * LOW,
+    });
+    const guests = withCompanion ? [guest, companion] : [guest];
+    const totalPriceCents = guests.reduce((sum, g) => sum + g.priceCents, 0);
+    return {
+      booking: editDoorBooking({
+        id: "b1",
+        memberId: "m1",
+        lodgeId: "lodge-1",
+        checkIn: D("2026-08-20"),
+        checkOut: D("2026-08-23"),
+        totalPriceCents,
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        finalPriceCents: totalPriceCents,
+        guests,
+      }),
+      bookingId: "b1",
+      isInProgressEdit: true,
+      editableFrom: D("2026-08-21"),
+      newCheckIn: D("2026-08-20"),
+      newCheckOut: D("2026-08-25"),
+      normalizedAddGuests: undefined,
+      removeGuestIds: undefined,
+      guestsForPricing: [
+        {
+          bookingGuestId: "g1",
+          ageTier: "ADULT" as const,
+          isMember: true,
+          memberId: "m1",
+          stayStart: D("2026-08-20"),
+          stayEnd: D("2026-08-25"),
+        },
+      ],
+      skipBookingLifecycleRules: false,
+      seasonRateData: SEASONS as never,
+      partnerSharedGuests: [],
+    };
+  }
+
+  it("persists each night's real rate, not the guest's average", async () => {
+    // `applyGuestChanges`/`syncGuestNights` writes `perNightCents[k]` onto the
+    // `BookingGuestNight` row for `nightDates[k]`, and `valuedNightLocksForGuest`
+    // hands that column to the NEXT edit — so these four numbers are what the
+    // system will later believe the member paid. They used to be four copies of
+    // the average (7000 each); they are the real rates now.
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const result = await pricedPricing(NO_DISCOUNT_TX, args());
+    const guest = result.priceBreakdown.guests[0];
+
+    expect(guest.nightDates).toEqual([
+      D("2026-08-20"),
+      D("2026-08-22"),
+      D("2026-08-23"),
+      D("2026-08-24"),
+    ]);
+    expect(guest.perNightCents).toEqual([LOW, LOW, HIGH, HIGH]);
+    expect(guest.perNightCents.reduce<number>((a, b) => a + (b ?? Number.NaN), 0)).toBe(guest.priceCents);
+    expect(result.newTotalPriceCents).toBe(2 * LOW + 2 * HIGH);
+    // Xero rebuilds its lines per contiguous run of equal price, so the runs
+    // have to multiply back out: 2 x LOW and 2 x HIGH, no phantom balance.
+    expect(2 * LOW + 2 * HIGH).toBe(guest.priceCents);
+  });
+
+  /**
+   * A removal ACROSS a rate rise, which is the shape the refund half of #2744
+   * exists for. Both nights sit in the HIGH season (from 08-23) but were bought
+   * at LOW and the rows say so, so the price the member paid and the price the
+   * table would quote today are DIFFERENT NUMBERS — which is what makes the
+   * assertions below discriminate. An earlier version of this fixture gave back
+   * 2026-08-22, a night the `s-low` season still covers, so the stored price and
+   * today's rate were the same LOW and the test passed with the locked prices
+   * removed from the pricing window entirely.
+   */
+  function removalArgs(
+    {
+      withNightRows = true,
+      editableFrom = D("2026-08-24"),
+    }: { withNightRows?: boolean; editableFrom?: Date } = {},
+  ) {
+    const guest = editDoorGuest({
+      id: "g1",
+      ageTier: "ADULT",
+      isMember: true,
+      memberId: "m1",
+      rateMembershipTypeId: MEMBER_TYPE,
+      stayStart: D("2026-08-23"),
+      stayEnd: D("2026-08-25"),
+      nights: withNightRows
+        ? [
+            { stayDate: D("2026-08-23"), priceCents: LOW, priceSource: "SOLD" },
+            { stayDate: D("2026-08-24"), priceCents: LOW, priceSource: "SOLD" },
+          ]
+        : [],
+      priceCents: 2 * LOW,
+    });
+    // A companion on the same nights, so taking g1 off does not leave the
+    // booking with future nights nobody holds (which the plan refuses, #2736).
+    // Always rowed: the shape under test is g1's, not the booking's.
+    const companion = editDoorGuest({
+      ...guest,
+      id: "g2",
+      memberId: "m2",
+      nights: [
+        { stayDate: D("2026-08-23"), priceCents: LOW, priceSource: "SOLD" },
+        { stayDate: D("2026-08-24"), priceCents: LOW, priceSource: "SOLD" },
+      ],
+    });
+    const totalPriceCents = 4 * LOW;
+    return {
+      booking: editDoorBooking({
+        id: "b1",
+        memberId: "m1",
+        lodgeId: "lodge-1",
+        checkIn: D("2026-08-23"),
+        checkOut: D("2026-08-25"),
+        totalPriceCents,
+        discountCents: 0,
+        promoAdjustmentCents: 0,
+        finalPriceCents: totalPriceCents,
+        guests: [guest, companion],
+      }),
+      bookingId: "b1",
+      isInProgressEdit: true,
+      // The 24th is the only night this edit can still touch; the 23rd is slept.
+      editableFrom,
+      newCheckIn: D("2026-08-23"),
+      newCheckOut: D("2026-08-25"),
+      normalizedAddGuests: undefined,
+      removeGuestIds: ["g1"],
+      guestsForPricing: [
+        {
+          bookingGuestId: "g2",
+          ageTier: "ADULT" as const,
+          isMember: true,
+          memberId: "m2",
+          stayStart: D("2026-08-23"),
+          stayEnd: D("2026-08-25"),
+        },
+      ],
+      skipBookingLifecycleRules: false,
+      seasonRateData: SEASONS as never,
+      partnerSharedGuests: [],
+    };
+  }
+
+  it("credits a removal at the stored price, so nobody comes off owing less than nothing", async () => {
+    // The club has raised its rate to HIGH since this booking was made, and an
+    // officer takes the guest off from the 24th. The 24th is given back at the
+    // LOW it was sold for — not the HIGH it would cost to buy today — leaving
+    // exactly the 23rd they slept, at what they paid for it.
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const result = await pricedPricing(NO_DISCOUNT_TX, removalArgs());
+    const guest = result.priceBreakdown.guests[0];
+    const plan = result.inProgressPlan?.proposedExistingGuests[0];
+
+    // The two numbers this test turns on: what they paid, and what it costs now.
+    expect(HIGH).not.toBe(LOW);
+    expect(plan?.oldFuturePriceCents).toBe(LOW);
+    expect(plan?.futureDeltaCents).toBe(-LOW);
+    expect(guest.priceCents).toBe(LOW);
+    // Acceptance criterion 1, through the real wiring: nobody comes off a
+    // booking owing less than nothing. Crediting today's HIGH against a stored
+    // 2 x LOW is what used to leave a guest who genuinely slept at the lodge
+    // showing 1000 instead of 5000 — still positive here only by accident of
+    // the numbers, which is why the delta above is asserted too.
+    expect(guest.priceCents).toBeGreaterThanOrEqual(0);
+    expect(guest.nightDates).toEqual([D("2026-08-23")]);
+    expect(guest.perNightCents).toEqual([LOW]);
+  });
+
+  it("T8: credits a removal with no row at its share of the stored total, landing on exactly $0 without a clamp", async () => {
+    // A booking approved from a request writes no `BookingGuestNight` rows
+    // (#2739). The old code valued its nights at today's HIGH and clamped the
+    // result; #3031 refused and #3170 parked it. #4317 values each night at its
+    // share of the stored 2 x LOW (R2), so removing the guest from the 23rd
+    // credits exactly 2 x LOW and leaves them on $0 — the stored total, not a
+    // clamp.
+    h.checkCapacityForGuestRanges.mockResolvedValue(AVAILABLE);
+
+    const result = await pricedPricing(
+      NO_DISCOUNT_TX,
+      removalArgs({
+        withNightRows: false,
+        // Removed from the 23rd, so BOTH nights are given back.
+        editableFrom: D("2026-08-23"),
+      }),
+    );
+    const plan = result.inProgressPlan?.proposedExistingGuests[0];
+
+    expect(2 * HIGH).toBeGreaterThan(2 * LOW);
+    expect(plan?.oldFuturePriceCents).toBe(2 * LOW);
+    expect(plan?.priceCents).toBe(0);
+    expect(result.priceBreakdown.guests[0].nightDates).toEqual([]);
+  });
+});

@@ -1,0 +1,98 @@
+import { isHttpUrl } from "@/lib/http-url";
+import {
+  DATA_ENCRYPTION_KEYS_ENV,
+  DATA_ENCRYPTION_LEGACY_KEY_ENV,
+  parseDataEncryptionKeys,
+} from "@/lib/data-encryption-key-material";
+
+function readEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+export function getAuthSecret(): string | undefined {
+  return readEnv("AUTH_SECRET") ?? readEnv("NEXTAUTH_SECRET");
+}
+
+/** Resolve the auth secret at call time, or fail closed with the caller's error. */
+export function requireAuthSecret(
+  errorMessage = "AUTH_SECRET or NEXTAUTH_SECRET is required",
+): string {
+  const secret = getAuthSecret();
+  if (!secret) {
+    throw new Error(errorMessage);
+  }
+  return secret;
+}
+
+export function getAuthTrustHost(): boolean {
+  const raw = readEnv("AUTH_TRUST_HOST");
+  return raw === "true";
+}
+
+// test seam
+export function getRuntimeConfigIssues(): string[] {
+  const issues: string[] = [];
+  const authSecret = getAuthSecret();
+
+  if (!authSecret) {
+    issues.push("AUTH_SECRET or NEXTAUTH_SECRET is required");
+  }
+
+  // #4456: an invalid data-encryption key ring makes credential capture and
+  // every two-factor code throw, so the release is not ready: readiness fails
+  // and blue/green never switches traffic to it. An UNSET ring is valid; the
+  // legacy-key switch set without one, or to anything but `retired`, is not.
+  const ring = parseDataEncryptionKeys(
+    readEnv(DATA_ENCRYPTION_KEYS_ENV),
+    authSecret,
+    readEnv(DATA_ENCRYPTION_LEGACY_KEY_ENV),
+  );
+  if (ring.status === "invalid") {
+    issues.push(ring.reason);
+  }
+
+  const nextAuthUrl = readEnv("NEXTAUTH_URL");
+  if (!nextAuthUrl) {
+    issues.push("NEXTAUTH_URL is required");
+  } else if (!isHttpUrl(nextAuthUrl)) {
+    issues.push("NEXTAUTH_URL must be a valid http(s) URL");
+  }
+
+  if (!readEnv("CRON_SECRET")) {
+    issues.push("CRON_SECRET is required");
+  }
+
+  const authTrustHost = readEnv("AUTH_TRUST_HOST");
+  if (
+    authTrustHost !== undefined &&
+    authTrustHost !== "true" &&
+    authTrustHost !== "false"
+  ) {
+    issues.push("AUTH_TRUST_HOST must be true or false");
+  }
+
+  return issues;
+}
+
+export function getRuntimeConfigCheck(): {
+  status: "ok" | "error";
+  latencyMs: number;
+  error?: string;
+} {
+  const start = Date.now();
+  const issues = getRuntimeConfigIssues();
+
+  if (issues.length === 0) {
+    return {
+      status: "ok",
+      latencyMs: Date.now() - start,
+    };
+  }
+
+  return {
+    status: "error",
+    latencyMs: Date.now() - start,
+    error: issues.join("; "),
+  };
+}

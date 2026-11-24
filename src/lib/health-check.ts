@@ -1,0 +1,360 @@
+import { getAppVersion } from "@/lib/app-version";
+import {
+  readEnvironmentRoleDeclaration,
+  type EnvironmentRoleDeclaration,
+} from "@/lib/environment-role-declaration";
+import { prisma } from "@/lib/prisma";
+import { readXeroConnection } from "@/lib/xero-connection";
+import { readXeroTaxHealth } from "@/lib/xero-tax-health";
+import { getRuntimeConfigCheck } from "@/lib/runtime-config";
+import { countExhaustedPaymentRecoveryOperations } from "@/lib/payment-recovery-health";
+import { PAYMENT_RECOVERY_CLAIMABLE_LATER_WHERE } from "@/lib/payment-recovery-constants";
+import { getOperationalStripeSecretKey } from "@/lib/stripe-config";
+import { readCronRuntimeZone } from "@/lib/cron-runtime-zone";
+
+interface CheckResult {
+  status: "ok" | "error";
+  latencyMs: number;
+  error?: string;
+}
+
+export interface DetailedHealthReport {
+  status: "healthy" | "degraded" | "unhealthy";
+  version: string;
+  uptime: number;
+  checks: {
+    db: CheckResult;
+    config?: CheckResult;
+    stripe: CheckResult;
+    xero: CheckResult;
+    smtp: CheckResult;
+    paymentRecovery: CheckResult;
+  };
+}
+
+export interface PublicHealthReport {
+  status: "healthy" | "unhealthy";
+  version: string;
+  uptime: number;
+  checks: {
+    db: Omit<CheckResult, "error">;
+  };
+}
+
+export interface ReadinessHealthReport {
+  status: "healthy" | "unhealthy";
+  version: string;
+  uptime: number;
+  checks: {
+    db: Omit<CheckResult, "error">;
+    config: Omit<CheckResult, "error">;
+  };
+}
+
+export interface RuntimeStatusReport {
+  cronEnabled: boolean;
+  role: string;
+  /**
+   * The zone THIS process registered its scheduled jobs against, or `null` when
+   * it did not register them (CT-5, #2869).
+   *
+   * The admin health page runs on a web slot and the scheduler runs in the cron
+   * leader, so without this the page can only report the club's CONFIGURED zone
+   * — which is a different fact between an admin changing it and the next
+   * restart. See `@/lib/cron-runtime-zone`.
+   */
+  clubTimeZone: string | null;
+  /**
+   * What THIS RUNNING PROCESS parsed out of `APP_ENVIRONMENT_ROLE`
+   * (ENV-SAFETY 1, #3034; epic #2986; INV-CONFIG-003) — the container's own
+   * self-report, which is the only witness that cannot disagree with what the
+   * container actually got.
+   *
+   * THE DECLARATION KIND, NOT THE EFFECTIVE ROLE, and the difference is
+   * load-bearing. A correctly declared production installation whose
+   * administrator has switched the safer override on legitimately RESOLVES
+   * `NON_PRODUCTION`, so a deploy asserting the resolved role would refuse a
+   * legitimate release. The declaration is also the half a deployment owns.
+   * `readEnvironmentRoleDeclaration()` is the pure, database-free parser,
+   * which is what makes it safe to call from a health endpoint at all.
+   *
+   * Both routes that expose this are authenticated — `/api/deploy/runtime-status`
+   * behind `requireCronSecret` and `/api/admin/runtime-status` behind
+   * `requireAdmin` — so the four-value enum sits beside the `role`
+   * (`web-blue` / `cron-leader`) that is already there. It carries no secret:
+   * an `invalid` declaration is reported as `invalid` and the refused value
+   * itself is deliberately NOT included.
+   */
+  environmentRole: EnvironmentRoleDeclaration["kind"];
+}
+
+const CHECK_TIMEOUT_MS = 3000;
+const processStartTime = Date.now();
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Timeout")), timeoutMs),
+    ),
+  ]);
+}
+
+async function checkDatabase(): Promise<CheckResult> {
+  const start = Date.now();
+  try {
+    await withTimeout(prisma.$queryRaw`SELECT 1`, CHECK_TIMEOUT_MS);
+    return { status: "ok", latencyMs: Date.now() - start };
+  } catch (err) {
+    return {
+      status: "error",
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}
+
+async function checkStripe(): Promise<CheckResult> {
+  const start = Date.now();
+  try {
+    // DB-only (#2082): resolve from the encrypted store, not the environment.
+    const key = await withTimeout(
+      getOperationalStripeSecretKey(),
+      CHECK_TIMEOUT_MS,
+    );
+    if (!key) {
+      return {
+        status: "error",
+        latencyMs: Date.now() - start,
+        error: "Stripe secret key not configured",
+      };
+    }
+    if (
+      !key.startsWith("sk_test_") &&
+      !key.startsWith("sk_live_") &&
+      !key.startsWith("rk_")
+    ) {
+      return {
+        status: "error",
+        latencyMs: Date.now() - start,
+        error: "Invalid key format",
+      };
+    }
+    return { status: "ok", latencyMs: Date.now() - start };
+  } catch (err) {
+    return {
+      status: "error",
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}
+
+async function checkXero(): Promise<CheckResult> {
+  const start = Date.now();
+  try {
+    const token = await withTimeout(readXeroConnection(), CHECK_TIMEOUT_MS);
+    if (!token) {
+      return {
+        status: "error",
+        latencyMs: Date.now() - start,
+        error: "Not connected",
+      };
+    }
+    if (token.expiresAt < new Date()) {
+      return {
+        status: "error",
+        latencyMs: Date.now() - start,
+        error: "Token expired",
+      };
+    }
+    // #4632: the tax code in force must still be usable in Xero. A read that
+    // fails or times out says nothing about tax, so it leaves the check ok.
+    const tax = await withTimeout(readXeroTaxHealth(), CHECK_TIMEOUT_MS).catch(() => null);
+    if (tax && tax.problems.length > 0) {
+      return { status: "error", latencyMs: Date.now() - start, error: tax.problems.join(" ") };
+    }
+    return { status: "ok", latencyMs: Date.now() - start };
+  } catch (err) {
+    return {
+      status: "error",
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}
+
+/**
+ * Prove the mail provider answers, WITHOUT acquiring anything that could send
+ * (#3035). `verifyEmailTransport` hands back a label and no transport, so this
+ * diagnostic cannot mail a member even by accident, and it needs no delivery
+ * clearance. It does inherit the ambiguous-configuration rule: an installation
+ * that is not confirmed production and sets neither provider flag now reports an
+ * invalid configuration rather than silently connecting to live AWS SES with the
+ * club's own credentials.
+ *
+ * Imported dynamically so a caller of this module does not statically pull
+ * nodemailer into its graph, which is what the previous shape did too.
+ */
+async function checkSmtp(): Promise<CheckResult> {
+  const start = Date.now();
+  try {
+    const { verifyEmailTransport } = await import("@/lib/email/internal");
+    await verifyEmailTransport();
+    return { status: "ok", latencyMs: Date.now() - start };
+  } catch (err) {
+    return {
+      status: "error",
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}
+
+const PAYMENT_RECOVERY_STALE_THRESHOLD_MS = 15 * 60 * 1000;
+
+async function checkPaymentRecoveryQueue(): Promise<CheckResult> {
+  const start = Date.now();
+  try {
+    const staleThreshold = new Date(
+      Date.now() - PAYMENT_RECOVERY_STALE_THRESHOLD_MS,
+    );
+    const [stale, exhausted] = await withTimeout(
+      Promise.all([
+        prisma.paymentRecoveryOperation.count({
+          where: {
+            status: "PENDING",
+            createdAt: { lt: staleThreshold },
+            // #4104: a dead row is never claimed; it is counted as exhausted.
+            ...PAYMENT_RECOVERY_CLAIMABLE_LATER_WHERE,
+          },
+        }),
+        countExhaustedPaymentRecoveryOperations(),
+      ]),
+      CHECK_TIMEOUT_MS,
+    );
+
+    const problems: string[] = [];
+    if (stale > 0) {
+      problems.push(
+        `${stale} payment recovery operation(s) pending > 15 minutes; check the cron leader's 15-minute payments cycle (payment-recovery on admin cron health)`,
+      );
+    }
+    if (exhausted > 0) {
+      problems.push(
+        `${exhausted} payment recovery operation(s) exhausted retries and need manual reconciliation`,
+      );
+    }
+
+    if (problems.length > 0) {
+      return {
+        status: "error",
+        latencyMs: Date.now() - start,
+        error: problems.join("; "),
+      };
+    }
+    return { status: "ok", latencyMs: Date.now() - start };
+  } catch (err) {
+    return {
+      status: "error",
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}
+
+function getBaseMetadata() {
+  return {
+    version: getAppVersion(),
+    uptime: Math.floor((Date.now() - processStartTime) / 1000),
+  };
+}
+
+function toPublicCheckResult(check: CheckResult) {
+  return {
+    status: check.status,
+    latencyMs: check.latencyMs,
+  };
+}
+
+export function getRuntimeStatus(): RuntimeStatusReport {
+  return {
+    cronEnabled: (process.env.CRON_ENABLED ?? "true").toLowerCase() === "true",
+    role: process.env.APP_RUNTIME_ROLE ?? "unknown",
+    clubTimeZone: readCronRuntimeZone(),
+    environmentRole: readEnvironmentRoleDeclaration().kind,
+  };
+}
+
+export async function getDetailedHealthReport(): Promise<{
+  httpStatus: number;
+  report: DetailedHealthReport;
+}> {
+  const [db, stripe, xero, smtp, paymentRecovery] = await Promise.all([
+    checkDatabase(),
+    checkStripe(),
+    checkXero(),
+    checkSmtp(),
+    checkPaymentRecoveryQueue(),
+  ]);
+  const config = getRuntimeConfigCheck();
+
+  const isUnhealthy = db.status === "error";
+  const isDegraded =
+    !isUnhealthy &&
+    (config.status === "error" ||
+      stripe.status === "error" ||
+      xero.status === "error" ||
+      smtp.status === "error" ||
+      paymentRecovery.status === "error");
+
+  return {
+    httpStatus: isUnhealthy ? 503 : 200,
+    report: {
+      ...getBaseMetadata(),
+      status: isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
+      checks: { db, config, stripe, xero, smtp, paymentRecovery },
+    },
+  };
+}
+
+export async function getPublicHealthReport(): Promise<{
+  httpStatus: number;
+  report: PublicHealthReport;
+}> {
+  const db = await checkDatabase();
+  const publicDbCheck = toPublicCheckResult(db);
+
+  return {
+    httpStatus: db.status === "ok" ? 200 : 503,
+    report: {
+      ...getBaseMetadata(),
+      status: db.status === "ok" ? "healthy" : "unhealthy",
+      checks: { db: publicDbCheck },
+    },
+  };
+}
+
+export async function getReadinessHealthReport(): Promise<{
+  httpStatus: number;
+  report: ReadinessHealthReport;
+}> {
+  const db = await checkDatabase();
+  const config = getRuntimeConfigCheck();
+  const isHealthy = db.status === "ok" && config.status === "ok";
+
+  return {
+    httpStatus: isHealthy ? 200 : 503,
+    report: {
+      ...getBaseMetadata(),
+      status: isHealthy ? "healthy" : "unhealthy",
+      checks: {
+        db: toPublicCheckResult(db),
+        config: toPublicCheckResult(config),
+      },
+    },
+  };
+}

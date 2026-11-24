@@ -1,0 +1,573 @@
+import { renderToStaticMarkup } from "react-dom/server";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    // #3372 (owner, 7 Oct 2026): Refunds owed / Credits owed, as at today.
+    manualRefundTask: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    memberCredit: { groupBy: vi.fn(async (): Promise<unknown[]> => []) },
+    // #3372 (7 Oct 2026): card refunds not yet paid, for "Refunds owed".
+    paymentRecoveryOperation: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    // The club-time delegate. `loadPersistedClubTimeSettings` returns `null`
+    // when it is ABSENT, and the page then falls back to the environment — the
+    // very defect CT-4 removes, silently, with nothing able to tell. Every test
+    // here leaves it resolving `null`, which reproduces the no-row fallback and
+    // keeps their expectations unchanged; the zone-authority test supplies a row.
+    clubTimeSettings: { findUnique: vi.fn() },
+    member: { count: vi.fn(), findUnique: vi.fn() },
+    booking: { count: vi.fn(), findMany: vi.fn() },
+    choreAssignment: { findMany: vi.fn() },
+    bedAllocation: { findMany: vi.fn() },
+    payment: { findMany: vi.fn() },
+    // #4969: the Booking Requests counts come from the real
+    // getBookingRequestPendingCounts over these tables (see mockDashboardCounts).
+    bookingChangeRequest: { count: vi.fn() },
+    newBookingPolicyExceptionRequest: { count: vi.fn(async () => 0) },
+    bookingRequest: { count: vi.fn(async () => 0) },
+    lodge: { count: vi.fn() },
+  },
+}));
+
+vi.mock("@/lib/auth", () => ({
+  auth: vi.fn(),
+}));
+
+// #4962: the attention cards read the one work-queue counter the sidebar's
+// Needs Attention badges read. Its queries are pinned in
+// admin-pending-counts.test.ts; this suite pins the cards and their links.
+vi.mock("@/lib/admin-pending-counts", () => ({
+  getAdminPendingCounts: vi.fn(),
+}));
+
+// Partial mock: only the query is faked. coverageNeedsLodgeContext and
+// coverageLodgeLabel are pure functions over the rows and the lodge count this
+// suite supplies, so mocking them would only let the suite disagree with
+// production about when a lodge name is shown (#2917).
+vi.mock("@/lib/hut-leader-coverage", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/hut-leader-coverage")),
+  // #3818: the amber card and "Handovers this week" come from one read.
+  getHutLeaderDashboardCoverage: vi.fn(),
+}));
+
+// The Bed Allocation card needs the module on as well as the permission (#3841).
+vi.mock("@/lib/module-settings", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/module-settings")),
+  loadEffectiveModuleFlags: vi.fn(async () => ({ bedAllocation: true })),
+}));
+
+import AdminDashboardPage from "@/app/(admin)/admin/dashboard/page";
+import { getAdminPendingCounts } from "@/lib/admin-pending-counts";
+import { getBookingRequestPendingCounts } from "@/lib/admin-booking-request-pending-counts";
+import { ZERO_ADMIN_PENDING_COUNTS } from "@/lib/admin-work-queues";
+import { auth } from "@/lib/auth";
+import { BED_ALLOCATABLE_BOOKING_STATUSES } from "@/lib/bed-allocation-lifecycle";
+import {
+  OPERATIONAL_STAY_BOOKING_STATUSES,
+  UPCOMING_CHECK_IN_BOOKING_STATUSES,
+} from "@/lib/booking-status";
+import { addDaysDateOnly, formatDateOnly, getTodayDateOnly } from "@/lib/date-only";
+import { ENVIRONMENT_CLUB_ZONE } from "@/lib/__tests__/helpers/environment-club-zone";
+import { chooseDivergentClubZone } from "@/lib/__tests__/helpers/club-time-zone";
+import {
+  getHutLeaderDashboardCoverage,
+} from "@/lib/hut-leader-coverage";
+import { prisma } from "@/lib/prisma";
+import { buildBookingRequestsHref } from "@/lib/admin-booking-requests-path";
+import {
+  netCollectedBookingSelect,
+  netCollectedCaptureEvidenceSelect,
+  netCollectedCardRefundSelect,
+} from "@/lib/additional-ledger-gap";
+
+function mockDashboardCounts({
+  pendingBookingReviews,
+  pendingBookingChangeRequests,
+  pendingPolicyExceptionRequests = 0,
+  pendingModificationPolicyExceptions = 0,
+  pendingPublicBookingRequests = 0,
+  pendingDeletionRequests = 0,
+  unpaidFinishedStays = 0,
+  unsettledAdditionalFinishedStays = 0,
+  unsettledAdditionalUpcomingStays = 0,
+}: {
+  pendingBookingReviews: number;
+  pendingBookingChangeRequests: number;
+  /** New-booking exception requests (their own table). */
+  pendingPolicyExceptionRequests?: number;
+  /** POLICY_EXCEPTION change requests, listed on the Policy Exceptions tab. */
+  pendingModificationPolicyExceptions?: number;
+  pendingPublicBookingRequests?: number;
+  pendingDeletionRequests?: number;
+  unpaidFinishedStays?: number;
+  unsettledAdditionalFinishedStays?: number;
+  unsettledAdditionalUpcomingStays?: number;
+}) {
+  // A Full Admin actor so every permission-gated officer card renders (#2091).
+  vi.mocked(auth).mockResolvedValue({ user: { id: "admin-1" } } as any);
+  vi.mocked(prisma.member.findUnique).mockResolvedValue({
+    id: "admin-1",
+    canLogin: true,
+    accessRoles: [{ role: "ADMIN" }],
+  } as any);
+  vi.mocked(prisma.member.count).mockResolvedValue(0);
+  // booking.count serves getStats()'s own totals (totalBookings,
+  // activeBookings, upcomingCheckIns). The roster and bed officer-card counts
+  // run through window-scoped helpers backed by booking.findMany +
+  // choreAssignment.findMany / bedAllocation.findMany (all mocked empty below
+  // → count 0). Every work-queue count comes from getAdminPendingCounts (#4962).
+  // Its one booking.count of its own, the Approvals queue, is the booking
+  // review where (#4969).
+  vi.mocked(prisma.booking.count).mockImplementation((async (args?: {
+    where?: { adminReviewStatus?: unknown };
+  }) =>
+    args?.where?.adminReviewStatus === "PENDING" ? pendingBookingReviews : 0) as any);
+  // The four Booking Requests counts are the real getBookingRequestPendingCounts
+  // over the tables mocked below (#4969), so a change-type policy exception is
+  // counted on the Policy Exceptions tab exactly as in production.
+  vi.mocked(getAdminPendingCounts).mockImplementation(async () => ({
+    ...ZERO_ADMIN_PENDING_COUNTS,
+    unavailable: [],
+    ...(await getBookingRequestPendingCounts()),
+    deletionRequests: pendingDeletionRequests,
+    unpaidFinishedStays,
+    unsettledAdditionalFinishedStays,
+    unsettledAdditionalUpcomingStays,
+  }));
+  // #3372: the revenue card reads the month's payments.
+  vi.mocked(prisma.payment.findMany).mockResolvedValue([] as any);
+  vi.mocked(prisma.booking.findMany).mockResolvedValue([]);
+  vi.mocked(prisma.choreAssignment.findMany).mockResolvedValue([] as any);
+  vi.mocked(prisma.bedAllocation.findMany).mockResolvedValue([] as any);
+  vi.mocked(prisma.bookingChangeRequest.count).mockImplementation((async (
+    args: { where?: { kind?: string } },
+  ) =>
+    args.where?.kind === "POLICY_EXCEPTION"
+      ? pendingModificationPolicyExceptions
+      : pendingBookingChangeRequests) as any);
+  vi.mocked(prisma.newBookingPolicyExceptionRequest.count).mockResolvedValue(
+    pendingPolicyExceptionRequests,
+  );
+  vi.mocked(prisma.bookingRequest.count).mockResolvedValue(
+    pendingPublicBookingRequests,
+  );
+  vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({
+    unassignedDates: [],
+    handovers: [],
+  });
+  // Single-lodge club: this suite asserts hrefs, not lodge copy (#2917).
+  vi.mocked(prisma.lodge.count).mockResolvedValue(1);
+}
+
+describe("admin dashboard deep links", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prisma.clubTimeSettings.findUnique).mockResolvedValue(null);
+  });
+
+  it("links booking request alerts to the changes tab when only change requests are pending", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 2,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain('href="/admin/booking-requests?tab=changes"');
+  });
+
+  it("links booking request alerts to the approvals tab when booking reviews are pending", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 1,
+      pendingBookingChangeRequests: 2,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain('href="/admin/booking-requests?tab=approvals"');
+  });
+
+  // #4969: the card opens the tab the Booking Requests page itself would land
+  // on, so a policy exception or public request alone no longer hides the card
+  // or sends the officer to an empty Approvals tab.
+  it.each([
+    {
+      queue: "only policy exceptions",
+      counts: { pendingPolicyExceptionRequests: 1 },
+      tab: "exceptions" as const,
+      summary: "1 policy exception request waiting",
+    },
+    {
+      queue: "only change-type policy exceptions",
+      counts: { pendingModificationPolicyExceptions: 2 },
+      tab: "exceptions" as const,
+      summary: "2 policy exception requests waiting",
+    },
+    {
+      queue: "new-booking and change-type policy exceptions",
+      counts: {
+        pendingPolicyExceptionRequests: 1,
+        pendingModificationPolicyExceptions: 1,
+      },
+      tab: "exceptions" as const,
+      summary: "2 policy exception requests waiting",
+    },
+    {
+      queue: "only public requests",
+      counts: { pendingPublicBookingRequests: 3 },
+      tab: "public" as const,
+      summary: "3 public booking requests waiting",
+    },
+    {
+      queue: "changes, exceptions and public requests",
+      counts: {
+        pendingBookingChangeRequests: 1,
+        pendingPolicyExceptionRequests: 2,
+        pendingPublicBookingRequests: 1,
+      },
+      tab: "changes" as const,
+      summary:
+        "1 change request, 2 policy exception requests and 1 public booking request waiting",
+    },
+  ])("links the booking request card to the page's landing tab when $queue are pending", async ({ counts, tab, summary }) => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+      ...counts,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain(`href="${buildBookingRequestsHref(tab)}"`);
+    expect(html).toContain(summary);
+  });
+
+  it("hides the booking request card when no queue has work", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).not.toContain("/admin/booking-requests");
+  });
+
+  it("links pending account deletion request alerts to the deletion request queue", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+      pendingDeletionRequests: 2,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    // #4962: the page lists both deletion flows, so the card opens it unfiltered.
+    expect(html).toContain('href="/admin/deletion-requests"');
+    expect(html).toContain("Account Deletion Requests");
+    expect(html).toContain(
+      "2 account deletion requests waiting for admin review",
+    );
+  });
+
+  it("flags unpaid finished stays and links to the pre-filtered bookings list", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+      unpaidFinishedStays: 3,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+    const todayKey = formatDateOnly(getTodayDateOnly(ENVIRONMENT_CLUB_ZONE));
+
+    expect(html).toContain("Unpaid Finished Stays");
+    expect(html).toContain(
+      `href="/admin/bookings?unpaid=finished&amp;checkOutTo=${todayKey}"`,
+    );
+    expect(html).toContain("3 bookings still payment pending after check-out");
+
+    // The count is the shared work-queue counter's, on this render's club day
+    // (#4962); its finished-stay predicate (#1709) is pinned in
+    // admin-pending-counts.test.ts rather than duplicated here.
+    expect(vi.mocked(getAdminPendingCounts)).toHaveBeenCalledWith(
+      expect.objectContaining({ today: getTodayDateOnly(ENVIRONMENT_CLUB_ZONE) }),
+    );
+  });
+
+  it("hides the unpaid finished stays card when no finished stay is owing", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).not.toContain("Unpaid Finished Stays");
+  });
+
+  it("flags unsettled stay additions and links to the additionalOwed filter (#1723, split by #2350)", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+      unsettledAdditionalFinishedStays: 3,
+      unsettledAdditionalUpcomingStays: 2,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain("Bookings With Unpaid Additions");
+    // #2350: one link covering BOTH halves — the bookings list has no
+    // upcoming-only filter, and the split is stated in the label instead.
+    expect(html).toContain(`href="/admin/bookings?additionalOwed=owed"`);
+    expect(html).toContain("5 confirmed bookings");
+    expect(html).toContain("2 upcoming");
+    expect(html).toContain("3 finished");
+
+    // The counts come from the shared work-queue counter (#4962), whose
+    // sibling finished-stay predicate (#1723 path 2) is pinned in
+    // admin-pending-counts.test.ts.
+  });
+
+  it("hides the unpaid-additions card when every finished stay's additions are settled", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).not.toContain("Finished Stays With Unpaid Additions");
+  });
+
+  it("scopes the officer-card counts to the next-7-day window using each surface's own filters (#2091)", async () => {
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+    });
+
+    await AdminDashboardPage();
+
+    const today = getTodayDateOnly(ENVIRONMENT_CLUB_ZONE);
+    const to = addDaysDateOnly(today, 7);
+
+    // Bookings card count matches the list it links to (/admin/bookings?
+    // upcoming=7): the upcoming status set (excludes AWAITING_REVIEW), not
+    // deleted, check-in within the next 7 days.
+    expect(vi.mocked(prisma.booking.count).mock.calls).toContainEqual([
+      {
+        where: {
+          status: { in: [...UPCOMING_CHECK_IN_BOOKING_STATUSES] },
+          deletedAt: null,
+          checkIn: { gte: today, lte: to },
+        },
+      },
+    ]);
+
+    // Roster count: operational stays overlapping the window, guest-existence
+    // required (roster-status.ts semantics), scoped to today..+7. #2631: the
+    // overlap is checkout-INCLUSIVE, because a stay whose last night was
+    // yesterday still needs this morning's chores done.
+    const rosterCall = vi
+      .mocked(prisma.booking.findMany)
+      .mock.calls.find(
+        ([args]) =>
+          JSON.stringify((args as { where?: { status?: unknown } })?.where?.status) ===
+          JSON.stringify({ in: [...OPERATIONAL_STAY_BOOKING_STATUSES] }),
+      );
+    expect(rosterCall).toBeDefined();
+    expect((rosterCall![0] as { where: unknown }).where).toMatchObject({
+      deletedAt: null,
+      checkIn: { lt: to },
+      checkOut: { gte: today },
+      guests: { some: { stayStart: { lt: to }, stayEnd: { gte: today } } },
+    });
+
+    // Chore assignments read for the same window.
+    expect(vi.mocked(prisma.choreAssignment.findMany).mock.calls).toContainEqual([
+      {
+        where: { date: { gte: today, lt: to } },
+        select: { date: true, status: true, bookingId: true },
+      },
+    ]);
+
+    // Bed count: allocatable stays overlapping the window, whole-lodge holds
+    // excluded, guest-existence required (bed-allocation-board.ts semantics).
+    const bedCall = vi
+      .mocked(prisma.booking.findMany)
+      .mock.calls.find(
+        ([args]) =>
+          (args as { where?: { wholeLodgeHold?: unknown } })?.where
+            ?.wholeLodgeHold === false,
+      );
+    expect(bedCall).toBeDefined();
+    expect((bedCall![0] as { where: unknown }).where).toMatchObject({
+      deletedAt: null,
+      status: { in: [...BED_ALLOCATABLE_BOOKING_STATUSES] },
+      wholeLodgeHold: false,
+      checkIn: { lt: to },
+      checkOut: { gt: today },
+      guests: { some: { stayStart: { lt: to }, stayEnd: { gt: today } } },
+    });
+
+    // Bed allocations diffed for the same window at guest-night granularity.
+    expect(vi.mocked(prisma.bedAllocation.findMany).mock.calls).toContainEqual([
+      {
+        where: { stayDate: { gte: today, lt: to } },
+        select: { bookingGuestId: true, stayDate: true },
+      },
+    ]);
+  });
+
+  /**
+   * THE DISCRIMINATING ONE (CT-4, #2870).
+   *
+   * The window test above renders with NO persisted row, so the page falls back
+   * to the environment seed and its `getTodayDateOnly()`-derived expectations
+   * agree with it. That is a correct thing to pin — it is the no-row fallback —
+   * but it says nothing about AUTHORITY, and until this test existed the
+   * dashboard's whole `getStats` derivation (the seven-day window AND the
+   * month bounds behind "revenue this month") had never once been exercised
+   * against a persisted zone. Every assertion on this page would have passed
+   * against the `APP_TIME_ZONE` code CT-4 replaced.
+   *
+   * The zone is CHOSEN rather than written down, because a contributor or a CI
+   * image running with `TZ=America/Denver` would otherwise make the "divergent"
+   * literal the environment's own zone and quietly stop discriminating.
+   *
+   * Both halves are asserted because they fail differently: the seven-day
+   * window is date-only arithmetic on the club's day, while the month bounds
+   * are real instants bracketing the club's civil month — a zone-blind
+   * implementation of the second can still get the first right.
+   */
+  it("derives the seven-day window and the month bounds from the PERSISTED club zone", async () => {
+    const todayIn = (zone: string) =>
+      new Intl.DateTimeFormat("en-CA", {
+        timeZone: zone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        // An INDEPENDENT oracle rather than `clubToday`: reading "what this zone
+        // would say" through the kernel under test lets one defect satisfy both
+        // sides of the comparison.
+      }).format(new Date());
+    const chosen = chooseDivergentClubZone({
+      subject: "the club's today at the frozen instant",
+      answerKey: "today",
+      cases: [
+        {
+          // −6 at this date: still 30 June, so the civil month is JUNE while
+          // the environment's is July.
+          zone: "America/Denver",
+          today: "2026-06-30",
+          monthStart: "2026-06-01T06:00:00.000Z",
+          monthEnd: "2026-07-01T05:59:59.999Z",
+        },
+        {
+          // +14, no DST: already 1 July. Kept as the fallback candidate for a
+          // host whose own TZ is Denver.
+          zone: "Pacific/Kiritimati",
+          today: "2026-07-01",
+          monthStart: "2026-06-30T10:00:00.000Z",
+          monthEnd: "2026-07-31T09:59:59.999Z",
+        },
+      ],
+      answerFor: todayIn,
+      // NOT `["UTC"]` — see the note in the chooser: a "today" assertion has at
+      // most three calendar days to play with and adding UTC as a rival can
+      // leave a correct tree with no candidate.
+    });
+
+    mockDashboardCounts({
+      pendingBookingReviews: 0,
+      pendingBookingChangeRequests: 0,
+    });
+    vi.mocked(prisma.clubTimeSettings.findUnique).mockResolvedValue({
+      timeZone: chosen.zone,
+    } as never);
+
+    await AdminDashboardPage();
+
+    const clubToday = new Date(`${chosen.today}T00:00:00.000Z`);
+    const clubPlus7 = new Date(clubToday.getTime() + 7 * 86_400_000);
+    const environmentToday = new Date(`${todayIn(ENVIRONMENT_CLUB_ZONE)}T00:00:00.000Z`);
+
+    // The seven-day window: the upcoming-check-ins count is the cheapest place
+    // to read both bounds off one call.
+    expect(vi.mocked(prisma.booking.count).mock.calls).toContainEqual([
+      {
+        where: {
+          status: { in: [...UPCOMING_CHECK_IN_BOOKING_STATUSES] },
+          deletedAt: null,
+          checkIn: { gte: clubToday, lte: clubPlus7 },
+        },
+      },
+    ]);
+    // and it is NOT the environment's day, which is what makes this a proof of
+    // authority rather than of shape.
+    expect(clubToday.getTime()).not.toBe(environmentToday.getTime());
+
+    /*
+      THE HUT-LEADER COVERAGE CARD IS WINDOWED FROM THE SAME DAY, and it is
+      asserted here because it is the one officer card on this page that has its
+      own fallback. Since #3123 that fallback is `clubTodayDateOnlyInstant()`
+      rather than `getTodayDateOnly()`, so omitting the argument would no longer
+      answer from the environment's zone — it would take a SECOND, independent reading
+      of the club's day. That is still two "today"s on one dashboard: a request
+      crossing club midnight between the two reads leaves the coverage card
+      counting a night the roster and bed-allocation cards beside it have already
+      dropped. A default that silently works is exactly the kind of omission no
+      other assertion on this page can see (CT-4, #2870).
+    */
+    expect(vi.mocked(getHutLeaderDashboardCoverage)).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: { kind: "all" }, today: clubToday }),
+    );
+
+    /*
+      THE MONTH BOUNDS ARE NOT THE ENVIRONMENT'S EITHER — the same negative the
+      seven-day window carries above, and it has to come BEFORE the assertion
+      that uses these literals rather than after it.
+
+      `chooseDivergentClubZone` never checks this pair: `answerKey` is
+      `"today"`, so the chooser verifies `today` against an independent oracle
+      and takes `monthStart`/`monthEnd` on trust. A later edit that drifted
+      those literals into agreeing with the environment is the failure this
+      catches — and placed after the `toContainEqual` below it would never run,
+      because the first failing assertion ends the test. Here it also gives that
+      drift a legible message instead of an opaque deep-equal diff.
+
+      Denver is on 30 June at this instant and the environment on 1 July, so the
+      civil MONTHS differ, not merely the days.
+    */
+    expect(new Date(chosen.monthStart).getTime()).not.toBe(
+      Date.UTC(
+        environmentToday.getUTCFullYear(),
+        environmentToday.getUTCMonth(),
+        1,
+      ),
+    );
+
+    // The month bounds behind "revenue this month". Written out by hand rather
+    // than recomputed through the kernel, so a kernel defect cannot agree with
+    // itself here.
+    // #3372: every status and every booking, so the net-collected-cash
+    // derivation and not this query decides which statuses are captured and
+    // which bookings count.
+    expect(vi.mocked(prisma.payment.findMany).mock.calls).toContainEqual([
+      {
+        select: {
+          status: true,
+          amountCents: true,
+          refundedAmountCents: true,
+          ...netCollectedCaptureEvidenceSelect,
+          ...netCollectedCardRefundSelect,
+          booking: { select: netCollectedBookingSelect },
+        },
+        where: {
+          createdAt: {
+            gte: new Date(chosen.monthStart),
+            lte: new Date(chosen.monthEnd),
+          },
+        },
+      },
+    ]);
+  });
+});

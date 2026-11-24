@@ -1,0 +1,134 @@
+import { z } from "zod";
+import { isHttpUrl } from "@/lib/http-url";
+import { MODULE_KEYS, type ModuleKey } from "./modules";
+
+const bedTypeSchema = z.enum(["dormitory", "private", "shared"]);
+const ageTierIdSchema = z.enum(["INFANT", "CHILD", "YOUTH", "ADULT"]);
+
+const bedSchema = z
+  .object({
+    id: z.string().trim().min(1, "bed id is required"),
+    name: z.string().trim().min(1, "bed name is required"),
+    capacity: z.number().int().positive("bed capacity must be a positive integer"),
+    type: bedTypeSchema,
+  })
+  .strict();
+
+const nightlyRateSchema = z
+  .object({
+    memberCents: z.number().int().min(0, "memberCents must be >= 0"),
+    nonMemberCents: z.number().int().min(0, "nonMemberCents must be >= 0"),
+  })
+  .strict();
+
+const ageTierNightlyRatesSchema = z
+  .object({
+    winter: nightlyRateSchema,
+    summer: nightlyRateSchema,
+  })
+  .strict();
+
+const ageTierSchema = z
+  .object({
+    id: ageTierIdSchema,
+    label: z.string().trim().min(1, "age tier label is required"),
+    minAge: z.number().int().min(0, "minAge must be >= 0"),
+    maxAge: z
+      .number()
+      .int()
+      .min(0, "maxAge must be >= 0 when set")
+      .nullable(),
+    subscriptionRequiredForBooking: z.boolean(),
+    familyGroupRequestCreateMemberAllowed: z.boolean(),
+    nightlyRates: ageTierNightlyRatesSchema,
+  })
+  .strict()
+  .refine(
+    (tier) => tier.maxAge === null || tier.maxAge >= tier.minAge,
+    { message: "maxAge must be >= minAge", path: ["maxAge"] },
+  );
+
+const socialLinksSchema = z
+  .object({
+    // z.string().url() accepts any scheme (javascript:, data:, ...); the
+    // isHttpUrl refinement keeps social links http(s)-only like publicUrl.
+    facebook: z
+      .string()
+      .url("facebook social link must be a valid URL")
+      .refine(isHttpUrl, {
+        message: "facebook social link must be a valid http(s) URL",
+      })
+      .optional(),
+  })
+  .strict();
+
+export const clubConfigSchema = z
+  .object({
+    name: z.string().trim().min(1, "club name is required"),
+    shortName: z.string().trim().min(1).optional(),
+    supportEmail: z.string().email("supportEmail must be a valid email"),
+    contactEmail: z
+      .string()
+      .email("contactEmail must be a valid email")
+      .optional(),
+    publicUrl: z
+      .string()
+      .url("publicUrl must be a valid URL")
+      .refine(isHttpUrl, {
+        message: "publicUrl must be a valid http(s) URL",
+      })
+      .refine((url) => !url.endsWith("/"), {
+        message: "publicUrl must not end with a trailing slash",
+      }),
+    emailFromName: z.string().trim().min(1, "emailFromName is required"),
+    lodgeTravelNote: z.string().trim().min(1).optional(),
+    hutLeaderLabel: z.string().trim().min(1).optional(),
+    socialLinks: socialLinksSchema.optional(),
+    beds: z.array(bedSchema).min(1, "at least one bed is required"),
+    ageTiers: z.array(ageTierSchema).min(1, "at least one age tier is required"),
+  })
+  .strict()
+  .superRefine((cfg, ctx) => {
+    const bedIds = new Set<string>();
+    cfg.beds.forEach((bed, i) => {
+      if (bedIds.has(bed.id)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `duplicate bed id "${bed.id}"`,
+          path: ["beds", i, "id"],
+        });
+      }
+      bedIds.add(bed.id);
+    });
+
+    const tierIds = new Set<string>();
+    cfg.ageTiers.forEach((tier, i) => {
+      if (tierIds.has(tier.id)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `duplicate age tier id "${tier.id}"`,
+          path: ["ageTiers", i, "id"],
+        });
+      }
+      tierIds.add(tier.id);
+    });
+  });
+
+export type ClubConfig = z.infer<typeof clubConfigSchema>;
+
+// Derived from MODULE_KEYS rather than spelled out (#2996). The hand-written
+// form was not type-linked to the registry: a key missing here was silently
+// STRIPPED by z.object on parse, so a new module's flag could vanish between
+// storage and every reader with a green typecheck. `modules.ts` imports only the
+// FeatureFlags TYPE from this file, so the import below is not a runtime cycle.
+export const featureFlagsSchema = z
+  .object(
+    Object.fromEntries(MODULE_KEYS.map((key) => [key, z.boolean()])) as Record<
+      ModuleKey,
+      z.ZodBoolean
+    >,
+  )
+  .strict();
+
+export type FeatureFlags = z.infer<typeof featureFlagsSchema>;
+export type FeatureFlagKey = keyof FeatureFlags;

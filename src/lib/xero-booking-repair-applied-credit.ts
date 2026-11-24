@@ -1,0 +1,205 @@
+import { isCreditOnlyCardPayment } from "@/lib/credit-only-card-payment";
+import { xeroRefusedOperation } from "@/lib/xero-error-shape";
+import {
+  XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE,
+  XERO_OUTBOX_BOOKING_INVOICE_TYPE,
+} from "@/lib/xero-operation-outbox-payload";
+import type {
+  BookingClassificationContext,
+  BookingXeroRepairAction,
+  MutableFinding,
+} from "./xero-booking-repair-types";
+import { getBlockingOperation, isStuckOperation } from "./xero-booking-repair-object-resolution";
+import { addAction, addFinding, addResolvedInXeroFinding, buildRetryAction } from "./xero-booking-repair-findings";
+
+/**
+ * A retry action, auto-applied only where Xero did not refuse the operation
+ * (#3836 M2, `xeroRefusedOperation`: the invoice voided, or settled by hand):
+ * its retry is offered but never auto-applied.
+ */
+function retryUnlessRefused(bookingId: string, match: Parameters<typeof buildRetryAction>[1]) {
+  const action = buildRetryAction(bookingId, match);
+  return xeroRefusedOperation(match.operation) ? { ...action, safeToAutoApply: false } : action;
+}
+
+/**
+ * #3836 (`INV-PAY-024`): a booking paid entirely by account credit on the card
+ * path, invoiced at full price before #3836 with its applied credit never
+ * allocated, so Xero shows the invoice outstanding. Queues the one allocation
+ * engine (`allocateAppliedCreditForBooking`), which allocates only what the
+ * ledger still holds unallocated and stamps it, so a re-run finds nothing.
+ *
+ * Not on a cancelled booking: the cancelled-open-invoice arm
+ * (`CANCELLED_BOOKING_OPEN_INVOICE`) clears that invoice with a note, and an
+ * allocation beside it would over-credit. While the booking's invoice
+ * operation is unfinished its own replay allocates, so that operation is
+ * retried rather than a second engine run queued beside it.
+ */
+function addUnallocatedCardAppliedCreditFindings(
+  findings: MutableFinding[],
+  actionMap: Map<string, BookingXeroRepairAction>,
+  context: BookingClassificationContext,
+): void {
+  const { booking } = context;
+  const payment = booking.payment;
+  if (
+    !payment?.xeroInvoiceId ||
+    booking.status === "CANCELLED" ||
+    !isCreditOnlyCardPayment(payment) ||
+    context.unallocatedAppliedCreditCents <= 0
+  ) {
+    return;
+  }
+  const details = {
+    paymentId: payment.id,
+    xeroInvoiceId: payment.xeroInvoiceId,
+    unallocatedAppliedCreditCents: context.unallocatedAppliedCreditCents,
+  };
+  const blocking =
+    getBlockingOperation(context.paymentOperations, "INVOICE", "CREATE", {
+      payloadQueueType: XERO_OUTBOX_BOOKING_INVOICE_TYPE,
+    }) ??
+    getBlockingOperation(context.paymentOperations, "ALLOCATION", "ALLOCATE", {
+      payloadQueueType: XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE,
+    });
+  if (blocking?.kind === "resolved") {
+    addResolvedInXeroFinding(findings, blocking.resolvedOperation, "applied-credit allocation", details);
+    return;
+  }
+  if (blocking?.kind === "retryable") {
+    const action = addAction(actionMap, retryUnlessRefused(booking.id, blocking));
+    addFinding(findings, {
+      code: "BLOCKED_BY_XERO_OPERATION",
+      severity: "warning",
+      summary: action.safeToAutoApply
+        ? "A failed or partial Xero operation is blocking the allocation of a credit-paid booking's applied credit."
+        : "Xero refused the allocation of a credit-paid booking's applied credit (the invoice may be voided or settled by hand); fix the cause in Xero before retrying it.",
+      safeToAutoApply: action.safeToAutoApply,
+      details: { ...details, operationId: blocking.operation.id, operationStatus: blocking.operation.status },
+      actionKeys: [action.key],
+    });
+    return;
+  }
+  if (blocking) {
+    addFinding(findings, {
+      code: "BLOCKED_BY_XERO_OPERATION",
+      severity: "warning",
+      summary: ["FAILED", "PARTIAL"].includes(blocking.operation.status)
+        ? "A failed Xero operation for a credit-paid booking's applied credit cannot be auto-retried - resolve it by hand."
+        : isStuckOperation(blocking.operation)
+          ? "A pending or running Xero operation for a credit-paid booking's applied credit looks stuck."
+          : "A Xero operation for a credit-paid booking's applied credit is already pending or running.",
+      safeToAutoApply: false,
+      details: { ...details, operationId: blocking.operation.id, operationStatus: blocking.operation.status },
+      actionKeys: [],
+    });
+    return;
+  }
+  const action = addAction(actionMap, {
+    key: `queue:applied-credit-allocation:${booking.id}`,
+    bookingId: booking.id,
+    type: "QUEUE_APPLIED_CREDIT_ALLOCATION",
+    description: "Queue the allocation of the member's applied credit against the booking's Xero invoice.",
+    safeToAutoApply: true,
+    payload: { bookingId: booking.id },
+  });
+  addFinding(findings, {
+    code: "UNALLOCATED_APPLIED_CREDIT",
+    severity: "critical",
+    summary: "The booking was paid with account credit, but the credit is not allocated against its Xero invoice, so Xero shows it owing.",
+    safeToAutoApply: true,
+    details,
+    actionKeys: [action.key],
+  });
+}
+
+/**
+ * #4220 (owner decision, 24 Oct 2026): the early warning that a credit note this
+ * booking still has to draw on was spent in Xero outside the app, so Xero will
+ * refuse the allocation (#4218). Report-only: no action, never auto-applied, and no
+ * Xero call - the reading was kept at ingest and judged in the load
+ * (`findCreditNotesSpentOutsideApp`). The converge (#4219) acts when Xero refuses
+ * the allocation; until then an officer checks the note in Xero. A booking whose
+ * allocation an officer resolved in Xero gets no warning: it is reported as resolved
+ * in Xero, once (the card arm above may already have). The converge's own close is
+ * not an officer's resolve and never reaches here (`resolvedAllocations` holds
+ * officers' marks only): it released the credit, which is chased by card (#4253).
+ */
+export function addCreditNoteSpentOutsideFindings(findings: MutableFinding[], context: BookingClassificationContext): void {
+  const bookingId = context.booking.id;
+  for (const note of context.creditNotesSpentOutsideApp ?? []) {
+    const details = {
+      creditNoteId: note.creditNoteId,
+      memberCreditId: note.lotId,
+      xeroRemainingCents: note.xeroRemainingCents,
+      pendingAllocationCents: note.pendingAllocationCents,
+      pendingSliceCents: note.pendingSliceCents,
+      unslicedDrawCents: note.unslicedDrawCents,
+      outsideSpendCents: note.outsideSpendCents,
+      leftForAllocationCents: note.leftForAllocationCents,
+      observedAt: note.observedAt.toISOString(),
+    };
+    const resolved = note.resolvedAllocations.find((entry) => entry.bookingId === bookingId);
+    if (resolved) {
+      const reported = findings.some(
+        (finding) => finding.code === "RESOLVED_IN_XERO_BY_OFFICER" && finding.details.operationId === resolved.operation.id,
+      );
+      if (!reported) addResolvedInXeroFinding(findings, resolved.operation, "applied-credit allocation", details);
+      continue;
+    }
+    if (!note.bookingIds.includes(bookingId)) continue;
+    addFinding(findings, {
+      code: "APPLIED_CREDIT_NOTE_CONSUMED_EXTERNALLY",
+      severity: "warning",
+      summary:
+        "A credit note this booking's applied credit still has to be allocated from was used in Xero outside the app, so Xero has less left on it than the app will allocate. Check the note in Xero before the allocation runs.",
+      safeToAutoApply: false,
+      details,
+      actionKeys: [],
+    });
+  }
+}
+
+/** Every applied-credit finding about a booking, in one call for the classifier (which is over its size budget). */
+export function addAppliedCreditFindings(
+  findings: MutableFinding[],
+  actionMap: Map<string, BookingXeroRepairAction>,
+  context: BookingClassificationContext,
+): void {
+  addUnallocatedCardAppliedCreditFindings(findings, actionMap, context);
+  addCreditNoteSpentOutsideFindings(findings, context); // #4220
+}
+
+/**
+ * #3836 (H1): the cancelled-open-invoice arm sizes its clearing note net of the
+ * allocations already committed. While the booking's invoice operation or an
+ * applied-credit allocation operation is unfinished, that figure can still
+ * move - the engine finishes committed slices on a cancelled booking - so the
+ * arm waits: it offers that operation's retry, or reports the wait, and queues
+ * no clearing note beside it. A failed or partial row that cannot be retried
+ * will not run again, so it is not waited for. Returns whether it is waiting.
+ */
+export function waitForAppliedCreditWorkBeforeClearing(
+  findings: MutableFinding[],
+  actionMap: Map<string, BookingXeroRepairAction>,
+  context: BookingClassificationContext,
+): boolean {
+  const blocking = [
+    getBlockingOperation(context.paymentOperations, "INVOICE", "CREATE", { payloadQueueType: XERO_OUTBOX_BOOKING_INVOICE_TYPE }),
+    getBlockingOperation(context.paymentOperations, "ALLOCATION", "ALLOCATE", { payloadQueueType: XERO_OUTBOX_APPLIED_CREDIT_ALLOCATION_TYPE }),
+  ].find((match) => match !== null && match.kind !== "resolved");
+  if (!blocking) return false;
+  // A failed or partial row nothing can retry will never run again: not waited for.
+  if (blocking.kind === "blocked" && ["FAILED", "PARTIAL"].includes(blocking.operation.status)) return false;
+  const retry = blocking.kind === "retryable" ? addAction(actionMap, retryUnlessRefused(context.booking.id, blocking)) : null;
+  addFinding(findings, {
+    code: "BLOCKED_BY_XERO_OPERATION",
+    severity: "warning",
+    summary:
+      "A cancelled booking's invoice-clearing note waits for its unfinished invoice or applied-credit allocation operation, which may still finish allocations the note must not repeat.",
+    safeToAutoApply: retry?.safeToAutoApply ?? false,
+    details: { operationId: blocking.operation.id, operationStatus: blocking.operation.status },
+    actionKeys: retry ? [retry.key] : [],
+  });
+  return true;
+}

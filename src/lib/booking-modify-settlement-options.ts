@@ -1,0 +1,460 @@
+// Split out of src/lib/booking-modify-settlement.ts (#3829, composing epic
+// #3813 with main): what a booking reduction may return and how - the
+// policy-tiered options, the untiered full-reduction options (D-3813-5) and
+// the one basis both read. Code moved verbatim; import via
+// "@/lib/booking-modify" or "@/lib/booking-modify-settlement".
+
+import { PaymentSource, type Prisma } from "@prisma/client";
+import {
+  assertReductionReadForNet,
+  type ReductionAgainstUnpaidAsk,
+} from "@/lib/additional-ask-reduction";
+import type { CalendarDate } from "@/lib/club-time";
+import {
+  calculateDualRefundAmounts,
+  daysUntilDate,
+  getRefundTier,
+  loadCancellationPolicy,
+  type CancellationPolicyDb,
+} from "@/lib/cancellation";
+import { hasCapturedPayment, isSettledBookingStatus, type BookingPaymentState } from "@/lib/booking-payment-state";
+import {
+  type BookingModificationSettlementMethod,
+  type LoadedBookingForModify,
+} from "@/lib/booking-modify-validation";
+import { ApiError } from "@/lib/api-error";
+import { effectiveOrganiserPaidChangeFeeCents } from "@/lib/organiser-extra-state";
+import { BookingModificationSettlementMethodRequiredError } from "@/lib/booking-modify-settlement-required";
+import {
+  refundableCashNetOfOpenHandBacks,
+  type OpenNonCancellationHandBackDb,
+} from "@/lib/edit-refund-hand-back";
+import { readSupersededCaptureHeldBack } from "@/lib/superseded-capture-hold-back";
+import type { OwnershipReader } from "@/lib/superseded-intent-ownership";
+import { paidByOrganiser, paidByOrganiserCard, paidByOrganiserInternetBanking } from "@/lib/group-organiser-paid";
+import { paymentHasRefundableCardIntent } from "@/lib/refundable-card-intent";
+import { paymentDisputedCaptureCents, type CaptureDisputeHold } from "@/lib/stripe-dispute-hold";
+import { heldForDisputeSettlementCents } from "@/lib/edit-dispute-held-settlement";
+
+export type BookingModificationSettlementOptions = {
+  basisAmountCents: number;
+  cardRefundAmountCents: number;
+  cardRefundPercentage: number;
+  accountCreditAmountCents: number;
+  accountCreditPercentage: number;
+  daysUntilCheckIn: number;
+  requiresSettlementMethod: boolean;
+  /**
+   * #3653, #3949 (review round 5): the booking was paid for by its group
+   * organiser (`paidByOrganiser`), so the reduction goes back to the organiser,
+   * on the card tier, and there is no choice to make - the joiner paid nothing
+   * and is never handed account credit for it.
+   */
+  returnsToOrganiser: boolean;
+  /**
+   * #3949: and the organiser paid by Internet Banking, so it goes back to them by
+   * bank transfer - the edit's hand-back (`raiseEditRefundHandBackIfOwed`) -
+   * never to a card. Always false where `returnsToOrganiser` is false; where it
+   * is true, false means the organiser's card.
+   */
+  organiserRefundByBankTransfer: boolean;
+  /**
+   * #5303: the member's own refund (the card arm) is a bank transfer the
+   * treasurer sends - an Internet Banking payment, or (#5212, `INV-PAY-160`) a
+   * card payment Stripe holds no record of - so the quote never promises the
+   * card. The settlement's own answer (`editReductionRefundsToCard`) read for
+   * the quote. Always false where `returnsToOrganiser` is true, which has its
+   * own flag above.
+   */
+  refundByBankTransfer: boolean;
+  /**
+   * #5061 follow-up (`INV-PAY-154`): an OPEN or LOST Stripe dispute holds the
+   * member's card payment (`editReductionDisputeHold`), so the reduction is
+   * handed to the treasurer: no choice is offered, no card refund is made and
+   * no account credit is minted (`heldForDisputeSettlementCents`).
+   */
+  refundHeldForDispute: boolean;
+};
+
+/** The quote and the save both read this. A quote is advisory; the save rechecks under the Payment row. */
+export type ModificationRefundCashDb = OpenNonCancellationHandBackDb &
+  OwnershipReader &
+  Pick<Prisma.TransactionClient, "paymentTransaction">;
+
+/** What `editReductionDisputeHold` reads: the dispute rows and the payment's ledger captures. */
+export type EditDisputeHoldDb = Pick<Prisma.TransactionClient, "stripeDispute" | "paymentTransaction">;
+
+const NO_DISPUTE_HOLD: CaptureDisputeHold = { cents: 0, disputes: [] };
+
+/**
+ * #5061 follow-up (`INV-PAY-154`): the Stripe dispute hold on the money a
+ * reduction would return - the member's own captured card payment. A booking
+ * the group organiser paid for is outside it: an organiser-card joiner's refund
+ * is stopped by the refund chokepoint instead (`processRefund`), and an
+ * organiser's bank payment has no card. Every edit door reads it under its
+ * locks, through `applyPaymentAdjustments` and the settlement options; the
+ * quote reads it with none, as advice.
+ */
+export async function editReductionDisputeHold(
+  db: EditDisputeHoldDb,
+  booking: Pick<LoadedBookingForModify, "status" | "payment" | "organiserSettled" | "parentBookingId">,
+): Promise<CaptureDisputeHold> {
+  const payment = booking.payment;
+  if (!payment || payment.source !== PaymentSource.STRIPE || paidByOrganiser(booking)) return NO_DISPUTE_HOLD;
+  if (!isSettledBookingStatus(booking.status) || !hasCapturedPayment(payment)) return NO_DISPUTE_HOLD;
+  return paymentDisputedCaptureCents(db, payment);
+}
+
+/**
+ * #5212 (`INV-PAY-160`): does a reduction on this booking have a card to go
+ * back to? Only where it was paid through Stripe and Stripe holds a record of
+ * the payment - otherwise the refund is the treasurer's to send by bank
+ * transfer, as an Internet Banking payment's is, and no card refund is
+ * promised or owed. The settlement and the quote's label
+ * (`refundByBankTransfer`, #5303) both ask it through
+ * `editReductionRefundsToCard`. A joiner the
+ * organiser paid for by card is answered by the organiser's combined payment,
+ * which holds the intent; the joiner's mirror never has one of its own. Read
+ * under the door's locks, beside the dispute hold.
+ */
+export async function editRefundHasCardToReturnTo(
+  db: Pick<Prisma.TransactionClient, "payment">,
+  booking: Pick<LoadedBookingForModify, "payment" | "organiserSettled" | "parentBookingId">,
+): Promise<boolean> {
+  // Defensive: the only production caller, `editReductionRefundsToCard`, already
+  // gates on `hasSettledCardPayment`, which requires a Stripe payment.
+  if (booking.payment?.source !== PaymentSource.STRIPE) return false;
+  return paidByOrganiserCard(booking) || paymentHasRefundableCardIntent(db, booking.payment);
+}
+
+/**
+ * What `calculateFullReductionSettlementOptions` takes from its caller, read
+ * under the caller's locks: the dispute hold (#5061 follow-up, `INV-PAY-154`)
+ * and whether the refund has a card to go back to (#5303, `INV-PAY-160`).
+ */
+export async function fullReductionLockedReads(
+  db: EditDisputeHoldDb & Pick<Prisma.TransactionClient, "payment">,
+  booking: Pick<LoadedBookingForModify, "status" | "payment" | "organiserSettled" | "parentBookingId">,
+): Promise<{ refundHeldForDispute: boolean; hasCardToReturnTo: boolean }> {
+  return {
+    refundHeldForDispute: (await editReductionDisputeHold(db, booking)).cents > 0,
+    hasCardToReturnTo: await editReductionRefundsToCard(db, booking),
+  };
+}
+
+/** Paid by card: a settled booking holding captured Stripe money. `applyPaymentAdjustments` reads it for an
+ * increase; a reduction also needs a card to return to (`editReductionRefundsToCard`). */
+export function hasSettledCardPayment(booking: { status: string; payment: (BookingPaymentState & { source: string }) | null | undefined }): boolean {
+  const { status, payment } = booking;
+  return isSettledBookingStatus(status) && hasCapturedPayment(payment) && payment?.source === PaymentSource.STRIPE;
+}
+
+/**
+ * #5212 (`INV-PAY-160`): does a REDUCTION on this booking go back to its card?
+ * Paid by card (`hasSettledCardPayment`) with a card to return to
+ * (`editRefundHasCardToReturnTo`); otherwise a refund is the bank-transfer
+ * hand-back. The one answer `applyPaymentAdjustments` settles a reduction by,
+ * read under the door's locks; the batch result carries it as
+ * `reductionRefundsToCard`, which "Add to work party" names its refund by (#5149).
+ */
+export async function editReductionRefundsToCard(
+  db: Pick<Prisma.TransactionClient, "payment">,
+  booking: Pick<LoadedBookingForModify, "status" | "payment" | "organiserSettled" | "parentBookingId">,
+): Promise<boolean> {
+  return hasSettledCardPayment(booking) && (await editRefundHasCardToReturnTo(db, booking));
+}
+
+/** One cash cap for the quote and save, after unpaid asks have been netted. */
+export async function refundableCashForModification(
+  db: ModificationRefundCashDb,
+  payment: LoadedBookingForModify["payment"],
+  reduction: ReductionAgainstUnpaidAsk,
+): Promise<number> {
+  const cashCents = await refundableCashNetOfOpenHandBacks(db, payment);
+  // #4872 (`INV-PAY-150`): a live superseded capture is not cash the edit can return.
+  // With no refundable cash there is nothing to hold back, so no read.
+  const heldBackCents = payment && cashCents > 0 ? (await readSupersededCaptureHeldBack(db, payment.id)).totalCents : 0;
+  const paidFeeCents = reduction.organiserExtras && payment
+    ? effectiveOrganiserPaidChangeFeeCents(payment.changeFeeCents, reduction.organiserExtras)
+    : 0;
+  return Math.max(0, cashCents - paidFeeCents - heldBackCents);
+}
+
+/**
+ * #4299 S2 (`INV-PAY-148`): the card tier an edit nets organiser extras at,
+ * from the same policy and day `calculateModificationSettlementOptions` reads,
+ * and read even where those options are null: a reduction sized wholly against
+ * an unpaid extra leaves no cash basis, yet cash that races its waiver is
+ * refunded at this tier. 100%, no fee, only for an untiered re-price.
+ */
+export async function modificationCardRefundTier(
+  db: CancellationPolicyDb,
+  booking: Pick<LoadedBookingForModify, "checkIn" | "lodgeId">,
+  todayAtClub: CalendarDate,
+  untiered: boolean,
+): Promise<{ refundPercentage: number; fixedFeeCents: number }> {
+  if (untiered) return { refundPercentage: 100, fixedFeeCents: 0 };
+  const tier = getRefundTier(daysUntilDate(booking.checkIn, todayAtClub), await loadCancellationPolicy(booking.checkIn, booking.lodgeId, db));
+  return { refundPercentage: tier.refundPercentage, fixedFeeCents: tier.fixedFeeCents };
+}
+
+/**
+ * `db` is REQUIRED and reads the cancellation policy set: this module is
+ * transaction-scoped and imports no module-level client, so a default would hide
+ * a second pooled connection under the caller's locks. `INV-LOCK-004`; see
+ * `CancellationPolicyDb` in `cancellation.ts`.
+ *
+ * `todayAtClub` is REQUIRED for the SAME reason and is the other half of the
+ * same rule (#3123). `INV-LOCK-004` names the club timezone as one of only two
+ * reads that cannot take a transaction client, so the club's day is resolved by
+ * whichever caller opened the transaction, BEFORE it opened it, and arrives here
+ * as a value. All four production callers hold the global cohort key and the
+ * per-lodge capacity key when they reach this line.
+ */
+export async function calculateModificationSettlementOptions({
+  booking,
+  netChargeCents,
+  reduction,
+  db,
+  todayAtClub,
+}: {
+  booking: Pick<
+    LoadedBookingForModify,
+    "id" | "checkIn" | "status" | "payment" | "lodgeId" | "organiserSettled" | "parentBookingId"
+  >;
+  netChargeCents: number;
+  /**
+   * #3954: this edit's net set against the booking's unpaid ask, READ ONCE by
+   * the caller (`readReductionAgainstUnpaidAsk`) and handed to
+   * `applyPaymentAdjustments` too, so the options are sized on exactly what the
+   * save retires - a capture between two reads can no longer split them.
+   */
+  reduction: ReductionAgainstUnpaidAsk;
+  /**
+   * Also reads the payment's OPEN edit refund hand-backs (#3827,
+   * `INV-PAY-117`), so a reduction is sized off cash not already promised back.
+   */
+  db: CancellationPolicyDb & ModificationRefundCashDb & EditDisputeHoldDb;
+  /**
+   * The club's own calendar day (`INV-CONFIG-002`), resolved outside this
+   * transaction. It feeds `daysUntilDate` below, which is the refund-tier
+   * boundary: a day early tiers a member's reduction refund one step down from
+   * the club's published policy.
+   */
+  todayAtClub: CalendarDate;
+}): Promise<BookingModificationSettlementOptions | null> {
+  assertReductionReadForNet(reduction, netChargeCents, booking.id);
+  const basisAmountCents = settlementBasisCents(
+    booking,
+    reduction.netChargeLeftCents,
+    await refundableCashForModification(db, booking.payment, reduction),
+  );
+  if (basisAmountCents === null) return null;
+
+  const policy = await loadCancellationPolicy(booking.checkIn, booking.lodgeId, db);
+  const daysUntilCheckIn = daysUntilDate(booking.checkIn, todayAtClub);
+  const {
+    cardRefundAmountCents,
+    cardRefundPercentage,
+    creditRefundAmountCents,
+    creditRefundPercentage,
+  } = calculateDualRefundAmounts(basisAmountCents, daysUntilCheckIn, policy);
+
+  if (paidByOrganiser(booking)) {
+    // #3653: one disposition, the organiser's, so nothing to choose. #3949
+    // (review round 5; owner decisions of 15-22 Oct 2026): so is a child the
+    // organiser settled by Internet Banking - its reduction goes back to the
+    // organiser by a bank-transfer hand-back on the card tier, as the joiner's
+    // own cancel does, never as the joiner's account credit.
+    return {
+      basisAmountCents,
+      cardRefundAmountCents,
+      cardRefundPercentage,
+      accountCreditAmountCents: 0,
+      accountCreditPercentage: 0,
+      daysUntilCheckIn,
+      requiresSettlementMethod: false,
+      returnsToOrganiser: true,
+      organiserRefundByBankTransfer: paidByOrganiserInternetBanking(booking),
+      refundByBankTransfer: false,
+      refundHeldForDispute: false,
+    };
+  }
+  // #5061 follow-up (`INV-PAY-154`): a disputed payment offers no choice; the treasurer has the reduction.
+  const refundHeldForDispute = (await editReductionDisputeHold(db, booking)).cents > 0;
+  return {
+    basisAmountCents,
+    cardRefundAmountCents,
+    cardRefundPercentage,
+    accountCreditAmountCents: creditRefundAmountCents,
+    accountCreditPercentage: creditRefundPercentage,
+    daysUntilCheckIn,
+    requiresSettlementMethod:
+      !refundHeldForDispute && (cardRefundAmountCents > 0 || creditRefundAmountCents > 0),
+    returnsToOrganiser: false,
+    organiserRefundByBankTransfer: false,
+    refundByBankTransfer: !(await editReductionRefundsToCard(db, booking)),
+    refundHeldForDispute,
+  };
+}
+
+/**
+ * What a reduction can return from the captured payment: the reduction, capped
+ * at what is still refundable — or null when the booking holds no captured
+ * payment in a settled status, or there is nothing to return. ONE basis for the
+ * policy-tiered options above and the untiered ones below.
+ *
+ * `refundableCashCents` is REQUIRED and is
+ * `refundableCashNetOfOpenHandBacks` (#3827, `INV-PAY-117`): the captured
+ * cash not yet refunded AND not already promised back by an open edit refund
+ * hand-back.
+ */
+function settlementBasisCents(
+  booking: Pick<LoadedBookingForModify, "status" | "payment">,
+  netChargeCents: number,
+  refundableCashCents: number,
+): number | null {
+  const basisAmountCents = Math.min(Math.max(0, -netChargeCents), refundableCashCents);
+  const hasSettledPayment =
+    isSettledBookingStatus(booking.status) && hasCapturedPayment(booking.payment);
+  return basisAmountCents > 0 && hasSettledPayment ? basisAmountCents : null;
+}
+
+/**
+ * The settlement options for a reduction that is NOT a cancellation, so no
+ * cancellation-policy tier applies: the whole basis comes back, by either arm
+ * (#3827, owner decision D-3813-5 — a guest's acceptance re-pricing the
+ * booking's promo codes). The same basis and shape as
+ * {@link calculateModificationSettlementOptions}, at 100%, so the ordinary
+ * `applyPaymentAdjustments` settles it unchanged. Pure: no policy is read.
+ */
+export function calculateFullReductionSettlementOptions({
+  booking,
+  netChargeCents,
+  refundableCashCents,
+  todayAtClub,
+  refundHeldForDispute,
+  hasCardToReturnTo,
+}: {
+  booking: Pick<
+    LoadedBookingForModify,
+    "checkIn" | "status" | "payment" | "organiserSettled" | "parentBookingId"
+  >;
+  netChargeCents: number;
+  /** The edit's cash basis (`refundableCashForModification`), read by the caller. */
+  refundableCashCents: number;
+  todayAtClub: CalendarDate;
+  /** #5061 follow-up: `editReductionDisputeHold` above zero (`INV-PAY-154`); see `fullReductionLockedReads`. */
+  refundHeldForDispute: boolean;
+  /** #5303: `editReductionRefundsToCard`, else the refund is a bank transfer; see `fullReductionLockedReads`. */
+  hasCardToReturnTo: boolean;
+}): BookingModificationSettlementOptions | null {
+  const basisAmountCents = settlementBasisCents(booking, netChargeCents, refundableCashCents);
+  if (basisAmountCents === null) return null;
+  const daysUntilCheckIn = daysUntilDate(booking.checkIn, todayAtClub);
+  if (paidByOrganiser(booking)) {
+    // #3653, composed by #3829: the booking was paid by the group organiser, so
+    // "the same way it was paid" (D-3813-5) is back to the organiser - their
+    // card, or (#3949) a bank transfer - one disposition, nothing to choose,
+    // exactly as the tiered options above.
+    return {
+      basisAmountCents,
+      cardRefundAmountCents: basisAmountCents,
+      cardRefundPercentage: 100,
+      accountCreditAmountCents: 0,
+      accountCreditPercentage: 0,
+      daysUntilCheckIn,
+      requiresSettlementMethod: false,
+      returnsToOrganiser: true,
+      organiserRefundByBankTransfer: paidByOrganiserInternetBanking(booking),
+      refundByBankTransfer: false,
+      refundHeldForDispute: false,
+    };
+  }
+  return {
+    basisAmountCents,
+    cardRefundAmountCents: basisAmountCents,
+    cardRefundPercentage: 100,
+    accountCreditAmountCents: basisAmountCents,
+    accountCreditPercentage: 100,
+    daysUntilCheckIn,
+    requiresSettlementMethod: !refundHeldForDispute,
+    returnsToOrganiser: false,
+    organiserRefundByBankTransfer: false,
+    refundByBankTransfer: !hasCardToReturnTo,
+    refundHeldForDispute,
+  };
+}
+
+/**
+ * The refund or credit an edit's chosen settlement takes of its options. Moved
+ * verbatim from `booking-modify-settlement.ts` (#3980, its size budget); its one
+ * caller is `applyPaymentAdjustments`.
+ */
+export function resolveSelectedSettlementAmount({
+  settlementOptions,
+  settlementMethod,
+}: {
+  settlementOptions: BookingModificationSettlementOptions | null | undefined;
+  settlementMethod: BookingModificationSettlementMethod | undefined;
+}) {
+  if (!settlementOptions) {
+    return {
+      settlementMethod: null,
+      amountCents: 0,
+      policyRetainedAmountCents: 0,
+    };
+  }
+
+  if (settlementOptions.returnsToOrganiser) {
+    if (settlementMethod === "credit") {
+      throw new ApiError(
+        "This booking was paid for by the group organiser, so a reduction goes back to the organiser and cannot be held as account credit.",
+        400,
+      );
+    }
+    const amountCents = settlementOptions.cardRefundAmountCents;
+    return {
+      settlementMethod: amountCents > 0 ? ("card" as const) : null,
+      amountCents,
+      policyRetainedAmountCents: Math.max(0, settlementOptions.basisAmountCents - amountCents),
+    };
+  }
+
+  if (settlementOptions.refundHeldForDispute) {
+    // #5061 follow-up (`INV-PAY-154`): money back, by the treasurer's hand - never account credit.
+    const amountCents = heldForDisputeSettlementCents(settlementOptions);
+    return {
+      settlementMethod: amountCents > 0 ? ("card" as const) : null,
+      amountCents,
+      policyRetainedAmountCents: Math.max(0, settlementOptions.basisAmountCents - amountCents),
+    };
+  }
+
+  if (settlementOptions.requiresSettlementMethod && !settlementMethod) {
+    throw new BookingModificationSettlementMethodRequiredError();
+  }
+
+  if (!settlementOptions.requiresSettlementMethod) {
+    return {
+      settlementMethod: null,
+      amountCents: 0,
+      policyRetainedAmountCents: settlementOptions.basisAmountCents,
+    };
+  }
+
+  const resolvedMethod = settlementMethod ?? "card";
+  const amountCents =
+    resolvedMethod === "credit"
+      ? settlementOptions.accountCreditAmountCents
+      : settlementOptions.cardRefundAmountCents;
+
+  return {
+    settlementMethod: resolvedMethod,
+    amountCents,
+    policyRetainedAmountCents: Math.max(
+      0,
+      settlementOptions.basisAmountCents - amountCents,
+    ),
+  };
+}

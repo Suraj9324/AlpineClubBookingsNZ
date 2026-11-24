@@ -1,0 +1,120 @@
+import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import { EmbeddedPageContentParts } from "@/components/website/embedded-page-content-parts";
+import { getCachedClubIdentity } from "@/lib/public-layout-config";
+import { setupInProgressMetadata } from "@/lib/website-setup-metadata";
+import {
+  getPublishedPageContentByPath,
+  pageContentHtmlToPlainText,
+} from "@/lib/page-content-html";
+import { buildEmbeddedBody } from "@/lib/page-content-embeds";
+
+/**
+ * Held back from static rendering on purpose (#2352 slice 1, owner decision D4).
+ *
+ * `(website)/layout.tsx` no longer reads the session or the request, so without
+ * this line Next would prerender this route AT BUILD — and a build has no database
+ * (`Dockerfile` points `DATABASE_URL` at an unreachable host) and no request, so it
+ * would freeze an empty home page carrying inline scripts with no CSP nonce. That
+ * second half is a build failure, not a silent one:
+ * `scripts/ci/check-prerendered-script-nonces.mjs` refuses build-time HTML whose
+ * inline scripts are unnonced.
+ *
+ * Slice 2 makes this page static, and its first task is choosing how a build-time
+ * render acquires the per-release nonce. That is a design question of its own, which
+ * is exactly why D4 split the work and why this route waits for a measured gate
+ * rather than riding along.
+ */
+export const dynamic = "force-dynamic";
+
+function pageSlugFromPath(path: string) {
+  return path.replace(/^\//, "") || "home";
+}
+
+export async function generateMetadata(): Promise<Metadata> {
+  // Pre-setup, before any lookup: the head must not describe a page the visitor
+  // is not being shown (#2420 F1). See setupInProgressMetadata().
+  const holdingScreen = await setupInProgressMetadata();
+
+  if (holdingScreen) {
+    return holdingScreen;
+  }
+
+  const [page, { name: clubName }] = await Promise.all([
+    getPublishedPageContentByPath("/home"),
+    getCachedClubIdentity(),
+  ]);
+
+  if (!page) {
+    return {
+      title: clubName,
+    };
+  }
+
+  return {
+    title: page.title,
+    description:
+      pageContentHtmlToPlainText(page.headerText) ||
+      `${page.title} information for ${clubName}.`,
+  };
+}
+
+export default async function HomePage() {
+  // `/home` cannot be unpublished through any supported write path (it is a
+  // system page), so the published filter only matters for a hand-written row —
+  // which then 404s here, same as a missing row (#2440).
+  const [page, clubIdentity] = await Promise.all([
+    getPublishedPageContentByPath("/home"),
+    getCachedClubIdentity(),
+  ]);
+
+  if (!page) {
+    notFound();
+  }
+
+  const embeddedBody = await buildEmbeddedBody(page.contentHtml);
+  const pageSlug = pageSlugFromPath(page.path);
+
+  return (
+    <>
+      <section
+        className="dynamic-header bg-gradient-to-br from-brand-charcoal to-brand-deep py-16 text-brand-snow sm:py-20"
+        data-page-slug={pageSlug}
+      >
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+          <span className="website-eyebrow mb-4">{page.caption}</span>
+          <h1 className="font-heading text-4xl font-bold tracking-tight sm:text-5xl">
+            {page.title}
+          </h1>
+          <div
+            className="mt-4 max-w-2xl text-lg text-brand-snow/80"
+            dangerouslySetInnerHTML={{ __html: page.headerText }}
+          />
+        </div>
+      </section>
+      <section
+        className="dynamic-body bg-brand-snow py-16 sm:py-20"
+        data-page-slug={pageSlug}
+      >
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+          {embeddedBody.length > 0 ? (
+            <div className="space-y-10 text-base leading-7 text-brand-deep/85 [&_a]:text-brand-charcoal [&_a]:underline [&_h1]:font-heading [&_h1]:text-3xl [&_h1]:font-bold [&_h2]:font-heading [&_h2]:text-2xl [&_h2]:font-semibold [&_h3]:font-heading [&_h3]:text-xl [&_h3]:font-semibold [&_li]:ml-6 [&_li]:list-disc [&_ol_li]:list-decimal [&_p]:mb-4">
+              <EmbeddedPageContentParts
+                parts={embeddedBody}
+                pageSlug={pageSlug}
+                clubIdentity={clubIdentity}
+              />
+            </div>
+          ) : (
+            <div
+              className="dynamic-empty rounded-lg border border-brand-ridge/35 bg-brand-mist/35 p-6 text-brand-deep/75"
+              data-page-slug={pageSlug}
+            >
+              No content has been published for this page yet.
+            </div>
+          )}
+        </div>
+      </section>
+    </>
+  );
+}

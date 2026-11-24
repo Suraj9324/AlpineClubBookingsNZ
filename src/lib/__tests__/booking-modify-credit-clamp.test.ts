@@ -1,0 +1,499 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+
+// F20 (#1887): applyLifecycleTransitions must take the EFFECTIVE (credit-reduced)
+// price for its zero-dollar decision so a pre-payment reduction that lands a
+// booking fully credit-covered auto-confirms at $0 instead of dead-ending at the
+// card-intent guard. This suite exercises that decision in isolation by mocking
+// the clamp, the ledger derive, and the intent-supersede helper.
+//
+// F1 (#1887): the clamp is gated on the LEDGER + a pre-payment status, NOT the
+// payment.creditAppliedCents mirror, so it also fires for a CARD booking that
+// has no Payment row yet (the card path writes no payment row at create).
+
+const mockClamp = vi.fn();
+const mockDerive = vi.fn();
+const mockQueueSuperseded = vi.fn();
+const mockPaymentUpsert = vi.fn();
+// #2265 (#2319): the guarded claim that clears a stale credit election when this
+// reprice settles the booking at $0.
+const mockBookingUpdateMany = vi.fn();
+
+vi.mock("@/lib/member-credit", () => ({
+  clampAppliedCreditToBookingPrice: (...args: unknown[]) => mockClamp(...args),
+  deriveBookingAppliedCreditCents: (...args: unknown[]) => mockDerive(...args),
+  // #3369: the one home for the account-credit refusal four settlement paths
+  // share. Real, not stubbed: the mock must not turn a refusal into a pass.
+  requireMemberCreditRecipient: (memberId: string | null) => {
+    if (!memberId) throw new Error("no account to credit (#3369)");
+    return memberId;
+  },
+}));
+
+vi.mock("@/lib/booking-payment-cleanup", () => ({
+  queueSupersededPrimaryIntentCancellations: (...args: unknown[]) =>
+    mockQueueSuperseded(...args),
+}));
+
+// applyLifecycleTransitions imports these but does not reach them on the
+// all-member, no-review path exercised here.
+vi.mock("@/lib/cancellation", () => ({
+  calculateDualRefundAmounts: vi.fn(),
+  daysUntilDate: vi.fn(),
+  loadCancellationPolicy: vi.fn(),
+  getNonMemberHoldPolicy: vi.fn(),
+}));
+vi.mock("@/lib/booking-payment-state", async (importOriginal) => {
+  const real = (await importOriginal()) as typeof import("@/lib/booking-payment-state");
+  return {
+  getRemainingRefundableCents: vi.fn(),
+  hasCapturedPayment: vi.fn(),
+  hasIssuedPrimaryXeroInvoice: vi.fn(),
+  isSettledBookingStatus: vi.fn(),
+  // #3340 widened this module's graph: `booking-modify-settlement` now reaches
+  // `additional-payment-ask`, which reads the one home of the captured-payment
+  // status list AT IMPORT TIME. A factory missing it throws before a single test
+  // runs, so the real value is handed back rather than a stub - nothing here
+  // exercises it, and a wrong list would be a silently different population.
+  CAPTURED_PAYMENT_STATUS_LIST: real.CAPTURED_PAYMENT_STATUS_LIST,
+  // #3750: the real one home of worth, amount owed and the recorded fee —
+  // pure arithmetic, so the real functions rather than copies of them.
+  bookingWorthCents: real.bookingWorthCents,
+  bookingAmountOwedCents: real.bookingAmountOwedCents,
+  recordedChangeFeeCents: real.recordedChangeFeeCents,
+  feeOwedAfterEditCents: real.feeOwedAfterEditCents,
+  };
+});
+vi.mock("@/lib/policies/booking-route-decisions", () => ({
+  calculateBookingHoldDecision: vi.fn(),
+}));
+
+import { applyLifecycleTransitions } from "@/lib/booking-modify-settlement";
+
+function makeTx() {
+  return {
+    payment: { upsert: mockPaymentUpsert },
+    booking: { updateMany: mockBookingUpdateMany },
+  } as any;
+}
+
+function baseBooking(
+  overrides: { creditAppliedCents?: number; hasPayment?: boolean } = {},
+) {
+  const hasPayment = overrides.hasPayment ?? true;
+  return {
+    id: "bk-1",
+    memberId: "member-1",
+    status: "PAYMENT_PENDING",
+    nonMemberHoldUntil: null,
+    lodgeId: "lodge-1",
+    // A CARD booking has NO payment row until it requests a card intent.
+    payment: hasPayment
+      ? { id: "pay-1", creditAppliedCents: overrides.creditAppliedCents ?? 0 }
+      : null,
+  } as any;
+}
+
+describe("applyLifecycleTransitions — F20 applied-credit clamp (#1887)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDerive.mockResolvedValue(0);
+    mockQueueSuperseded.mockResolvedValue([]);
+    mockPaymentUpsert.mockResolvedValue({ id: "pay-1" });
+    mockBookingUpdateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("refunds the over-consumed credit and auto-confirms at $0 when the reprice drops below applied credit", async () => {
+    // Applied 5000 on the ledger, reprice to 3000: clamp returns 2000, net 3000.
+    mockDerive.mockResolvedValue(5000);
+    mockClamp.mockResolvedValue({
+      appliedCreditCents: 3000,
+      refundedExcessCents: 2000,
+    });
+
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: baseBooking({ creditAppliedCents: 5000 }),
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 3000,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(mockClamp).toHaveBeenCalledWith(
+      { memberId: "member-1", bookingId: "bk-1", newWorthCents: 3000, format: CLUB_FORMAT_TEST },
+      expect.anything(),
+    );
+    expect(result.newStatus).toBe("PAID");
+    expect(result.zeroDollarAutoPaid).toBe(true);
+    expect(result.appliedCreditCents).toBe(3000);
+    expect(result.refundedExcessCreditCents).toBe(2000);
+    // The $0 payment mirror keeps amountCents + creditAppliedCents = finalPrice.
+    expect(mockPaymentUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { bookingId: "bk-1" },
+        create: expect.objectContaining({
+          amountCents: 0,
+          creditAppliedCents: 3000,
+          status: "SUCCEEDED",
+        }),
+      }),
+    );
+    // A credit-covered $0 sweeps every positive pending intent (effective 0).
+    expect(mockQueueSuperseded).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ newFinalPriceCents: 0 }),
+    );
+  });
+
+  it("clamps a CARD booking with NO payment row and auto-confirms it at $0 (F1 regression, #1887)", async () => {
+    // The card path writes no payment row at create, so booking.payment is null.
+    // The mirror gate would skip the clamp here and the booking would dead-end
+    // unpayable at the card-intent guard. The ledger gate fires the clamp, which
+    // upserts (creates) the $0 payment row and auto-confirms the booking.
+    mockDerive.mockResolvedValue(4000);
+    mockClamp.mockResolvedValue({
+      appliedCreditCents: 3000,
+      refundedExcessCents: 1000,
+    });
+
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: baseBooking({ hasPayment: false }),
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 3000,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(mockDerive).toHaveBeenCalledWith("bk-1", expect.anything());
+    expect(mockClamp).toHaveBeenCalled();
+    expect(result.newStatus).toBe("PAID");
+    expect(result.zeroDollarAutoPaid).toBe(true);
+    expect(result.appliedCreditCents).toBe(3000);
+    expect(result.refundedExcessCreditCents).toBe(1000);
+    // upsert CREATES the payment row for the previously payment-less card booking.
+    expect(mockPaymentUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { bookingId: "bk-1" },
+        create: expect.objectContaining({
+          amountCents: 0,
+          creditAppliedCents: 3000,
+          status: "SUCCEEDED",
+        }),
+      }),
+    );
+  });
+
+  it("clamps an approved member whole-lodge booking - CONFIRMED, held, no Payment row - and settles it PAID at $0 (#4019, #4264 F1)", async () => {
+    // The approval applied $800 of credit to a $1,000 booking and minted no
+    // receivable; the party is then re-rated and the price drops to $600. The
+    // excess $200 must come back and the booking must settle, exactly as a
+    // PAYMENT_PENDING card booking would - otherwise both pay doors refuse it
+    // ("fully credit-covered") and it never reaches PAID.
+    mockDerive.mockResolvedValue(80000);
+    mockClamp.mockResolvedValue({
+      appliedCreditCents: 60000,
+      refundedExcessCents: 20000,
+    });
+
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: {
+        ...baseBooking({ hasPayment: false }),
+        status: "CONFIRMED",
+        wholeLodgeHold: true,
+      },
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 60000,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(mockClamp).toHaveBeenCalled();
+    expect(result.newStatus).toBe("PAID");
+    expect(result.zeroDollarAutoPaid).toBe(true);
+    expect(result.appliedCreditCents).toBe(60000);
+    expect(result.refundedExcessCreditCents).toBe(20000);
+  });
+
+  it("leaves a CONFIRMED booking WITH a Payment row alone: it carries a receivable or a capture, not the whole-lodge gap", async () => {
+    mockDerive.mockResolvedValue(80000);
+
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: {
+        ...baseBooking({ hasPayment: true, creditAppliedCents: 80000 }),
+        status: "CONFIRMED",
+        wholeLodgeHold: true,
+      },
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 60000,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(mockClamp).not.toHaveBeenCalled();
+    expect(result.newStatus).toBe("CONFIRMED");
+    expect(result.zeroDollarAutoPaid).toBe(false);
+  });
+  it("#3750 (#3955 F1): keeps credit up to the WORTH and never settles at $0 while a recorded fee is owed", async () => {
+    // Priced 40000 with 30000 credit applied; a correction removes 20000 and
+    // records a 10000 fee. The bare price (20000) is below the credit, but the
+    // booking is worth 30000 — the credit covers it exactly and nothing is
+    // given back; owed 0 settles it at $0 WITH the fee paid by credit.
+    mockDerive.mockResolvedValue(30000);
+    mockClamp.mockResolvedValue({ appliedCreditCents: 30000, refundedExcessCents: 0 });
+
+    const exact = await applyLifecycleTransitions(makeTx(), {
+      booking: baseBooking({ creditAppliedCents: 30000 }),
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 20000,
+      feeRecordedByThisEditCents: 10000,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+    expect(mockClamp).toHaveBeenCalledWith(
+      expect.objectContaining({ newWorthCents: 30000 }),
+      expect.anything(),
+    );
+    expect(exact.appliedCreditCents).toBe(30000);
+    expect(exact.refundedExcessCreditCents).toBe(0);
+
+    // With 25000 credit the same correction leaves 5000 owed: payable, not PAID.
+    vi.clearAllMocks();
+    mockQueueSuperseded.mockResolvedValue([]);
+    mockDerive.mockResolvedValue(25000);
+    mockClamp.mockResolvedValue({ appliedCreditCents: 25000, refundedExcessCents: 0 });
+    const owing = await applyLifecycleTransitions(makeTx(), {
+      booking: { ...baseBooking({ creditAppliedCents: 25000 }), payment: { id: "pay-1", creditAppliedCents: 25000, changeFeeCents: 0 } },
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 20000,
+      feeRecordedByThisEditCents: 10000,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+    expect(owing.newStatus).toBe("PAYMENT_PENDING");
+    expect(owing.zeroDollarAutoPaid).toBe(false);
+    expect(mockPaymentUpsert).not.toHaveBeenCalled();
+    // F4: a pending intent is stale unless it asks for what is owed (5000).
+    expect(mockQueueSuperseded).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ newFinalPriceCents: 5000 }),
+    );
+  });
+
+  it("#3750 (#3955 F4): a same-price swap that records a fee supersedes the intent sized before it", async () => {
+    // No credit; the price is unchanged but a fee is now recorded on the
+    // payment, so an intent at the old price is stale.
+    mockDerive.mockResolvedValue(0);
+    await applyLifecycleTransitions(makeTx(), {
+      booking: { ...baseBooking(), payment: { id: "pay-1", creditAppliedCents: 0, changeFeeCents: 1500 } },
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 12000,
+      feeRecordedByThisEditCents: 2500,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+    // The fee recorded before this edit (1500) and this edit's (2500) are both owed.
+    expect(mockQueueSuperseded).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ newFinalPriceCents: 16000 }),
+    );
+  });
+
+  it("leaves a partially-credit-covered card reprice payable (clamp no-op, no $0 path)", async () => {
+    // Applied 4000, reprice to 5000 (still above credit): clamp is a no-op, the
+    // booking stays PAYMENT_PENDING with a positive effective price to charge.
+    mockDerive.mockResolvedValue(4000);
+    mockClamp.mockResolvedValue({
+      appliedCreditCents: 4000,
+      refundedExcessCents: 0,
+    });
+
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: baseBooking({ hasPayment: false }),
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 5000,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(mockClamp).toHaveBeenCalled();
+    expect(result.newStatus).toBe("PAYMENT_PENDING");
+    expect(result.zeroDollarAutoPaid).toBe(false);
+    expect(result.appliedCreditCents).toBe(4000);
+    expect(mockPaymentUpsert).not.toHaveBeenCalled();
+  });
+
+  it("does not touch the credit ledger or auto-pay for a no-credit reduction (unchanged behaviour)", async () => {
+    mockDerive.mockResolvedValue(0);
+
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: baseBooking({ creditAppliedCents: 0 }),
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 3000,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    // No applied credit on the ledger -> the clamp (and its lock) is never invoked.
+    expect(mockClamp).not.toHaveBeenCalled();
+    expect(result.newStatus).toBe("PAYMENT_PENDING");
+    expect(result.zeroDollarAutoPaid).toBe(false);
+    expect(result.appliedCreditCents).toBe(0);
+    expect(mockPaymentUpsert).not.toHaveBeenCalled();
+    // Existing #1161 supersede still runs against the full new price.
+    expect(mockQueueSuperseded).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ newFinalPriceCents: 3000 }),
+    );
+  });
+
+  it("keeps the legacy no-credit price-to-zero auto-pay ($0 == effective when no credit)", async () => {
+    mockDerive.mockResolvedValue(0);
+
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: baseBooking({ creditAppliedCents: 0 }),
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 0,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(mockClamp).not.toHaveBeenCalled();
+    expect(result.newStatus).toBe("PAID");
+    expect(result.zeroDollarAutoPaid).toBe(true);
+    expect(mockPaymentUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ amountCents: 0, creditAppliedCents: 0 }),
+      }),
+    );
+  });
+});
+
+/**
+ * #2265 (#2319). The one arm that could genuinely land a SETTLED booking still
+ * carrying a stored credit election.
+ *
+ * A guest removal on a booking parked in AWAITING_REVIEW releases it to
+ * PAYMENT_PENDING with its election intact — correctly, because the pay step is
+ * supposed to consume it. But if that same removal reprices the stay to nothing,
+ * this function auto-pays it at $0 right here, and the election would ride into a
+ * PAID row that no consumer will ever read again.
+ *
+ * Cleared silently, and that is the honest treatment rather than an oversight:
+ * nothing is owed, so the election is MOOT, not unhonoured. No credit was
+ * consumed, the member's balance is exactly as it was, and there is no
+ * disappointed choice to explain to anybody — the same reasoning (and the same
+ * silence) as confirm-draft's $0 confirm.
+ */
+describe("applyLifecycleTransitions — stale credit election on a $0 settle (#2265)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDerive.mockResolvedValue(0);
+    mockQueueSuperseded.mockResolvedValue([]);
+    mockPaymentUpsert.mockResolvedValue({ id: "pay-1" });
+    mockBookingUpdateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("clears the election when the reprice settles the booking at $0", async () => {
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: { ...baseBooking({ creditAppliedCents: 0 }), creditElectionCents: 7500 },
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 0,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(result.newStatus).toBe("PAID");
+    expect(result.zeroDollarAutoPaid).toBe(true);
+    // Guarded on the exact amount read, like every other consumer of the column.
+    expect(mockBookingUpdateMany).toHaveBeenCalledWith({
+      where: { id: "bk-1", creditElectionCents: 7500 },
+      data: { creditElectionCents: null },
+    });
+  });
+
+  it("leaves the election alone when the reprice does NOT settle the booking", async () => {
+    const result = await applyLifecycleTransitions(makeTx(), {
+      booking: { ...baseBooking({ creditAppliedCents: 0 }), creditElectionCents: 7500 },
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 9000,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    // Still payable, so the election is still perfectly honourable — the pay step
+    // will apply it against the NEW price. Clearing it here would be the original
+    // #2265 bug all over again.
+    expect(result.newStatus).toBe("PAYMENT_PENDING");
+    expect(result.zeroDollarAutoPaid).toBe(false);
+    expect(mockBookingUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("costs nothing for a $0 settle on a booking that never made an election", async () => {
+    await applyLifecycleTransitions(makeTx(), {
+      booking: { ...baseBooking({ creditAppliedCents: 0 }), creditElectionCents: null },
+      bookingId: "bk-1",
+      newCheckIn: new Date("2026-08-01"),
+      newFinalPriceCents: 0,
+      feeRecordedByThisEditCents: 0,
+      format: CLUB_FORMAT_TEST,
+      guestsForPricing: [{ isMember: true }],
+      skipBookingLifecycleRules: false,
+    });
+
+    expect(mockBookingUpdateMany).not.toHaveBeenCalled();
+  });
+});
+
+it("keeps the newly recorded fee in the credit clamp for a PENDING booking with captured payment", async () => {
+  mockDerive.mockResolvedValue(30000);
+  mockClamp.mockResolvedValue({ appliedCreditCents: 25000, refundedExcessCents: 5000 });
+  const booking = baseBooking({ creditAppliedCents: 30000 });
+  const result = await applyLifecycleTransitions(makeTx(), {
+    booking: { ...booking, status: "PENDING", payment: { ...booking.payment!, status: "SUCCEEDED", amountCents: 10000 } },
+    bookingId: "bk-1",
+    newCheckIn: new Date("2026-08-01"),
+    newFinalPriceCents: 20000,
+    feeRecordedByThisEditCents: 5000,
+    format: CLUB_FORMAT_TEST,
+    guestsForPricing: [{ isMember: true }],
+    skipBookingLifecycleRules: false,
+  });
+  expect(mockClamp).toHaveBeenCalledWith(
+    expect.objectContaining({ newWorthCents: 25000 }),
+    expect.anything(),
+  );
+  expect(result.refundedExcessCreditCents).toBe(5000);
+});

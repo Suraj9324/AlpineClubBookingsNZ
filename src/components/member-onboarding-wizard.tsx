@@ -1,0 +1,512 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckCircle2,
+  CircleAlert,
+  Clock,
+  Loader2,
+  LogOut,
+  RefreshCw,
+  UserCheck,
+  Users,
+} from "lucide-react";
+import { toast } from "sonner";
+import { FamilyGroupSection } from "@/components/profile/family-group-section";
+import { ProfileForm } from "@/components/profile/profile-form";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { emitMemberOnboardingConfirmed } from "@/lib/member-onboarding-events";
+import { signOutToLogin } from "@/lib/sign-out";
+
+interface MissingField {
+  key: string;
+  label: string;
+}
+
+interface OnboardingStatus {
+  isProfileComplete: boolean;
+  isDetailsConfirmed: boolean;
+  canBeBookedAsMember: boolean;
+  missingFields: string[];
+  missingFieldDetails: MissingField[];
+  needsOwnLoginConfirmation: boolean;
+  confirmationMode: "self" | "delegated" | "not_allowed";
+  hasCompletedOnboarding: boolean;
+  needsOnboardingConfirmation: boolean;
+  requiresWizard: boolean;
+}
+
+interface ProfileFormMember {
+  id: string;
+  firstName: string;
+  lastName: string;
+  phoneCountryCode: string;
+  phoneAreaCode: string;
+  phoneNumber: string;
+  dateOfBirth: string;
+  streetAddressLine1: string;
+  streetAddressLine2: string;
+  streetCity: string;
+  streetRegion: string;
+  streetPostalCode: string;
+  streetCountry: string;
+  postalAddressLine1: string;
+  postalAddressLine2: string;
+  postalCity: string;
+  postalRegion: string;
+  postalPostalCode: string;
+  postalCountry: string;
+  occupation?: string;
+  /** Present only while the club has the dietary field ON (#2941). */
+  dietaryRequirements?: string;
+}
+
+interface FamilyMember {
+  id: string;
+  name: string;
+  firstName: string;
+  lastName: string;
+  ageTier: string;
+  active: boolean;
+  canLogin: boolean;
+  role: string;
+  isCurrentUser: boolean;
+  status: OnboardingStatus;
+  nextAction:
+    | "current_user"
+    | "self_confirmation_required"
+    | "delegated_placeholder"
+    | "confirmation_not_required"
+    | "complete";
+}
+
+interface FamilyGroup {
+  id: string;
+  name: string | null;
+  members: FamilyMember[];
+}
+
+interface PendingRequest {
+  id: string;
+  type: string;
+  familyGroupName: string | null;
+  childName: string | null;
+  requestedName: string | null;
+  subjectMember: { id: string; name: string } | null;
+  invitedMember: { id: string; name: string } | null;
+  requester: { id: string; name: string } | null;
+  direction: "submitted" | "invitation" | "family_group";
+  isPendingAdminRequest: boolean;
+}
+
+interface OnboardingData {
+  shouldShow: boolean;
+  currentMember: {
+    id: string;
+    name: string;
+    ageTier: string;
+    showOccupation: boolean;
+    showDietaryRequirements: boolean;
+    profile: ProfileFormMember;
+    status: OnboardingStatus;
+    needsOwnDetailsConfirmation: boolean;
+  };
+  familyGroups: FamilyGroup[];
+  pendingRequests: PendingRequest[];
+}
+
+type WizardStep = "profile" | "confirm" | "family";
+
+function getMemberStatusBadge(member: FamilyMember) {
+  if (member.status.confirmationMode === "not_allowed") {
+    return <Badge variant="secondary">No confirmation needed</Badge>;
+  }
+
+  if (member.status.isProfileComplete && member.status.isDetailsConfirmed) {
+    return <Badge variant="success">Confirmed</Badge>;
+  }
+
+  if (member.canLogin) {
+    return <Badge variant="warning">Needs their login</Badge>;
+  }
+
+  return <Badge variant="warning">Needs family adult</Badge>;
+}
+
+function PendingRequestSummary({ request }: { request: PendingRequest }) {
+  const title =
+    request.type === "CHILD_REQUEST"
+      ? request.childName
+        ? `Add ${request.childName}`
+        : "Child/youth request"
+      : request.type === "ADULT_INVITE"
+        ? request.invitedMember
+          ? `Invite for ${request.invitedMember.name}`
+          : "Adult invite"
+        : request.type === "ADULT_REQUEST"
+          ? request.requestedName
+            ? `Add ${request.requestedName}`
+            : "Same-email adult request"
+          : request.type === "REMOVAL_REQUEST"
+            ? request.subjectMember
+              ? `Remove ${request.subjectMember.name}`
+              : "Removal request"
+        : request.requester
+          ? `${request.requester.name} join request`
+          : "Join request";
+
+  return (
+    <div className="flex items-start justify-between gap-3 rounded-md border bg-card px-3 py-2">
+      <div>
+        <p className="text-sm font-medium text-foreground">{title}</p>
+        <p className="text-xs text-muted-foreground">
+          {request.familyGroupName ?? "Family group"} · Pending
+          {request.isPendingAdminRequest ? " admin review" : " response"}
+        </p>
+      </div>
+      <Badge variant="warning">Pending</Badge>
+    </div>
+  );
+}
+
+export function MemberOnboardingWizard({
+  initialShouldShow,
+}: {
+  initialShouldShow: boolean;
+}) {
+  const [open, setOpen] = useState(initialShouldShow);
+  const [data, setData] = useState<OnboardingData | null>(null);
+  const [loading, setLoading] = useState(initialShouldShow);
+  const [confirming, setConfirming] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [detailsAccepted, setDetailsAccepted] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  const loadOnboarding = useCallback(async () => {
+    setLoading(true);
+    setLoadError("");
+
+    try {
+      const res = await fetch("/api/member/onboarding", {
+        credentials: "same-origin",
+      });
+      const body = await res.json();
+
+      if (!res.ok) {
+        throw new Error(body.error ?? "Could not load onboarding");
+      }
+
+      setData(body);
+      setOpen(Boolean(body.shouldShow));
+      setDetailsAccepted(false);
+    } catch (error) {
+      setLoadError(
+        error instanceof Error ? error.message : "Could not load onboarding"
+      );
+      setOpen(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (initialShouldShow) {
+      void loadOnboarding();
+    }
+  }, [initialShouldShow, loadOnboarding]);
+
+  const step: WizardStep = useMemo(() => {
+    if (!data?.currentMember.status.isProfileComplete) return "profile";
+    if (!detailsAccepted) return "confirm";
+    return "family";
+  }, [data, detailsAccepted]);
+
+  const confirmOnboarding = async () => {
+    setConfirming(true);
+
+    try {
+      const res = await fetch("/api/member/onboarding/confirm", {
+        method: "POST",
+        credentials: "same-origin",
+      });
+      const body = await res.json();
+
+      if (!res.ok) {
+        toast.error(body.error ?? "Could not confirm your details");
+        await loadOnboarding();
+        return;
+      }
+
+      toast.success("Details confirmed");
+      setData((prev) => (prev ? { ...prev, shouldShow: body.shouldShow } : prev));
+      setOpen(Boolean(body.shouldShow));
+      if (!body.shouldShow) {
+        // Pages under this overlay (e.g. /book's family list) cached
+        // bookability state from before the confirmation and must refetch.
+        emitMemberOnboardingConfirmed();
+      }
+    } catch {
+      toast.error("Could not confirm your details");
+    } finally {
+      setConfirming(false);
+    }
+  };
+
+  if (!initialShouldShow && !open) {
+    return null;
+  }
+
+  return (
+    <Dialog open={open}>
+      <DialogContent
+        ref={contentRef}
+        className="max-h-[92vh] max-w-3xl overflow-y-auto"
+        // Radix focuses the first tabbable element on open. Left alone that is
+        // Log out (the only tabbable element while loading), so an accidental
+        // Enter or Space would sign the member out. Focus the dialog itself;
+        // Log out stays first in the tab order.
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          contentRef.current?.focus();
+        }}
+        onEscapeKeyDown={(event) => event.preventDefault()}
+        onInteractOutside={(event) => event.preventDefault()}
+        showCloseButton={false}
+      >
+        <DialogHeader>
+          <DialogTitle>Confirm member details</DialogTitle>
+          <DialogDescription>
+            Please complete these required details before continuing. We use them for membership records, bookings, and Xero sync.
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* Outside the state branches below so no state can lose it: the gate
+            blocks Escape, outside clicks and the nav bar, so this is the only
+            way out, and signing out leaves onboarding incomplete (#4953). */}
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
+          <p>You can log out and finish this next time you sign in.</p>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => void signOutToLogin()}
+            disabled={confirming}
+          >
+            <LogOut className="h-4 w-4" />
+            Log out
+          </Button>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading member details
+          </div>
+        ) : loadError ? (
+          <div className="space-y-4 rounded-md border border-danger-6 bg-danger-3 p-4 text-sm text-danger-11">
+            <p>{loadError}</p>
+            <Button type="button" variant="outline" onClick={loadOnboarding}>
+              <RefreshCw className="h-4 w-4" />
+              Try again
+            </Button>
+          </div>
+        ) : data ? (
+          <div className="space-y-5">
+            <div className="grid gap-2 sm:grid-cols-3">
+              <div className="rounded-md border bg-card p-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <CircleAlert className="h-4 w-4 text-warning-11" />
+                  Profile
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {data.currentMember.status.isProfileComplete
+                    ? "Complete"
+                    : "Required details missing"}
+                </p>
+              </div>
+              <div className="rounded-md border bg-card p-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <UserCheck className="h-4 w-4 text-info-11" />
+                  Confirmation
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {detailsAccepted ? "Ready for family review" : "Needs review"}
+                </p>
+              </div>
+              <div className="rounded-md border bg-card p-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Users className="h-4 w-4 text-cat3-11" />
+                  Family
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {data.familyGroups.length > 0 ? "Review linked members" : "No family group"}
+                </p>
+              </div>
+            </div>
+
+            {step === "profile" ? (
+              <div className="space-y-4">
+                {data.currentMember.status.missingFieldDetails.length > 0 ? (
+                  <div className="rounded-md border border-warning-6 bg-warning-3 p-3">
+                    <p className="text-sm font-medium text-warning-11">Missing details</p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {data.currentMember.status.missingFieldDetails.map((field) => (
+                        <Badge key={field.key} variant="warning">
+                          {field.label}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                <ProfileForm
+                  member={data.currentMember.profile}
+                  onSaved={loadOnboarding}
+                  submitLabel="Save and continue"
+                  ageTier={data.currentMember.ageTier}
+                  showOccupation={data.currentMember.showOccupation}
+                  showDietaryRequirements={
+                    data.currentMember.showDietaryRequirements
+                  }
+                />
+              </div>
+            ) : null}
+
+            {step === "confirm" ? (
+              <div className="space-y-4 rounded-md border bg-card p-4">
+                <div className="flex items-start gap-3">
+                  <CheckCircle2 className="mt-0.5 h-5 w-5 text-success-11" />
+                  <div>
+                    <h3 className="font-medium text-foreground">
+                      Confirm your details are correct.
+                    </h3>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      You are confirming your own member profile. Login-capable family members must sign in and confirm themselves.
+                    </p>
+                  </div>
+                </div>
+                <div className="grid gap-2 rounded-md bg-card p-3 text-sm sm:grid-cols-2">
+                  <div>
+                    <span className="text-muted-foreground">Name</span>
+                    <p className="font-medium">{data.currentMember.name}</p>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Date of birth</span>
+                    <p className="font-medium">
+                      {data.currentMember.profile.dateOfBirth}
+                    </p>
+                  </div>
+                </div>
+                <DialogFooter>
+                  <Button type="button" onClick={() => setDetailsAccepted(true)}>
+                    Confirm details are correct
+                  </Button>
+                </DialogFooter>
+              </div>
+            ) : null}
+
+            {step === "family" ? (
+              <div className="space-y-4">
+                {data.familyGroups.length === 0 ? (
+                  <div className="rounded-md border bg-card p-4 text-sm text-muted-foreground">
+                    No family group members are linked to your profile.
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {data.familyGroups.map((group) => (
+                      <div key={group.id} className="space-y-3 rounded-md border bg-card p-4">
+                        <div className="flex items-center gap-2">
+                          <Users className="h-4 w-4 text-cat3-11" />
+                          <h3 className="font-medium">
+                            {group.name ?? "Family group"}
+                          </h3>
+                        </div>
+                        <div className="space-y-2">
+                          {group.members.map((member) => (
+                            <div
+                              key={`${group.id}-${member.id}`}
+                              className="rounded-md border bg-card px-3 py-2"
+                            >
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="text-sm font-medium text-foreground">
+                                  {member.name}
+                                  {member.isCurrentUser ? " (you)" : ""}
+                                </p>
+                                {getMemberStatusBadge(member)}
+                              </div>
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                {member.isCurrentUser
+                                  ? "Your own details are reviewed in this wizard."
+                                  : member.nextAction === "self_confirmation_required"
+                                    ? `${member.firstName} has their own login and needs to sign in and confirm their details.`
+                                    : member.nextAction === "delegated_placeholder"
+                                      ? `${member.firstName} does not have their own login. A family adult can complete their details.`
+                                      : member.nextAction === "confirmation_not_required"
+                                        ? `${member.firstName} does not need member detail confirmation.`
+                                      : "Member details are confirmed."}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+
+                    <FamilyGroupSection
+                      familyGroups={data.familyGroups.map((group) => ({
+                        id: group.id,
+                        name: group.name,
+                        members: group.members
+                          .filter((member) => !member.isCurrentUser)
+                          .map((member) => ({
+                            id: member.id,
+                            firstName: member.firstName,
+                            lastName: member.lastName,
+                          })),
+                      }))}
+                      canManage
+                    />
+                  </div>
+                )}
+
+                {data.pendingRequests.length > 0 ? (
+                  <div className="space-y-2 rounded-md border bg-card p-4">
+                    <div className="flex items-center gap-2">
+                      <Clock className="h-4 w-4 text-warning-11" />
+                      <h3 className="font-medium">Pending family requests</h3>
+                    </div>
+                    {data.pendingRequests.map((request) => (
+                      <PendingRequestSummary key={request.id} request={request} />
+                    ))}
+                  </div>
+                ) : null}
+
+                <DialogFooter>
+                  <Button
+                    type="button"
+                    onClick={confirmOnboarding}
+                    disabled={confirming}
+                  >
+                    {confirming ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="h-4 w-4" />
+                    )}
+                    Confirm and finish
+                  </Button>
+                </DialogFooter>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  );
+}

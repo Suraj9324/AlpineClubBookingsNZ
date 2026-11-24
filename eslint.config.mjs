@@ -1,0 +1,3267 @@
+import { fixupConfigRules } from "@eslint/compat";
+import { defineConfig, globalIgnores } from "eslint/config";
+import nextVitals from "eslint-config-next/core-web-vitals";
+import nextTs from "eslint-config-next/typescript";
+import jsxA11y from "eslint-plugin-jsx-a11y";
+import css from "@eslint/css";
+import accessibility from "./scripts/eslint/accessibility.mjs";
+import testClock from "./scripts/eslint/test-clock.mjs";
+import designSystem, { PRIMITIVE_IMPLEMENTATIONS } from "./scripts/eslint/design-system.mjs";
+
+// #2264 — the three date-rendering restrictions, named so the "Number
+// formatting only" block below can re-state the two date ones while dropping
+// just `toLocaleString`, instead of switching the whole rule off.
+//
+// All three enforce INV-DATE-015 (`docs/invariants/booking-dates-and-capacity.md`),
+// and each message opens with that id so whoever trips the rule is handed the
+// rule it belongs to rather than only the fix (#2691).
+const NO_BARE_TO_LOCALE_DATE_STRING = {
+  selector:
+    "CallExpression > MemberExpression.callee[property.name='toLocaleDateString']",
+  message:
+    "INV-DATE-015: Render through @/lib/club-time (CT-2, #2990). Holding a lodge night, a birthday or any other CALENDAR DAY? formatClubDate / formatClubLongDate / formatClubWeekdayDate / formatClubMonthYear, which take no timezone because a calendar day has none. Holding a real INSTANT such as createdAt? formatClubInstantDate / formatClubInstantDateTime and their siblings, with the club zone from clubTime() (@/lib/club-time/server) on the server or received as data on the client. A bare toLocaleDateString renders in the viewer's zone and locale (#2256, #2264). There is no second seam: #3123 deleted @/lib/nzst-date, so the kernel is the only one — do not build another.",
+};
+
+const NO_BARE_TO_LOCALE_TIME_STRING = {
+  selector:
+    "CallExpression > MemberExpression.callee[property.name='toLocaleTimeString']",
+  message:
+    "INV-DATE-015: Use formatClubInstantTime / formatClubInstantDateTime from @/lib/club-time (CT-2, #2990), with the club zone from clubTime() (@/lib/club-time/server) on the server or received as data on the client. A bare toLocaleTimeString renders in the viewer's zone and locale (#2256, #2264). There is no second seam: #3123 deleted @/lib/nzst-date, so the kernel is the only one — do not build another.",
+};
+
+const NO_BARE_TO_LOCALE_STRING = {
+  selector:
+    "CallExpression > MemberExpression.callee[property.name='toLocaleString']",
+  message:
+    "INV-DATE-015: Use formatClubInstantDateTime / formatClubInstantDate from @/lib/club-time (CT-2, #2990) for an instant, or formatClubDate for a calendar day, which takes no timezone at all. A bare toLocaleString on a Date renders in the viewer's zone and locale (#2256, #2264). Formatting a NUMBER? Add the file to the Number-formatting block in this config with a one-line reason. There is no second seam: #3123 deleted @/lib/nzst-date, so the kernel is the only one — do not build another.",
+};
+
+// #2289 — the two shapes of raw SQL that can lie about their own result.
+//
+// `prisma.$queryRaw<SomeRow[]>` is an UNCHECKED CAST. Raw SQL returns the
+// PHYSICAL column names; the type argument declares whatever the author
+// believed. Nothing verifies the two agree — not the compiler (the cast silences
+// it) and not the tests (a mocked Prisma returns the shape the author believed,
+// which is the same wrong belief). Where they disagreed in a real deployment,
+// every property arrived `undefined`: `maxRedemptionsTotal` undefined made
+// `!== null` true and `n > undefined` false, so a promo's total-redemption cap
+// never fired, and `freeNightsPerIndividual` undefined made `?? 0` yield zero,
+// so FREE_NIGHTS promos applied no discount at booking creation while the quote
+// path showed the member one. Members were quoted a discount and charged without
+// it, for months, with nothing logged.
+//
+// The type argument IS the hazard, so it is the thing banned. It cannot tell you
+// a column name is wrong — only that somebody asserted a shape without checking
+// it. Two honest alternatives remain, and the message names both.
+//
+// BOTH CALL FORMS ARE COVERED, deliberately. Prisma accepts a raw statement as a
+// tagged template (``$queryRaw`SELECT …` ``) AND as an ordinary call taking a
+// composed `Prisma.Sql` (`$queryRaw(Prisma.sql`SELECT …`)`) — and the second is
+// this repository's own idiom for anything longer than a one-liner
+// (`src/lib/audit-retention.ts` builds its archive statements that way). A rule
+// that only matched the tagged template would leave the exact banned pattern —
+// typed cast, `SELECT *`, `FOR UPDATE` on a read — passing lint in the style the
+// codebase already uses, which is worse than no rule because it reads as covered.
+//
+// Both messages enforce INV-OPS-001 (`docs/invariants/operations.md`), which
+// names these rules and the census test beside them as its two enforcement arms,
+// and both open with that id (#2691).
+const RAW_SQL_METHOD = "/^\\$(queryRaw|executeRaw)(Unsafe)?$/";
+const RESULT_CAST_MESSAGE =
+  "INV-OPS-001: Do not type a raw-SQL result: `$queryRaw<T>` is an unchecked cast and a wrong column name arrives as `undefined`, not as an error (#2289). Taking a row lock? Use `$executeRaw` on a statement selecting a constant (`SELECT 1 … FOR UPDATE`) and read what you need through the Prisma model. Genuinely cannot express it as a model read? Validate the rows with `decodeRawRows` from @/lib/raw-sql-rows.";
+const SELECT_STAR_MESSAGE =
+  "INV-OPS-001: Do not `SELECT *` in a raw statement (#2289): the returned column set becomes whatever the database currently has, so a migration changes the result shape with nothing in the source to review. Name the columns — or, if the statement is only there for a row lock, select a constant (`SELECT 1 … FOR UPDATE`).";
+
+// `$queryRaw<T>`…`` — the tagged-template cast.
+const NO_RAW_SQL_RESULT_CAST = {
+  selector: `TaggedTemplateExpression[typeArguments][tag.property.name=${RAW_SQL_METHOD}]`,
+  message: RESULT_CAST_MESSAGE,
+};
+
+// `$queryRaw<T>(Prisma.sql`…`)` and `$queryRawUnsafe<T>("…")` — the same cast
+// written as a call. One selector covers all four methods.
+const NO_RAW_SQL_CALL_RESULT_CAST = {
+  selector: `CallExpression[typeArguments][callee.property.name=${RAW_SQL_METHOD}]`,
+  message: RESULT_CAST_MESSAGE,
+};
+
+// `SELECT *` in a raw statement is the same hazard one step earlier: it makes the
+// returned column set whatever the DATABASE currently happens to have, so the
+// statement silently changes shape when a migration does — and there is nothing
+// in the source to review it against. Name the columns you actually want.
+//
+// Four selectors because the SQL text can reach the driver four ways, and the
+// three below the first are precisely the ones the tagged-template rule missed.
+const NO_SELECT_STAR_IN_RAW_SQL = {
+  selector: `TaggedTemplateExpression[tag.property.name=${RAW_SQL_METHOD}] TemplateElement[value.raw=/SELECT\\s+\\*/i]`,
+  message: SELECT_STAR_MESSAGE,
+};
+
+// `$queryRawUnsafe(`SELECT * …`)` — a template literal passed as an argument.
+// The child combinator keeps this off `Prisma.sql`…`` arguments, which the
+// composition rule below reports instead, so nothing is flagged twice.
+const NO_SELECT_STAR_IN_RAW_SQL_CALL = {
+  selector: `CallExpression[callee.property.name=${RAW_SQL_METHOD}] > TemplateLiteral TemplateElement[value.raw=/SELECT\\s+\\*/i]`,
+  message: SELECT_STAR_MESSAGE,
+};
+
+// `$queryRawUnsafe("SELECT * …")` — a plain string argument.
+const NO_SELECT_STAR_IN_RAW_SQL_STRING = {
+  selector: `CallExpression[callee.property.name=${RAW_SQL_METHOD}] > Literal[value=/SELECT\\s+\\*/i]`,
+  message: SELECT_STAR_MESSAGE,
+};
+
+// ``Prisma.sql`SELECT * …` `` — anchored on the composition helper rather than on
+// the call, so a statement built into a variable and passed to `$queryRaw` on a
+// later line is still caught. `Prisma.sql` exists only to build SQL, so there is
+// no false-positive surface here.
+const NO_SELECT_STAR_IN_PRISMA_SQL = {
+  selector:
+    'TaggedTemplateExpression[tag.object.name="Prisma"][tag.property.name="sql"] TemplateElement[value.raw=/SELECT\\s+\\*/i]',
+  message: SELECT_STAR_MESSAGE,
+};
+
+// #2685 — building integer cents inline, instead of at one of the two reviewed
+// money boundaries.
+//
+// Two different mistakes wear the same shape, `something * 100`:
+//
+//  1. TEXT a person typed. `Math.round(parseFloat(value) * 100)` sends a decimal
+//     the person wrote through a binary double, which cannot hold most decimal
+//     fractions exactly; `parseFloat` also accepts "50abc" as 50 and returns
+//     `NaN` for anything it cannot read at all — and several call sites turned
+//     that `NaN` into `0`, or into a `JSON.stringify` `null`, so a typo saved a
+//     nightly rate of $0.00 or filed a refund appeal with no amount, silently.
+//     `parseDecimalDollarsToCents` reads the digit groups as integers instead,
+//     and returns `null` so the caller must show an error.
+//  2. A NUMBER a provider already parsed. Xero hands over a JavaScript number,
+//     so the decimal source text is gone and the exact parser cannot be used.
+//     That conversion belongs at `providerAmountToCents`, the single reviewed
+//     rounding boundary, not in twenty-five inline copies.
+//
+// THE RULE MATCHES THE COMPOSITION, NOT A FUNCTION NAME. Banning `parseFloat`
+// was measured on this tree and rejected: every non-test call either already
+// ended in a `* 100` (so it adds no coverage) or parses OKLCH colour tokens in
+// `club-theme-schema.ts` (so it adds four false positives), and it would miss
+// the `Number()`-based parser entirely.
+//
+// WHAT IT DELIBERATELY DOES NOT MATCH: `ratio * 100` for a percentage —
+// occupancy, success rate, setup progress, Xero API budget use — and
+// `Math.round(n * 100) / 100` two-decimal rounding in `src/lib/theme/`. There
+// are two dozen of those and they are all legitimate; the negative fixtures in
+// `money-cents-guard.test.ts` pin every shape.
+//
+// All of them enforce INV-MONEY-003 (`docs/invariants/money.md`) and open with
+// that id, so whoever trips one is handed the rule (#2691).
+const MONEY_CENTS_MESSAGE =
+  "INV-MONEY-003: Do not build cents inline. Money a PERSON typed goes through parseDecimalDollarsToCents (or parseSignedDecimalDollarsToCents where a negative is a real amount) from @/lib/money-input — it parses the decimal digits exactly and returns null, which you must surface as a validation error rather than a silent $0.00. An ALREADY-NUMERIC provider amount, such as a Xero API number, goes through providerAmountToCents from @/lib/money-provider-amount, the one reviewed rounding boundary. Xero REPORT cell text, which arrives with thousands separators and accountants' bracket negatives, goes through parseProviderReportAmountToCents from the same module — the typed-money parser refuses both of those. Computing a PERCENTAGE rather than cents, or otherwise sure this rule has misfired? Add the file to MONEY_GUARD_EXEMPTIONS in eslint.config.mjs with a written reason — that list is the escape hatch and it is read by money-cents-guard.test.ts, so adding to it passes CI. Never an eslint-disable comment (#2685).";
+
+// A numeric-parse call anywhere inside an expression that is multiplied by 100.
+// The descendant combinator is what makes alternate spellings and compositions
+// fail too: `(parseFloat(x) || 0) * 100` and `(Number(a) + Number(b)) * 100`
+// are the same mistake as `parseFloat(x) * 100` and are all caught here, where
+// a selector anchored on the operand itself would let both through.
+const PARSE_CALL_SELECTORS = [
+  'CallExpression[callee.name=/^(Number|parseFloat|parseInt)$/]',
+  'CallExpression[callee.object.name="Number"][callee.property.name=/^(parseFloat|parseInt)$/]',
+];
+
+// A binding whose name ends in `Cents`. That suffix is not a guess about English
+// — it is this repository's own money convention (INV-MONEY-001), and nothing
+// ever stores a percentage in one, which is what lets this arm catch a
+// conversion built from a plain variable without touching the percentages.
+const CENTS_TARGET_SELECTOR =
+  ':matches(VariableDeclarator[id.name=/[Cc]ents$/], AssignmentExpression[left.name=/[Cc]ents$/], AssignmentExpression[left.property.name=/[Cc]ents$/], Property[key.name=/[Cc]ents$/], PropertyDefinition[key.name=/[Cc]ents$/])';
+
+const TIMES_100_SELECTORS = [
+  'BinaryExpression[operator="*"][right.value=100]',
+  'BinaryExpression[operator="*"][left.value=100]',
+];
+
+// The same multiplication, minus the one shape that is a percentage by
+// construction: a DIVISION sitting directly inside it. `(calls / budget) * 100`,
+// `(beds / capacity) * 100` and `(settled / limit) * 100` are ratios scaled to a
+// percentage, and nothing in this repository builds cents that way — a cents
+// conversion scales an amount, not a quotient. Excluding it is what lets the
+// broad arm below cover the payment modules without making the obvious fix to
+// `xero-api-usage.ts`'s fractional `usagePercent` illegal to write.
+//
+// The residue this gives up is narrow, but it is only narrow because the two
+// arms below put the rest back: a quotient of PARSED TEXT scaled to cents, and a
+// quotient of anything else scaled INTO a `…Cents` binding, are both still
+// caught. What is genuinely given up is `(a / b) * 100` that really is money,
+// built from neither typed text nor a `…Cents` destination — indistinguishable,
+// by shape or by name, from the occupancy percentage two lines above it.
+const TIMES_100_NOT_A_RATIO_SELECTORS = [
+  'BinaryExpression[operator="*"][right.value=100]:not([left.type="BinaryExpression"][left.operator="/"])',
+  'BinaryExpression[operator="*"][left.value=100]:not([right.type="BinaryExpression"][right.operator="/"])',
+];
+
+// Scaling to cents WITHOUT a `* 100` anywhere in the source.
+//
+//   * `c *= 100` is the compound-assignment spelling, and it escaped every arm —
+//     including the broad money-module one — because there is no
+//     `BinaryExpression` to match. It is the shape one refactoring step away
+//     from `const c = parseFloat(raw); c *= 100;`.
+//   * `x / 0.01` is `x * 100` written as a division. Dividing by a hundredth is
+//     never anything else.
+const SCALED_TO_CENTS_WITHOUT_TIMES_100_SELECTORS = [
+  'AssignmentExpression[operator="*="][right.value=100]',
+  'BinaryExpression[operator="/"][right.value=0.01]',
+];
+
+const MONEY_CENTS_RESTRICTIONS = [
+  // Arm 1 — an inline numeric parse scaled to cents.
+  ...TIMES_100_SELECTORS.flatMap((times100) =>
+    PARSE_CALL_SELECTORS.map((parseCall) => `${times100} ${parseCall}`),
+  ),
+  // Arm 2 — a unary `+` coercion scaled to cents (`+input * 100`).
+  'BinaryExpression[operator="*"][right.value=100][left.type="UnaryExpression"][left.operator="+"]',
+  'BinaryExpression[operator="*"][left.value=100][right.type="UnaryExpression"][right.operator="+"]',
+  // Arm 3 — anything scaled to cents ON THE WAY INTO a `…Cents` binding, MINUS
+  // the two shapes arms 1 and 2 have already reported. `parseFloat(raw) * 100`
+  // and `parseFloat(raw)` begin at the same column, so without these exclusions
+  // the commonest real mistake printed the identical message twice at the
+  // identical line:column, and a 25-site regression printed fifty of them
+  // (#2685 review). The exclusions mirror arms 1 and 2 exactly — a parse call
+  // anywhere inside, or a unary `+` as the scaled operand — so nothing stops
+  // being reported, it is reported once.
+  ...[
+    `BinaryExpression[operator="*"][right.value=100]:not(:has(:matches(${PARSE_CALL_SELECTORS.join(", ")}))):not([left.type="UnaryExpression"][left.operator="+"])`,
+    `BinaryExpression[operator="*"][left.value=100]:not(:has(:matches(${PARSE_CALL_SELECTORS.join(", ")}))):not([right.type="UnaryExpression"][right.operator="+"])`,
+  ].map((times100) => `${CENTS_TARGET_SELECTOR} ${times100}`),
+  // Arm 5 — the two spellings that carry no `* 100` at all.
+  ...SCALED_TO_CENTS_WITHOUT_TIMES_100_SELECTORS,
+].map((selector) => ({ selector, message: MONEY_CENTS_MESSAGE }));
+
+// Inside the money-domain modules themselves, a bare `x * 100` is a cents
+// conversion and nothing else — these files compute no occupancy percentages and
+// no theme ratios, which is exactly why the broad selector is safe here and
+// nowhere else. This is the arm that catches a fresh
+// `return Math.round(invoice.total * 100)` written straight into a Xero module,
+// and equally `const d = parseFloat(raw); const c = Math.round(d * 100);`, which
+// the shape-based arms above cannot see because the parse and the scaling are in
+// different statements.
+//
+// WHAT THE BROAD ARM DOES AND DOES NOT COVER — stated exactly, because getting
+// this wrong is what opened a hole. It covers arms 1–3 for ANY `x * 100` whose
+// scaled operand is not a division: whatever `x` is, the broad selector already
+// matches the same node, so re-stating the narrower arms for that shape would
+// only report one mistake two and three times over. It does NOT cover the shape
+// its own `:not(...)` exclusion removes — a division sitting inside the
+// multiplication — and there the narrower arms are the only cover there ever
+// was. Both arms below put that back:
+//
+//   * RATIO_OF_PARSE_SELECTORS — a quotient of PARSED TEXT scaled to cents,
+//     `(parseFloat(gross) / 1.15) * 100` (GST-exclusive), `(parseFloat(raw) /
+//     guests) * 100` (per-guest share), `(parseFloat(line.total) / line.qty) *
+//     100` (unit price). Every one of those is money built from typed text, and
+//     without this arm all three converted unguarded in every money module and
+//     every API route while the identical line was caught in an ordinary
+//     `src/lib` file — the guard at its weakest exactly where money lives.
+//   * RATIO_INTO_CENTS_SELECTORS — a quotient of anything else scaled INTO a
+//     `…Cents` binding, where the repository's own naming convention says the
+//     result is money.
+//
+// A ratio with NEITHER a parse inside it nor a `…Cents` destination stays legal,
+// which is the whole point of the exclusion: `(calls / budget) * 100` and
+// `(beds / capacity) * 100` are percentages, and they are spelled this way
+// inside these very files.
+const PARSE_CALL_MATCHES = `:matches(${PARSE_CALL_SELECTORS.join(", ")})`;
+
+const RATIO_OF_PARSE_SELECTORS = [
+  `BinaryExpression[operator="*"][right.value=100][left.type="BinaryExpression"][left.operator="/"] ${PARSE_CALL_MATCHES}`,
+  `BinaryExpression[operator="*"][left.value=100][right.type="BinaryExpression"][right.operator="/"] ${PARSE_CALL_MATCHES}`,
+];
+
+// The same exclusion arm 3 carries, and for the same reason: a parse anywhere
+// inside the quotient is reported by the arm above, anchored on the parse call.
+// Without it, `const amountCents = Math.round((parseFloat(x) / n) * 100);`
+// printed the identical message twice — once at the multiplication and once at
+// the parse one column along — which is the duplicate-reporting defect the
+// earlier review already made this config fix once (#2685 review).
+const RATIO_INTO_CENTS_SELECTORS = [
+  `${CENTS_TARGET_SELECTOR} BinaryExpression[operator="*"][right.value=100][left.type="BinaryExpression"][left.operator="/"]:not(:has(${PARSE_CALL_MATCHES}))`,
+  `${CENTS_TARGET_SELECTOR} BinaryExpression[operator="*"][left.value=100][right.type="BinaryExpression"][right.operator="/"]:not(:has(${PARSE_CALL_MATCHES}))`,
+];
+
+const MONEY_MODULE_RESTRICTIONS = [
+  ...TIMES_100_NOT_A_RATIO_SELECTORS,
+  ...RATIO_OF_PARSE_SELECTORS,
+  ...RATIO_INTO_CENTS_SELECTORS,
+  ...SCALED_TO_CENTS_WITHOUT_TIMES_100_SELECTORS,
+].map((selector) => ({ selector, message: MONEY_CENTS_MESSAGE }));
+
+/**
+ * The two money arm families as bare selector strings, for
+ * `money-cents-guard.test.ts`.
+ *
+ * The suite resolves this config through ESLint's own
+ * `calculateConfigForFile()` at a roster of real production paths and checks the
+ * resolved rule still carries every selector the family declares. It reads them
+ * from HERE rather than from a copy, because a copied list passes happily while
+ * the config that ships has dropped the rule — which is the whole failure mode
+ * this file's guards exist to prevent. The suite pins a floor on the LENGTH of
+ * each family, and its lint-a-real-fixture cases pin the behaviour, so emptying
+ * one of these arrays does not quietly empty the expectation with it.
+ */
+export const MONEY_GUARD_ARMS = {
+  standard: MONEY_CENTS_RESTRICTIONS.map((entry) => entry.selector),
+  moneyModule: MONEY_MODULE_RESTRICTIONS.map((entry) => entry.selector),
+};
+
+/**
+ * THE ESCAPE HATCH, and the only one. Each entry lifts the money restrictions
+ * from one path and states in writing why that path is allowed to build cents
+ * itself. There are no `eslint-disable` comments for this rule, and a new entry
+ * here should be read as a site that was never classified.
+ *
+ * `money-cents-guard.test.ts` reads THIS array rather than a copy of it, and
+ * fails on an entry with no reason — so the instruction the rule's own message
+ * gives ("add the file with a written reason") is a move that actually passes
+ * CI. It did not used to be: the test hard-coded the two helper paths, so a
+ * developer told to add a third had no legal option at all (#2685 review).
+ */
+export const MONEY_GUARD_EXEMPTIONS = [
+  {
+    file: "src/lib/money-input.ts",
+    reason:
+      "The canonical exact text parser. It combines the integer dollar and cent groups with `dollars * 100 + cents`, which is the arithmetic every other file is being sent here to use.",
+  },
+  {
+    file: "src/lib/money-provider-amount.ts",
+    reason:
+      "The reviewed provider boundary. It owns `Math.round(value * 100)` for already-numeric amounts, and the documented legacy float fallback for a Xero report cell whose magnitude falls outside the canonical grammar.",
+  },
+];
+
+const MONEY_HELPER_MODULES = MONEY_GUARD_EXEMPTIONS.map((entry) => entry.file);
+
+// ---------------------------------------------------------------------------
+// #3302 — the MIRROR of INV-MONEY-003 above. That guard catches BUILDING
+// cents inline (dollars typed or provided, scaled up). Nothing caught the
+// reverse: hand-rolling `(cents / 100).toFixed(n)` to RENDER cents instead of
+// importing the shared `formatCents` / `formatCentsPlain` from `@/lib/utils`.
+// That exact shape was independently written nine times under the name
+// `formatCents`, and a TENTH (`formatOfferCents`) escaped #3302's own census
+// because it kept its own name — proof the census alone cannot hold this
+// still; only a structural check can.
+//
+// WHAT THIS DELIBERATELY DOES NOT DISTINGUISH. The AST node this matches is
+// identical whether the result becomes a currency-labelled display string or
+// a bare numeric export cell — that distinction lives in what happens to the
+// call's RESULT, which this selector does not follow. `CENTS_DISPLAY_EXEMPTIONS`
+// below is where that judgement is made, once, in writing, per file — exactly
+// the shape `MONEY_GUARD_EXEMPTIONS` above already uses for the same reason.
+const CENTS_DISPLAY_MESSAGE =
+  "INV-SSOT-001 / #3302: do not hand-roll `(cents / 100).toFixed(n)` to render an amount. Use the shared formatCents (a currency-formatted string) or formatCentsPlain (a bare two-decimal string with no symbol or grouping — including editable dollars inputs), both from @/lib/utils. A raw CSV or JSON export cell, and an amount prefixed with a provider's own currency code, are formatCentsPlain's output too. Only a genuinely different output, one neither helper returns, may need an exemption: add that file to CENTS_DISPLAY_EXEMPTIONS in eslint.config.mjs with a written reason that names the difference in terms a reader can check against the code. The list is checked by cents-display-guard.test.ts. Never an eslint-disable comment.";
+
+// #3533 — the OTHER way a person is shown the storage form: not a bad
+// division, but no division at all. `${refundAmountCents} cents` in an audit
+// `details` string, a thrown Error, a repair report line or a cron summary
+// hands a booking officer "8450 cents" to convert in their head, and a
+// factor-of-a-hundred misread is easy. A census on 20 Sep 2026 found 26 of
+// them under `src/`, seven in `booking-cancel.ts` alone.
+//
+// The selector keys on a template quasi that BEGINS WITH A SPACE and then the
+// word: in `` `${x} cents` `` the second quasi's raw value is exactly
+// `" cents"`, and a leading space can only come from text that follows an
+// interpolation. That is what keeps `` `cents: ${x}` `` — a label, not an
+// amount — out of it, and it is why the space is load-bearing rather than
+// cosmetic, and why the word must not run on into a longer noun
+// (`" cents-per-night rows"` is a row count, not an amount). The negative
+// fixtures in `cents-in-prose-guard.test.ts` pin every one of those shapes.
+const CENTS_IN_PROSE_MESSAGE =
+  "INV-SSOT-001 / #3533/#3589: do not write `${someCents} cents` or `${someCents}c` into text a person reads. An audit `details` string, a thrown Error, an operator report line and a cron summary are all read by a booking officer or the treasurer reconstructing a booking's money, and every amount there must read as a formatted currency value — use formatCents (or formatSignedCents where the sign is the point) from @/lib/utils with the club's resolved format. The STORED value stays integer cents; this is about the sentence. Bare `${someCents}` without a unit is covered only in the six scoped operator-message sources by operator-cents-message-census.test.ts; classify new cent-valued aliases there. Writing a raw numeric export cell? Emit the number alone (formatCentsPlain from @/lib/utils) without the unit word; the rule only fires when `cents` or `c` follows the amount. No exemption list lifts this rule: CENTS_DISPLAY_EXEMPTIONS in eslint.config.mjs covers only the toFixed arithmetic, and cents-in-prose-guard.test.ts proves the prose rule still fires in every file on it. Never an eslint-disable comment.";
+
+const CENTS_DISPLAY_RESTRICTIONS = [
+  {
+    selector:
+      'CallExpression[callee.type="MemberExpression"][callee.property.name="toFixed"][callee.object.type="BinaryExpression"][callee.object.operator="/"][callee.object.right.value=100]',
+    message: CENTS_DISPLAY_MESSAGE,
+  },
+];
+
+/**
+ * ITS OWN GROUP, and that is the whole point of the separation.
+ *
+ * The first cut appended this selector to `CENTS_DISPLAY_RESTRICTIONS`, which
+ * made it inherit that group's exemptions at the time - ten files excused for
+ * seeding an editable input's plain value, writing a raw export cell or
+ * prefixing a Xero invoice's currency, none of which is a reason to write the
+ * storage form into a sentence. (#3399 retired all ten; only the canonical
+ * definition in `src/lib/utils.ts` is still listed.) That is exactly the
+ * hazard this file warns about two groups above for the raw-SQL set and again
+ * for the money set: an exemption written for one rule silently lifting
+ * another it was never weighed against. Review of #3533 caught it before it
+ * shipped; keeping the array separate is what makes the mistake unavailable
+ * rather than merely noticed.
+ *
+ * It has no file-wide exemption and no per-file override.
+ */
+const CENTS_IN_PROSE_RESTRICTIONS = [
+  {
+    selector:
+      'TemplateLiteral:not(TaggedTemplateExpression > TemplateLiteral) > TemplateElement[value.raw=/^ cents(?![-\\w])/i]',
+    message: CENTS_IN_PROSE_MESSAGE,
+  },
+  {
+    selector:
+      'TemplateLiteral:not(TaggedTemplateExpression > TemplateLiteral) > TemplateElement[value.raw=/^c(?![-\\w])/i]',
+    message: CENTS_IN_PROSE_MESSAGE,
+  },
+];
+
+/** Bare selectors, for `cents-in-prose-guard.test.ts`, same mirror as above. */
+export const CENTS_IN_PROSE_GUARD_ARM = CENTS_IN_PROSE_RESTRICTIONS.map(
+  (entry) => entry.selector,
+);
+
+/**
+ * The one arm as a bare selector array, for `cents-display-guard.test.ts` —
+ * same reason `MONEY_GUARD_ARMS` is exported above: the suite resolves the
+ * REAL config and checks the resolved rule still carries every selector this
+ * array declares, so a copy nobody kept in sync cannot pass while the config
+ * that ships has dropped the rule.
+ */
+export const CENTS_DISPLAY_GUARD_ARM = CENTS_DISPLAY_RESTRICTIONS.map(
+  (entry) => entry.selector,
+);
+
+// INV-CONFIG-001 (#3325) — the locale and currency are the club's
+// configuration. `new Intl.NumberFormat("en-NZ", { style: "currency", ... })`
+// was found in three files at the merge base (the fee sections, the joining
+// fee preview, the public content tokens) that #3302's toFixed arm above
+// structurally cannot see (there is no division to match), and two of them
+// sat on that arm's editable-input exemption (retired in #3399). This is
+// therefore its OWN group, on the mandatory set, so
+// `srcRestrictedSyntaxWithout(CENTS_DISPLAY_RESTRICTIONS, ...)` does not lift
+// it: an exemption from the toFixed arithmetic never excuses a hard-coded
+// locale. The two homes (`@/lib/utils`, `@/lib/finance-format`)
+// pass identifiers off the club's resolved format — `APP_LOCALE` and
+// `APP_CURRENCY` until #3565, `format.locale` and `format.currencyCode`
+// through `@/lib/club-format-intl` since — so they pass without an exemption
+// list, which is the point: there is no legitimate literal locale or currency
+// code in `src/`.
+//
+// Two arms, each with the shape it does and does not see stated in
+// `cents-display-guard.test.ts`. Both match `Intl.NumberFormat` whether or not
+// it is spelled with `new`. The FIRST fires on a string-literal LOCALE on a
+// currency formatter; the SECOND on a string-literal CURRENCY code whatever
+// the locale argument is. Neither sees a template-literal or array locale, an
+// aliased constructor, `Intl["NumberFormat"]`, or `toLocaleString(...)` — the
+// guard is a structural check on the one shape this codebase has actually
+// written, not a proof that no other shape exists.
+// INV-CONFIG-006 / #3566 — the club's FORMAT is a required argument, and this
+// arm keeps it one (#3628 review, finding B7).
+//
+// The compiler is the census for a missing format only while the parameter is
+// REQUIRED. A `format: ClubDateFormat = { locale: "en-NZ" }` default, a
+// `format = CLUB_FORMAT_TEST`, or a `format?: ClubFormat` would make every
+// caller that forgets the club's format compile again — silently, in a wrapper
+// such as `season-label.ts` that the `@ts-expect-error` locks in
+// `house-shapes.test.ts` and `club-format-kernel.test.ts` never call. So a
+// default value (an `AssignmentPattern`) or an optional marker on ANY parameter
+// typed `ClubDateFormat` or `ClubFormat`, anywhere in `src/`, is refused. On the
+// mandatory set, so no block can lift it. Branding the type was the
+// alternative and was not taken: every test fixture and every server reader
+// would need to mint the brand, for no protection this arm does not give.
+//
+// WHAT IT SEES (widened in the #3628 re-review). A club-format type reference
+// (`ClubDateFormat`, `ClubFormat`, or qualified `ct.ClubDateFormat`) that IS the
+// annotation, or sits in it as a union / intersection member, an array element,
+// or a generic argument (`Readonly<ClubDateFormat>`, `Readonly<X | null>`,
+// `Array<ClubFormat>`) — on:
+//  - a parameter with a DEFAULT (`format: ClubDateFormat | undefined = NZ`);
+//  - an OPTIONAL identifier: a function parameter, an interface-method or
+//    function-type parameter (`format?: ClubDateFormat | null`);
+//  - an OPTIONAL property signature, so an options object cannot carry it
+//    optionally (`opts: { format?: ClubDateFormat }`), nor a class field;
+//  - an optional TUPLE element, so a rest tuple cannot
+//    (`...rest: [ClubDateFormat?]`, `...rest: [format?: ClubDateFormat]`);
+//  - a DESTRUCTURED default on a property named `format` / `clubFormat` /
+//    `dateFormat` (`({ format = NZ }: Options)`) — by NAME, because a selector
+//    cannot follow `Options` to its declaration; the optional-property arm is
+//    what refuses `format?:` on that declaration.
+// The annotation is walked by explicit CHILD paths, not a descendant `:has`, on
+// purpose: an optional property whose type is a FUNCTION taking a required
+// format (`sendAlert?: (report, format: ClubFormat) => Promise<void>`, in
+// `xero-credit-sync-checker.ts`) keeps that format required, and a descendant
+// match would refuse it. That function's own parameters are still judged,
+// by the optional-identifier arm, so `(format?: ClubFormat) => void` is caught.
+// What a selector cannot see is a type ALIAS (`type F = ClubDateFormat;
+// (format?: F)`), which needs type resolution; `club-format-required-guard.test.ts`
+// backs that with a census refusing any alias of a club format outside the
+// kernel's own definition.
+const CLUB_FORMAT_TYPE_NAME = "/^Club(?:Date)?Format$/";
+const CLUB_FORMAT_REF = `TSTypeReference:matches([typeName.name=${CLUB_FORMAT_TYPE_NAME}], [typeName.right.name=${CLUB_FORMAT_TYPE_NAME}])`;
+/** Where, below an annotation's root, a club-format reference still makes that annotation "a club format". */
+const CLUB_FORMAT_ANNOTATION_PATHS = [
+  CLUB_FORMAT_REF,
+  `TSUnionType > ${CLUB_FORMAT_REF}`,
+  `TSIntersectionType > ${CLUB_FORMAT_REF}`,
+  `TSArrayType > ${CLUB_FORMAT_REF}`,
+  `TSUnionType > TSArrayType > ${CLUB_FORMAT_REF}`,
+  `TSTypeOperator > TSArrayType > ${CLUB_FORMAT_REF}`,
+  `TSTypeReference > TSTypeParameterInstantiation > ${CLUB_FORMAT_REF}`,
+  `TSTypeReference > TSTypeParameterInstantiation > TSUnionType > ${CLUB_FORMAT_REF}`,
+  `TSUnionType > TSTypeReference > TSTypeParameterInstantiation > ${CLUB_FORMAT_REF}`,
+];
+/** `head > path` for every annotation path, as one comma-list selector. */
+const clubFormatAnnotated = (head) =>
+  CLUB_FORMAT_ANNOTATION_PATHS.map((path) => `${head} > ${path}`).join(", ");
+const CLUB_FORMAT_REQUIRED_MESSAGE =
+  "INV-CONFIG-006 / #3566: a `ClubDateFormat` / `ClubFormat` parameter is REQUIRED — no default value and no `?`. A default is the ambient-locale shape the owner declined on #3566 and #3565: it lets a caller that forgot the club's format compile. Take the format from the caller (clubTime().format / clubFormatValues() on the server, useClubTime().format / useClubFormat() in the browser).";
+const CLUB_FORMAT_PARAMETER_RESTRICTIONS = [
+  clubFormatAnnotated("AssignmentPattern > Identifier.left > TSTypeAnnotation"),
+  clubFormatAnnotated("Identifier[optional=true] > TSTypeAnnotation"),
+  clubFormatAnnotated("TSPropertySignature[optional=true] > TSTypeAnnotation"),
+  clubFormatAnnotated("PropertyDefinition[optional=true] > TSTypeAnnotation"),
+  clubFormatAnnotated("TSOptionalType"),
+  clubFormatAnnotated("TSNamedTupleMember[optional=true]"),
+  "ObjectPattern > Property[key.name=/^(?:format|clubFormat|dateFormat)$/] > AssignmentPattern",
+].map((selector) => ({ selector, message: CLUB_FORMAT_REQUIRED_MESSAGE }));
+
+/**
+ * The #3566 required-format arm as bare selector strings, for
+ * `club-format-required-guard.test.ts` — read from HERE, never copied.
+ */
+export const CLUB_FORMAT_GUARD_ARMS = {
+  requiredParameter: CLUB_FORMAT_PARAMETER_RESTRICTIONS.map((entry) => entry.selector),
+};
+
+// INV-CONFIG-006 / #3567 — NOTHING IMPORTS `@/config/operational`. #3566 banned
+// importing `APP_LOCALE` / `APP_CURRENCY` from it (#3628 review, finding B9);
+// #3567 retired the last two exports, `APP_STRIPE_CURRENCY` and `APP_TIME_ZONE`,
+// and DELETED the file. The arm now refuses any import of that path, so a
+// recreated file starts out unreachable: the club's currency, locale and time
+// zone are its stored settings, and the environment only seeds them.
+//
+// A `no-restricted-syntax` arm on the mandatory set rather than
+// `no-restricted-imports`, for the reason the environment-zone note above gives:
+// flat config REPLACES a rule's options, and `src/lib/xero-*` sets its own
+// `no-restricted-imports`, so an import rule would be silently lifted for the
+// modules that write Xero documents. Every spelling of the module path is
+// matched, and a namespace import, a default import and a re-export are refused
+// too. Tests are outside it (they are outside `no-restricted-syntax`
+// altogether); `app-currency-import-census.test.ts` walks them instead.
+// The module path, however spelled: `@/config/operational`,
+// `../config/operational`, `@/config/./operational`, `@/config//operational`,
+// `@/config/operational.js` (round 2 of the #3628 review). A template literal
+// (`import(`@/config/${name}`)`) or a `require` cannot always be read to its
+// value, so any template mentioning `config` or `operational` in a dynamic
+// import or `require` is refused outright. What no selector can follow — a
+// computed module name, a `createRequire` alias — is backstopped by the
+// word-level census in `app-currency-import-census.test.ts`: none of the four
+// retired names anywhere in `src/` code, tests included, comments stripped. The
+// browser-import census in `client-server-boundary-census.test.ts` protects the
+// path in the client graph as well.
+// Case-insensitive, and the module as a path SEGMENT: with or without an
+// extension, a trailing slash, `/index` or anything beneath it (#3567 review).
+const OPERATIONAL_MODULE = "/(?:^|\\/)config(?:\\/+\\.)*\\/+operational(?:\\.[cm]?[jt]sx?)?(?:\\/.*)?$/i";
+const OPERATIONAL_TEMPLATE = "TemplateElement[value.raw=/config|operational/i]";
+const RETIRED_FORMAT_CONSTANT_MESSAGE =
+  "INV-CONFIG-006 / #3567: do not import @/config/operational. #3567 deleted it with its four constants (APP_CURRENCY, APP_LOCALE, APP_STRIPE_CURRENCY, APP_TIME_ZONE). The club's currency and locale are the persisted setting: clubFormatValues() / clubFormat() on the server, useClubFormat() in the browser, getClubFormat() in a src/lib module that already imports @/lib/prisma; card charges take the currency from the format stripe.ts already requires; the club's time zone is clubTimeZone() / clubTime() from @/lib/club-time/server or readClubTimeZoneOutsideRequest(). The environment is a seed only (club-format-env.ts, club-time-zone-env.ts).";
+const RETIRED_FORMAT_CONSTANT_RESTRICTIONS = [
+  `ImportDeclaration[source.value=${OPERATIONAL_MODULE}]`,
+  `ExportNamedDeclaration[source.value=${OPERATIONAL_MODULE}]`,
+  `ExportAllDeclaration[source.value=${OPERATIONAL_MODULE}]`,
+  `ImportExpression[source.value=${OPERATIONAL_MODULE}]`,
+  `ImportExpression[source.type="TemplateLiteral"]:has(${OPERATIONAL_TEMPLATE})`,
+  `CallExpression[callee.name="require"][arguments.0.value=${OPERATIONAL_MODULE}]`,
+  `CallExpression[callee.name="require"][arguments.0.type="TemplateLiteral"]:has(${OPERATIONAL_TEMPLATE})`,
+  `TSExternalModuleReference[expression.value=${OPERATIONAL_MODULE}]`,
+].map((selector) => ({ selector, message: RETIRED_FORMAT_CONSTANT_MESSAGE }));
+
+/** The #3566/#3567 retired-module arm as bare selectors, read by its guard test. */
+export const RETIRED_FORMAT_CONSTANT_ARMS = RETIRED_FORMAT_CONSTANT_RESTRICTIONS.map(
+  (entry) => entry.selector,
+);
+
+const CURRENCY_LOCALE_MESSAGE =
+  "INV-CONFIG-001 / #3325: do not construct `Intl.NumberFormat(<literal locale>, { style: \"currency\" })` — the locale is the club's configuration, not this codebase's. Render an integer-cent amount with formatCents / formatSignedCents from @/lib/utils, or a whole-dollar dashboard figure with formatDollarsDisplay from @/lib/finance-format; since #3565 both TAKE the club's resolved format, which a server caller gets from clubFormat() and a browser caller from bindClubFormat. A genuinely new rendering SHAPE is declared in @/lib/club-format-intl beside the others, never as another Intl instance. There is no exemption list for this rule and no eslint-disable.";
+
+const CURRENCY_CODE_MESSAGE =
+  "INV-CONFIG-001 / #3325: do not pass a literal currency code (`currency: \"NZD\"`) to Intl.NumberFormat — the currency is the club's configuration (APP_CURRENCY), not this codebase's. Use formatCents / formatSignedCents from @/lib/utils or formatDollarsDisplay from @/lib/finance-format, which take it; a formatter in a foreign currency (a Xero invoice's own) takes that currency as a variable, never a literal. There is no exemption list for this rule and no eslint-disable.";
+
+const INTL_NUMBER_FORMAT =
+  ':matches(NewExpression, CallExpression)[callee.object.name="Intl"][callee.property.name="NumberFormat"]';
+
+const CURRENCY_LOCALE_RESTRICTIONS = [
+  {
+    selector: `${INTL_NUMBER_FORMAT}[arguments.0.type="Literal"]:has(Property[key.name="style"][value.value="currency"])`,
+    message: CURRENCY_LOCALE_MESSAGE,
+  },
+  {
+    selector: `${INTL_NUMBER_FORMAT}:has(Property[key.name="currency"][value.type="Literal"])`,
+    message: CURRENCY_CODE_MESSAGE,
+  },
+];
+
+/**
+ * Bare selectors, for `cents-display-guard.test.ts` — the same mirror
+ * `CENTS_DISPLAY_GUARD_ARM` provides above: the suite resolves the REAL config
+ * at an ordinary file AND at every toFixed-exempted file and checks each still
+ * carries every selector here, so an edit that drops or lifts one fails.
+ */
+export const CURRENCY_LOCALE_GUARD_ARM = CURRENCY_LOCALE_RESTRICTIONS.map(
+  (entry) => entry.selector,
+);
+
+/**
+ * THE ESCAPE HATCH for `CENTS_DISPLAY_RESTRICTIONS`, same rule as
+ * `MONEY_GUARD_EXEMPTIONS`: every entry names the file(s) and states in
+ * writing why hand-rolled `(cents / 100).toFixed(n)` is allowed there.
+ * `cents-display-guard.test.ts` reads THIS array and fails an entry with no
+ * reason, and separately fails if a listed file no longer contains the
+ * pattern — an exemption is deleted when its cause is, never left "for now".
+ */
+export const CENTS_DISPLAY_EXEMPTIONS = [
+  {
+    files: ["src/lib/utils.ts"],
+    reason:
+      "The canonical definition. `formatCentsPlain`'s own body IS this arithmetic — every other file is sent here to call it rather than write it again.",
+  },
+];
+
+// Where a bare `x * 100` is money by construction.
+//
+// The families are matched by PREFIX so the guard follows the code through an
+// ordinary rename or a split into a directory — the earlier hand-written list
+// missed `src/lib/xero.ts` (the facade #4930 deleted: `xero-*` missed it), had no
+// `/**` form for `membership-cancellation-*` although the other two families
+// did, and matched `.ts` only, so moving one module to `.tsx` would have dropped
+// it silently (#2685 review).
+//
+// The named modules are the rest of the money surface the census found: the
+// payment, credit, promo, fee, invoice and pricing modules, plus every API
+// route, all of which convert money and none of which computes a percentage.
+// `src/lib/admin-payments-service.ts` is the one the issue itself calls
+// "invisible to any rule keyed off parseFloat or Math.round" — it is visible to
+// this arm.
+//
+// Still deliberately NOT here: the Xero ADMIN SCREENS under
+// `src/app/(admin)/admin/finance/xero/`, which render API-budget percentages with the
+// same `usagePercent * 100` shape, and are correct.
+const MONEY_DOMAIN_MODULES = [
+  "src/lib/xero-*.{ts,tsx}",
+  "src/lib/xero-*/**/*.{ts,tsx}",
+  "src/lib/finance-*.{ts,tsx}",
+  "src/lib/finance-*/**/*.{ts,tsx}",
+  "src/lib/membership-cancellation-*.{ts,tsx}",
+  "src/lib/membership-cancellation-*/**/*.{ts,tsx}",
+  "src/lib/*payment*.{ts,tsx}",
+  "src/lib/*credit*.{ts,tsx}",
+  "src/lib/*refund*.{ts,tsx}",
+  "src/lib/*promo*.{ts,tsx}",
+  "src/lib/*fee*.{ts,tsx}",
+  "src/lib/*invoice*.{ts,tsx}",
+  "src/lib/*subscription*.{ts,tsx}",
+  "src/lib/pricing.ts",
+  "src/lib/stripe.ts",
+  "src/lib/stripe-*.{ts,tsx}",
+  "src/app/api/**/*.{ts,tsx}",
+];
+
+// Flat config REPLACES a rule's whole option list rather than merging it, so
+// every block that sets `no-restricted-syntax` for its own reasons has to
+// re-state these. Keeping them in one array is what stops a future exemption
+// block from silently dropping the raw-SQL guard along with the rule it meant to
+// lift (#2289).
+const RAW_SQL_RESTRICTIONS = [
+  NO_RAW_SQL_RESULT_CAST,
+  NO_RAW_SQL_CALL_RESULT_CAST,
+  NO_SELECT_STAR_IN_RAW_SQL,
+  NO_SELECT_STAR_IN_RAW_SQL_CALL,
+  NO_SELECT_STAR_IN_RAW_SQL_STRING,
+  NO_SELECT_STAR_IN_PRISMA_SQL,
+];
+
+// The same hazard, one rule later: every block below that sets
+// `no-restricted-syntax` must re-state the money restrictions as well, or the
+// block silently lifts them along with whatever it meant to lift.
+// `src/lib/__tests__/money-cents-guard.test.ts` fails the build if one ever
+// does (#2685).
+
+// #2684 — the date-only ENCODING must be written once, in `src/lib/date-only.ts`.
+//
+// A lodge night, a stay bound, a finance window edge and a Xero document date
+// are all `yyyy-MM-dd`, and the codebase had 119 hand-written copies of the
+// truncation that produces one, in five spellings: `.slice(0, 10)`,
+// `.substring(0, 10)`, `.substr(0, 10)`, and `.split("T")[0]` in either quote
+// style. That is a maintainability problem on its own, but the reason it is a
+// LINT rule rather than a style note is what the duplication hides.
+//
+// The truncation is only correct for a DATE-ONLY receiver. A `@db.Date` column
+// is pinned to UTC midnight as the ENCODING of a CLUB calendar day and not as a
+// moment (INV-DATE-010), so reading the UTC day back returns the day it encodes
+// — INV-DATE-019's first exact boundary, over the columns INV-DATE-026
+// establishes as calendar days; those are the citation for a decode, and
+// INV-DATE-010 is not (#3080). A bare `DateTime`
+// is a real instant, and New Zealand runs 12-13 hours ahead of UTC, so its UTC
+// day is the PREVIOUS NZ day for roughly the first half of every NZ day — which
+// is how a Xero invoice due date and a finance export both landed a day early
+// (#2697, INV-DATE-019), and how #2682's fifteen "today" sites went wrong before
+// them. The two cases are indistinguishable at a glance and identical in syntax;
+// the only thing that separates them is what the value MEANS.
+//
+// Scattered across 119 sites nobody could audit that. Routed through named
+// helpers, the choice is written down at every call: `formatDateOnly` for a
+// date-only value, `formatDateOnlyForTimeZone` for an instant,
+// `todayDateOnlyForTimeZone` / `getTodayDateOnly` for "today" (INV-DATE-019).
+// This rule only enforces that the choice is MADE somewhere named; which one is
+// right for a given receiver is what `date-only-encoding-guard.test.ts` checks,
+// because a syntactic rule cannot see a Prisma column type.
+//
+// A WRAPPER DOES NOT GET A FREE PASS, but it is also not impossible — and this
+// comment used to claim otherwise. The rule is over the syntax wherever it
+// appears in `src/**`, so the forbidden pattern is illegal inside a helper's own
+// body as much as at a call site, which matters because one exported
+// `formatDate` one-liner in `xero-invoice-helpers` was enough to put roughly
+// eighteen live Xero document dates beyond reach of the #2682 spelling census.
+// What defeats a selector anchored on the truncation is a wrapper that takes ONE
+// intermediate step — `const iso = d.toISOString(); return iso.slice(0, 10);` —
+// because the slice's receiver is then a plain identifier. That is `formatDate`
+// reconstituted and harder to spot, so `NO_TRUNCATION_ASSEMBLED_IN_A_WRAPPER`
+// below matches the function that contains both halves. The only body in `src/`
+// allowed to contain the truncation is the helper module exempted below, and the
+// guard test additionally refuses an EXPORTED bare delegation so the blind spot
+// cannot re-form under a new name.
+//
+// KNOWN LIMITATION (accepted, and the same one INV-DATE-015's rule carries). The
+// selectors are syntactic, so they match spellings rather than meanings. Named
+// exactly, what still gets through today is:
+//
+//   * a DETACHED METHOD ALIAS — `const f = d.toISOString; f().slice(0, 10)`;
+//   * the truncation assembled across TWO functions — one returning the ISO
+//     string, another cutting it — rather than inside one. The wrapper arm below
+//     is scoped to a single function body on purpose: widening it to "calls
+//     toISOString anywhere, slices ten characters anywhere" was measured and
+//     reported two real files where the two halves are unrelated, so the loose
+//     version costs more than it catches;
+//   * a bare `.slice(0, 10)` on a value ALREADY serialised to a string, where
+//     nothing in the expression says it is a date. This one is deliberate:
+//     `.slice(0, 10)` on a string is indistinguishable from an array take-10 or
+//     an ordinary text truncation, and this tree has both, so banning it would
+//     be a false-positive generator rather than a guard;
+//   * an encoding derived from a NON-UTC clock face — `getFullYear()` and
+//     friends — which is a different defect (the BROWSER's calendar day) that
+//     INV-DATE-014 and #2474 own, not this rule.
+//
+// What IS covered, and was not before this list was measured against real lint
+// runs: every `(0, 10)` cut of a `toISOString()`/`toJSON()` result including
+// through computed access (`d["toISOString"]()`), the same cut assembled through
+// a local inside one function, `.split("T")` taken with `[0]`, `.at(0)` or
+// `.shift()` and with the separator written as a string or as `/T/`, the
+// `.replace(/T.*$/, "")` spelling, and the encoding assembled from UTC parts in
+// a template literal — which was live in three files, and which no arm of this
+// rule could see until it was added.
+const DATE_TRUNCATION_MESSAGE =
+  "INV-DATE-019: Do not hand-write an ISO date truncation (#2684). New code goes to @/lib/club-time (CT-2, #2990): clubCalendarDateOf(instant, zone) for a real INSTANT such as `createdAt`, whose UTC day is the PREVIOUS club day all morning (#2697); calendarDateOfDateOnlyInstant(value) for a `@db.Date` column, whose UTC midnight IS the encoding of a club calendar day (INV-DATE-010); clubToday(zone) for today. The @/lib/date-only equivalents (formatDateOnly / formatMonthOnly / formatDateOnlyForTimeZone / getTodayDateOnly) are compatibility adapters that #2991 closed with, kept as reviewed adapters.";
+
+const DATE_SPLIT_MESSAGE =
+  "INV-DATE-019: Do not hand-write an ISO date truncation (#2684). Holding a Date? @/lib/club-time (CT-2, #2990): calendarDateOfDateOnlyInstant for a `@db.Date` value (INV-DATE-010) or clubCalendarDateOf(instant, zone) for a real instant. Holding a value already serialised to a string? parseCalendarDate, or dateOnlyFromIsoString from the @/lib/date-only adapter.";
+
+// The ISO producers, spelled both ways a member access can reach them:
+// `d.toISOString()` reads `callee.property.name`, `d["toISOString"]()` reads
+// `callee.property.value`. The computed form was named in this file's own
+// limitations paragraph as something that slipped past — it does not any more.
+const ISO_PRODUCER_SELECTORS = [
+  "[callee.object.callee.property.name=/^(toISOString|toJSON)$/]",
+  "[callee.object.callee.property.value=/^(toISOString|toJSON)$/]",
+];
+
+// `d.toISOString().slice(0, 10)` and its `substring` / `substr` spellings.
+const NO_HAND_WRITTEN_DATE_ONLY_TRUNCATION = ISO_PRODUCER_SELECTORS.map(
+  (producer) => ({
+    selector: `CallExpression[callee.property.name=/^(slice|substring|substr)$/]${producer}`,
+    message: DATE_TRUNCATION_MESSAGE,
+  }),
+);
+
+// `.replace(/T.*$/, "")` — the same cut written as a substitution, on a `Date`
+// or on a string that is already ISO.
+//
+// Anchored on the PATTERN, not on the receiver, which was measured rather than
+// assumed. Anchoring on the receiver instead — any `.replace()` on a
+// `toISOString()` result — read as the tighter rule and was in fact far looser:
+// it reported `new Date().toISOString().replace(/[:.]/g, "-")` in
+// `src/lib/backup.ts`, which builds a filename out of the WHOLE timestamp and
+// truncates nothing. A regex beginning with a capital `T` followed by a wildcard
+// is the time half of an ISO value and cannot be much else.
+const NO_ISO_DATE_REPLACE = {
+  selector:
+    'CallExpression[callee.property.name="replace"][arguments.0.regex.pattern=/^T[.*+?]/]',
+  message: DATE_TRUNCATION_MESSAGE,
+};
+
+// The head of a split on a capital T, taken any of the three ways JavaScript
+// offers, with the separator written as a string or as a regex. Including on a
+// value that is ALREADY a string, because splitting on a capital T and keeping
+// the front has exactly one meaning.
+const SPLIT_ON_T_SELECTORS = [
+  "[object.callee.property.name='split'][object.arguments.0.value='T']",
+  "[object.callee.property.name='split'][object.arguments.0.regex.pattern='T']",
+];
+
+const NO_ISO_DATE_SPLIT_ON_T = [
+  // `parts[0]`
+  ...SPLIT_ON_T_SELECTORS.map((split) => ({
+    selector: `MemberExpression[computed=true][property.value=0]${split}`,
+    message: DATE_SPLIT_MESSAGE,
+  })),
+  // `parts.at(0)` and `parts.shift()`
+  ...SPLIT_ON_T_SELECTORS.flatMap((split) => {
+    // EVERY attribute moves under `callee`, not just the first. Anchoring this
+    // with `^` rewrote only the leading one and left `[object.arguments.0…]`
+    // behind, so both arms silently matched nothing — which is why the fixture
+    // probe lints each spelling rather than trusting the string surgery.
+    const onSplit = split.replace(/\[object\./g, "[callee.object.");
+    return [
+      {
+        selector: `CallExpression[callee.property.name="at"][arguments.0.value=0]${onSplit}`,
+        message: DATE_SPLIT_MESSAGE,
+      },
+      {
+        selector: `CallExpression[callee.property.name="shift"]${onSplit}`,
+        message: DATE_SPLIT_MESSAGE,
+      },
+    ];
+  }),
+];
+
+// The truncation ASSEMBLED INSIDE ONE FUNCTION rather than written as a single
+// expression:
+//
+//   export function formatDocumentDate(date: Date): string {
+//     const iso = date.toISOString();
+//     return iso.slice(0, 10);
+//   }
+//
+// Every arm above anchors the cut on its receiver, and here the receiver is a
+// plain identifier, so all of them missed it — and so did the census test, whose
+// wrapper-following only recognised delegations to a canonical encoder, not a
+// body that writes the truncation itself. This is `formatDate` rebuilt one step
+// at a time, which is exactly the shape that hid roughly eighteen Xero document
+// dates, so it is matched at the level where both halves are visible: the
+// function.
+//
+// BOTH HALVES ARE PINNED TIGHTLY, and the loose version was measured before this
+// one was written. Requiring only "a function that calls toISOString somewhere
+// and slices ten characters somewhere" reported two real files —
+// `email-failure-review.ts` and `token-email-recovery.ts` — where the
+// `toISOString()` calls serialise full timestamps into a response object and the
+// `.slice(0, 10)` is an ARRAY take-ten of the ten most recent rows. Those are not
+// the same expression and never were.
+//
+// So the ISO half must be STORED (`const iso = d.toISOString()`, or assigned to
+// an existing binding), and the cut must be taken on a plain IDENTIFIER. That is
+// the shape of the escape and not the shape of the coincidence.
+const ISO_STORED_IN_A_BINDING = [
+  'VariableDeclarator[init.callee.property.name=/^(toISOString|toJSON)$/]',
+  'AssignmentExpression[right.callee.property.name=/^(toISOString|toJSON)$/]',
+];
+
+const CUT_TEN_OFF_A_BINDING =
+  'CallExpression[callee.property.name=/^(slice|substring|substr)$/][callee.object.type="Identifier"][arguments.0.value=0][arguments.1.value=10]';
+
+const NO_TRUNCATION_ASSEMBLED_IN_A_WRAPPER = [
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "ArrowFunctionExpression",
+].flatMap((fn) =>
+  ISO_STORED_IN_A_BINDING.map((stored) => ({
+    selector: `${fn}:has(${stored}):has(${CUT_TEN_OFF_A_BINDING})`,
+    message:
+      "INV-DATE-019: This function stores a toISOString()/toJSON() result and then cuts ten characters off a binding, which is a hand-written date-only encoding assembled in two steps (#2684). One expression or two, it is the same duplication — and splitting it across a local is precisely what hid the last one from both this rule and the census. Call formatDateOnly / formatMonthOnly from @/lib/date-only for a DATE-ONLY value (INV-DATE-010), formatDateOnlyForTimeZone for a real instant (#2697), or dateOnlyFromIsoString when what you hold is already an ISO string.",
+  })),
+);
+
+// The encoding assembled from UTC CLOCK-FACE PARTS, which produces the identical
+// `yyyy-MM-dd` (or `yyyy-MM`) string with no ISO spelling anywhere in it:
+//
+//   `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`
+//
+// This was LIVE IN THREE FILES when the rule was written and no arm could see
+// any of them — `previousMonthKey` in `finance-sync-health.ts` (in a file this
+// very branch was already editing), and the EXPORTED `formatDateKey` and
+// `monthKey` helpers on the kiosk week strip and the occupancy calendar. All
+// three are migrated; the selector is what stops a fourth.
+//
+// A template literal interpolating BOTH the UTC year and the UTC month or day is
+// a date key and nothing else. Reading one part alone — `getUTCFullYear()` for a
+// season label, `getUTCMonth()` for arithmetic — is untouched, which is why this
+// costs no false positives on the tree today.
+const NO_DATE_ONLY_FROM_UTC_PARTS = {
+  selector:
+    'TemplateLiteral:has(CallExpression[callee.property.name="getUTCFullYear"]):has(CallExpression[callee.property.name=/^getUTC(Month|Date)$/])',
+  message:
+    "INV-DATE-019: Do not assemble a date key from UTC clock-face parts (#2684). `${d.getUTCFullYear()}-${...getUTCMonth() + 1...}` is the same hand-written encoding as toISOString().slice(0, 10), written in a spelling no date census recognises. Use formatDateOnly / formatMonthOnly from @/lib/date-only for a DATE-ONLY value (INV-DATE-010), or formatDateOnlyForTimeZone for a real instant (#2697). Building a Date FROM parts is the opposite direction and is fine — this is about reading one back out.",
+};
+
+const DATE_ONLY_ENCODING_RESTRICTIONS = [
+  ...NO_HAND_WRITTEN_DATE_ONLY_TRUNCATION,
+  NO_ISO_DATE_REPLACE,
+  ...NO_ISO_DATE_SPLIT_ON_T,
+  ...NO_TRUNCATION_ASSEMBLED_IN_A_WRAPPER,
+  NO_DATE_ONLY_FROM_UTC_PARTS,
+];
+
+// #2264, one hole later — an `Intl.DateTimeFormat` built with NO `timeZone`.
+//
+// The rule above bans `toLocaleDateString()` because it renders in the VIEWER's
+// zone, and the message sends the author to "a module-level Intl.DateTimeFormat
+// pinned to APP_LOCALE + APP_TIME_ZONE". An unpinned `new Intl.DateTimeFormat()`
+// has exactly the defect the ban exists for and is clean under every arm of it,
+// which makes it the obvious workaround for anyone the rule inconveniences —
+// and `new Intl.DateTimeFormat("en-CA").format(d)` is worse than the general
+// case, because `en-CA` numeric IS `yyyy-MM-dd`. That is a date-only ENCODING
+// taken from the viewer's calendar: a lodge night rendered in Vancouver comes
+// out a day early, silently, with no ISO spelling and no `toLocale*` call for
+// either guard to catch.
+//
+// Every `new Intl.DateTimeFormat` in `src/` already passes a `timeZone`, so this
+// costs nothing today. A formatter that genuinely must follow the reader's own
+// clock passes `timeZone: undefined` explicitly, which says so in the source.
+const NO_UNZONED_INTL_DATE_TIME_FORMAT = {
+  selector:
+    'NewExpression[callee.object.name="Intl"][callee.property.name="DateTimeFormat"]:not(:has(Property[key.name="timeZone"]))',
+  message:
+    "INV-DATE-015: An Intl.DateTimeFormat with no `timeZone` renders in the VIEWER's zone, which is the whole defect the toLocaleDateString ban exists for (#2264) — and `en-CA` numeric is `yyyy-MM-dd`, so an unpinned one is a date-only encoding taken from the reader's calendar rather than the club's. Since CT-2 (#2990) no call site should be building one at all: use a named house shape from @/lib/club-time, which owns the only formatter factory in the tree and memoises it by zone. A formatter that really must follow the reader's clock passes `timeZone: undefined` explicitly.",
+};
+
+const ZONED_FORMATTER_RESTRICTIONS = [NO_UNZONED_INTL_DATE_TIME_FORMAT];
+
+// ---------------------------------------------------------------------------
+// CT-6 (#2991) — the two recurrence paths the epic left mechanically open.
+// ---------------------------------------------------------------------------
+//
+// The three arms above cover the RENDERING escapes (`toLocale*`, an unzoned
+// `Intl.DateTimeFormat`) and the date-only ENCODING escapes. Two classes were
+// still guarded by nothing at all, and each is the shape a whole CT-4 group was
+// spent removing:
+//
+//   * reading a `Date` back through its HOST clock face — `getFullYear()`,
+//     `getMonth()`, `getDate()` — which answers in the container's zone rather
+//     than the club's, so west of Greenwich a stored lodge night reads a day
+//     early. `#3082` (a boundary birthday selecting the wrong price band) and
+//     `#3100` (a stay expander that did not terminate) were both this;
+//   * taking the ENVIRONMENT's zone as civil-time authority, either by reading
+//     `process.env.TZ` directly or by importing `APP_TIME_ZONE`. Since CT-1
+//     (#2989) the club's zone is the persisted `ClubTimeSettings.timeZone`
+//     (`INV-CONFIG-002`); `TZ` seeds that row at setup and has no further say.
+//
+// Both are expressed as `no-restricted-syntax` arms rather than as
+// `no-restricted-imports`, deliberately. Flat config REPLACES a rule's options
+// rather than merging them, and `src/lib/xero-*.ts` already sets
+// `no-restricted-imports` for its own facade rule — so an import-based guard
+// here would be silently lifted for exactly the Xero modules that date
+// financial documents. Everything mandatory lives in ONE array, which is the
+// architecture the fold below already insists on.
+
+const HOST_CLOCK_FACE_READERS =
+  "^(getFullYear|getMonth|getDate|getDay|getHours|getMinutes|getSeconds)$";
+const HOST_CLOCK_FACE_WRITERS =
+  "^(setFullYear|setMonth|setDate|setHours|setMinutes|setSeconds)$";
+
+const HOST_CLOCK_FACE_MESSAGE =
+  "INV-DATE-014 / INV-CONFIG-002: This reads or writes a Date through the HOST's clock face, so it answers in whatever zone the container happens to run in (CT-6, #2991). A `@db.Date` lodge night is UTC midnight, and west of Greenwich `.getDate()` on one returns the PREVIOUS day — that is #3082 (a boundary birthday priced a year young) and #3100 (a stay expander that never terminated). Calendar arithmetic on a stay day: addDaysDateOnly / addMonthsDateOnly / eachDateOnlyInRange / countNightsDateOnly from @/lib/date-only, which are UTC-based and zone-free. A civil date or time from a real instant: clubCalendarDateOf(instant, zone) or a house shape from @/lib/club-time. A DURATION: subtract milliseconds from the instant, which is what `setDate(getDate() - n)` was approximating and gets wrong by an hour across DST. The getUTC* readers are untouched — they name their frame.";
+
+// Both spellings a member access can reach these through, matching the
+// encoding arm above: `d.getDate()` reads `property.name`, `d["getDate"]()`
+// reads `property.value`. The computed form is the documented escape from every
+// syntactic rule in this file, so a new rule should close it on the way in
+// rather than record it as a known limitation.
+const NO_HOST_CLOCK_FACE = [
+  `CallExpression > MemberExpression.callee[property.name=/${HOST_CLOCK_FACE_READERS}/]`,
+  `CallExpression > MemberExpression.callee[property.value=/${HOST_CLOCK_FACE_READERS}/]`,
+  `CallExpression > MemberExpression.callee[property.name=/${HOST_CLOCK_FACE_WRITERS}/]`,
+  `CallExpression > MemberExpression.callee[property.value=/${HOST_CLOCK_FACE_WRITERS}/]`,
+].map((selector) => ({ selector, message: HOST_CLOCK_FACE_MESSAGE }));
+
+const ENVIRONMENT_ZONE_MESSAGE =
+  "INV-CONFIG-002: The environment's timezone is not the club's (CT-1, #2989; CT-6, #2991). `TZ` / `NEXT_PUBLIC_TZ` SEED the persisted `ClubTimeSettings.timeZone` row at setup and have no say afterwards, so a business or display decision taken from them follows whichever container the process happens to be in. Server component or route: clubTimeZone() / clubTime() from @/lib/club-time/server, which is request-scoped and memoised. A cron tick or a CLI, which `server-only` refuses: readClubTimeZoneOutsideRequest() from @/lib/club-time-zone-runtime. A client component: receive the zone as data through ClubTimeProvider — the browser never decides it. @/lib/date-only is the last compatibility adapter (#2991 closed with it kept as a reviewed adapter), and it no longer DEFAULTS a zone: #3123 deleted its six `= APP_TIME_ZONE` defaults, so every helper there now demands one from its caller. The rendering adapter beside it, @/lib/nzst-date, is already deleted (#3123). Do not add a caller, and do not build a replacement.";
+
+// `process.env.TZ` and `process.env.NEXT_PUBLIC_TZ`, read anywhere but the two
+// modules whose job is to read them once.
+//
+// THREE SPELLINGS, because a syntactic rule that closes only the obvious one is
+// a rule with a documented way round it. The dotted form was all this arm
+// matched at first, and a review lens measured that `process.env["TZ"]` and
+// `const { TZ } = process.env` both walked straight past it — while the census
+// beside it looked for `APP_TIME_ZONE` and could not see them either, so for
+// those two spellings the "two instruments" claim was untrue. Both neighbouring
+// arms in this file already close their computed twin on principle
+// (`NO_HOST_CLOCK_FACE` has a `property.value` pair, `NO_ENVIRONMENT_ZONE_IMPORT`
+// an `imported.value` one); this now matches them. Live population is zero, so
+// this costs nothing today and is purely about what may be written next.
+const NO_ENVIRONMENT_ZONE_ENV_READ = [
+  // `process.env.TZ`
+  'MemberExpression[object.object.name="process"][object.property.name="env"][property.name=/^(TZ|NEXT_PUBLIC_TZ)$/]',
+  // `process.env["TZ"]`
+  'MemberExpression[object.object.name="process"][object.property.name="env"][property.value=/^(TZ|NEXT_PUBLIC_TZ)$/]',
+  // `const { TZ } = process.env`, and its quoted-key form
+  'VariableDeclarator[init.object.name="process"][init.property.name="env"] > ObjectPattern > Property[key.name=/^(TZ|NEXT_PUBLIC_TZ)$/]',
+  'VariableDeclarator[init.object.name="process"][init.property.name="env"] > ObjectPattern > Property[key.value=/^(TZ|NEXT_PUBLIC_TZ)$/]',
+].map((selector) => ({ selector, message: ENVIRONMENT_ZONE_MESSAGE }));
+
+// Importing the environment zone by name. `@/config/operational` exported it as
+// a plain string, so nothing downstream of the import could tell it from a club
+// zone — which is how 133 call sites came to take it as a default without one
+// review noticing. #3567 deleted the module; these stay so a recreated one
+// cannot hand the zone out again.
+const NO_ENVIRONMENT_ZONE_IMPORT = [
+  'ImportDeclaration[source.value="@/config/operational"] > ImportSpecifier[imported.name="APP_TIME_ZONE"]',
+  'ImportDeclaration[source.value="@/config/operational"] > ImportSpecifier[imported.value="APP_TIME_ZONE"]',
+].map((selector) => ({ selector, message: ENVIRONMENT_ZONE_MESSAGE }));
+
+// INV-CONFIG-006 / #3567 review — the ENVIRONMENT's currency and locale, read
+// anywhere but the one seed reader. `CURRENCY` / `LOCALE` seed the stored
+// `ClubFormatSettings` row once; `NEXT_PUBLIC_CURRENCY` / `NEXT_PUBLIC_LOCALE`
+// are not read at all. A new reader of any of the four is a second authority for
+// what the club charges and shows, so the same three spellings the zone arm
+// closes are closed here, and `club-format-env.ts` is the one file exempt.
+const ENVIRONMENT_FORMAT_ENV = "/^(CURRENCY|LOCALE|NEXT_PUBLIC_CURRENCY|NEXT_PUBLIC_LOCALE)$/";
+const ENVIRONMENT_FORMAT_MESSAGE =
+  "INV-CONFIG-006 / #3567: The environment's currency and locale are not the club's. `CURRENCY` / `LOCALE` seed the stored ClubFormatSettings row once, in club-format-env.ts, and `NEXT_PUBLIC_CURRENCY` / `NEXT_PUBLIC_LOCALE` are not read at all. Read the club's format with clubFormatValues() / clubFormat() on the server, useClubFormat() in the browser, or getClubFormat() in a src/lib module that already imports @/lib/prisma; card charges take the currency from stripeChargeCurrency(format).";
+const ENVIRONMENT_FORMAT_RESTRICTIONS = [
+  `MemberExpression[object.object.name="process"][object.property.name="env"][property.name=${ENVIRONMENT_FORMAT_ENV}]`,
+  `MemberExpression[object.object.name="process"][object.property.name="env"][property.value=${ENVIRONMENT_FORMAT_ENV}]`,
+  `VariableDeclarator[init.object.name="process"][init.property.name="env"] > ObjectPattern > Property[key.name=${ENVIRONMENT_FORMAT_ENV}]`,
+  `VariableDeclarator[init.object.name="process"][init.property.name="env"] > ObjectPattern > Property[key.value=${ENVIRONMENT_FORMAT_ENV}]`,
+  // A template-literal key, process.env[`CURRENCY`] (#3567 re-review). An alias
+  // (`const env = process.env; env.CURRENCY`) is past any selector; the
+  // word-level census in app-currency-import-census.test.ts closes that.
+  `MemberExpression[object.object.name="process"][object.property.name="env"][property.type="TemplateLiteral"]:has(TemplateElement[value.raw=${ENVIRONMENT_FORMAT_ENV}])`,
+].map((selector) => ({ selector, message: ENVIRONMENT_FORMAT_MESSAGE }));
+
+/** The one file allowed to read the environment's currency and locale. */
+const ENVIRONMENT_FORMAT_ADAPTER_FILES = ["src/lib/club-format-env.ts"];
+
+/** The environment-format arm as bare selectors, read by its guard test. */
+export const ENVIRONMENT_FORMAT_ARMS = ENVIRONMENT_FORMAT_RESTRICTIONS.map((entry) => entry.selector);
+
+// #5399 — the caller's IP read anywhere but the one helper. The FIRST
+// `X-Forwarded-For` address is whatever the caller sent; 25 route sites read it
+// (three stored the raw header), so behind an appending proxy the audit log held
+// an address the caller chose. Any string naming a client-address header is
+// refused, which also catches a local alias, a bracket read, a destructured key
+// and a header written by hand: the one writer (`mcp/dispatch.ts`'s loopback)
+// uses `FORWARDED_FOR_HEADER` from the helper. The platform headers are named
+// too, so trusting one later is a decision made in the helper, not a quiet read.
+// `forwarded` (RFC 7239) is also an ordinary word and an audit-census kind in
+// `scripts/audit/`, so only a header-shaped read of it is refused.
+const CLIENT_IP_HEADER_NAME =
+  "/^(x-forwarded-for|x-real-ip|cf-connecting-ip|true-client-ip|x-vercel-forwarded-for|fly-client-ip)$/i";
+const RFC_FORWARDED_NAME = "/^forwarded$/i";
+const CLIENT_IP_HEADER_MESSAGE =
+  "#5399: Read the caller's IP with getClientIp(request), or getAuditRequestContext(request) for an audit context; clientIpFromHeaders(headers) where only headers are in hand. The first X-Forwarded-For address is whatever the caller sent, so the rule (last address, then X-Real-IP) lives once, in src/lib/rate-limit-http.ts; a platform header (CF-Connecting-IP, True-Client-IP, Forwarded and the like) is trusted there or nowhere.";
+const CLIENT_IP_HEADER_RESTRICTIONS = [
+  `Literal[value=${CLIENT_IP_HEADER_NAME}]`,
+  `TemplateElement[value.raw=${CLIENT_IP_HEADER_NAME}]`,
+  `CallExpression[callee.property.name=/^(get|has)$/] > Literal[value=${RFC_FORWARDED_NAME}]`,
+  `CallExpression[callee.property.name=/^(get|has)$/] > TemplateLiteral > TemplateElement[value.raw=${RFC_FORWARDED_NAME}]`,
+  `MemberExpression[computed=true][property.value=${RFC_FORWARDED_NAME}]`,
+].map((selector) => ({ selector, message: CLIENT_IP_HEADER_MESSAGE }));
+
+/** The one file allowed to name the client-address headers. */
+const CLIENT_IP_HEADER_ADAPTER_FILES = ["src/lib/rate-limit-http.ts"];
+
+/** The client-IP arm as bare selectors, read by its guard test. */
+export const CLIENT_IP_HEADER_ARMS = CLIENT_IP_HEADER_RESTRICTIONS.map((entry) => entry.selector);
+
+const HOST_CLOCK_RESTRICTIONS = [...NO_HOST_CLOCK_FACE];
+
+const ENVIRONMENT_ZONE_RESTRICTIONS = [
+  ...NO_ENVIRONMENT_ZONE_ENV_READ,
+  ...NO_ENVIRONMENT_ZONE_IMPORT,
+];
+
+// ---------------------------------------------------------------------------
+// CT-6 (#2991) — the class no syntactic guard above can see.
+// ---------------------------------------------------------------------------
+//
+// The host-clock arm matches `.getDate()` where it is WRITTEN. `date-fns` does
+// the identical read inside `node_modules`, so a file that imports `format` or
+// `startOfMonth` has every one of that arm's defects and is clean under every
+// selector in this file. That is not a theory — measured on this runtime, with
+// one `@db.Date` lodge night stored at `2026-09-01T00:00:00.000Z`:
+//
+//   format(night, "yyyy-MM-dd")   UTC -> "2026-09-01"   Denver -> "2026-08-31"
+//   startOfMonth(night)           UTC -> 1 Sep 00:00Z   Denver -> 1 AUG 06:00Z
+//   addDays(26 Sep night, 1)      Auckland -> 2026-09-26T23:00:00.000Z, an hour
+//                                 short of UTC midnight, because it crossed the
+//                                 27 September daylight-saving transition
+//
+// So a stay day renders a day early west of Greenwich, a report bucket lands in
+// the wrong MONTH, and a `@db.Date` range bound built by adding a day falls on
+// the wrong side of a stored night on one weekend a year.
+//
+// Not every export is a hazard: `formatDistanceToNow` measures a DURATION and
+// `differenceInCalendarDays` between two UTC-midnight values shifts both ends
+// equally, so both are zone-independent here. The ban is on the MODULE anyway,
+// because which exports are safe is a judgement that belongs in a reviewed
+// allowlist entry rather than in a regular expression somebody widens later.
+
+//
+// SEVEN SPELLINGS, and the RE-EXPORT is the one that mattered most: a single
+// file writing `export { addDays } from "date-fns"` makes every downstream
+// importer clean under every selector in this file, so one line would have
+// re-opened the class wholesale. A review lens found four spellings walking
+// past the first three selectors; all four are closed here.
+//
+// WHAT IS STILL OPEN, said plainly rather than left to be discovered. A
+// dynamic import whose specifier is a VARIABLE — `const m = "date-fns";
+// await import(m)` — is not statically decidable and no selector can reach it,
+// and neither can a `require` assembled from a template. That is the same
+// residue every syntactic rule in this file carries; the census beside this one
+// is the second instrument, and `date-fns-tz` is deliberately not a dependency
+// so there is no sibling package to smuggle it in through.
+const NO_DATE_FNS = [
+  'ImportDeclaration[source.value="date-fns"]',
+  'ImportDeclaration[source.value=/^date-fns\\//]',
+  'CallExpression[callee.name="require"][arguments.0.value="date-fns"]',
+  'CallExpression[callee.name="require"][arguments.0.value=/^date-fns\\//]',
+  // `export { addDays } from "date-fns"` and `export * from "date-fns"`
+  'ExportNamedDeclaration[source.value="date-fns"]',
+  'ExportNamedDeclaration[source.value=/^date-fns\\//]',
+  'ExportAllDeclaration[source.value="date-fns"]',
+  'ExportAllDeclaration[source.value=/^date-fns\\//]',
+  // `await import("date-fns")`
+  'ImportExpression[source.value="date-fns"]',
+  'ImportExpression[source.value=/^date-fns\\//]',
+].map((selector) => ({
+  selector,
+  message:
+    "INV-DATE-014 / INV-CONFIG-002: `date-fns` reads and writes the HOST's clock face, so it carries every defect the host-clock ban above exists for while being invisible to it (CT-6, #2991). Measured on a `@db.Date` lodge night at UTC midnight: `format(night, \"yyyy-MM-dd\")` answers the PREVIOUS day west of Greenwich, `startOfMonth(night)` lands in the previous MONTH, and `addDays(night, 1)` returns an hour short of UTC midnight across a daylight-saving transition. Calendar arithmetic on stay days: addCalendarDays / addCalendarMonths / startOfCalendarMonth / eachCalendarDate / countClubNights from @/lib/club-time, which are zone-free. Rendering: formatClubDate for a calendar day, formatClubInstant* for a real instant. A relative DURATION (`formatDistanceToNow`) is genuinely zone-free — if that is all you need, say so on DATE_FNS_ADAPTERS rather than importing the module here.",
+}));
+
+const DATE_FNS_RESTRICTIONS = [...NO_DATE_FNS];
+
+/**
+ * The files still importing `date-fns`, each with what it uses and why it has
+ * not moved. A RATCHET, like `ENVIRONMENT_ZONE_ADAPTERS`: it only shrinks, and
+ * `club-time-boundary-guard.test.ts` refuses to let it grow.
+ *
+ * None of these is a new decision by CT-6. `admin-reports.ts` is the admin
+ * report bucket/date-series residual #2870's ledger names (its chart labels
+ * moved onto the club-time kernel in #5258); the rest are relative-duration
+ * hints and the dataset-reset month windows.
+ */
+const DATE_FNS_ADAPTER_FILES = [
+  "src/app/(admin)/admin/membership/members/_components/xero-groups-refresh-hint.tsx",
+  "src/components/admin/member-password-action-button.tsx",
+  "src/lib/admin-dataset-reset-state.ts",
+  "src/lib/admin-reports.ts",
+];
+
+export const DATE_FNS_ADAPTERS = [
+  {
+    file: "src/app/(admin)/admin/membership/members/_components/xero-groups-refresh-hint.tsx",
+    uses: "formatDistanceToNow",
+    reason:
+      "A relative DURATION (\"3 hours ago\") for a refresh hint, which is zone-independent: it is the gap between two instants and no civil date is derived from it.",
+  },
+  {
+    file: "src/components/admin/member-password-action-button.tsx",
+    uses: "formatDistanceToNow",
+    reason:
+      "The same relative-duration hint on a password action, zone-independent for the same reason.",
+  },
+  {
+    file: "src/lib/admin-reports.ts",
+    uses: "addDays, addMonths, addWeeks, differenceInCalendarDays, endOfMonth, endOfWeek, format, isAfter, startOfMonth, startOfWeek",
+    reason:
+      "The report BUCKETING itself, and the largest single remaining escape hatch in the tree: ten host-local helpers deciding which week or month a booking falls in. #2870's ledger names it as the admin-report bucket/date-series residual. CT-6 measured it rather than moved it, because a bucket boundary change alters what every historical report says.",
+  },
+  {
+    file: "src/lib/admin-dataset-reset-state.ts",
+    uses: "endOfMonth, format, startOfMonth, subMonths",
+    reason:
+      "Month windows for the dataset-reset screen, sharing the report residual's shape and blocked on the same decision about bucket boundaries.",
+  },
+];
+
+/**
+ * The modules still allowed to name the ENVIRONMENT's zone, each with the
+ * reason it is not simply a defect. Exported so
+ * `club-time-boundary-census.test.ts` reads this record rather than keeping a
+ * copy that drifts out of step with the config that ships.
+ *
+ * THIS LIST IS A RATCHET AND IT ONLY SHRINKS. One entry is left, and it is
+ * structural — the environment has to be read somewhere for the setup wizard to
+ * offer it. #3567 took the last three away: it deleted `src/config/operational.ts`
+ * (which defined `APP_TIME_ZONE`) and moved the two AI metering month keys
+ * (`ai-assistant-usage.ts`, `ai-diagnostics-usage.ts`) onto the club's stored
+ * zone. Adding a file here re-opens the class the guard exists to close, so the
+ * census test asserts the list has not grown.
+ *
+ * IT SHRANK AGAIN IN #3126, and by the route this list prefers. The last entry
+ * to leave, `src/lib/member-merge-field-kinds.ts`, was excused so a client
+ * component could keep a `= APP_TIME_ZONE` DEFAULT on its renderer — and the
+ * exemption written for a READ was quietly covering a default, which is a
+ * different and worse thing. Deleting the default (`INV-SSOT-003`) left the file
+ * naming the environment nowhere, so the entry had outlived its cause and went
+ * with it. The new `AUTHORITY_DEFAULT_RESTRICTIONS` arm is deliberately NOT
+ * droppable by any block, so no future entry here can cover a default again.
+ *
+ * IT HAD ALREADY SHRUNK ONCE BEFORE THAT, and how is worth recording:
+ * `src/lib/nzst-date.ts`
+ * was the rendering adapter and the last module that BOUND the environment zone
+ * at module load. #3123 did not migrate it — it DELETED it, once every
+ * production caller had moved to the kernel. An entry leaving this list by way
+ * of the file being deleted is the intended end state, not a special case, and
+ * `club-time-boundary-guard.test.ts` fails on an entry naming a file that no
+ * longer exists precisely so the two cannot drift apart.
+ *
+ * `src/lib/date-only.ts` IS NOT HERE, AND NO LONGER NEEDS TO BE ANYWHERE. It still
+ * has a block of its own further down (#2991 closed with the module kept as a
+ * reviewed adapter), which used to drop this group as well because
+ * six of its helpers defaulted their `timeZone` to `APP_TIME_ZONE`. #3123 removed
+ * those defaults and the import, so that block drops only the ENCODING group now
+ * and these arms reach the file like any other. Were it ever to need this group
+ * again it would still belong in its own block rather than on this list: listing
+ * it twice would give it two matching blocks, the later of which silently wins.
+ */
+export const ENVIRONMENT_ZONE_ADAPTERS = [
+  {
+    file: "src/lib/club-time-zone-env.ts",
+    reason:
+      "STRUCTURAL. CT-1's seed reader (#2989), and since #3567 the one read of `process.env.TZ` in the tree: exactly one module decides what the environment claims, and `client-server-boundary-census.test.ts` already keeps it out of the browser bundle.",
+  },
+];
+
+// Derived from the reasons list above so the two cannot name different files.
+const ENVIRONMENT_ZONE_ADAPTER_FILES = ENVIRONMENT_ZONE_ADAPTERS.map((entry) => entry.file);
+
+/**
+ * The three `toLocale*` DATE-RENDERING arms (#2256, #2264), as a NAMED array
+ * rather than three literals repeated in four blocks.
+ *
+ * A block lifts these by omitting them, which is invisible: nothing distinguishes
+ * "this block does not need the rendering arms" from "somebody dropped them".
+ * Named here, `DATE_GUARD_ARMS.rendering` lets `date-only-encoding-guard.test.ts`
+ * assert that a given path still resolves to all three — which is what pins
+ * `src/lib/date-only.ts` still carrying the DATE-rule exemption its own block
+ * grants it, and nothing else. It also pinned `src/lib/nzst-date.ts` losing its
+ * exemption in CT-2 (#2990) — a removal no test could see before — until #3123
+ * deleted that file and the pin with it.
+ */
+const DATE_RENDERING_RESTRICTIONS = [
+  NO_BARE_TO_LOCALE_DATE_STRING,
+  NO_BARE_TO_LOCALE_TIME_STRING,
+  NO_BARE_TO_LOCALE_STRING,
+];
+
+/**
+ * The date arm families as bare selector strings, for
+ * `date-only-encoding-guard.test.ts` — the mirror of `MONEY_GUARD_ARMS` below.
+ *
+ * The suite resolves this config through ESLint's own
+ * `calculateConfigForFile()` at the shared production roster and checks the
+ * resolved rule still carries every selector each family declares. It reads them
+ * from HERE rather than from a copy, because a copy passes happily while the
+ * config that ships has dropped the arm.
+ */
+/**
+ * The CT-6 (#2991) arm families, as bare selector strings, for
+ * `club-time-boundary-guard.test.ts` — the same mirror `DATE_GUARD_ARMS`
+ * provides for the #2684 families.
+ *
+ * Read from HERE rather than from a copy in the suite: a copy passes happily
+ * while the config that ships has dropped the arm, which is the exact failure
+ * the roster audit below exists to catch.
+ */
+export const CLUB_TIME_GUARD_ARMS = {
+  hostClock: HOST_CLOCK_RESTRICTIONS.map((entry) => entry.selector),
+  environmentZone: ENVIRONMENT_ZONE_RESTRICTIONS.map((entry) => entry.selector),
+  dateFns: DATE_FNS_RESTRICTIONS.map((entry) => entry.selector),
+};
+
+export const DATE_GUARD_ARMS = {
+  encoding: DATE_ONLY_ENCODING_RESTRICTIONS.map((entry) => entry.selector),
+  zonedFormatter: ZONED_FORMATTER_RESTRICTIONS.map((entry) => entry.selector),
+  rendering: DATE_RENDERING_RESTRICTIONS.map((entry) => entry.selector),
+};
+
+// ---------------------------------------------------------------------------
+// INV-SSOT-003 (#3126) — no default on a parameter that resolves a CLUB
+// authority.
+// ---------------------------------------------------------------------------
+//
+// A parameter default answers for every caller that did not pass one, and it
+// answers SILENTLY. When the value is a club authority with a second source,
+// the default decides which source wins for the whole tree — and it is never
+// the club's. `getTodayDateOnly(timeZone = APP_TIME_ZONE)` was one line; it took
+// 81 call sites across 52 files with it, and policing them needed a hand-built
+// census that counts call sites by walking parentheses and pins five exact
+// numbers. EVERY BIT OF THAT MACHINERY EXISTED BECAUSE THE DEFAULT EXISTED.
+//
+// WHY THIS IS A SEPARATE ARM FROM `NO_ENVIRONMENT_ZONE_*` ABOVE, which already
+// bans naming the environment's zone at all. That group is LIFTED for the files
+// on `ENVIRONMENT_ZONE_ADAPTER_FILES`, because an adapter has a reason to read
+// the environment — and a lifted group lifts the default with it. That is not a
+// theory either: `src/lib/date-only.ts` held its six `= APP_TIME_ZONE` defaults
+// legally for months inside a block of its own, and
+// `src/lib/member-merge-field-kinds.ts` held a seventh on the shared adapter
+// block until #3126 deleted it. THIS ARM IS ON `ALWAYS_RESTRICTED_IN_SRC` AND NO
+// BLOCK LIFTS IT. Reading the environment's zone is a reviewed exception;
+// handing it to callers as a default is not, in any file.
+//
+// WHICH NAMES ARE ON THE LIST. `INV-SSOT-003` names them, and this array is that
+// rule's implementation rather than a second opinion about it: the names the
+// deleted `@/config/operational` exported for a club-facing authority — kept so
+// a revival is refused on sight — plus the environment variables behind them.
+//
+// The zone is the measured case. The club's civil time is the
+// `ClubTimeSettings.timeZone` row (`INV-CONFIG-002`, CT-1 #2989), and
+// `TZ` / `NEXT_PUBLIC_TZ` / `APP_TIME_ZONE` are the ENVIRONMENT's claim, which
+// seeds that row at setup and has no say afterwards — two sources, and the
+// default silently picked the wrong one.
+//
+// THE LOCALE IS ON THE LIST AHEAD OF ITS SECOND SOURCE, and that is worth saying
+// out loud rather than leaving a reader to infer a criterion the list does not
+// satisfy. `APP_LOCALE` was listed here while there was no persisted club locale
+// at all and its live default population was zero — banned ahead of its second
+// source because it is the same KIND of value, on the reasoning that listing it
+// early costs nothing where adding it late costs a migration and a census. That
+// bet is now settled: #3563 created `ClubFormatSettings.locale`, so the second
+// source exists and the arm covers it from the day it arrived rather than from
+// whenever somebody noticed.
+//
+// WHAT IS DELIBERATELY NOT BANNED, because stating the boundary is half of this
+// arm's value:
+//
+//   * `APP_CURRENCY` and `APP_STRIPE_CURRENCY` used to be excluded here, and
+//     THE RATCHET THAT EXCLUSION CARRIED HAS NOW FIRED (#3563, owner decision
+//     D5). The exclusion rested on one fact — no persisted club-currency
+//     SETTING competed with `APP_CURRENCY`, so there was no wrong-source-of-two
+//     to pick — and on a cost: `src/lib/stripe.ts`'s two
+//     `currency = APP_STRIPE_CURRENCY` defaults had six live call sites that
+//     relied on them, so deleting the defaults would have spread the
+//     `@/config/operational` import without single-sourcing anything. It said
+//     in terms that the day a persisted club-currency setting existed, both
+//     names would join the list and `stripe.ts` would become a real violation.
+//     #3563 created `ClubFormatSettings`, so that day arrived: both names are
+//     in `CLUB_AUTHORITY_DEFAULT_NAMES` above, both defaults are deleted, and
+//     each of the six call sites states the currency. This entry is kept rather
+//     than removed because the boundary it drew is still worth reading — it is
+//     the worked example of an exclusion written WITH a trigger, which is the
+//     only kind that does not rot into a permanent hole.
+//
+//     The old note also named three defects this arm is not the instrument
+//     for, and #3567 took all three: the admin display formatters that
+//     hardcoded `currency: "NZD"` read the club's format; the `"nzd"` column
+//     default — on `PaymentRefund.currency`, which this note used to misname
+//     `PaymentTransaction.currency` (that table has no currency column) — is
+//     dropped by migration 20261012010000; and `normalizeRefundCurrency` in
+//     `src/lib/payment-transactions.ts` no longer falls back
+//     `(currency ?? APP_STRIPE_CURRENCY)`. That fallback was invisible to this
+//     arm rather than excluded — a `??` in a function body is a
+//     `LogicalExpression`, not an `AssignmentPattern`.
+//   * `process.env.<anything else>` as a default, which `INV-SSOT-003`'s prose
+//     describes more broadly than this arm implements. MEASURED, rather than
+//     assumed, and re-measured for #3126's review because the first measurement
+//     was wrong: there are SEVEN live instances in this tree, not the three an
+//     earlier draft of this comment named. SIX default the whole environment as
+//     an injection seam — `src/lib/admin-cron-health.ts` twice,
+//     `src/lib/email-delivery.ts`, `src/lib/environment-role-declaration.ts`,
+//     `src/lib/ignored-email-env.ts` and `src/lib/xero-config.ts` — and ONE
+//     defaults a single variable, `isValidCronSecret(expected =
+//     process.env.CRON_SECRET)` in `src/lib/cron-auth.ts`. The conclusion is
+//     unchanged and in fact stronger: a seam that takes `process.env` so a test
+//     can pass a fake is not a default picking the wrong one of two sources, so
+//     a broad ban would be seven false positives out of seven matches. One
+//     nuance rather than a blanket claim of no second source:
+//     `environment-role-declaration.ts` is governed by `INV-CONFIG-003`, under
+//     which the DATABASE may force the safer environment role — a second source
+//     by this invariant's own definition, though what it defaults is the seam
+//     and not the role. A guard that is wrong every time it fires trains its
+//     reader to switch it off, and #3126's own risk note says the one live
+//     hazard here is an arm too broad to live with. So the environment half of
+//     the arm is scoped to the NAMED variables behind the club authorities it
+//     covers — `TZ` and `NEXT_PUBLIC_TZ` for the zone, and since #3563
+//     `CURRENCY`, `LOCALE` and their `NEXT_PUBLIC_` twins for the format,
+//     measured to have zero live defaults between them so the widening adds no
+//     false positive. Widening it FURTHER, to `process.env.<anything>`, is
+//     still a decision with the seven named call sites above attached, which is
+//     the shape a decision should have.
+//   * A default that CALLS a club authority resolver — `= await clubTimeZone()`,
+//     `= readClubTimeZoneOutsideRequest()`. Those return the CLUB's answer, so
+//     they are not this defect at all. Population zero; recorded so a later
+//     reader knows it was considered rather than missed. READ THAT NARROWLY: it
+//     says these two resolvers, not "resolver calls are fine". #3133 added a
+//     second arm below, `NO_AMBIENT_AUTHORITY_RESOLVER_DEFAULT`, which bans a
+//     NAMED list of resolvers that answer from a module-level cache with a
+//     shipped fallback — including two wrappers around the very variables this
+//     group bans. The criterion separating the two is stated there.
+//   * A `??` or `||` fallback in a function BODY — `const tz = opts.tz ??
+//     APP_TIME_ZONE`. Said plainly as a known limit: it is the same hazard
+//     written differently, and it is out of scope because banning it would reach
+//     a large legitimate population at genuine boundaries. The second instrument
+//     is `ssot-authority-default-guard.test.ts`, which censuses the source
+//     directly.
+const CLUB_AUTHORITY_DEFAULT_NAMES =
+  "^(APP_TIME_ZONE|APP_LOCALE|APP_CURRENCY|APP_STRIPE_CURRENCY)$";
+const CLUB_AUTHORITY_DEFAULT_ENV =
+  "^(TZ|NEXT_PUBLIC_TZ|CURRENCY|NEXT_PUBLIC_CURRENCY|LOCALE|NEXT_PUBLIC_LOCALE)$";
+
+const AUTHORITY_DEFAULT_MESSAGE =
+  "INV-SSOT-003: This parameter DEFAULTS to a club authority, so it answers for every caller that did not pass one — and it answers from the environment rather than from the club. The club's currency and locale are the persisted `ClubFormatSettings` row (`INV-CONFIG-006`, #3563) and its civil time is the persisted `ClubTimeSettings.timeZone` row (`INV-CONFIG-002`, CT-1 #2989); `APP_TIME_ZONE`, `APP_LOCALE`, `APP_CURRENCY`, `APP_STRIPE_CURRENCY` and the `TZ` / `CURRENCY` / `LOCALE` variables behind them (with their `NEXT_PUBLIC_` twins) are the ENVIRONMENT's claim, which seeds those rows once and has no say afterwards. THE REMEDY IS TO DELETE THE DEFAULT and let the compiler enumerate the call sites: a required argument beats a lint rule, one exported symbol beats an allowlist, and a deleted default beats a counted ratchet. That is a worked precedent rather than a proposal — `getTodayDateOnly(timeZone = APP_TIME_ZONE)` cost a hand-counted census of every call site that left the zone unstated, ratcheted down lane by lane, until #3123 deleted the six `= APP_TIME_ZONE` defaults from @/lib/date-only and turned the whole class into a compile error. Those figures are recorded in exactly one place, `club-time-escape-hatch-census.test.ts`, and a number restated in prose is a number that drifts. Then pass the club's zone in: clubTimeZone() / clubTime() from @/lib/club-time/server in a server component or route, readClubTimeZoneOutsideRequest() from @/lib/club-time-zone-runtime in a cron tick or a CLI, and ClubTimeProvider data in a client component, which never decides it.";
+
+// `AssignmentPattern` is the default in EVERY position it can be written, which
+// is why the arm anchors on it rather than on a function's parameter list: a
+// plain parameter default (`f(tz = APP_TIME_ZONE)`), an options-object property
+// default (`f({ tz = APP_TIME_ZONE })` — the shape this codebase actually
+// writes), an array-destructuring default and a destructured default inside a
+// body are one node type and one defect.
+//
+// TWO FORMS PER SHAPE, AND THE PAIRING IS THE WHOLE DESIGN.
+//
+// The first arm of each pair is a FIELD anchor — `> Identifier.right`, which
+// matches only when the authority IS the default. The second is a DESCENDANT of
+// the field — `> .right Identifier`, where `> .right` selects whatever node
+// occupies the `right` field whatever its type, and the descendant combinator
+// then finds the authority anywhere beneath it.
+//
+// The pair cannot double-report, and that is a property of the descendant
+// combinator rather than of the node types involved: `A B` in esquery EXCLUDES
+// self, so when the authority is the field itself only the first arm matches,
+// and when it is wrapped only the second can. That matters because
+// `f({ tz = APP_TIME_ZONE } = {})` nests an inner `AssignmentPattern` inside an
+// outer one, and #2685 already paid for reporting one node three times at one
+// line:column. The outer pattern's `right` is the `{}`, which contains nothing;
+// the inner pattern's `right` is the authority itself. One report. Measured, and
+// asserted for every spelling in `ssot-authority-default-guard.test.ts`.
+//
+// WHY NOT ENUMERATE THE WRAPPERS. The arm used to name `LogicalExpression` and
+// `ConditionalExpression` explicitly, and six spellings walked past it:
+// `= APP_TIME_ZONE as string`, `= process.env.TZ!`, `= APP_TIME_ZONE satisfies
+// string`, `` = `${APP_TIME_ZONE}` ``, `= String(APP_TIME_ZONE)` and
+// `= (0, APP_TIME_ZONE)`. The `as` and `!` spellings are not exotic — they are
+// what the TYPE SYSTEM forces. `process.env.TZ` is `string | undefined`, so on
+// the `timeZone: string` parameter this codebase writes everywhere the defect
+// CANNOT be spelled `= process.env.TZ` at all; of the three spellings that
+// compile, the enumerated arm closed one. Enumeration is whack-a-mole and the
+// next TypeScript expression node re-opens it, so the wrapper list is gone and
+// `> .right` closes the class instead.
+//
+// WHAT THIS ARM STILL CANNOT SEE, and where it is covered instead. A
+// `no-restricted-syntax` selector has no symbol table, so an authority renamed
+// on the way in — `import { APP_TIME_ZONE as CLUB_ZONE }`, `const { TZ } =
+// process.env`, `const env = process.env` — is invisible to it, and the group
+// that would otherwise catch such a read is LIFTED in exactly the files most
+// likely to write one. That half is the second instrument's:
+// `ssot-authority-default-guard.test.ts` resolves those bindings from the source
+// and censuses `src/`, `scripts/` and `prisma/` for them. The same file states
+// the two spellings neither instrument closes. So do not answer a new
+// indirection by adding a selector here — a selector cannot resolve a name.
+const NO_CLUB_AUTHORITY_DEFAULT = [
+  // `f(tz = APP_TIME_ZONE)` — the authority IS the default.
+  `AssignmentPattern > Identifier.right[name=/${CLUB_AUTHORITY_DEFAULT_NAMES}/]`,
+  // The same name anywhere inside a wrapped default: `as`, `satisfies`, `!`, a
+  // template, a call, a sequence, `??`, a ternary, or anything TypeScript adds
+  // next. It also covers `f(tz = operational.APP_TIME_ZONE)` and
+  // `f(tz = ns?.APP_TIME_ZONE)` without a member-specific arm, because the
+  // property of a non-computed member expression is itself an `Identifier` node
+  // — which is why no `[property.name=...]` arm is listed here. Adding one back
+  // would report those twice.
+  `AssignmentPattern > .right Identifier[name=/${CLUB_AUTHORITY_DEFAULT_NAMES}/]`,
+  // `f(tz = operational["APP_TIME_ZONE"])`, whose property is a Literal rather
+  // than an Identifier, so the pair above cannot see it. Computed access is the
+  // documented escape from every syntactic rule in this file and is closed on
+  // the way in rather than recorded as a known limitation.
+  `AssignmentPattern > MemberExpression.right[property.value=/${CLUB_AUTHORITY_DEFAULT_NAMES}/]`,
+  `AssignmentPattern > .right MemberExpression[property.value=/${CLUB_AUTHORITY_DEFAULT_NAMES}/]`,
+  // `f(tz = process.env.TZ)` and `f(tz = process.env["TZ"])`, plus every wrapped
+  // spelling of each. Anchored on `.env.<VAR>` rather than on the receiver being
+  // literally `process`, so `globalThis.process.env.TZ` is closed too.
+  `AssignmentPattern > MemberExpression.right[object.property.name="env"][property.name=/${CLUB_AUTHORITY_DEFAULT_ENV}/]`,
+  `AssignmentPattern > .right MemberExpression[object.property.name="env"][property.name=/${CLUB_AUTHORITY_DEFAULT_ENV}/]`,
+  `AssignmentPattern > MemberExpression.right[object.property.name="env"][property.value=/${CLUB_AUTHORITY_DEFAULT_ENV}/]`,
+  `AssignmentPattern > .right MemberExpression[object.property.name="env"][property.value=/${CLUB_AUTHORITY_DEFAULT_ENV}/]`,
+].map((selector) => ({ selector, message: AUTHORITY_DEFAULT_MESSAGE }));
+
+// ---------------------------------------------------------------------------
+// THE SECOND HALF OF THE SAME RULE: a default that resolves the authority from
+// AMBIENT PROCESS-GLOBAL STATE rather than from the environment (#3133).
+// ---------------------------------------------------------------------------
+//
+// `INV-SSOT-003`'s first sentence bans a default whose value resolves "a global,
+// environment or configuration authority". Everything above mechanises the
+// ENVIRONMENT word, and #3126 said so out loud rather than leaving the gap to be
+// discovered: the environment list is a floor.
+//
+// This is the rest of it, and the defect is the same one written through a
+// function name. A module-level cache with a synchronous accessor and a shipped
+// fallback answers EVERY caller that did not pass a value — and answers with the
+// product default whenever nothing seeded it. The call site reads as though it
+// stated the fact. It did not.
+//
+// THE MEASURED INSTANCE IS #3116, and it is the reason this arm exists rather
+// than a hypothetical. `seasonYearsLabel(seasonYear, yearEndMonth =
+// getFinancialYearEndMonth())` reads `financial-year.ts`'s process cache. That
+// cache is seeded by `refreshFinancialYearConfig()`, whose callers are all
+// request paths; the subscription-invoice mint runs from
+// `xero-operation-outbox.ts`, a background worker that seeds nothing. So on a
+// cold worker a club whose financial year does not end in March had the wrong
+// season rendered into a Xero INVOICE LINE — and the obvious remedy, routing the
+// four hand-written labels through the shared helper and accepting its default,
+// would have reworded every existing club's invoices while leaving that defect
+// exactly where it was. Routing to the single definition is necessary and not
+// sufficient. #3136 fixed the money paths by resolving and PASSING the year-end;
+// this arm is what stops the default being written back in.
+//
+// WHY A NAMED LIST AND NOT A PATTERN. "Any zero-argument call used as a default"
+// was considered and rejected, and the rejection is MEASURED rather than
+// reasoned. A TypeScript-AST census of every default in `src/`, `scripts/` and
+// `prisma/` (3928 files) finds TWENTY non-test defaults whose value contains a
+// call. Sixteen are correct and would each be a false positive: `Date.now()`
+// five times over, `performance.now()`, `crypto.randomBytes(8)`,
+// `process.cwd()` in an operator script, `defaultDb()` twice as a Prisma
+// injection seam, `isContainerised()`, `defaultDistDir()`,
+// `requireDatabaseUrl()`, and a map built from an argument the same call already
+// received. A guard that is wrong sixteen times out of twenty trains its reader
+// to switch it off. WHICH NAMES ARE HAZARDOUS IS A JUDGEMENT, and a judgement
+// belongs in a reviewed list, not in a regular expression the next lane widens
+// by one character.
+//
+// THE SHAPE THAT QUALIFIES, so the list can be extended on a criterion rather
+// than on taste. All four of these must hold:
+//
+//   1. it is a SYNCHRONOUS accessor — an `await`ed read goes to the real source
+//      every time and cannot be cold;
+//   2. it answers from MODULE-LEVEL MUTABLE STATE, not from its arguments;
+//   3. something else must have SEEDED that state, and at least one live
+//      runtime does not — a cron tick, an outbox worker, a CLI, or the browser
+//      bundle, where a `server-only` seeder can never run at all;
+//   4. unseeded, it returns a SHIPPED DEFAULT rather than failing — so the wrong
+//      answer is indistinguishable from the right one.
+//
+// A resolver that fails or blocks when it has no answer is not this defect. Nor
+// is a resolver that returns the CLUB's own answer: `await clubTimeZone()` and
+// `await readClubTimeZoneOutsideRequest()` read the persisted
+// `ClubTimeSettings` row on every call and cache no value between them, so a
+// default calling either is stated-but-verbose rather than wrong. Both are
+// asserted clean in `ssot-authority-default-guard.test.ts`, and were before this
+// arm existed.
+//
+// WHAT THE CLUB-TIME SURVEY FOUND, because #3133 asked for it by name and "I
+// checked and here is why none qualify" is the answer a reader can act on.
+// Examined: `clubTimeZone()`, `clubTime()` and `clubTodayDateOnlyInstant()`
+// (`club-time/server.ts`) — async, request-scoped React `cache()`, persisted
+// row, so clause 1 fails and clause 3 cannot arise; `getClubTimeZone()`,
+// `loadPersistedClubTimeSettings()` and `resolveClubTimeZoneWithSource()`
+// (`club-time-zone-settings.ts`) — async, and that module says outright that it
+// caches nothing, deliberately; `readClubTimeZoneOutsideRequest()` and
+// `resolveClubTimeZoneOutsideRequest()` (`club-time-zone-runtime.ts`) — async,
+// re-reads the row per call, and its only module-level state is a
+// once-per-minute log throttle, which is not an answer; `emailClubDate()` and
+// its siblings (`email-templates-club-time.ts`) — these DO read a primed
+// module cache, but they are OPERATIONS that take the value they format, not
+// resolvers a default can stand in for, so no default can name them;
+// `emailClubTimeZoneForTests()` — a test seam, and naming it would ban a
+// fixture rather than a defect.
+//
+// TWO club-time readers DO qualify, and they are the most valuable entries on
+// the list because they are THIS FILE'S OWN existing target hidden behind a
+// function name. `readEnvironmentClubTimeZoneSeed()` and
+// `classifyEnvironmentClubTimeZoneSeed()` (`club-time-zone-env.ts`) return
+// `process.env.TZ ?? process.env.NEXT_PUBLIC_TZ`, live. The arm above bans those
+// two VARIABLES; a named wrapper around them is invisible to a name regex, and
+// `= readEnvironmentClubTimeZoneSeed()` would walk straight past every selector
+// written before today. Their live default population is zero, which is exactly
+// why they are cheap to list now: the same argument `INV-SSOT-003` already makes
+// for `APP_LOCALE`, and the same one that made this arm necessary at all.
+const AMBIENT_AUTHORITY_RESOLVERS = {
+  /**
+   * Banned outright. Every name here has a live default population of ZERO on
+   * this branch, so listing it costs nothing today and closes the class before
+   * the first instance is written — which is cheaper than the migration that
+   * closing it afterwards would need.
+   */
+  banned: [
+    // `club-identity-settings.ts`. Module cache seeded by
+    // `primeClubIdentitySync()`, falls back to `DEFAULT_IDENTITY`. The club's
+    // own name and branding, with a persisted row competing with a shipped
+    // default — the same two-sources-and-a-guess as the year-end.
+    "getClubIdentitySync",
+    // `email-theme.ts`. Module cache seeded by `primeEmailPalette()`, falls back
+    // to `DEFAULT_EMAIL_PALETTE`. An unseeded worker renders a club's email in
+    // the shipped colours and nothing says so.
+    "emailPalette",
+    // `club-time-zone-env.ts`. Named wrappers around `process.env.TZ` /
+    // `NEXT_PUBLIC_TZ` — the arm above bans the variables, and a regex over
+    // names cannot see a function that reads them.
+    "readEnvironmentClubTimeZoneSeed",
+    "classifyEnvironmentClubTimeZoneSeed",
+  ],
+  /**
+   * NAMED, MEASURED, AND NOT YET BANNED — with the condition that promotes each
+   * one published beside it.
+   *
+   * THIS IS NOT AN EXEMPTION, and the difference is structural rather than
+   * verbal. An exemption is a FILE the arm stops applying to, it lives on
+   * `SRC_RESTRICTION_EXEMPTIONS`, and it shelters whatever else that file grows
+   * later — which is precisely how the `= APP_TIME_ZONE` default survived for
+   * months inside a lift written for a READ. `AUTHORITY_DEFAULT_RESTRICTIONS`
+   * carries no such entry, `ssot-authority-default-guard.test.ts` asserts that
+   * it never will, and nothing here changes that. A pending name is the arm
+   * declining to fire on ONE identifier anywhere in the tree, with its live
+   * count pinned in that same suite, so the count is a ratchet with a
+   * MECHANICAL trigger: delete the last default and the census fails and tells
+   * you to promote the name.
+   */
+  pending: [
+    {
+      name: "getFinancialYearEndMonth",
+      /**
+       * Two live defaults remain, and the reason each is still here is a
+       * measurement rather than reluctance. #3133 expected zero — #3116 was
+       * deleting all four in flight — and #3136 merged having fixed the money
+       * paths WITHOUT deleting them.
+       *
+       * `season-label.ts`'s `seasonSelectLabel` — thirteen non-test callers,
+       * TEN of them inside five `"use client"` files, and the value is not
+       * available in a browser at all: the cache is a module-level `let` whose
+       * only writer is `server-only`, so `getFinancialYearEndMonth()` in a
+       * client bundle returns the March default unconditionally. That module's
+       * own docblock reasons this out at length and concludes that plumbing the
+       * LABEL alone makes the screen WORSE, because `clubSeasonYear()` beside it
+       * reads the same unseeded cache and the picker would then name `(Jul-Jun)`
+       * while still selecting April-based season years. Deferring both together
+       * is coherent; finishing half is not.
+       *
+       * `financial-year.ts`'s `seasonYearOfCalendarDate` — worse, and not for
+       * its own sake. Two optional pass-throughs forward the parameter,
+       * `seasonYearOfStoredDate(value, yearEndMonth?)` and
+       * `clubSeasonYear(zone, clock?, yearEndMonth?)`, and requiring it
+       * cascades to roughly NINETY non-test call sites across booking,
+       * waitlist, quote, membership, Xero, cron and `prisma/seed.ts`. Most of
+       * them have no year-end in scope, so the change that would actually get
+       * written at each is `getFinancialYearEndMonth()` AT the call site — which
+       * satisfies the letter of this rule while reading the same cold cache, and
+       * spreads one ambient read into ninety modules. That is worse for single
+       * source of truth, not better, by the same argument this file already
+       * makes for excluding `APP_STRIPE_CURRENCY`.
+       *
+       * Promote this name — move it to `banned` above and delete its pin in
+       * `ssot-authority-default-guard.test.ts` — when both defaults are gone.
+       * Neither is deleted by threading harder; each needs a decision the arm
+       * cannot make. The year-end has to reach the browser as data the way the
+       * zone already does, through `ClubTimeSettings` and the provider, and the
+       * cascade has to be taken as its own change.
+       */
+      liveDefaults: 2,
+    },
+  ],
+};
+
+/** Regex-safe alternation over the banned resolver names. */
+const CLUB_AUTHORITY_RESOLVER_NAMES = `^(${AMBIENT_AUTHORITY_RESOLVERS.banned.join("|")})$`;
+
+const AUTHORITY_RESOLVER_DEFAULT_MESSAGE =
+  "INV-SSOT-003: This parameter DEFAULTS to a resolver that answers from AMBIENT PROCESS-GLOBAL STATE, so it answers for every caller that did not pass one — and on any runtime that did not seed that state it answers with the SHIPPED DEFAULT, indistinguishably from the right answer. That is the same defect as defaulting to the environment, written through a function name: the call site reads as though it stated the fact, and it did not. THE MEASURED CASE IS #3116 — a season label defaulting to the `financial-year.ts` process cache, which no outbox worker seeds, put the wrong season on a Xero INVOICE LINE for any club whose financial year does not end in March, and routing the four hand-written labels through the shared helper while ACCEPTING its default would have reworded every existing club's invoices without fixing it. THE REMEDY IS TO DELETE THE DEFAULT and let the compiler enumerate the call sites: a required argument beats a lint rule, one exported symbol beats an allowlist, and a deleted default beats a counted ratchet. #3123 is the worked precedent — six `= APP_TIME_ZONE` defaults deleted from @/lib/date-only turned a hand-counted census into a compile error. Then resolve the fact and PASS it: `await refreshFinancialYearConfig()` for the year-end, `await getClubIdentity()` for the club's identity, `await ensureEmailPaletteReady()` before an email render, and the persisted `ClubTimeSettings` row rather than the environment seed for the club's zone. A resolver that reads the CLUB's own answer on every call — clubTimeZone() from @/lib/club-time/server, readClubTimeZoneOutsideRequest() from @/lib/club-time-zone-runtime — is NOT this defect and is not on the banned list.";
+
+// The same PAIRED design as the arm above, and for the same reason: a field
+// anchor for the bare spelling, a `> .right` descendant for every wrapped one.
+// The descendant combinator EXCLUDES self in esquery, so exactly one form of
+// each pair can match one node and #2685's triple-report at a single
+// line:column cannot come back. `ssot-authority-default-guard.test.ts` asserts
+// "exactly once" for every spelling rather than "at least once", which is what
+// makes that a measurement instead of a claim.
+//
+// THREE SHAPES, because a call's callee is written three ways. Do NOT collapse
+// them onto a bare `[callee.name=...]`: a namespace import
+// (`= ambient.getClubIdentitySync()`) has a MemberExpression callee with no
+// `name` at all, and the computed spelling has no property `name` either. The
+// three are mutually exclusive by construction — a callee that is an Identifier
+// has no `callee.property`, and a non-computed member access has no
+// `property.value` — so no node can match two of the six.
+//
+// AND DO NOT ANSWER A NEW INDIRECTION HERE. `import { getFinancialYearEndMonth
+// as yearEnd }` then `= yearEnd()` is invisible to every selector in this file,
+// because a selector has no symbol table. That half belongs to the second
+// instrument, which resolves the alias out of the source; the census in
+// `ssot-authority-default-guard.test.ts` reads the banned list from THIS
+// definition so the two instruments cannot drift apart into a rubber stamp
+// (`INV-SSOT-004`).
+const NO_AMBIENT_AUTHORITY_RESOLVER_DEFAULT = [
+  // `f(month = getFinancialYearEndMonth())` — the resolver call IS the default.
+  `AssignmentPattern > CallExpression.right[callee.name=/${CLUB_AUTHORITY_RESOLVER_NAMES}/]`,
+  // The same call anywhere inside a wrapped default: `as`, `satisfies`, `!`, a
+  // template, an outer call, a sequence, `??`, a ternary, a thunk
+  // (`= () => getClubIdentitySync()`, which defers the read without stating the
+  // fact), or whatever TypeScript adds next.
+  `AssignmentPattern > .right CallExpression[callee.name=/${CLUB_AUTHORITY_RESOLVER_NAMES}/]`,
+  // `f(month = ambient.getFinancialYearEndMonth())`, whose callee is a
+  // MemberExpression and therefore carries no `callee.name`.
+  `AssignmentPattern > CallExpression.right[callee.property.name=/${CLUB_AUTHORITY_RESOLVER_NAMES}/]`,
+  `AssignmentPattern > .right CallExpression[callee.property.name=/${CLUB_AUTHORITY_RESOLVER_NAMES}/]`,
+  // `f(month = ambient["getFinancialYearEndMonth"]())`. Computed access is the
+  // documented escape from every syntactic rule in this file and is closed on
+  // the way in rather than recorded as a known limitation.
+  `AssignmentPattern > CallExpression.right[callee.property.value=/${CLUB_AUTHORITY_RESOLVER_NAMES}/]`,
+  `AssignmentPattern > .right CallExpression[callee.property.value=/${CLUB_AUTHORITY_RESOLVER_NAMES}/]`,
+].map((selector) => ({
+  selector,
+  message: AUTHORITY_RESOLVER_DEFAULT_MESSAGE,
+}));
+
+const AUTHORITY_DEFAULT_RESTRICTIONS = [
+  ...NO_CLUB_AUTHORITY_DEFAULT,
+  ...NO_AMBIENT_AUTHORITY_RESOLVER_DEFAULT,
+];
+
+/**
+ * The banned and pending resolver names, for the second instrument in
+ * `ssot-authority-default-guard.test.ts`.
+ *
+ * Read from HERE rather than from a copy in the suite, for the reason
+ * `INV-SSOT-004` states: a copy passes happily while the config that ships has
+ * dropped a name, and two instruments that do not share their input are one
+ * instrument and a rubber stamp.
+ */
+export { AMBIENT_AUTHORITY_RESOLVERS };
+
+/**
+ * The `INV-SSOT-003` arm family as bare selector strings, for
+ * `ssot-authority-default-guard.test.ts` — the same mirror `DATE_GUARD_ARMS` and
+ * `CLUB_TIME_GUARD_ARMS` provide for their own families.
+ *
+ * Read from HERE rather than from a copy in the suite: a copy passes happily
+ * while the config that ships has dropped the arm.
+ */
+export const SSOT_GUARD_ARMS = {
+  authorityDefault: AUTHORITY_DEFAULT_RESTRICTIONS.map((entry) => entry.selector),
+};
+
+// ---------------------------------------------------------------------------
+// INV-SSOT-004 (#3164) — ONE comment stripper, and the rule keys on BEHAVIOUR
+// rather than on what the copy is called.
+// ---------------------------------------------------------------------------
+//
+// #3132 converged seventeen definitions spelled `stripComments` onto
+// `src/lib/__tests__/support/strip-comments.ts` and fixed a real defect in the
+// canonical one while doing it: an escaped forward slash inside a regex literal
+// (`.replace(/\//g, "_")`) puts two slashes adjacent, which a naive scanner
+// reads as the start of a line comment and follows to the end of the line,
+// DELETING REAL CODE.
+//
+// THAT SWEEP WAS SCOPED BY SYMBOL NAME, and the cost of that is why this rule
+// exists at all. Measured after it landed, seven more strippers were alive in
+// the tree under the name `withoutComments`, none of which had adopted the fix,
+// and #3164 then found more again as anonymous inline `.replace()` chains that
+// carry no name to sweep by. A guard keyed on a name misses every one of those,
+// and misses the next author who picks a third name or no name at all.
+//
+// So the rule reads what a function DOES. It reports a function whose own body
+// names a JAVASCRIPT BLOCK-COMMENT delimiter — as a regex literal matching one,
+// or as a string whose whole value is one — or which compares characters
+// against a slash and a star, which is the hand-written-scanner shape. Every
+// copy #3164 converged is one of those two shapes, and so is the canonical
+// helper.
+//
+// IT ALSO READS THE MODULE BODY, at a higher bar. A stripper written beside the
+// imports rather than inside a function used to be invisible here, and the
+// identical chain one line further in was reported — an accidental limit, and an
+// undeclared one. Out there a report needs BOTH block delimiters rather than
+// one, because a single escaped opener at module scope is real code:
+// `diagnostics/tools/define.ts` bans a SQL comment opener from operator-authored
+// SQL and writes it as a bare module-level regex. Nothing in this tree names
+// both at module scope without being a scanner.
+//
+// WHAT IT DELIBERATELY CANNOT CATCH, stated here and in the failure message so
+// nobody reads this guard as wider than it is:
+//
+//   * A stripper that handles ONLY line comments and writes them escaped inside
+//     a regex. That is byte-identical to the URL patterns this tree is full of
+//     (`/^https?:\/\//`, and the protocol-relative `href` check in
+//     `lodge-display/css-tokens.ts`), so firing on it would be a false positive
+//     on real code every time — and a guard that is wrong whenever it fires
+//     trains its reader to switch it off. The BLOCK delimiter is what separates
+//     a comment scanner from a URL, because no URL contains one.
+//   * A stripper written entirely through computed values — delimiters built by
+//     `String.fromCharCode`, or imported from another module. A lint rule has no
+//     symbol table and does no constant folding. This file's own rule
+//     implementation is written that way deliberately, so the guard cannot
+//     report itself; that is the shape of the hole, admitted rather than hidden.
+//   * A stripper for a DIFFERENT language's comments — SQL `--`, dotenv `#`,
+//     and (because CSS shares JavaScript's block delimiters) a CSS strip, which
+//     the canonical module now carries as `stripCssComments` rather than three
+//     more times in the contracts that need it. #3164 measured three of those
+//     among the seven the issue asked it to converge, and converging any onto
+//     the JavaScript scanner would have BROKEN the census rather than repaired
+//     it.
+//   * A MODULE-LEVEL stripper that names only ONE of the two block delimiters —
+//     a line-comment-only strip written outside every function. The pair is what
+//     separates a scanner from `define.ts`'s banlist out there, so this half of
+//     the module-scope reach is bought with a hole rather than for free.
+//
+// THE REMEDY IS ALWAYS THE SAME: import `stripComments` from
+// `@/lib/__tests__/support/strip-comments`. It is the only definition that
+// handles regex literals, template interpolations and string literals, and its
+// docblock states its two remaining imprecisions and the direction each fails
+// in. A copy starts life with none of that.
+
+/**
+ * The files allowed to define a comment scanner of their own, each with the
+ * reason it is not a copy of the canonical helper.
+ *
+ * THIS IS NOT AN EXEMPTION LIST IN THE USUAL SENSE, and the difference matters.
+ * An exemption shelters whatever a file grows later; every entry here is a
+ * DIFFERENT CONCEPT the canonical helper cannot express — a second FORM, or
+ * another language's comment syntax. A file whose stripper does the same job as
+ * `stripComments` does not belong here at any length of reason. It belongs
+ * converged.
+ *
+ * Exported so `ssot-comment-stripper-guard.test.ts` reads THIS list rather than
+ * keeping a copy — `INV-SSOT-004`: two instruments that do not share their
+ * input are one instrument and a rubber stamp.
+ */
+export const COMMENT_STRIPPER_ALLOWLIST = [
+  {
+    file: "src/lib/__tests__/support/strip-comments.ts",
+    reason:
+      "THE canonical helper. The rule exists to send every other file here, and this one has to write the scanner somewhere — the same shape as `src/lib/date-only.ts`'s exemption from the date-encoding arm. Since #3164's fix round it also holds `stripCssComments`, because three contracts had written the identical one-line CSS `replaceAll` at five call sites: length is not the test of whether something belongs here.",
+  },
+  {
+    file: "src/lib/__tests__/ssot-comment-stripper-guard.test.ts",
+    reason:
+      "FIXTURES, not a scanner. This is the rule's own suite, and its fixtures are module-level string constants holding the copies nobody has written yet — text a test hands to ESLint, which strips nothing. It is listed because it HAS to be: before the module-scope reach landed it was silent by ACCIDENT, and the accident was load-bearing, since moving one fixture inside an `it(...)` callback reported the file. Listing it says that out loud, and the suite's own `reports its own fixture text at any other path` case proves the listing is what silences it rather than some property of the file.",
+  },
+  {
+    file: "prisma/migration-verification/split-statements.ts",
+    reason:
+      "SQL, not JavaScript. `splitSqlStatements` and `hasExecutableText` step over `--` line comments, NESTED block comments (PostgreSQL nests them; JavaScript does not) and dollar-quoted bodies, to find where one statement ends. The canonical helper knows none of those, and this splitter is what the migration-verification gate runs on real migration text.",
+  },
+  {
+    file: "scripts/audit/audit-writer-census.ts",
+    reason:
+      "SQL, not JavaScript. `stripSqlComments` exists because the door-code migration discusses `UPDATE \"AuditLog\"` in its header comment as well as performing it, and a census that did not strip SQL comments would count the sentence as a writer.",
+  },
+  {
+    file: "src/lib/__tests__/data-migration-verification-gate.test.ts",
+    reason:
+      "SQL, not JavaScript. `stripSqlComments` leaves single-quoted, double-quoted and dollar-quoted bodies untouched, because a comment token inside a SQL string is data. It deliberately mirrors what the two splitters implement, which is `INV-SSOT-002` rather than a copy of this rule's subject.",
+  },
+  {
+    file: "src/lib/__tests__/family-group-role-retirement.test.ts",
+    reason:
+      "SQL and an EXTRACTOR, once its JavaScript half was converged. It had three scanners and was on the ratchet below; #3164's fix round moved `codeOnly` onto `stripCommentsAndStrings`, which reports the same on `member-merge.ts` and is stricter where the two differ. What is left is not convergeable and is not waiting on anything: `stringLiterals` COLLECTS every string literal with its offset so an offender can be reported at its real line — the same concept as `commentBlocks` below, which gathers rather than removes — and `blankSqlComments` steps over `--` and block comments inside those extracted literals while skipping single-quoted SQL strings.",
+  },
+  {
+    file: "src/app/api/bookings/__tests__/rooms-unscoped-mode-has-no-internal-caller.test.ts",
+    reason:
+      "It COLLECTS comments rather than removing them. `commentBlocks` groups the docblock lines above a call so the test can assert what the comment says; the canonical helper deletes exactly the text this assertion is about. The file imports `stripComments` as well, for the half of its work that is a strip — which is what makes the distinction visible rather than theoretical.",
+  },
+  {
+    file: "src/lib/image-metadata-svg.ts",
+    reason:
+      "CSS inside an uploaded SVG, and PRODUCTION code, not a source scanner. `cleanCss` removes `/* … */` from a drawing's `<style>` text and `style` attributes because an editor's comment can carry the author's name (#5244), and refuses the file when an opener is left unterminated. CSS has no line comments, and the canonical helper is a test-support module that production code cannot import.",
+  },
+];
+
+/**
+ * The comment-aware SCANNERS that have been measured and not converged, with
+ * the work each is waiting on.
+ *
+ * THIS LIST IS EMPTY, AND EMPTY IS ITS FINISHED STATE — not a gap somebody has
+ * yet to fill. Every scanner in this tree now reads source through
+ * `src/lib/__tests__/support/strip-comments.ts`, so there is no second copy of
+ * the lexer left to converge and nothing here to wait on. What the list still
+ * DOES is refuse: `ssot-comment-stripper-guard.test.ts` pins its length at
+ * zero, so the next file that would need an entry cannot get one. That file is
+ * a new copy, which is the thing this rule exists to refuse — the answer is to
+ * converge it, or, if it truly is a different CONCEPT, to argue that case on
+ * `COMMENT_STRIPPER_ALLOWLIST` above, where the bar is permanent rather than
+ * provisional.
+ *
+ * THIS IS A RATCHET, NOT AN ALLOWLIST, and the difference is the whole reason it
+ * is a second list. Every entry above is a different CONCEPT that the canonical
+ * helper cannot express and never will. Every entry here did something the
+ * canonical module COULD express and did not offer yet, so each one was a filed
+ * piece of work rather than a settled exception. That is why this list could
+ * reach zero and that one cannot.
+ *
+ * IT WAS FIVE, THEN FOUR, THEN ONE, AND IS NOW NONE. #3164's fix round
+ * converged `family-group-role-retirement.test.ts` onto the canonical second
+ * form. #3180 wrote the offset-preserving blanker the next three were waiting
+ * on — `blankLiterals`, a fourth FORM in the canonical module — and converged
+ * `lock-bound-club-zone-outside-transaction.test.ts`,
+ * `payment-link-expiry-club-zone.test.ts` and
+ * `xero-object-url-write-guard.test.ts` onto it. Two of the three re-measured
+ * byte-identical; the third did not, and what it found is recorded in its own
+ * file: none of the three private copies recognised a REGEX LITERAL, so
+ * `xero-contacts.ts`'s `.replace(/\//g, "")` desynchronised that census for the
+ * rest of the file and hid a real `xeroSyncOperation.update` from it. Live, and
+ * latent only because the hidden write happened not to carry the column.
+ *
+ * #3196 took the last one, `advisory-lock-guard.test.ts`, which never shared the
+ * offset-preserving property and could not be converged by #3180 for a reason
+ * of its own: it hunts raw SQL, which lives inside string literals, while the
+ * prose it must ignore lives inside string literals too. A blanker that
+ * suppressed both would have dropped its pinned lock inventory. The remedy was
+ * `blankLiteralsWithSpans` — the same blanking, reporting the runs it blanked —
+ * so the census restores the raw statements it can name and the SQL policy
+ * stays at the one caller that has one. Re-measured across the tree, the two
+ * scanners disagree about the masked TEXT of 2,154 of 2,157 non-test files and
+ * agree exactly, file by file, on all three things the census counts: 122
+ * advisory sites, 20 row-lock statements, one mint of the per-lodge key.
+ */
+export const UNCONVERGED_COMMENT_SCANNERS = [];
+
+// The delimiters are built from character codes rather than written out, so no
+// function in this rule contains a literal comment delimiter and the rule
+// cannot report itself. Making the shape unrepresentable beats adding this file
+// to the list above (`INV-SSOT-001`).
+const CHAR_SLASH = String.fromCharCode(47);
+const CHAR_STAR = String.fromCharCode(42);
+const CHAR_BACKSLASH = String.fromCharCode(92);
+
+/** The two block delimiters and the line delimiter, as plain text. */
+const BLOCK_OPEN = CHAR_SLASH + CHAR_STAR;
+const BLOCK_CLOSE = CHAR_STAR + CHAR_SLASH;
+const LINE_DELIMITER = CHAR_SLASH + CHAR_SLASH;
+
+/**
+ * The block delimiters as they appear ESCAPED inside a regex literal's source,
+ * which is how every two-regex stripper in this tree writes them. A
+ * `new RegExp("...")` string carries the identical text as its VALUE, so one
+ * check covers both spellings.
+ */
+const ESCAPED_BLOCK_OPEN =
+  CHAR_BACKSLASH + CHAR_SLASH + CHAR_BACKSLASH + CHAR_STAR;
+const ESCAPED_BLOCK_CLOSE =
+  CHAR_BACKSLASH + CHAR_STAR + CHAR_BACKSLASH + CHAR_SLASH;
+
+// BOTH characters have to be escaped, and that is a MEASURED narrowing rather
+// than caution. A first cut also accepted the half-escaped forms, on the theory
+// that somebody might write one — and `/<br\s*\/?>/` contains one of them, so
+// the rule reported `clubPostHtmlToText` and `htmlToLineText`, two HTML-to-text
+// converters that strip no comments at all. A quantifier followed by an escaped
+// slash is ordinary regex; only the fully escaped pair is a comment delimiter.
+
+const FUNCTION_NODE_TYPES = new Set([
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "ArrowFunctionExpression",
+]);
+
+const COMMENT_STRIPPER_MESSAGE =
+  'INV-SSOT-004: This function scans source text for JavaScript COMMENT DELIMITERS, which makes it a second comment stripper. There is one, and importing it is the whole fix: `stripComments` from `src/lib/__tests__/support/strip-comments.ts`. A local copy is not a style question. The canonical helper recognises `.replace(/\\//g, "_")` as a regex literal; a copy without that branch reads the two adjacent slashes as a line comment and DELETES the rest of the line — measured across `src/` before #3155 repaired it, that silently truncated a dozen files and desynchronised `xero-contacts.ts` for a thousand lines after it. A census whose stripper under-reports goes FALSELY GREEN: it passes while the thing it exists to catch is sitting in the file. This rule keys on behaviour rather than on a name because #3132 swept by name and left seven copies alive under a second one. It still cannot see FOUR shapes, and they are listed rather than left to be discovered: a stripper that handles only line comments; one whose delimiters are computed at runtime; one written for another language; and, at MODULE top level outside every function, one that names only a single block delimiter — out there the rule needs both, because `diagnostics/tools/define.ts` writes a lone escaped opener as a SQL banlist entry and a guard that fires on real code teaches its reader to switch it off. If yours strips SQL, dotenv or CSS comments, or is a deliberate second FORM of this one, add it to `COMMENT_STRIPPER_ALLOWLIST` in `eslint.config.mjs` with the reason it cannot be the canonical helper.';
+
+/**
+ * Repo-relative POSIX path for a linted file, so the allowlist can be written
+ * the way a person refers to a file.
+ */
+function repoRelativePath(filename) {
+  const normalised = String(filename).split("\\").join("/");
+  const root = String(import.meta.dirname).split("\\").join("/");
+  return normalised.startsWith(`${root}/`)
+    ? normalised.slice(root.length + 1)
+    : normalised;
+}
+
+/** The nearest enclosing function of `node`, or null at module top level. */
+function enclosingFunction(node) {
+  for (let current = node.parent; current; current = current.parent) {
+    if (FUNCTION_NODE_TYPES.has(current.type)) return current;
+  }
+  return null;
+}
+
+/**
+ * The behavioural rule itself.
+ *
+ * It is a real rule rather than a `no-restricted-syntax` arm for two structural
+ * reasons. `no-restricted-syntax` is switched OFF for every test file by the
+ * block at the bottom of this config, and test files are the entire population
+ * this guard has to cover. And "does this function strip comments" is a fact
+ * about a whole function body, which an esquery selector — matching one node at
+ * a time, with no memory of the others — cannot express.
+ */
+const noLocalCommentStripper = {
+  meta: {
+    type: "problem",
+    docs: {
+      description:
+        "Report a locally-defined JavaScript comment stripper; there is one canonical helper (INV-SSOT-004).",
+    },
+    schema: [],
+    messages: { copy: COMMENT_STRIPPER_MESSAGE },
+  },
+  create(context) {
+    const file = repoRelativePath(context.filename);
+    const excused = [
+      ...COMMENT_STRIPPER_ALLOWLIST,
+      ...UNCONVERGED_COMMENT_SCANNERS,
+    ];
+    if (excused.some((entry) => entry.file === file)) return {};
+
+    /**
+     * function node -> what its own literals say about it.
+     *
+     * `proof` is a delimiter nothing else writes. `slashes` and `stars` count
+     * the CHARACTER comparisons a hand-written scanner makes, and both counts
+     * have to reach two before that shape is called a stripper — the narrowing
+     * is measured, not cautious. One of each matches `globToRegExp` in
+     * `diagnostics/knowledge/allowlist.ts` (`c === "*"`, `glob[i + 1] === "/"`)
+     * and `matchScore` in `help/match.ts` (`endsWith("/*")`), neither of which
+     * has anything to do with comments. A scanner does not get away that
+     * cheaply: it has to recognise a line opener, a block opener AND a block
+     * closer, so it names a slash at least twice and a star at least twice.
+     */
+    const evidence = new Map();
+
+    /**
+     * MODULE TOP LEVEL, where there is no enclosing function to hang evidence
+     * on, and where the bar is deliberately higher.
+     *
+     * Until #3164's fix round this rule saw nothing out here at all: a
+     * `const code = raw.replace(/…/g, "")` chain written beside the imports
+     * was SILENT, and the identical chain moved one line into a function was
+     * reported. That is not a limit anybody would choose, and it was not
+     * written down either.
+     *
+     * It cannot be the SAME test out here, though, because one escaped block
+     * delimiter at module scope is real code: `diagnostics/tools/define.ts`
+     * bans a SQL comment opener from operator-authored SQL and writes it as a
+     * bare module-level regex. Measured over this tree, that is the only
+     * module-level literal naming one, and nothing names BOTH without being a
+     * scanner. So a report out here needs the opener AND the closer — which
+     * every block-comment regex and every hand-written block scanner writes
+     * together, and which a banlist entry does not.
+     */
+    const moduleScope = { opener: null, closer: null };
+
+    function evidenceFor(node) {
+      const fn = enclosingFunction(node);
+      if (!fn) return null;
+      const found = evidence.get(fn) ?? { proof: null, slashes: 0, stars: 0 };
+      evidence.set(fn, found);
+      return found;
+    }
+
+    function inspectContainedText(node, text) {
+      if (typeof text !== "string") return;
+      // Both membership tests run BEFORE the walk to the enclosing function,
+      // because every string and template chunk in the tree reaches this and
+      // almost none of them contains either delimiter.
+      const opens = text.includes(ESCAPED_BLOCK_OPEN);
+      const closes = text.includes(ESCAPED_BLOCK_CLOSE);
+      if (!opens && !closes) return;
+
+      const fn = enclosingFunction(node);
+      if (!fn) {
+        if (opens && !moduleScope.opener) moduleScope.opener = node;
+        if (closes && !moduleScope.closer) moduleScope.closer = node;
+        return;
+      }
+
+      const found = evidence.get(fn) ?? { proof: null, slashes: 0, stars: 0 };
+      evidence.set(fn, found);
+      if (!found.proof) found.proof = node;
+    }
+
+    /**
+     * A literal whose WHOLE value is a delimiter or one of its characters.
+     * Containment is deliberately not enough: a glob contains a block opener
+     * and is still a glob, and a fixture asserting on the canonical helper
+     * contains whatever it needed to assert about.
+     */
+    function inspectExactValue(node, value) {
+      // Checked BEFORE walking up to the enclosing function, because every
+      // string literal in the tree reaches this and almost none of them is one
+      // of these five characters.
+      if (
+        value !== BLOCK_OPEN &&
+        value !== BLOCK_CLOSE &&
+        value !== LINE_DELIMITER &&
+        value !== CHAR_SLASH &&
+        value !== CHAR_STAR
+      ) {
+        return;
+      }
+      const found = evidenceFor(node);
+      if (!found) return;
+      // A whole-value block CLOSER is proof by itself: it is meaningless in a
+      // path, a glob or a URL, and every char-scanning stripper writes it. The
+      // OPENER is not, because `entryPath.endsWith("/*")` is a real glob test
+      // in `help/match.ts`, so it counts as one slash and one star instead.
+      if (value === BLOCK_CLOSE) {
+        if (!found.proof) found.proof = node;
+        return;
+      }
+      if (value === BLOCK_OPEN) {
+        found.slashes += 1;
+        found.stars += 1;
+        return;
+      }
+      if (value === CHAR_SLASH || value === LINE_DELIMITER) found.slashes += 1;
+      else if (value === CHAR_STAR) found.stars += 1;
+    }
+
+    return {
+      Literal(node) {
+        if (node.regex) {
+          inspectContainedText(node, node.regex.pattern);
+          return;
+        }
+        inspectExactValue(node, node.value);
+        inspectContainedText(node, node.value);
+      },
+      TemplateElement(node) {
+        inspectExactValue(node, node.value?.cooked);
+        inspectContainedText(node, node.value?.cooked);
+      },
+      "Program:exit"() {
+        for (const [fn, found] of evidence) {
+          // Proof is reported where it is written, so the message lands on the
+          // delimiter rather than on a hundred-line function. The character
+          // counts have no single node to blame, so those report the function.
+          if (found.proof) {
+            context.report({ node: found.proof, messageId: "copy" });
+          } else if (found.slashes >= 2 && found.stars >= 2) {
+            context.report({ node: fn, messageId: "copy" });
+          }
+        }
+        // One report for the module body, on the delimiter that completed the
+        // pair, so it lands on a line rather than on the whole file.
+        if (moduleScope.opener && moduleScope.closer) {
+          context.report({ node: moduleScope.closer, messageId: "copy" });
+        }
+      },
+    };
+  },
+};
+
+/**
+ * This repository's own ESLint rules, as a flat-config plugin.
+ *
+ * Exported for `ssot-comment-stripper-guard.test.ts`, which lints fixtures
+ * through the SHIPPED config rather than through a copy of the rule.
+ */
+export const SSOT_LOCAL_RULES = {
+  rules: { "no-local-comment-stripper": noLocalCommentStripper },
+};
+
+// ---------------------------------------------------------------------------
+// #3318 — the TypeScript shapes Semgrep's parser cannot read.
+// ---------------------------------------------------------------------------
+//
+// `semgrep scan --error` exits 0 on code it could not PARSE. A parse failure is
+// a `warn`-level entry in the JSON `errors` array and is nowhere in the exit
+// status, so a file the scanner skipped a region of has looked exactly like a
+// file it read and cleared. #2842 made that visible — the affected files are
+// listed in `.semgrep/unparsed-allowlist.json` and
+// `scripts/ci/check-semgrep-coverage.mjs` ratchets the list in both directions
+// — and this rule is what stops the list REGROWING. Catching each new entry
+// afterwards was measured: while #2842 was in flight, one upstream sync and
+// three separate batches of sibling children each added entries, so the
+// recurrence is not an event to absorb once, it is anything landing at all.
+// Removing the growth at source is the structural fix `INV-SSOT-001` prefers.
+//
+// HOW MUCH OF THE CLASS THIS RULE REACHES, said plainly, because the honest
+// version is not "the shapes are closed". #3318 shipped saying THREE shapes
+// defeat the parser and that two of them could not come back. #3345 re-measured
+// and found roughly a dozen further failing positions with the rule silent on
+// every one of them, so the arms below are wider and the CLAIM is narrower:
+// this rule reaches the positions listed here, and the coverage gate remains
+// the backstop for anything it does not.
+//
+// EVERY LINE BELOW WAS MEASURED, on the pinned image `semgrep/semgrep:1.161.0`
+// (the one the blocking scan runs) against minimal single-construct files, with
+// a probe rule written to defeat Semgrep's prefilter so that every target is
+// really parsed. `f` is any function at all and `A` is any exported type.
+//
+// THE CALL CLASS — an `import()` type inside a call's type-argument list:
+//
+//     f<typeof import("x")>()                   FAILS  `>()` was unexpected
+//     f<typeof import("x")>( "x", ) on 3 lines   FAILS  `,` was unexpected
+//     f<typeof import("x"), string>("x")         FAILS  two type arguments
+//     f<typeof import("x")>                      FAILS  `>` was unexpected
+//     f<typeof import("x")>?.()                  FAILS  `>?.()` was unexpected
+//     f<typeof import("x")>("x")                parses
+//     f<typeof import("x")>("x", 1)             parses
+//     f?.<typeof import("x")>()                 parses
+//     tag<typeof import("x")>`abc`              parses
+//     new K<typeof import("x")>()               parses, and so does every other
+//                                               argument-list variant of `new`,
+//                                               INCLUDING the trailing comma
+//
+// Which side of that line a CALL sits on is decided by PRINT WIDTH: a rename
+// that pushes the call past it splits the argument list across lines, the
+// trailing comma arrives with the reflow, and a passing line becomes an
+// unscanned region with no change of any substance. That is not hypothetical —
+// it appeared at 12 call sites, and for 10 of the 169 entries #3318 inherited
+// it was the only cause. A further 23 files in the tree held the "parses today"
+// spelling, every one of them one reflow from an entry of its own. So the whole
+// call class is reported, and the remedy moves the type out of the call, where
+// nothing about it depends on formatting:
+//
+//     (await f()) as typeof import("x")
+//
+// which is measured clean, including with the multi-line trailing-comma
+// argument list the fixer leaves behind.
+//
+// `new` is the one member of the family that print width does NOT reach, so it
+// is deliberately not reported: `new K<typeof import("x")>` is clean with no
+// arguments, with arguments, with a trailing comma and with no parentheses at
+// all. A `new` whose type argument is DECORATED does fail, and the arm below
+// reports that wherever it appears — including there.
+//
+// THE DECORATED-TYPE CLASS — an `import()` type carrying a type-argument list,
+// an indexed access, a `keyof`, or a wrapping parenthesis. This is where #3318
+// was narrowest: it reported only the FUNCTION PARAMETER position, and the
+// position turned out to be almost irrelevant.
+//
+//     type P = import("x").A<null>                   FAILS  `<null>` unexpected
+//     interface I { p: import("x").A<null> }         FAILS
+//     (i: import("x").A<null>)                       FAILS
+//     (): import("x").A<null>                        FAILS
+//     let v: import("x").A<null>                     FAILS
+//     class C { p!: import("x").A<null> }            FAILS
+//     <T extends import("x").A<null>>                FAILS
+//     <T = import("x").A<null>>                      FAILS
+//     Array<import("x").A<null>>                     FAILS
+//     interface I extends import("x").A<null> {}     FAILS
+//     class C implements import("x").A<null> {}      FAILS
+//     new () => import("x").A<null>                  FAILS
+//     new K<import("x").A<null>>()                   FAILS
+//     keyof import("x")                              FAILS
+//     keyof import("x").A                            FAILS
+//     (import("x").A)                                FAILS
+//     (typeof import("x").v)                         FAILS
+//     (i: import("x").A["k"])                        FAILS
+//     (): import("x").A["k"]                         FAILS
+//     (i: import("x")["v"])                          FAILS
+//
+// and, in the SAME construct family, measured clean:
+//
+//     type P = import("x").A<null>["k"]             parses
+//     type P = import("x").A["k"]                   parses
+//     x as import("x").A<null>                      parses
+//     x satisfies import("x").A<null>               parses
+//     readonly import("x").A<null>[]                parses
+//     (typeof import("x"))                          parses
+//     keyof typeof import("x")                      parses
+//
+// THAT is the argument for reporting the class. Adding an index to a failing
+// alias FIXES it and removing one BREAKS it; the same type fails in a return
+// position and parses in an alias; `keyof` fails on a bare module type and
+// parses the moment a `typeof` is in front of it. No contributor can predict
+// which side of that boundary their line lands on, and nothing in the shape
+// tells them.
+//
+// THE REMEDY FOR A DECORATED TYPE IS A TOP-LEVEL `import type`, and getting
+// this wrong is what #3345 was filed to fix. #3318's message said "give the
+// type a name and use the name", which is measured WRONG for the commonest
+// member of the class: `type P = import("x").A<null>;` does not parse, so
+// following that instruction verbatim produced a new unscanned region and the
+// rule was silent on it — a guard printing an instruction that creates the hole
+// it exists to close. Measured clean:
+//
+//     import type { A } from "@/lib/x";        then  A<null>["k"]
+//     import type * as M from "@/lib/x";       then  M.A<null>
+//
+// Both are type-only and fully erased, so a module that must stay dynamically
+// loaded stays dynamically loaded. Where a value-space namespace is genuinely
+// wanted, rooting the type at `typeof` is the other clean answer:
+// `typeof import("@/lib/x").k` and `(typeof import("@/lib/x"))["k"]` parse in
+// every position outside a call.
+//
+// THE PARAMETER POSITION is still reported on its own, for an UNDECORATED type
+// that measures clean there, and it is the one arm resting on a margin argument
+// rather than on a measured failure: `(i: import("x").A)` and
+// `(i: typeof import("x"))` both parse, and one added type argument, index or
+// `keyof` fails. It is also the shape that put
+// `adult-member-hosting-queue-merge.realdb.test.ts` on the allowlist while
+// carrying no call shape at all, so that entry read as unexplained for as long
+// as the construct description named only the call.
+//
+// WHAT THIS RULE STILL CANNOT SEE, stated rather than left to be found:
+// `((typeof import("x")))` — a DOUBLY parenthesised module type, which fails
+// where the single-parenthesised form parses. typescript-eslint drops
+// `TSParenthesizedType` from the AST entirely, so parentheses are visible only
+// as tokens; the arm below reads the one pair immediately around the type and
+// requires a qualifier, which is the measured-failing shape. Population in this
+// tree is zero, and the coverage gate is what would catch it.
+
+const IMPORT_TYPE_CALL_MESSAGE =
+  '#3318: Semgrep cannot parse a call whose TYPE ARGUMENT contains an `import()` type, so it skips a region of this file and every security rule stops running there — while `semgrep scan --error` still exits 0 and reports nothing (#2842). Move the type out of the call: `(await importOriginal()) as typeof import("@/lib/x")`, which is type-equivalent because these helpers are declared `<T = unknown>() => Promise<T>`. YOUR CALL MAY WELL PARSE TODAY, and it is still reported: measured on semgrep 1.161.0, an EMPTY argument list, a multi-line TRAILING COMMA, a second type argument, a bare instantiation `f<typeof import("x")>` with no call, and `f<typeof import("x")>?.()` all fail, while `f<typeof import("x")>("x")`, `f?.<typeof import("x")>()` and a tagged template parse — so which side of the line a call sits on is decided by print width, and a rename that reflows the argument list turns a scanned line into an unscanned region. Gate: `scripts/ci/check-semgrep-coverage.mjs`. Background: docs/MAINTENANCE.md -> "Semgrep parse coverage".';
+
+const IMPORT_TYPE_DECORATED_MESSAGE =
+  '#3318/#3345: Semgrep cannot parse an `import()` type once it carries a type-argument list, an indexed access, a `keyof` or a wrapping parenthesis, so it skips a region of this file and every security rule stops running there — while `semgrep scan --error` still exits 0 and reports nothing (#2842). THE REMEDY IS A TOP-LEVEL TYPE-ONLY IMPORT, NOT AN ALIAS: measured on semgrep 1.161.0, `type P = import("@/lib/x").A<null>;` FAILS, so the "give the type a name" instruction this rule used to print created the very hole it exists to close (#3345). Write `import type { A } from "@/lib/x";` and then `A<null>["k"]`, or `import type * as M from "@/lib/x";` and then `M.A<null>` — both are erased at compile time, so a dynamically-loaded module stays dynamically loaded. If you need the value-space namespace, root the type at `typeof`: `typeof import("@/lib/x").k` and `(typeof import("@/lib/x"))["k"]` parse everywhere outside a call. The whole class is reported because the boundary inside it is incoherent and unguessable: `import("x").A<null>` fails in an alias while `import("x").A<null>["k"]` parses, the same type fails in a return position and parses in an alias, `keyof import("x")` fails while `keyof typeof import("x")` parses, and `(import("x").A)` fails while `(typeof import("x"))` parses. Gate: `scripts/ci/check-semgrep-coverage.mjs`. Background: docs/MAINTENANCE.md -> "Semgrep parse coverage".';
+
+const IMPORT_TYPE_PARAMETER_MESSAGE =
+  '#3318: an `import()` type in a FUNCTION PARAMETER annotation is one added type argument, index or `keyof` away from a shape Semgrep cannot parse — and when it cannot parse one it skips a region of this file, every security rule stops running there, and `semgrep scan --error` still exits 0 and reports nothing (#2842). THIS EXACT LINE PARSES TODAY: measured on semgrep 1.161.0, `(i: import("x").A)` and `(i: typeof import("x"))` are clean, while `(i: import("x").A<null>)`, `(i: import("x").A["k"])` and `(i: import("x")["v"])` all fail. It is reported because a parameter annotation is where this fault was found — one line of it put a whole file on `.semgrep/unparsed-allowlist.json` with none of the generic-call shape in it at all — and because the remedy costs a line: `import type { A } from "@/lib/x";` at the top of the file, then `(input: A)`. A type-only import is erased at compile time, so a dynamically-loaded module stays dynamically loaded. Gate: `scripts/ci/check-semgrep-coverage.mjs`. Background: docs/MAINTENANCE.md -> "Semgrep parse coverage".';
+
+/**
+ * The callee spellings whose declared signature makes the cast form
+ * type-equivalent, and therefore the ones the autofix will rewrite.
+ *
+ * DETECTION IS BEHAVIOURAL AND THIS LIST IS NOT PART OF IT. The parse fault is
+ * a property of the syntax and fires for any `f` at all, so the report keys on
+ * the shape; a name-keyed report would repeat #3132's mistake of sweeping by
+ * name and leaving the same defect alive under a second one. What the name buys
+ * is only the FIX: `importOriginal<T>()` and `vi.importActual<T>(path)` are both
+ * declared to resolve to `T`, so dropping the type argument and asserting the
+ * awaited value yields the identical type. For an arbitrary generic function it
+ * would not, and an autofix that silently changed a type would be worse than no
+ * autofix, so every other callee is reported unfixed.
+ */
+const IMPORT_TYPE_CALL_AUTOFIXABLE_CALLEES = new Set([
+  "importOriginal",
+  "importActual",
+  "vi.importActual",
+]);
+
+/** Node kinds that own a `params` list, i.e. every parameter position. */
+const PARAMETER_OWNER_NODE_TYPES = new Set([
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "ArrowFunctionExpression",
+  "TSDeclareFunction",
+  "TSFunctionType",
+  "TSMethodSignature",
+  "TSEmptyBodyFunctionExpression",
+  "TSConstructorType",
+  "TSConstructSignatureDeclaration",
+]);
+
+/**
+ * The expression kinds whose type-argument list the parser chokes on.
+ *
+ * `TSInstantiationExpression` is the shape #3318 missed twice over. It is
+ * `f<typeof import("x")>` with no call at all, which fails on its own, and it
+ * is ALSO how `f<typeof import("x")>?.()` parses — there the type arguments
+ * hang off the callee rather than off the optional call, so a visitor keyed on
+ * `CallExpression.typeArguments` sees neither (#3345).
+ *
+ * `NewExpression` is deliberately absent: measured, every `new` variant of the
+ * fault parses, including the trailing-comma reflow that is the whole reason
+ * the call class is banned wholesale. A decorated type argument still fails
+ * under `new`, and the decorated arm reports that wherever it appears.
+ */
+const IMPORT_TYPE_ARGUMENT_OWNER_NODE_TYPES = new Set([
+  "CallExpression",
+  "TSInstantiationExpression",
+]);
+
+/** Whether `node`'s subtree contains an `import()` TYPE anywhere. */
+function containsImportType(node, visitorKeys) {
+  if (!node || typeof node.type !== "string") return false;
+  if (node.type === "TSImportType") return true;
+  const keys =
+    visitorKeys[node.type] ??
+    Object.keys(node).filter((key) => key !== "parent");
+  for (const key of keys) {
+    const value = node[key];
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        if (containsImportType(child, visitorKeys)) return true;
+      }
+    } else if (containsImportType(value, visitorKeys)) return true;
+  }
+  return false;
+}
+
+/**
+ * `f`, `vi.importActual` — the dotted source spelling of a callee, or null for
+ * anything computed or deeper, which is never autofixed.
+ */
+function calleeSpelling(callee) {
+  if (callee.type === "Identifier") return callee.name;
+  if (
+    callee.type === "MemberExpression" &&
+    !callee.computed &&
+    callee.object.type === "Identifier" &&
+    callee.property.type === "Identifier"
+  ) {
+    return `${callee.object.name}.${callee.property.name}`;
+  }
+  return null;
+}
+
+/**
+ * Whether this `import()` type sits in a type-argument list the call arm has
+ * already reported, so the decorated and parameter arms stay quiet and one
+ * construct produces exactly one report.
+ */
+function inReportedTypeArgumentList(node) {
+  let child = node;
+  for (let current = node.parent; current; current = current.parent) {
+    if (
+      IMPORT_TYPE_ARGUMENT_OWNER_NODE_TYPES.has(current.type) &&
+      current.typeArguments === child
+    ) {
+      return true;
+    }
+    child = current;
+  }
+  return false;
+}
+
+/**
+ * How this `import()` type is DECORATED, or null when it is a plain module or
+ * qualified-name type.
+ *
+ * The four decorations are the measured-failing ones, listed in the block
+ * comment above with the clean forms beside them. Two details of the walk are
+ * load-bearing:
+ *
+ * - a `typeof` in front RESCUES the indexed and `keyof` forms — measured,
+ *   `typeof import("x")["k"]` and `keyof typeof import("x")` are clean while
+ *   `import("x")["k"]` and `keyof import("x")` fail — so the walk records
+ *   whether it crossed a `TSTypeQuery` and stops asking;
+ * - the QUALIFIER is a child of `TSImportType`, never a `TSQualifiedName`
+ *   parent, so there is nothing to climb for it. `node.qualifier` is the whole
+ *   test, and it is what separates the failing `(import("x").A)` and
+ *   `(typeof import("x").v)` from the clean `(typeof import("x"))`.
+ *
+ * Parentheses are read as TOKENS because typescript-eslint drops
+ * `TSParenthesizedType` from the AST: `(import("x").A)` and `import("x").A` are
+ * the identical tree. Reading the single pair immediately around the type is
+ * why the doubly-parenthesised module type is a stated limit rather than a
+ * covered case.
+ */
+function importTypeDecoration(node, sourceCode) {
+  if (node.typeArguments) return "typeArguments";
+
+  let outer = node;
+  let underTypeof = false;
+  while (outer.parent && outer.parent.type === "TSTypeQuery") {
+    underTypeof = true;
+    outer = outer.parent;
+  }
+
+  const consumer = outer.parent;
+  if (!underTypeof && consumer) {
+    if (
+      consumer.type === "TSIndexedAccessType" &&
+      consumer.objectType === outer
+    ) {
+      return "indexedAccess";
+    }
+    if (consumer.type === "TSTypeOperator" && consumer.operator === "keyof") {
+      return "keyof";
+    }
+  }
+
+  if (node.qualifier) {
+    const before = sourceCode.getTokenBefore(outer);
+    const after = sourceCode.getTokenAfter(outer);
+    if (before?.value === "(" && after?.value === ")") return "parenthesised";
+  }
+
+  return null;
+}
+
+/**
+ * Whether this `import()` type sits in a parameter annotation.
+ *
+ * The remedy — a top-level type-only import — needs nothing special here, and a
+ * first cut that stopped the walk at a `TSTypeAliasDeclaration` "so the alias is
+ * not reported in a circle" was DEAD CODE: a type alias can only be declared at
+ * statement level, so an `import()` type inside one never has a function whose
+ * `params` contain the branch it came up through. A mutation probe that deleted
+ * that branch left every case of
+ * `semgrep-unparsable-import-type-guard.test.ts` green, which is how it was
+ * found; it is gone rather than left in place with a comment claiming it does
+ * work.
+ */
+function inParameterAnnotation(node) {
+  let child = node;
+  for (let current = node.parent; current; current = current.parent) {
+    if (
+      PARAMETER_OWNER_NODE_TYPES.has(current.type) &&
+      Array.isArray(current.params) &&
+      current.params.includes(child)
+    ) {
+      return true;
+    }
+    child = current;
+  }
+  return false;
+}
+
+/**
+ * The autofix for the call shape, or null when it cannot be made safely.
+ *
+ * It rebuilds the whole `await` expression rather than patching around the type
+ * argument, so the trailing comma and the line break a reflow introduced go
+ * away with it. Anything it cannot account for — a callee it does not know to
+ * resolve to `T`, more than one type argument, a call that is not directly
+ * awaited, an optional call, an instantiation expression with no call to await
+ * at all, or a comment inside the expression it would rewrite — is reported
+ * with no fix rather than fixed approximately.
+ */
+function importTypeCallFix(node, typeArguments, sourceCode) {
+  if (node.type !== "CallExpression") return null;
+  if (typeArguments.params.length !== 1) return null;
+  if (node.optional) return null;
+  const spelling = calleeSpelling(node.callee);
+  if (!spelling || !IMPORT_TYPE_CALL_AUTOFIXABLE_CALLEES.has(spelling)) {
+    return null;
+  }
+  const awaited = node.parent;
+  if (
+    !awaited ||
+    awaited.type !== "AwaitExpression" ||
+    awaited.argument !== node
+  ) {
+    return null;
+  }
+  if (sourceCode.getCommentsInside(awaited).length > 0) return null;
+
+  const typeText = sourceCode.getText(typeArguments.params[0]);
+  const args = node.arguments
+    .map((argument) => sourceCode.getText(argument))
+    .join(", ");
+  const call = `${sourceCode.getText(node.callee)}(${args})`;
+  return (fixer) =>
+    fixer.replaceText(awaited, `(await ${call}) as ${typeText}`);
+}
+
+/**
+ * The rule, reached through `SCAN_COVERAGE_LOCAL_RULES` below and exercised by
+ * `semgrep-unparsable-import-type-guard.test.ts` through the SHIPPED config.
+ *
+ * It is a rule of its own rather than a `no-restricted-syntax` arm for the same
+ * reason `no-local-comment-stripper` is: that rule is switched OFF for every
+ * test file by the block at the bottom of this config, and test files are the
+ * entire population — every call site #3318 measured was in a test
+ * (counts live in `docs/MAINTENANCE.md` -> "Semgrep parse coverage", their one home).
+ */
+const noSemgrepUnparsableImportType = {
+  meta: {
+    type: "problem",
+    docs: {
+      description:
+        "Report the TypeScript shapes Semgrep cannot parse, each of which silently removes a region of the file from the security scan (#2842, #3318, #3345).",
+    },
+    fixable: "code",
+    schema: [],
+    messages: {
+      callTypeArgument: IMPORT_TYPE_CALL_MESSAGE,
+      decoratedImportType: IMPORT_TYPE_DECORATED_MESSAGE,
+      parameterAnnotation: IMPORT_TYPE_PARAMETER_MESSAGE,
+    },
+  },
+  create(context) {
+    const sourceCode = context.sourceCode;
+    const visitorKeys = sourceCode.visitorKeys ?? {};
+
+    /** Shared by the call and instantiation visitors — the fault is identical. */
+    const reportTypeArgumentOwner = (node) => {
+      const typeArguments = node.typeArguments;
+      if (!typeArguments) return;
+      if (!containsImportType(typeArguments, visitorKeys)) return;
+      const fix = importTypeCallFix(node, typeArguments, sourceCode);
+      context.report({
+        node: typeArguments,
+        messageId: "callTypeArgument",
+        ...(fix ? { fix } : {}),
+      });
+    };
+
+    return {
+      CallExpression: reportTypeArgumentOwner,
+      TSInstantiationExpression: reportTypeArgumentOwner,
+      TSImportType(node) {
+        if (inReportedTypeArgumentList(node)) return;
+        if (importTypeDecoration(node, sourceCode)) {
+          context.report({ node, messageId: "decoratedImportType" });
+          return;
+        }
+        if (inParameterAnnotation(node)) {
+          context.report({ node, messageId: "parameterAnnotation" });
+        }
+      },
+    };
+  },
+};
+
+/**
+ * The scan-coverage rules, as a flat-config plugin.
+ *
+ * A namespace of its own rather than another entry under `ssot` because this
+ * enforces Semgrep's parse coverage, not single-source-of-truth, and a rule id
+ * that misdescribes what it protects is the first thing a reader gets wrong.
+ *
+ * NOT exported, unlike its neighbour, and deliberately.
+ * `semgrep-unparsable-import-type-guard.test.ts` reaches the rule by linting
+ * fixture text through the shipped config with the real `ESLint` class, so it
+ * never needs the plugin object — and an export nothing imports would also
+ * owe `eslint.config.d.mts` a declaration to stay reachable from TypeScript.
+ */
+const SCAN_COVERAGE_LOCAL_RULES = {
+  rules: { "no-semgrep-unparsable-import-type": noSemgrepUnparsableImportType },
+};
+
+// ---------------------------------------------------------------------------
+// Composition: every restriction that must survive in EVERY `src/**` block,
+// whatever else that block is there to lift.
+// ---------------------------------------------------------------------------
+//
+// A comment saying "re-state these" was the whole mechanism until now, and it
+// only holds while everyone reads it — flat config REPLACES a rule's option list
+// rather than merging it, so a block written to lift one rule takes every other
+// rule down with it and lint still passes.
+//
+// A MERGE can do the same thing from the other direction, and more quietly. When
+// two branches each add a block here, git can align the conflict so one side's
+// whole restriction group sits inside the hunk and the other side's is a closing
+// paren; resolving THAT the obvious way deletes a guard outright and the file
+// still parses. So the rule LISTS live here as named arrays, separately from the
+// blocks that apply them, and every block's rule value is a function CALL —
+// never an array literal. Merging two named arrays is a decision somebody can
+// see; merging two block literals is how a guard disappears.
+//
+// THAT IS NOT A HYPOTHETICAL. #2684 and #2685 were built in parallel, each
+// adding its own guard and its own blocks, and a three-way merge of the two
+// aligned #2685's whole money group inside a hunk whose #2684 side was a single
+// `),`. Resolving it the obvious way deleted the money guard's broad arm and its
+// helper exemption, and the file still parsed. The fold below is the answer:
+// ONE mandatory array, THREE named groups inside it, and no block that spells
+// out a list of its own.
+//
+// ADDING A GUARD: put its restrictions in a named array beside the others below
+// and add that array here. That is the only edit needed — every block picks it
+// up, INCLUDING the `scripts/` and `prisma/` blocks, and BOTH
+// `date-only-encoding-guard.test.ts` and `money-cents-guard.test.ts` read this
+// same array, so the integrity checks extend themselves rather than each needing
+// its own copy of the list.
+//
+// "INCLUDING the `scripts/` and `prisma/` blocks" is a promise this file used to
+// break. `operatorScriptRestrictedSyntax()` hand-wrote `[...RAW_SQL,
+// ...MONEY_CENTS]` four lines under a comment saying adding an array here was
+// the only edit needed — so a guard added here would silently not have reached
+// either directory, and NEITHER suite could have noticed, because both skipped
+// any block whose globs do not start with `src/`. Both now go through the shared
+// path, and the roster in `eslint-guard-coverage.ts` carries a `scripts/` and a
+// `prisma/` path so the audit sees them.
+const ALWAYS_RESTRICTED_IN_SRC = [
+  ...RAW_SQL_RESTRICTIONS,
+  ...DATE_ONLY_ENCODING_RESTRICTIONS,
+  ...ZONED_FORMATTER_RESTRICTIONS,
+  ...HOST_CLOCK_RESTRICTIONS,
+  ...ENVIRONMENT_ZONE_RESTRICTIONS,
+  ...DATE_FNS_RESTRICTIONS,
+  ...MONEY_CENTS_RESTRICTIONS,
+  ...CENTS_DISPLAY_RESTRICTIONS,
+  ...CENTS_IN_PROSE_RESTRICTIONS,
+  ...CURRENCY_LOCALE_RESTRICTIONS,
+  ...AUTHORITY_DEFAULT_RESTRICTIONS,
+  ...CLUB_FORMAT_PARAMETER_RESTRICTIONS,
+  ...RETIRED_FORMAT_CONSTANT_RESTRICTIONS,
+  ...ENVIRONMENT_FORMAT_RESTRICTIONS,
+  ...CLIENT_IP_HEADER_RESTRICTIONS,
+];
+
+/**
+ * Blocks allowed to omit part of the mandatory set, each with the group it omits
+ * and why. Exported so the integrity test reads the SAME record instead of
+ * keeping its own copy, which would drift out of step with this file.
+ *
+ * `files` must match a block's list EXACTLY, so widening a block's globs does
+ * not quietly widen its exemption too.
+ */
+export const SRC_RESTRICTION_EXEMPTIONS = [
+  {
+    files: ["src/lib/date-only.ts"],
+    omits: [...DATE_ONLY_ENCODING_RESTRICTIONS],
+    reason:
+      "The canonical home for the date-only encoding (#2684): the rule exists to make every OTHER file call these helpers instead of hand-writing the truncation, and the helpers have to write it somewhere. It carried the ENVIRONMENT-ZONE group too until #3123, because six of its helpers defaulted their `timeZone` to `APP_TIME_ZONE`; those defaults and the import are gone, every caller passes a zone, and the exemption went with them. An exemption is deleted when its cause is, not when somebody next happens to read the block.",
+  },
+  {
+    files: DATE_FNS_ADAPTER_FILES,
+    omits: DATE_FNS_RESTRICTIONS,
+    reason:
+      "The files still importing `date-fns`, measured by CT-6 (#2991) at seven and six since #3566 moved the reports page off it. Two are relative-duration hints that are genuinely zone-free; the rest are the admin report bucket/date-series residual #2870 already carries. Each entry on `DATE_FNS_ADAPTERS` above names what it uses and what is blocking it, and the list is a ratchet.",
+  },
+  {
+    files: ENVIRONMENT_ZONE_ADAPTER_FILES,
+    omits: ENVIRONMENT_ZONE_RESTRICTIONS,
+    reason:
+      "The two structural readers of the environment's zone, plus the callers CT-6 (#2991) could not migrate without threading a club zone through a surface belonging to another issue. Entries leave this list BOTH ways and #3123 did each: it DELETED `src/lib/nzst-date.ts` once its last production caller had moved, and it MIGRATED `src/lib/member-guest-consent-labels.ts` and `src/lib/member-guest-delegate-page.ts` by threading the club's persisted zone through them. #3126 then took `src/lib/member-merge-field-kinds.ts` off by deleting the `= APP_TIME_ZONE` DEFAULT the exemption had been covering (`INV-SSOT-003`) — an exemption written for a READ should never have excused a default, and `AUTHORITY_DEFAULT_RESTRICTIONS` is on the mandatory set precisely so no entry here can excuse one again. Migration is the intended way off this list; deletion is the terminus for a module with nothing left to do. No count is stated here on purpose — the length is asserted in exactly one place, `club-time-boundary-guard.test.ts`, and a number restated in prose is a number that drifts. Every entry carries its own reason on `ENVIRONMENT_ZONE_ADAPTERS` above, and the list is a ratchet the census test refuses to let grow.",
+  },
+  {
+    files: ENVIRONMENT_FORMAT_ADAPTER_FILES,
+    omits: ENVIRONMENT_FORMAT_RESTRICTIONS,
+    reason:
+      "The seed reader for the club's currency and locale (#3563; #3567 review): the one module whose job is to read CURRENCY / LOCALE once, for the first-boot backfill and the no-row fallback, and to warn when only a retired NEXT_PUBLIC_ twin is set. Every other file reads the stored setting.",
+  },
+  {
+    files: CLIENT_IP_HEADER_ADAPTER_FILES,
+    omits: CLIENT_IP_HEADER_RESTRICTIONS,
+    reason:
+      "The one home of the caller-IP rule (#5399): last X-Forwarded-For address, then X-Real-IP. The rule exists to make every other file call getClientIp() / clientIpFromHeaders() instead of reading a client-address header, and to take FORWARDED_FOR_HEADER from here when writing one; the helper has to name them somewhere.",
+  },
+  {
+    files: ["prisma/**/*.{ts,tsx}"],
+    omits: DATE_ONLY_ENCODING_RESTRICTIONS,
+    reason:
+      "The seed and fixture files synthesise date STRINGS for a throwaway database rather than reading a domain column (#2684), and `prisma/e2e-fixtures.ts` is contractually a pure constants module — importing `@/lib/date-only` would pull a module graph into a file whose whole point is that it imports nothing. `scripts/` gets no such exemption: it carries the full set.",
+  },
+  {
+    files: MONEY_DOMAIN_MODULES,
+    omits: MONEY_CENTS_RESTRICTIONS,
+    reason:
+      "STRICTER, not weaker (#2685): inside the money-domain modules a bare `x * 100` is a cents conversion by construction, so MONEY_MODULE_RESTRICTIONS below replaces the narrow shape-based arms with one that subsumes them. Listing both reported the same node two and three times at the identical line:column.",
+  },
+  {
+    files: MONEY_HELPER_MODULES,
+    omits: MONEY_CENTS_RESTRICTIONS,
+    reason:
+      "The two reviewed money boundaries (#2685). They own the conversion every other file is sent here to use, so they are the one place allowed to write it; each carries its own written reason on MONEY_GUARD_EXEMPTIONS above.",
+  },
+];
+
+/** The mandatory set, for the integrity test to measure blocks against. */
+export const MANDATORY_SRC_RESTRICTIONS = ALWAYS_RESTRICTED_IN_SRC;
+
+/**
+ * `no-restricted-syntax` for a `src/**` block: the mandatory restrictions, plus
+ * whatever that block adds. Always use this rather than writing the array out.
+ */
+function srcRestrictedSyntax(...additional) {
+  return ["error", ...ALWAYS_RESTRICTED_IN_SRC, ...additional];
+}
+
+/**
+ * The same, minus ONE named group — for a block that legitimately cannot obey a
+ * single guard (the helper module that implements it, say) but must keep every
+ * other. Dropping a group BY NAME keeps whatever arrives later, which writing
+ * the remaining list out by hand would not.
+ *
+ * The omission must also appear in `SRC_RESTRICTION_EXEMPTIONS`, or the
+ * integrity test rejects it.
+ */
+function srcRestrictedSyntaxWithout(omitted, ...additional) {
+  const dropped = new Set(omitted.map((restriction) => restriction.selector));
+  return [
+    "error",
+    ...ALWAYS_RESTRICTED_IN_SRC.filter((r) => !dropped.has(r.selector)),
+    ...additional,
+  ];
+}
+
+/**
+ * `prisma/` takes everything except the date-only ENCODING restrictions, which
+ * two seed files there genuinely cannot obey; the block below gives the reason,
+ * and it is recorded on `SRC_RESTRICTION_EXEMPTIONS` like every other omission.
+ *
+ * `scripts/` needs no function of its own: it takes the whole mandatory set
+ * through `srcRestrictedSyntax()`, exactly as `src/**` does.
+ */
+function operatorSeedRestrictedSyntax() {
+  return srcRestrictedSyntaxWithout(DATE_ONLY_ENCODING_RESTRICTIONS);
+}
+
+const eslintConfig = defineConfig([
+  // Next has a global rules block; keep its JavaScript rules off CSS ASTs.
+  ...fixupConfigRules([...nextVitals, ...nextTs]).map((config) => config.rules
+    ? { ...config, ignores: [...(config.ignores ?? []), "**/*.css"] } : config),
+  {
+    rules: {
+      // The current admin/lodge UI relies on effect-driven fetch/reset flows.
+      // Enabling these rules would require a broad React refactor rather than
+      // a lint-only cleanup pass.
+      "react-hooks/set-state-in-effect": "off",
+      "react-hooks/static-components": "off",
+    },
+  },
+  {
+    /*
+      #2690, owner decision 15 Aug 2026 — ONE of the two rules above is switched
+      back on, for ONE folder.
+
+      `react-hooks/static-components` is measured at zero errors across
+      `src/components/edit-booking/**`, both before and after the edit-panel
+      split, so turning it on changes nothing today and costs nothing. Its value
+      is forward-looking: it stops a component being defined inside another
+      component from being reintroduced into the folder the split just cleaned.
+      That mistake gives the inner component a new identity on every render, so
+      React discards and rebuilds that part of the tree instead of updating it —
+      which reaches a user as typed text being wiped, focus jumping out of a
+      field, or a panel flickering.
+
+      `react-hooks/set-state-in-effect` is deliberately NOT enabled here. Two
+      sites in this folder still trip it: the per-guest-dates auto-disable in
+      `hooks/use-guest-date-modes.ts` and the hosting-override retirement in
+      `hooks/use-hosting-coverage-override.ts`. Both are reset flows, and
+      rewriting either to derive during render changes WHEN the reset fires on
+      the admin booking screen. That is a real behaviour change, and #2690's
+      whole claim is that it changes none, so it is not being smuggled in behind
+      a lint switch.
+
+      THE BLIND SPOT, and it matters more than the count. Measured on this
+      refactor: `set-state-in-effect` reported THREE errors in the monolithic
+      panel and TWO after the split. Nothing was fixed. The one that disappeared
+      is the debounced quote effect's `setQuote(null)`, and it disappeared only
+      because `setQuote` became a hook PARAMETER — the rule can no longer prove
+      a value it received as an argument is a state setter, so it stops looking.
+      The code is identical; the checker went blind to it.
+
+      So "two remaining" flatters this folder, and the same discount applies to
+      any future effect extracted into a hook that takes its setters as
+      arguments — which is exactly the shape this refactor introduced. Do not
+      read a falling number here as the folder getting cleaner.
+
+      Scope is deliberately this folder and nothing else. The repository-wide
+      `off` above is untouched; widening either rule is a separate decision with
+      its own measurement.
+    */
+    /*
+      Every extension the ratchet treats as production, not just .ts/.tsx. Next's
+      default pageExtensions serve .js/.jsx whatever tsconfig says (allowJs has
+      been off since #2693), so a component written as .jsx in this folder
+      would otherwise be scoped out of the very rule this block exists to apply — and, as file-size-budget.ts records, a
+      .js file under src is policed by nothing at all.
+    */
+    files: ["src/components/edit-booking/**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"],
+    rules: {
+      "react-hooks/static-components": "error",
+    },
+  },
+  {
+    files: ["**/__tests__/**/*.{ts,tsx}", "**/*.test.{ts,tsx}"],
+    rules: {
+      "@typescript-eslint/no-explicit-any": "off",
+    },
+  },
+  {
+    // #2264 — every rendered date and time must go through the club's ONE
+    // rendering seam, `@/lib/club-time` (CT-2, #2990). The six NZ-pinned helpers
+    // in `src/lib/nzst-date.ts` (`formatNZDate`, `formatNZDateTime`,
+    // `formatNZLongDate`, `formatNZTime`, `formatNZMonthYear`,
+    // `formatNZWeekdayDate`) were that seam until CT-2 made them delegate to the
+    // kernel and #3123 deleted the file. A bare `toLocaleDateString()` /
+    // `toLocaleTimeString()` / `toLocaleString()` renders in the VIEWER's time
+    // zone and locale, so an admin abroad saw a different lodge night than the
+    // one stored, and the lobby clock showed the wrong time on a TV whose
+    // browser was not set to New Zealand (#2256, #2264).
+    //
+    // ALL THREE `toLocale*` date entry points are restricted. `toLocaleString`
+    // was originally left out because `Number.prototype.toLocaleString` is
+    // thousands-separator formatting and has nothing to do with dates — but
+    // roughly a quarter of the sites this issue fixed were date-context
+    // `toLocaleString` calls, so leaving it unguarded left the biggest single
+    // hole in a rule `docs/DOMAIN_INVARIANTS.md` claims closes the class. It is
+    // restricted here, and the three files that genuinely format NUMBERS get a
+    // narrow block of their own below.
+    //
+    // KNOWN LIMITATION (accepted): the selector is syntactic, so computed
+    // access (`d["toLocaleDateString"]()`) and a detached method alias
+    // (`const f = d.toLocaleDateString; f()`) both slip past it. Neither
+    // appears in the tree and neither is a shape anyone writes by accident;
+    // the rule is a guard against the ordinary mistake, not a sandbox.
+    //
+    // A site whose format is legitimately none of the six helper shapes
+    // (weekday-bearing, month-year-short, seconds-bearing, or an `en-CA` ISO
+    // extractor) is expressed as a module-level
+    // `new Intl.DateTimeFormat(APP_LOCALE, { timeZone: APP_TIME_ZONE, … })`
+    // constant, which is both zone-correct and rule-clean. THAT is the escape
+    // hatch — not an `eslint-disable` comment. There are none in the tree, and
+    // a new one should be read as a site that was never classified.
+    //
+    // Documented exclusions (each has its own block below):
+    //   * `src/lib/date-only.ts` — the helper module itself, the sanctioned home
+    //     for the date-only encoding. `src/lib/nzst-date.ts` sat beside it until
+    //     CT-2 (#2990) took its exemption away and #3123 deleted the file.
+    //   * `src/lib/email-templates/chores.ts` USED TO BE HERE, for the
+    //     chore-roster date (#2256), and #3566 took the exemption away: the
+    //     roster now renders the kernel's `longWeekdayDate` house shape through
+    //     the email seam, in the club's locale rather than a hard-coded `en-NZ`,
+    //     so the file needs no exemption at all. `date-only.ts` is now the only
+    //     file-wide DATE-rule exclusion.
+    //   * the three Number-formatting files — a narrowed block, NOT an `off`:
+    //     they keep both date restrictions and drop only `toLocaleString`.
+    //   * `src/lib/xero-invoice-helpers.ts` — ISO payload dates for the Xero
+    //     API. Listed for the record only: it builds them with `toISOString()`,
+    //     so it never actually trips this rule and needs no block.
+    //   * tests — expectation builders deliberately mirror a component's
+    //     current (non-standard) format, which is how they catch a drift.
+    //   * `e2e/**` is outside this block's `files` glob already (`src/**`
+    //     only). `e2e/helpers/booking.ts`, `e2e/helpers/stay-dates.ts` and
+    //     `e2e/admin-retroactive-booking.spec.ts` build expected label strings
+    //     on purpose; if this rule is ever widened to the repository root, add
+    //     an `off` block for `e2e/**`.
+    files: ["src/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntax(...DATE_RENDERING_RESTRICTIONS),
+    },
+  },
+  {
+    // CT-6 (#2991) — the files still importing `date-fns`. Reasons are on
+    // `DATE_FNS_ADAPTERS` above. The rendering arms are re-stated for the same
+    // reason as the block below: flat config replaces, it does not merge.
+    files: DATE_FNS_ADAPTER_FILES,
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        DATE_FNS_RESTRICTIONS,
+        ...DATE_RENDERING_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // CT-6 (#2991) — the files allowed to name the ENVIRONMENT's zone. The
+    // reason for each is on `ENVIRONMENT_ZONE_ADAPTERS` above, where the census
+    // test can read it; only the group is dropped here.
+    //
+    // The DATE_RENDERING arms are re-stated rather than inherited, because flat
+    // config REPLACES a rule's options: a block that merely dropped one group
+    // would take the three rendering arms down with it, silently, for every file
+    // named here. That is not hypothetical — it is what CT-2 (#2990) deliberately
+    // undid for `nzst-date.ts` by taking its rendering exemption away, on the
+    // file that WAS the club's rendering seam (#3123 has since deleted it). This
+    // is the failure the fold above exists to prevent, arriving through a new
+    // block rather than through a merge.
+    files: ENVIRONMENT_ZONE_ADAPTER_FILES,
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        ENVIRONMENT_ZONE_RESTRICTIONS,
+        ...DATE_RENDERING_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // The seed reader for the club's currency and locale is the one file that
+    // may read CURRENCY / LOCALE and the retired NEXT_PUBLIC_ twins (#3567
+    // review). Only that group is dropped; the rendering arms are re-stated for
+    // the reason the block above gives.
+    files: ENVIRONMENT_FORMAT_ADAPTER_FILES,
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        ENVIRONMENT_FORMAT_RESTRICTIONS,
+        ...DATE_RENDERING_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // The caller-IP helper is the one file that may read X-Forwarded-For and
+    // X-Real-IP (#5399). Only that group is dropped; the rendering arms are
+    // re-stated for the reason the zone block above gives.
+    files: CLIENT_IP_HEADER_ADAPTER_FILES,
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        CLIENT_IP_HEADER_RESTRICTIONS,
+        ...DATE_RENDERING_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // The raw-SQL guard (#2289) is NOT an `src/`-only rule, even though the date
+    // rules above are. Operator CLIs and seed/migration helpers are where
+    // hand-written SQL is most likely — Prisma cannot express a bulk correlated
+    // update, and these files run against production data with an operator
+    // watching a row count. `scripts/` alone holds the money-adjacent
+    // `backfill-orphaned-applied-credits.ts`,
+    // `backfill-finance-monthly-facts.ts` and `xero-booking-repair.ts`. Neither
+    // directory contains any raw SQL today, so this costs nothing now and is
+    // purely about what may be written next — and it makes the unqualified
+    // promise in CONTRIBUTING.md and docs/DOMAIN_INVARIANTS.md true rather than
+    // aspirational.
+    //
+    // `e2e/**` is deliberately NOT here: it is entirely Playwright tests, which
+    // are exempt for the same reason `src/**/__tests__/**` is (see the last
+    // block) — a test's raw statement runs against a throwaway database and its
+    // result is asserted on the spot.
+    //
+    // `scripts/` takes the WHOLE mandatory set, date-only encoding included.
+    //
+    // This used to be one block over both directories that omitted the #2684
+    // encoding restrictions, on the ground that "the guard follows the DOMAIN,
+    // which lives in `src/`" — four lines above extending the MONEY guard here
+    // because "`scripts/` holds the money-adjacent backfills". Both arguments
+    // apply equally to both guards, so the asymmetry was reasoning, not a
+    // reason. `scripts/` contains ZERO truncations today (the only two outside
+    // `src/` are `prisma/demo-seed.ts:81` and `prisma/e2e-fixtures.ts:46`), so
+    // extending the date restrictions here costs nothing and closes it. The real
+    // exemption belongs to `prisma/`, and it has its own block below.
+    files: ["scripts/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntax(),
+    },
+  },
+  {
+    // `prisma/` — same as `scripts/`, minus the #2684 encoding restrictions, and
+    // the two files that need that say why. `prisma/demo-seed.ts` and
+    // `prisma/e2e-fixtures.ts` synthesise date STRINGS for a throwaway database
+    // rather than reading a domain column, and `e2e-fixtures.ts` declares itself
+    // "a pure constants module: no Playwright, no Prisma, no `server-only`
+    // imports" — importing `@/lib/date-only` would pull a module graph into a
+    // module whose whole contract is that it imports nothing.
+    //
+    // Dropped BY NAME, and recorded on `SRC_RESTRICTION_EXEMPTIONS`, so every
+    // other guard — raw SQL, money, the zoned-formatter rule, anything added
+    // later — still reaches every seed and migration helper.
+    files: ["prisma/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": operatorSeedRestrictedSyntax(),
+    },
+  },
+  {
+    // `src/lib/date-only.ts` is the ONE file exempt from the #2684 encoding
+    // restrictions, because it is the sanctioned home for the truncation: the
+    // rule exists to make every other file call `formatDateOnly` instead of
+    // writing `toISOString().slice(0, 10)`, and that helper has to write it
+    // somewhere. It still carries the raw-SQL and money restrictions, which have
+    // nothing to do with that.
+    //
+    // IT USED TO DROP THE ENVIRONMENT-ZONE GROUP TOO, and #3123 took that back.
+    // Six helpers here defaulted their `timeZone` parameter to `APP_TIME_ZONE`;
+    // once every caller passed a zone the defaults and the import went, and the
+    // exemption had nothing left to excuse. A lifted guard outlives its cause in
+    // SILENCE — no assertion fails on the day the last violation leaves the file
+    // — which is why `club-time-boundary-guard.test.ts` now re-reads every file
+    // this config excuses from that group, not only the ones named on
+    // `ENVIRONMENT_ZONE_ADAPTERS`, and fails on one whose code no longer names
+    // the environment zone.
+    //
+    // This is the only entry `date-only-encoding-guard.test.ts` accepts on its
+    // exemption list. A second file added here is a site that was never
+    // classified, not a file that needs an exemption.
+    files: ["src/lib/date-only.ts"],
+    rules: {
+      // Drops ONE named group. Every other guard — the raw-SQL restrictions, the
+      // money restrictions and the environment-zone arms today, anything added
+      // later — stays on this file automatically.
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        DATE_ONLY_ENCODING_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // Number formatting, not dates: these three call
+    // `Number.prototype.toLocaleString` for thousands separators, so only that
+    // one restriction is lifted — both date restrictions still apply here.
+    files: [
+      // Character counter: "12,345 / 50,000 characters" on the raw-CSS box.
+      "src/app/(admin)/admin/website/site-style/site-style-wizard.tsx",
+      // Validation message quoting the notice body's character limit.
+      "src/components/admin/notice-editor.tsx",
+      // Redemption/export row counts in the promo-code panel.
+      "src/app/(admin)/admin/rules/promo-codes/promo-redemptions-panel.tsx",
+    ],
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntax(
+        NO_BARE_TO_LOCALE_DATE_STRING,
+        NO_BARE_TO_LOCALE_TIME_STRING,
+      ),
+    },
+  },
+  {
+    // #2685 — inside the money-domain modules a bare `x * 100` is a cents
+    // conversion by construction, so the broad selector replaces the narrower
+    // shape-based arms FOR THAT SHAPE rather than joining them: it matches the
+    // same node they do, and listing both made the commonest real mistake report
+    // two and three times at the same line and column; a 25-site regression
+    // printed sixty identical messages and read far worse than it was (#2685
+    // review). These files compute no percentages: that is what makes the broad
+    // selector safe here and unsafe anywhere else.
+    //
+    // IT IS NOT, HOWEVER, STRICTLY STRONGER THAN THE NARROW ARMS, and this
+    // config used to claim it was. The broad arm excludes a division inside the
+    // multiplication so that a genuine percentage stays writable, and for a
+    // while that exclusion was the only money rule these files had — so a typed
+    // amount that was DIVIDED and then scaled, `(parseFloat(gross) / 1.15) * 100`
+    // or `(parseFloat(raw) / guests) * 100`, was caught in an ordinary
+    // `src/lib` file and caught nowhere at all in a Xero module, a payment
+    // module or an API route. `MONEY_MODULE_RESTRICTIONS` therefore states the
+    // ratio-of-a-parse arm explicitly; see the comment above it.
+    //
+    // It drops the narrow money group BY NAME and adds the broad one, so every
+    // OTHER guard rides along untouched. That is not a nicety here: this glob
+    // list is every Xero, finance, membership-cancellation, payment, credit,
+    // refund, promo, fee, invoice, subscription, pricing and Stripe module plus
+    // the whole of `src/app/api/**` — which is to say most of the surface
+    // #2684's encoding guard exists for. A block that spelled its own list out
+    // would have lifted that guard from all of it with lint still green.
+    files: MONEY_DOMAIN_MODULES,
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        MONEY_CENTS_RESTRICTIONS,
+        ...DATE_RENDERING_RESTRICTIONS,
+        ...MONEY_MODULE_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // #2685 — the exempt paths. The money restrictions are lifted here and ONLY
+    // here, each with its written reason on `MONEY_GUARD_EXEMPTIONS` above; the
+    // date and raw-SQL restrictions still apply, which is why this block drops
+    // one named group rather than switching the rule off.
+    files: MONEY_HELPER_MODULES,
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        MONEY_CENTS_RESTRICTIONS,
+        ...DATE_RENDERING_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // #3302 — CENTS_DISPLAY_EXEMPTIONS. Drops only the new group by name,
+    // plus re-states `DATE_RENDERING_RESTRICTIONS` (the generic `src/**`
+    // block's own addition, not part of the mandatory set), so nothing else
+    // these files were guarded against is lifted with it. #3399 retired the
+    // separate block for exempt files that were also `MONEY_DOMAIN_MODULES`
+    // members, because none remains; a new exemption in a money-domain family
+    // needs that block back (restating `MONEY_MODULE_RESTRICTIONS`), or this
+    // one would silently hand it the narrow money arm.
+    files: CENTS_DISPLAY_EXEMPTIONS.flatMap((entry) => entry.files),
+    rules: {
+      "no-restricted-syntax": srcRestrictedSyntaxWithout(
+        CENTS_DISPLAY_RESTRICTIONS,
+        ...DATE_RENDERING_RESTRICTIONS,
+      ),
+    },
+  },
+  {
+    // Test expectation builders mirror the component format under test.
+    //
+    // The raw-SQL restrictions (#2289) are off here too, deliberately. A test's
+    // raw statement runs against a throwaway database and its result is
+    // asserted on the spot, so a wrong shape fails the test rather than
+    // silently mispricing a booking — `concurrency-lock-races.realdb.test.ts`
+    // reads counts that way on purpose. What must never regress is PRODUCTION
+    // code, and `raw-sql-shape-guard.test.ts` pins that inventory file by file.
+    files: ["src/**/__tests__/**/*.{ts,tsx}", "src/**/*.test.{ts,tsx}"],
+    rules: { "no-restricted-syntax": "off" },
+  },
+  {
+    // INV-SSOT-004 (#3164) — the behavioural comment-stripper guard, applied to
+    // EVERY linted file rather than to a src/ block.
+    //
+    // The population it guards is source-scanning TESTS, and the block above
+    // switches `no-restricted-syntax` off for every one of those — which is the
+    // second reason this is a rule of its own rather than another arm on
+    // `ALWAYS_RESTRICTED_IN_SRC`. Nothing here lifts it anywhere: the only way
+    // out is `COMMENT_STRIPPER_ALLOWLIST`, by file, with a written reason.
+    files: ["**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"],
+    plugins: { ssot: SSOT_LOCAL_RULES },
+    rules: { "ssot/no-local-comment-stripper": "error" },
+  },
+  {
+    // #3318 — the shapes Semgrep cannot parse, applied to EVERY linted file
+    // for the same reason as the block above: the population is TESTS, and
+    // `no-restricted-syntax` is switched off for every one of those.
+    //
+    // This config grants no allowlist and no per-file exemption. Every arm has
+    // a remedy that is available everywhere and changes no behaviour — the cast
+    // form for the call, a top-level type-only import for the type — so an
+    // exemption would only ever be a way of signing part of a file off as
+    // unscanned, which is what `.semgrep/unparsed-allowlist.json` is for and
+    // what this rule exists to stop needing.
+    //
+    // "No escape" USED to be an overclaim, because an inline ESLint disable
+    // directive naming the rule is exactly one: `pnpm run lint` is bare
+    // `eslint`, `noInlineConfig` is not set, and 37 files in this tree already
+    // carry directives for other rules. The residual was bounded for a
+    // construct that genuinely fails to parse — the coverage gate catches those
+    // — and UNBOUNDED for the half of the class that parses today, which is the
+    // whole reason the rule was widened past the broken spelling. So the claim
+    // is now enforced the way #2685 enforced the money guard's:
+    // `semgrep-unparsable-import-type-guard.test.ts` censuses the tree for one
+    // (#3345). That census reads raw source, so it keeps prose about a
+    // directive on a different line from the rule id — which is why the
+    // sentence above is spelled the long way round.
+    files: ["**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"],
+    plugins: { scan: SCAN_COVERAGE_LOCAL_RULES },
+    rules: { "scan/no-semgrep-unparsable-import-type": "error" },
+  },
+  {
+    files: ["e2e/**/*.spec.ts", "e2e/**/*.setup.ts"],
+    rules: {
+      "no-restricted-imports": ["error", { paths: [{
+        name: "@playwright/test",
+        importNames: ["test"],
+        message: "Import test from the shared e2e/helpers/accessibility fixture so every journey is audited (#4466).",
+      }] }],
+    },
+  },
+  {
+    files: ["**/*.{jsx,tsx}"],
+    settings: {
+      "jsx-a11y": {
+        components: { TableRow: "tr", TableCell: "td", TableHead: "th", Button: "button" },
+      },
+    },
+    rules: jsxA11y.flatConfigs.recommended.rules,
+  },
+  {
+    files: ["src/**/*.{js,jsx,ts,tsx}"],
+    plugins: { accessibility },
+    rules: {
+      "accessibility/minimum-text-size": "error",
+      "accessibility/no-nested-interactive": "error",
+      "accessibility/no-mouse-only-table-row": "error",
+    },
+  },
+  {
+    // #4467 item 2: raw <button>, <input>, <select>, <table> and the browser's
+    // confirm box, outside the design-system primitives. Today's usages are
+    // recorded in eslint-suppressions.json and the count only falls
+    // (docs/TESTING.md -> "Design-system control ratchet").
+    // Not app UI, so out of scope: the primitives themselves, and test files,
+    // whose harnesses and module mocks render raw stand-ins for primitives.
+    files: ["src/**/*.{js,jsx,ts,tsx}"],
+    ignores: ["src/components/ui/**", "src/**/__tests__/**", "src/**/*.test.{js,jsx,ts,tsx}", "src/test/**"],
+    plugins: { "design-system": designSystem },
+    // Every rule the plugin has, so a new one cannot ship switched off.
+    rules: Object.fromEntries(Object.keys(designSystem.rules).map((rule) => [`design-system/${rule}`, "error"])),
+  },
+  // A shared primitive built outside src/components/ui/ may use the one element
+  // it is built on; each entry carries its reason in PRIMITIVE_IMPLEMENTATIONS.
+  ...PRIMITIVE_IMPLEMENTATIONS.map(({ file, rule }) => ({
+    files: [file],
+    rules: { [`design-system/${rule}`]: "off" },
+  })),
+  {
+    // #4462: the frozen test clock's elapsed-time rule, enforced rather than
+    // written down (docs/TESTING.md -> "The frozen test clock", rule 5). Vitest
+    // files only: the Playwright suite under e2e/ runs on the real clock.
+    files: ["**/__tests__/**/*.{ts,tsx,mts,js,mjs}", "**/*.test.{ts,tsx,mts,js,mjs}"],
+    ignores: ["e2e/**"],
+    plugins: { "test-clock": testClock },
+    rules: { "test-clock/no-date-now-elapsed": "error" },
+  },
+  {
+    files: ["src/**/*.css"],
+    plugins: { css, accessibility },
+    language: "css/css",
+    languageOptions: { tolerant: true },
+    rules: { "accessibility/minimum-text-size": "error" },
+  },
+  // Override default ignores of eslint-config-next.
+  globalIgnores([
+    // Default ignores of eslint-config-next:
+    ".next/**",
+    "out/**",
+    "build/**",
+    "next-env.d.ts",
+    // #2686: Semgrep rule fixtures. Deliberately-broken sample code that exists
+    // to be reported by `.semgrep/rules/**`; linting it would report the same
+    // faults a second time, in a tool that cannot express why they are there.
+    ".semgrep/**",
+    // #3078: local scratch space, not source. `.gitignore` already declares
+    // `/.artifacts/` non-source, so nothing here is ever committed or built,
+    // and `docs/agents/SCOPED_CONTEXT.md` describes it as ignored, local,
+    // bounded context. Linting it made an interrupted agent's half-written
+    // mutation harness the only "error" in an unrelated lane's `pnpm run lint`
+    // — a wrong signal at the exact moment the next agent is reconstructing
+    // state. The ignore is the whole directory rather than today's harness
+    // extension, so the next harness cannot bring the problem back.
+    ".artifacts/**",
+    // #4459: generated by a mutation or coverage run and gitignored. Stryker's
+    // sandbox is a full copy of the tree it mutates (deliberately broken code),
+    // and the reports are generated HTML and JavaScript.
+    ".stryker-tmp/**",
+    "reports/mutation/**",
+    "coverage/**",
+  ]),
+]);
+
+export default eslintConfig;

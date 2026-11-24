@@ -1,0 +1,121 @@
+# Modules
+
+Audience: Operator
+
+## What it is
+
+The single on/off panel for every optional part of the platform. A module's
+toggle here is the **only** control for whether that feature is available across
+the whole site — turning it off hides its admin pages, sidebar entries, public
+widgets, and routes. Find it at **Admin → Setup & Configuration → Modules**
+(`/admin/modules`).
+
+Module activation lives under the **support** ("Support & System") permission
+area: a support-**edit** admin can change toggles; a support-**view** admin sees
+them read-only. The toggles are stored in the database and hold **no secrets** —
+some modules still need their own setup (for example Xero credentials) before
+they can do useful work. See [`CONFIGURATION.md`](../../CONFIGURATION.md) for the
+environment side.
+
+## When you'd use it
+
+- You're setting up a fork and want to switch off features your club doesn't use.
+- A guide says a page "404s unless the `<module>` module is on" and you need to
+  enable it.
+- You're enabling a capability (Xero, kiosk, bed allocation, two-factor) as part
+  of rolling it out.
+
+## Step-by-step
+
+### Turn a module on or off
+
+1. Go to **Admin → Setup & Configuration → Modules**. Each module is a card with
+   a checkbox, an Enabled/Disabled badge, a description, and a readiness note.
+
+   ![Modules page showing each optional module as a card with an enable checkbox, status badge, description, and readiness/dependencies](../images/admin/admin-modules.png)
+
+2. Tick or untick the modules you want to change. A module that needs extra
+   setup shows **Needs setup** with its dependencies listed (e.g. Xero
+   credentials, an API key).
+3. Click **Save**. When the save finishes, the admin sidebar, top menu and Search
+   update to show the saved modules. **Refresh** reloads both the saved settings
+   and these menus.
+
+## Settings reference
+
+Modules and their out-of-the-box default (capability modules that need
+deploy-time setup default **off**; general-purpose modules default **on**):
+
+| Module | Enables | Default |
+| --- | --- | --- |
+| Lodge kiosk (`kiosk`) | Guest arrival/departure and lodge access screens | Off |
+| Chores and roster (`chores`) | Roster generation, chore templates, guest chore tracking | Off |
+| Finance dashboard (`financeDashboard`) | Finance reports, sync diagnostics, finance-only dashboards | Off |
+| Waitlist (`waitlist`) | Waitlist state, admin queue, offer handling | Off |
+| Xero integration (`xeroIntegration`) | Xero linking, sync, reconciliation, and the Integrations page | Off |
+| Bed allocation (`bedAllocation`) | Room/bed setup, guest-to-bed allocation, auto-allocation, and allocation approvals | Off |
+| Internet Banking payments (`internetBankingPayments`) | Member bank-transfer option backed by Xero invoices | Off |
+| Address autocomplete (`addressAutocomplete`) | Addy-powered address suggestions. Manual address entry remains available whenever the module is off, credentials are missing, Addy fails, or rate limiting applies | Off |
+| Group bookings (`groupBookings`) | Organiser-run group bookings with a join code | On |
+| Lockers (`lockers`) | Physical locker records and member allocation | On |
+| Lodge induction (`induction`) | Induction checklists, signers, and sign-off | On |
+| Work parties (`workParties`) | Volunteer working bees and their booking discounts | On |
+| Promo codes (`promoCodes`) | Discount codes on bookings | On |
+| Several promo codes on one booking (`multiPromoCodes`) | Lets one booking carry more than one promo code, so members sharing a group booking can each use their own. A **rollout switch** (#3826): while it is off a booking holds at most one code, which keeps the previous release safe to roll back to. Turn it on only after the upgrade that added it has fully cut over. Does not travel in a configuration transfer | Off |
+| Hut leaders (`hutLeaders`) | Daily hut-leader assignment and auto-assignment | On |
+| Communications (`communications`) | Admin bulk email to members. Transactional notifications (booking, payment and membership emails) are unaffected | On |
+| Member notices (`memberNotices`) | Committee news notices targeted to member audiences, shown on the dashboard with read/acknowledge tracking | On |
+| Events calendar (`eventsCalendar`) | Club events calendar, recurring events, and the dashboard Events card | On |
+| Ski-field conditions (`skifieldConditions`) | Snow.nz condition widgets for any New Zealand ski field, placed on a public page with the `{{skifield-conditions:<id>}}` token, and their public API route | On |
+| Whakapapa (Mt Ruapehu) conditions report (`skifieldWhakapapa`) | **Whakapapa (Mt Ruapehu) only.** The live mountain and road status panel from the `{{skifield-whakapapa}}` token, its public feed, and the admin [Mountain Conditions](mountain-conditions.md) cache page. Off on a new install; an install upgraded from before #4932 keeps the value its `skifieldConditions` switch had | Off |
+| Two-factor authentication (`twoFactor`) | Second-factor after password login | Off |
+| Email sign-in link (`magicLink`) | Single-use email sign-in links | Off |
+| Google sign-in (`googleLogin`) | Sign in with a linked Google account. Credentials are entered in-app at **Admin › Integrations › Google sign-in**; see [Integrations](integrations.md) | Off |
+| Google Analytics (`analytics`) | GA4 on the public website. This toggle is the master switch; the measurement id, the visitor consent banner and its wording are configured at **Admin › Integrations › Google Analytics** (no env vars, no restart). See [Integrations](integrations.md) | Off |
+| Lobby TV display (`lobbyDisplay`) | Read-only paired lobby screens | Off |
+| AI help assistant (`aiAssistant`) | Free-text help questions answered by a paid AI model, grounded in each page's help content; the curated page help works without it. Needs your Anthropic API key under **Admin › Integrations** — there is no enable-gate on the key, so with the module on and no key the ask box degrades to a structured fallback. A monthly spend cap stops answers for the rest of the month once it is reached. See [AI Help Assistant](ai-help.md) | Off |
+| Add another member as a guest (`memberGuests`) | Lets a member put another club member — outside their own family group — on their booking, on the create path and when editing. By default the other member is emailed and asked first and a bed is held until they answer. Also brings admin adds, the admin booking-copy and the booking-request pipeline under the same notify rule. Its policy lives on **Admin › Bookings setup › Member guests** | Off |
+| AI Diagnostics (`aiDiagnostics`) | A separate admin-only paid assistant that will explain the deployed system and retrieve bounded, permission-scoped operational evidence. Distinct from the AI help assistant: its own **dedicated** Anthropic key and monthly spend budget. Turning it on authorises no spend — it also needs a dedicated key and a positive budget, and stays "not ready" until both are set. Configuration is per-deployment and does not travel in config bundles. Its card states that questions send excerpts to Anthropic, which may process them outside New Zealand; switching it on needs that statement ticked before Save, and the acknowledgement is audited ([provider disclosure](../ai-diagnostics/deployment.md#provider-disclosure-and-retention)). See [`docs/ai-diagnostics/README.md`](../ai-diagnostics/README.md) | Off |
+| Maintenance reports (`maintenanceReports`) | Members report a physical fault at the lodge from a card on their dashboard, and the report lands in a queue for whoever holds Lodge Operations. The printed QR code that opens the same form **without** signing in is a separate, off-by-default setting under **Admin › Lodge › Maintenance reports**, so turning this module on opens nothing to the public. See [Maintenance reports](maintenance-reports.md) | On |
+| Alpine Central Server (`alpineCentralServer`) | Connects this club to the Alpine Central Server (ServerNZ) to upload and download data shared across clubs, starting with the Other Clubs registry. **Shares data outside your club**: your lodges' names, locations, bed counts and booking-officer contact details go to the central server and on to every other connected club. Nothing is sent until you also enable an item on its setup page. Needs an API key from the central server, entered under **Admin › Integrations › Alpine Central Server**. See [Integrations](integrations.md) | Off |
+| AI app connections (MCP) (`mcpServer`) | Lets a signed-in person connect an approved AI app, such as Claude or ChatGPT, to their own account, so the app can look things up and act for them with their permissions only. **Sends data outside your club**: whatever the person asks about goes to the AI app's provider. You choose who may connect, whether connections may make changes, and which apps are approved under **Admin › Help & system › AI connections**. Connections start view-only, and officers cannot connect until you allow it. See [AI app connections](mcp-server.md) | Off |
+| Message board (`commsPortal`) | A member-written message board for the club. Posts stay inside your club unless a member ticks **share with all clubs**, which sends that post to every other club connected through the Alpine Central Server. The board itself needs no central-server connection; only sharing does. Off by default because switching it on is a decision about publishing your members' writing beyond your own club | Off |
+| Food orders (`foodOrders`) | Members order food for a lodge stay from a card on their dashboard; each order is emailed to the food officer address set under **Admin › Lodge Operations › Food Orders**, and a hut leader at that lodge or a Lodge Operations edit admin ticks items received as they arrive; the order closes on the last. A price can be recorded for the club's history; nothing is charged, invoiced or sent to Xero. Off by default because it needs that email address first. See [Food Orders](food-orders.md) | Off |
+| Member lodge roster (`memberLodgeRoster`) | Lets a signed-in member see who else is staying, for the next 30 nights, at a lodge they can already book. Names and nights only: no contact details, no prices, no booking information. **Shows your members to each other** — a member's name and the nights they are staying become visible to every other member with access to that lodge, and an individual cannot hide themselves. How much of a name is shown is set per lodge under **Admin › Lodges › the lodge › Member roster**, and defaults to the full name. A booking that includes a child never names anyone in it: it shows a family or group label instead, at every setting. Nights under a whole-lodge hold are shown as "Reserved for a private booking", without naming or counting the party — the booking calendar still shows them as full. Off by default because switching it on is a decision about showing your members to one another | Off |
+
+### What needs Xero
+
+These features work only while **Xero integration** is on. A club without Xero
+uses the manual alternative:
+
+| Feature | Without Xero |
+| --- | --- |
+| Internet Banking payments (bank transfer against a Xero invoice) | Take card payments, or record a bank transfer by hand on the booking |
+| Annual subscription invoicing (the annual batch and its retries) | Bill members outside the app; record a listed member's payment with **Mark as paid (manual)** in [Subscriptions](subscriptions.md#if-the-club-does-not-use-xero) |
+| Subscription and joining-fee invoices on application approval | Approval still succeeds without them and warns you; invoice the new member outside the app |
+| The Finance dashboard's Xero data (monthly accounts figures from the finance sync) | Use [Reports](reports.md), which read the app's own bookings and payments |
+
+While Xero is off, the app writes no subscription or joining-fee invoice work,
+so nothing waits to go out late the day Xero is switched back on.
+
+Each card's **readiness** badge reads Enabled, Disabled, or **Needs setup** (the
+module is on but a dependency — credentials, an API key, inventory — is missing).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| The toggles are read-only | Your role has support **view**, not **edit** | Ask a full admin for support edit access |
+| A module shows "Needs setup" | It's on but a dependency isn't configured | Add the named credential/API key/inventory; see [`CONFIGURATION.md`](../../CONFIGURATION.md) |
+| A page still 404s after enabling | The change was not saved, or the target page is open in another tab | Check that Save succeeded; use **Refresh** to reload settings and menus here, and reload the target tab if it was already open |
+| Enabling Internet Banking payments does nothing | It depends on Xero integration | Enable Xero integration first |
+| Subscriptions can't confirm the annual batch, or an approval says subscription invoicing is off | Subscription and joining-fee invoicing depend on Xero integration | Bill outside the app and record listed members' payments with **Mark as paid (manual)**, or enable Xero integration ([What needs Xero](#what-needs-xero)) |
+
+## Related links
+
+- Back to the [documentation hub](../README.md).
+- Sibling guides: [Setup](setup.md), [Login & Security](security.md),
+  [Integrations](integrations.md), [Access Roles](access-roles.md).
+- Reference: how module settings are stored, and how cron jobs respect them, in
+  [`CONFIGURATION.md` → Module Controls](../../CONFIGURATION.md#module-controls-and-admin-modules).
+  The table above is the only per-module list; that section points back here.

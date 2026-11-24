@@ -1,0 +1,1200 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { NextRequest } from "next/server";
+import {
+  NET_COLLECTED_SCOPE_FIXTURE,
+  NET_COLLECTED_SCOPE_PAYMENTS,
+  REFUNDS_AND_CREDITS_OWED_FIXTURE,
+  creditBalanceGroupRows,
+  refundsOwedTaskRows,
+  netCollectedFixtureBooking,
+  netCollectedFixtureEvidence,
+} from "@/lib/__tests__/helpers/net-collected-scope-fixture";
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    // #3372 (owner, 7 Oct 2026): Refunds owed / Credits owed, as at today.
+    manualRefundTask: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    // #4911: no payment on the page is disputed.
+    stripeDispute: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    memberCredit: { groupBy: vi.fn(async (): Promise<unknown[]> => []) },
+    // #3372 (7 Oct 2026): card refunds not yet paid, for "Refunds owed".
+    paymentRecoveryOperation: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    member: { count: vi.fn(), findMany: vi.fn() },
+    memberSubscription: { findMany: vi.fn(), count: vi.fn(), groupBy: vi.fn() },
+    // #5190: the club's liability rule; null reads NOT_CHOSEN.
+    membershipLockoutSettings: { findUnique: vi.fn(async (): Promise<unknown> => null) },
+    payment: {
+      findMany: vi.fn(),
+      count: vi.fn(),
+      aggregate: vi.fn(),
+      // #3372: present only so the summary test can pin that a read of the
+      // ledger never reaches a write delegate; absent, a call would throw.
+      update: vi.fn(),
+      updateMany: vi.fn(),
+      create: vi.fn(),
+      upsert: vi.fn(),
+      delete: vi.fn(),
+    },
+    xeroSyncOperation: { findMany: vi.fn() },
+    xeroObjectLink: { findMany: vi.fn() },
+    auditLog: { findMany: vi.fn(), count: vi.fn() },
+  },
+}));
+
+vi.mock("@/lib/auth", () => ({ auth: vi.fn() }));
+const {
+  mockRequireActiveSessionUser,
+  mockRequireAdmin,
+  mockGetXeroContactGroupMemberships,
+  mockGetXeroContactIdsForGroup,
+} = vi.hoisted(() => ({
+  mockRequireActiveSessionUser: vi
+    .fn<(memberId: string) => Promise<Response | null>>()
+    .mockResolvedValue(null),
+  mockRequireAdmin: vi.fn(),
+  mockGetXeroContactGroupMemberships: vi
+    .fn<
+      (contactIds: string[]) => Promise<Record<string, Array<{ id: string; name: string }>>>
+    >()
+    .mockResolvedValue({}),
+  mockGetXeroContactIdsForGroup: vi
+    .fn<(groupId: string) => Promise<string[]>>()
+    .mockResolvedValue([]),
+}));
+vi.mock("@/lib/session-guards", () => ({
+  requireActiveSessionUser: mockRequireActiveSessionUser,
+  requireAdmin: mockRequireAdmin,
+}));
+vi.mock("@/lib/xero-contact-groups", () => ({
+  getXeroContactGroupMemberships: mockGetXeroContactGroupMemberships,
+  getXeroContactIdsForGroup: mockGetXeroContactIdsForGroup,
+}));
+
+vi.mock("@/lib/logger", () => ({
+  default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+import { GET as getSubscriptions } from "@/app/api/admin/subscriptions/route";
+import { GET as getPayments } from "@/app/api/admin/payments/route";
+import { GET as getAuditLog } from "@/app/api/admin/audit-log/route";
+import { NOT_REQUIRED_ROW_BILLING_NOTE } from "@/lib/subscription-season-row-note";
+
+const mockedAuth = vi.mocked(auth);
+
+describe("Admin Subscriptions API", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRequireAdmin.mockImplementation(async (options) =>
+      (await import("./helpers/require-admin-mock")).evaluateRequireAdminMock(
+        options,
+      )
+    );
+    vi.mocked(prisma.member.count).mockResolvedValue(1 as any);
+    vi.mocked(prisma.member.findMany).mockResolvedValue([] as any);
+    mockGetXeroContactGroupMemberships.mockResolvedValue({});
+    mockGetXeroContactIdsForGroup.mockResolvedValue([]);
+  });
+
+  it("returns 401 for unauthenticated requests", async () => {
+    mockedAuth.mockResolvedValue(null as any);
+    const req = new NextRequest("http://localhost/api/admin/subscriptions");
+    const res = await getSubscriptions(req);
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns 403 for non-admin users", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "m1", role: "MEMBER", accessRoles: [{ role: "USER" }] } } as any);
+    const req = new NextRequest("http://localhost/api/admin/subscriptions");
+    const res = await getSubscriptions(req);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe("Forbidden");
+  });
+
+  it("returns subscriptions data and summary for admin", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+
+    const mockData = [
+      {
+        id: "sub1", memberId: "m1", seasonYear: 2026, status: "PAID",
+        xeroInvoiceId: "inv-1", xeroInvoiceNumber: null, paidAt: new Date("2026-04-01"),
+        member: {
+          firstName: "Alice",
+          lastName: "Smith",
+          email: "alice@test.com",
+          ageTier: "ADULT",
+          role: "MEMBER",
+          canLogin: false,
+          passwordChangedAt: null,
+          lastLoginAt: null,
+          passwordResetTokens: [],
+          xeroContactId: "xc-1",
+        },
+      },
+    ];
+
+    mockGetXeroContactGroupMemberships.mockResolvedValue({
+      "xc-1": [{ id: "cg-1", name: "Adult Members" }],
+    });
+    vi.mocked(prisma.memberSubscription.findMany).mockResolvedValue(mockData as any);
+
+    const req = new NextRequest("http://localhost/api/admin/subscriptions?page=1&pageSize=10");
+    const res = await getSubscriptions(req);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.total).toBe(1);
+    expect(body.page).toBe(1);
+    expect(body.pageSize).toBe(10);
+    expect(body.summary.paid).toBe(1);
+    expect(body.summary.unpaid).toBe(0);
+    expect(body.summary.overdue).toBe(0);
+    expect(body.summary.notRequired).toBe(0);
+    expect(body.summary.total).toBe(1);
+    expect(body.data[0].member.ageTier).toBe("ADULT");
+    expect(body.data[0].xeroContactGroups).toEqual([
+      { id: "cg-1", name: "Adult Members" },
+    ]);
+    expect(body.xeroContactGroupsLoaded).toBe(true);
+  });
+
+  it("filters by status", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.memberSubscription.findMany).mockResolvedValue([
+      {
+        id: "sub1",
+        memberId: "m1",
+        seasonYear: 2026,
+        status: "PAID",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        paidAt: null,
+        member: {
+          firstName: "Alice",
+          lastName: "Smith",
+          email: "alice@test.com",
+          ageTier: "ADULT",
+          role: "MEMBER",
+          canLogin: false,
+          passwordChangedAt: null,
+          lastLoginAt: null,
+          passwordResetTokens: [],
+          xeroContactId: null,
+        },
+      },
+      {
+        id: "sub2",
+        memberId: "m2",
+        seasonYear: 2026,
+        status: "UNPAID",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        paidAt: null,
+        member: {
+          firstName: "Bob",
+          lastName: "Jones",
+          email: "bob@test.com",
+          ageTier: "ADULT",
+          role: "MEMBER",
+          canLogin: false,
+          passwordChangedAt: null,
+          lastLoginAt: null,
+          passwordResetTokens: [],
+          xeroContactId: null,
+        },
+      },
+    ] as any);
+
+    const req = new NextRequest("http://localhost/api/admin/subscriptions?status=PAID");
+    const res = await getSubscriptions(req);
+    const body = await res.json();
+
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].status).toBe("PAID");
+  });
+
+  it("applies pagination after sorting", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.memberSubscription.findMany).mockResolvedValue(
+      Array.from({ length: 25 }, (_, index) => ({
+        id: `sub${index + 1}`,
+        memberId: `m${index + 1}`,
+        seasonYear: 2026,
+        status: "PAID",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        paidAt: null,
+        member: {
+          firstName: `Member ${String(index + 1).padStart(2, "0")}`,
+          lastName: "Test",
+          email: `m${index + 1}@test.com`,
+          ageTier: "ADULT",
+          role: "MEMBER",
+          canLogin: false,
+          passwordChangedAt: null,
+          lastLoginAt: null,
+          passwordResetTokens: [],
+          xeroContactId: null,
+        },
+      })) as any
+    );
+
+    const req = new NextRequest("http://localhost/api/admin/subscriptions?page=3&pageSize=10");
+    const res = await getSubscriptions(req);
+    const body = await res.json();
+
+    expect(body.data).toHaveLength(5);
+    expect(body.total).toBe(25);
+  });
+
+  it("filters by age tier and xero contact group", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockGetXeroContactIdsForGroup.mockResolvedValue(["xc-1", "xc-2"]);
+    vi.mocked(prisma.memberSubscription.findMany).mockResolvedValue([]);
+
+    const req = new NextRequest(
+      "http://localhost/api/admin/subscriptions?ageTier=YOUTH&xeroContactGroup=cg-youth"
+    );
+    await getSubscriptions(req);
+
+    expect(mockGetXeroContactIdsForGroup).toHaveBeenCalledWith("cg-youth");
+    expect(prisma.memberSubscription.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          seasonYear: 2026,
+          member: {
+            ageTier: "YOUTH",
+            archivedAt: null,
+            xeroContactId: { in: ["xc-1", "xc-2"] },
+          },
+        },
+      })
+    );
+  });
+});
+
+// #5190 (owner decision 22 Nov 2026, issue comment 7070827526): a saved
+// NOT_REQUIRED row whose member billing treats as owing gets a plain note.
+describe("Admin Subscriptions API: billing note on a saved Not-required row (#5190)", () => {
+  const NOTE = NOT_REQUIRED_ROW_BILLING_NOTE;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRequireAdmin.mockImplementation(async (options) =>
+      (await import("./helpers/require-admin-mock")).evaluateRequireAdminMock(
+        options,
+      )
+    );
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.member.findMany).mockResolvedValue([] as any);
+    vi.mocked(prisma.membershipLockoutSettings.findUnique).mockResolvedValue(null);
+    mockGetXeroContactGroupMemberships.mockResolvedValue({});
+  });
+
+  function seasonRow(opts: {
+    status: string;
+    subscriptionBehavior: string;
+    ageTier: string;
+    chargeCoverage?: unknown[];
+    active?: boolean;
+  }) {
+    return {
+      id: "sub-note", memberId: "m-note", seasonYear: 2026, status: opts.status,
+      xeroInvoiceId: null, xeroInvoiceNumber: null, paidAt: null,
+      manuallyMarkedPaidAt: null, manualPaymentNote: null,
+      chargeCoverage: opts.chargeCoverage ?? [],
+      member: {
+        firstName: "Note", lastName: "Shape", email: "note@test.com",
+        ageTier: opts.ageTier, dateOfBirth: null, active: opts.active ?? true, archivedAt: null,
+        role: "MEMBER", canLogin: false,
+        passwordChangedAt: null, lastLoginAt: null, passwordResetTokens: [],
+        xeroContactId: null,
+        seasonalMembershipAssignments: [
+          { membershipType: { subscriptionBehavior: opts.subscriptionBehavior } },
+        ],
+      },
+    };
+  }
+
+  async function rowFor(row: ReturnType<typeof seasonRow>) {
+    vi.mocked(prisma.memberSubscription.findMany).mockResolvedValue([row] as any);
+    const res = await getSubscriptions(new NextRequest("http://localhost/api/admin/subscriptions"));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    return body.data[0] as { status: string; billingNote: string | null };
+  }
+
+  it("reads the active-claim test with the season rows", async () => {
+    await rowFor(seasonRow({ status: "PAID", subscriptionBehavior: "REQUIRED", ageTier: "ADULT" }));
+    expect(prisma.memberSubscription.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: expect.objectContaining({
+          chargeCoverage: { where: { releasedAt: null }, take: 1, select: { id: true } },
+        }),
+      }),
+    );
+  });
+
+  it("notes an age-based member on a liable tier with a saved NOT_REQUIRED row", async () => {
+    const row = await rowFor(seasonRow({
+      status: "NOT_REQUIRED", subscriptionBehavior: "BASED_ON_AGE_TIER", ageTier: "ADULT",
+    }));
+    // The lists follow billing, so the row shows billing's status.
+    expect(row.status).toBe("NOT_INVOICED");
+    expect(row.billingNote).toBe(NOTE);
+  });
+
+  it("notes a REQUIRED-type member on an exempt tier with a saved NOT_REQUIRED row", async () => {
+    const row = await rowFor(seasonRow({
+      status: "NOT_REQUIRED", subscriptionBehavior: "REQUIRED", ageTier: "CHILD",
+    }));
+    expect(row.billingNote).toBe(NOTE);
+  });
+
+  it("no note for a REQUIRED-type member whose row is not NOT_REQUIRED", async () => {
+    const row = await rowFor(seasonRow({
+      status: "NOT_INVOICED", subscriptionBehavior: "REQUIRED", ageTier: "CHILD",
+    }));
+    expect(row.billingNote).toBeNull();
+  });
+
+  it("no note when a no-invoice fee already covers the row", async () => {
+    const row = await rowFor(seasonRow({
+      status: "NOT_REQUIRED", subscriptionBehavior: "REQUIRED", ageTier: "ADULT",
+      chargeCoverage: [{ id: "claim-1" }],
+    }));
+    expect(row.billingNote).toBeNull();
+  });
+
+  it("no note for an inactive member, whom billing never considers", async () => {
+    const row = await rowFor(seasonRow({
+      status: "NOT_REQUIRED", subscriptionBehavior: "REQUIRED", ageTier: "CHILD", active: false,
+    }));
+    expect(row.billingNote).toBeNull();
+  });
+
+  it("reads the member's active flag and archive date for the population check", async () => {
+    await rowFor(seasonRow({ status: "PAID", subscriptionBehavior: "REQUIRED", ageTier: "ADULT" }));
+    expect(prisma.memberSubscription.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: expect.objectContaining({
+          member: expect.objectContaining({
+            select: expect.objectContaining({ active: true, archivedAt: true }),
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("no note once a rule is chosen and the member stops owing", async () => {
+    vi.mocked(prisma.membershipLockoutSettings.findUnique).mockResolvedValue({
+      requiredTypeAgeRule: "AGE_TIER_EXEMPTS", liabilityAgeSource: "SEASON_START",
+    } as any);
+    const row = await rowFor(seasonRow({
+      status: "NOT_REQUIRED", subscriptionBehavior: "REQUIRED", ageTier: "CHILD",
+    }));
+    expect(row.status).toBe("NOT_REQUIRED");
+    expect(row.billingNote).toBeNull();
+  });
+
+  it("a member the rule exempts outright carries no note", async () => {
+    vi.mocked(prisma.memberSubscription.findMany).mockResolvedValue([] as any);
+    vi.mocked(prisma.member.findMany).mockResolvedValue([
+      {
+        id: "m-admin", firstName: "Admin", lastName: "User", email: "admin@test.com",
+        ageTier: "ADULT", role: "ADMIN", canLogin: false, passwordChangedAt: null,
+        lastLoginAt: null, passwordResetTokens: [], xeroContactId: null,
+        seasonalMembershipAssignments: [],
+      },
+    ] as any);
+    const res = await getSubscriptions(new NextRequest("http://localhost/api/admin/subscriptions"));
+    const body = await res.json();
+    expect(body.data[0].status).toBe("NOT_REQUIRED");
+    expect(body.data[0].billingNote).toBeNull();
+  });
+});
+
+describe("Admin Payments API", () => {
+  function makePaymentCandidate(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "pay1",
+      bookingId: "b1",
+      amountCents: 5000,
+      source: "STRIPE",
+      refundedAmountCents: 0,
+      reference: null,
+      status: "SUCCEEDED",
+      stripePaymentIntentId: "pi_123",
+      xeroInvoiceId: null,
+      xeroInvoiceNumber: null,
+      updatedAt: new Date("2026-04-01T09:00:00.000Z"),
+      transactions: [],
+      // #3372: Net Collected's capture evidence (one captured ledger row).
+      _count: { transactions: 1 },
+      refunds: [],
+      // #3372 (7 Oct 2026): no card refund outstanding.
+      recoveryOperations: [],
+      booking: {
+        id: "b1",
+        status: "PAID",
+        checkIn: new Date("2026-04-10"),
+        deletedAt: null,
+        creditsFromCancellation: [],
+        creditsApplied: [],
+        manualRefundTasks: [],
+        member: {
+          id: "m1",
+          firstName: "Bob",
+          lastName: "Jones",
+          email: "bob@test.com",
+        },
+      },
+      ...overrides,
+    };
+  }
+
+  function makePaymentRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "pay1",
+      bookingId: "b1",
+      amountCents: 5000,
+      source: "STRIPE",
+      refundedAmountCents: 0,
+      reference: null,
+      status: "SUCCEEDED",
+      stripePaymentIntentId: "pi_123",
+      xeroInvoiceId: null,
+      xeroInvoiceNumber: null,
+      createdAt: new Date("2026-04-01T08:00:00.000Z"),
+      updatedAt: new Date("2026-04-01T09:00:00.000Z"),
+      booking: {
+        id: "b1",
+        status: "PAID",
+        checkIn: new Date("2026-04-10"),
+        checkOut: new Date("2026-04-12"),
+        creditsFromCancellation: [],
+        member: {
+          id: "m1",
+          firstName: "Bob",
+          lastName: "Jones",
+          email: "bob@test.com",
+        },
+      },
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prisma.member.count).mockResolvedValue(1 as any);
+    vi.mocked(prisma.xeroSyncOperation.findMany).mockResolvedValue([] as any);
+    vi.mocked(prisma.xeroObjectLink.findMany).mockResolvedValue([] as any);
+    mockRequireAdmin.mockResolvedValue({
+      ok: true,
+      session: { user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } },
+    });
+  });
+
+  it("returns 401 for unauthenticated requests", async () => {
+    mockedAuth.mockResolvedValue(null as any);
+    mockRequireAdmin.mockResolvedValueOnce({
+      ok: false,
+      response: new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 }),
+    });
+    const req = new NextRequest("http://localhost/api/admin/payments");
+    const res = await getPayments(req);
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns 403 for non-admin users", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "m1", role: "MEMBER", accessRoles: [{ role: "USER" }] } } as any);
+    mockRequireAdmin.mockResolvedValueOnce({
+      ok: false,
+      response: new Response(JSON.stringify({ error: "Forbidden" }), { status: 403 }),
+    });
+    const req = new NextRequest("http://localhost/api/admin/payments");
+    const res = await getPayments(req);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe("Forbidden");
+  });
+
+  it("returns payments data and summary for admin", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+
+    vi.mocked(prisma.payment.findMany)
+      .mockResolvedValueOnce([
+        makePaymentCandidate({
+          transactions: [{ updatedAt: new Date("2026-04-03T11:00:00.000Z") }],
+        }),
+      ] as any)
+      .mockResolvedValueOnce([makePaymentRow()] as any);
+
+    const req = new NextRequest("http://localhost/api/admin/payments?page=1&pageSize=10");
+    const res = await getPayments(req);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.total).toBe(1);
+    expect(body.page).toBe(1);
+    expect(body.pageSize).toBe(10);
+    expect(body.summary.netCollectedCents).toBe(5000);
+    expect(body.summary.refundedCents).toBe(0);
+    expect(body.summary.count).toBe(1);
+    expect(body.data[0].reference).toBeNull();
+    expect(body.data[0].lastUpdatedAt).toBe("2026-04-03T11:00:00.000Z");
+  });
+
+  /*
+    #3372 — the "Net Collected" tile (once "Total Revenue"). It used to add gross `amountCents` for every
+    row the filter matched: a refund never subtracted, and under the default
+    "all" status filter a PENDING or FAILED payment's amount counted as revenue.
+    The tile is now net over CAPTURED payments through `summarizeCollectedCash`,
+    and - owner decision A - a cancelled booking counts what it paid less what was
+    refunded (#773's exclusion is retired for this figure). This fixture is built so
+    each exclusion moves the number.
+  */
+  it("sums Net Collected over captured payments only, net of refunds, cancelled bookings at what they paid and kept", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+
+    const cancelledBooking = {
+      ...makePaymentCandidate().booking,
+      id: "b-cancelled",
+      status: "CANCELLED",
+    };
+    vi.mocked(prisma.payment.findMany)
+      .mockResolvedValueOnce([
+        // The #3340 booking: $130.00 captured, $65.00 refunded → $65.00 net.
+        makePaymentCandidate({
+          id: "partly-refunded",
+          status: "PARTIALLY_REFUNDED",
+          amountCents: 13_000,
+          refundedAmountCents: 6_500,
+        }),
+        // Uncaptured money: neither counts, whatever its amount.
+        makePaymentCandidate({ id: "pending", status: "PENDING", amountCents: 9_000 }),
+        makePaymentCandidate({ id: "failed", status: "FAILED", amountCents: 4_000 }),
+        // Captured, then the booking was cancelled with $50.00 of it refunded:
+        // the club kept $150.00, which is money collected.
+        makePaymentCandidate({
+          id: "cancelled",
+          bookingId: "b-cancelled",
+          status: "PARTIALLY_REFUNDED",
+          amountCents: 20_000,
+          refundedAmountCents: 5_000,
+          booking: cancelledBooking,
+        }),
+      ] as any)
+      .mockResolvedValueOnce([] as any);
+
+    const req = new NextRequest("http://localhost/api/admin/payments?page=1&pageSize=10");
+    const res = await getPayments(req);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.summary).toEqual({
+      // (13_000 - 6_500) + (20_000 - 5_000). Were the cancelled row left out
+      // (#773) it would read 6_500; were PENDING/FAILED gross added it would
+      // read 34_500.
+      netCollectedCents: 21_500,
+      // As at today, club-wide: nothing owed in this fixture's empty ledgers.
+      refundsOwedCents: 0,
+      creditsOwedCents: 0,
+      // 6_500 + 5_000.
+      refundedCents: 11_500,
+      count: 4,
+      // No payment here records an uncollected-ledger additional payment.
+      additionalLedgerGapCents: 0,
+      additionalLedgerGapBookings: 0,
+    });
+    expect(body.summary).not.toHaveProperty("totalRevenueCents");
+    expect(body.summary).not.toHaveProperty("netRevenueCents");
+
+    // Display only (#3372 acceptance): a read of the ledger writes nothing.
+    expect(prisma.payment.update).not.toHaveBeenCalled();
+    expect(prisma.payment.updateMany).not.toHaveBeenCalled();
+    expect(prisma.payment.create).not.toHaveBeenCalled();
+    expect(prisma.payment.upsert).not.toHaveBeenCalled();
+    expect(prisma.payment.delete).not.toHaveBeenCalled();
+  });
+
+  /*
+    #3372, owner decision A: the one Net Collected booking scope. The shared
+    fixture - a cancelled booking that kept a $50.00 fee, and a soft-deleted
+    booking's $70.00 capture - reads $50.00 here, on the dashboard and on
+    Reports. The tile used to leave the cancelled booking out ($0.00).
+  */
+  it("counts a cancelled booking's kept fee and leaves a deleted booking out, like every Net Collected figure", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.manualRefundTask.findMany).mockResolvedValue(refundsOwedTaskRows() as any);
+    vi.mocked(prisma.memberCredit.groupBy).mockResolvedValue(creditBalanceGroupRows() as any);
+
+    vi.mocked(prisma.payment.findMany)
+      .mockResolvedValueOnce(
+        NET_COLLECTED_SCOPE_PAYMENTS.map((payment) =>
+          makePaymentCandidate({
+            id: payment.bookingId,
+            bookingId: payment.bookingId,
+            status: payment.status,
+            amountCents: payment.amountCents,
+            refundedAmountCents: payment.refundedAmountCents,
+            ...netCollectedFixtureEvidence(payment),
+            booking: {
+              ...makePaymentCandidate().booking,
+              ...netCollectedFixtureBooking(payment),
+              id: payment.bookingId,
+              creditsFromCancellation: payment.creditsFromCancellation.map(
+                (credit) => ({ ...credit, description: null }),
+              ),
+            },
+          })
+        ) as any
+      )
+      .mockResolvedValueOnce([] as any);
+
+    const res = await getPayments(
+      new NextRequest("http://localhost/api/admin/payments?page=1&pageSize=10")
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.summary.netCollectedCents).toBe(
+      NET_COLLECTED_SCOPE_FIXTURE.expectedNetCollectedCents
+    );
+    // The refund tile is every matched row, as its hint says - the never-paid
+    // cancelled booking's $30.00 mirror refund and the never-paid live
+    // booking's $50.00 folded credit note included, though the Net Collected
+    // tile (owner review on #3811) gives both bookings nil, as it does the
+    // booking refunded its whole $120.00.
+    expect(body.summary.refundedCents).toBe(35_000);
+    expect(body.summary.count).toBe(8);
+    // Beside it, as at today and club-wide (owner, 7 Oct 2026).
+    expect(body.summary.refundsOwedCents).toBe(
+      REFUNDS_AND_CREDITS_OWED_FIXTURE.expectedRefundsOwedCents,
+    );
+    expect(body.summary.creditsOwedCents).toBe(
+      REFUNDS_AND_CREDITS_OWED_FIXTURE.expectedCreditsOwedCents,
+    );
+  });
+
+  /*
+    #3372 review: Reports warns that Net Collected "may understate" when a
+    payment records a collected additional payment with no captured ADDITIONAL
+    ledger row behind it (#2408). The tile carries the same figure, so the
+    summary carries the same check, over the payments the tile counts.
+  */
+  it("returns Reports' ledger-gap check over the payments Net Collected counts", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+
+    vi.mocked(prisma.payment.findMany)
+      .mockResolvedValueOnce([
+        // A $21.00 addition recorded as collected, with no ledger row: a gap.
+        makePaymentCandidate({
+          id: "gap",
+          bookingId: "b-gap",
+          additionalAmountCents: 2_100,
+          additionalPaymentStatus: "SUCCEEDED",
+          transactions: [],
+        }),
+        // The same addition WITH its captured ADDITIONAL ledger row: no gap.
+        makePaymentCandidate({
+          id: "evidenced",
+          bookingId: "b-evidenced",
+          additionalAmountCents: 3_000,
+          additionalPaymentStatus: "SUCCEEDED",
+          transactions: [
+            {
+              updatedAt: new Date("2026-04-01T09:00:00.000Z"),
+              kind: "ADDITIONAL",
+              status: "SUCCEEDED",
+              amountCents: 3_000,
+            },
+          ],
+        }),
+      ] as any)
+      .mockResolvedValueOnce([] as any);
+
+    const res = await getPayments(
+      new NextRequest("http://localhost/api/admin/payments?page=1&pageSize=10")
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.summary.additionalLedgerGapCents).toBe(2_100);
+    expect(body.summary.additionalLedgerGapBookings).toBe(1);
+
+    // The inputs ride the one candidate query; no second query is made for it.
+    const [candidateArgs] = vi.mocked(prisma.payment.findMany).mock.calls[0] as any[];
+    expect(candidateArgs.select).toMatchObject({
+      additionalAmountCents: true,
+      additionalPaymentStatus: true,
+      transactions: {
+        select: { updatedAt: true, kind: true, status: true, amountCents: true },
+      },
+    });
+  });
+
+  it("filters by status", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.payment.count).mockResolvedValue(0);
+
+    const req = new NextRequest("http://localhost/api/admin/payments?status=SUCCEEDED");
+    await getPayments(req);
+
+    expect(prisma.payment.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { status: "SUCCEEDED" },
+      })
+    );
+  });
+
+  it("filters by legacy last-updated date range aliases", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany)
+      .mockResolvedValueOnce([
+        makePaymentCandidate({
+          id: "outside",
+          updatedAt: new Date("2026-04-01T09:00:00.000Z"),
+        }),
+        makePaymentCandidate({
+          id: "inside",
+          updatedAt: new Date("2026-04-01T09:00:00.000Z"),
+          transactions: [{ updatedAt: new Date("2026-04-20T09:00:00.000Z") }],
+        }),
+      ] as any)
+      .mockResolvedValueOnce([makePaymentRow({ id: "inside" })] as any);
+
+    const req = new NextRequest("http://localhost/api/admin/payments?from=2026-04-15&to=2026-04-30");
+    const res = await getPayments(req);
+
+    const body = await res.json();
+    expect(body.total).toBe(1);
+    expect(body.data[0].id).toBe("inside");
+    expect(body.data[0].lastUpdatedAt).toBe("2026-04-20T09:00:00.000Z");
+  });
+
+  it("applies member, check-in, amount, and sort filters", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany).mockResolvedValue([]);
+
+    const req = new NextRequest(
+      "http://localhost/api/admin/payments?search=Alice%20Jones&amountMin=50&amountMax=75&checkInFrom=2026-07-01&checkInTo=2026-07-31&sortBy=amount&sortDir=asc"
+    );
+    await getPayments(req);
+
+    const callArgs = vi.mocked(prisma.payment.findMany).mock.calls[0][0] as any;
+    expect(callArgs.where.amountCents).toEqual({ gte: 5000, lte: 7500 });
+    expect(callArgs.where.booking.is.checkIn.gte).toEqual(new Date("2026-07-01T00:00:00.000Z"));
+    expect(callArgs.where.booking.is.checkIn.lte).toEqual(new Date("2026-07-31T00:00:00.000Z"));
+    expect(callArgs.where.AND).toHaveLength(2);
+    expect(callArgs.where.AND[0].OR).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reference: { contains: "Alice", mode: "insensitive" },
+        }),
+      ])
+    );
+  });
+
+  it("filters by source and searches payment references", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany).mockResolvedValue([]);
+
+    const req = new NextRequest(
+      "http://localhost/api/admin/payments?source=INTERNET_BANKING&search=BOOKING-IB-1"
+    );
+    await getPayments(req);
+
+    const callArgs = vi.mocked(prisma.payment.findMany).mock.calls[0][0] as any;
+    expect(callArgs.where.source).toBe("INTERNET_BANKING");
+    expect(callArgs.where.AND[0].OR).toEqual(
+      expect.arrayContaining([
+        {
+          reference: {
+            contains: "BOOKING-IB-1",
+            mode: "insensitive",
+          },
+        },
+      ])
+    );
+  });
+
+  it("lets exact amount take precedence over min and max", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany).mockResolvedValue([]);
+
+    const req = new NextRequest(
+      "http://localhost/api/admin/payments?amountExact=123.45&amountMin=1&amountMax=999"
+    );
+    await getPayments(req);
+
+    const callArgs = vi.mocked(prisma.payment.findMany).mock.calls[0][0] as any;
+    expect(callArgs.where.amountCents).toBe(12345);
+  });
+
+  it("rejects invalid amount ranges", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+
+    const req = new NextRequest("http://localhost/api/admin/payments?amountMin=75&amountMax=50");
+    const res = await getPayments(req);
+
+    expect(res.status).toBe(400);
+    expect(prisma.payment.findMany).not.toHaveBeenCalled();
+  });
+
+  /*
+    #2685 — the filter is parsed to cents in the schema now, so the `where`
+    builder tests a number rather than a string. A deliberate "$0.00" filter is
+    the FALSY value 0, and a truthiness check would drop it and quietly return
+    every payment instead of the zero-amount ones.
+  */
+  it("keeps a deliberate $0.00 exact-amount filter", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany).mockResolvedValue([]);
+
+    const req = new NextRequest("http://localhost/api/admin/payments?amountExact=0.00");
+    await getPayments(req);
+
+    const callArgs = vi.mocked(prisma.payment.findMany).mock.calls[0][0] as any;
+    expect(callArgs.where.amountCents).toBe(0);
+  });
+
+  it("refuses an amount beyond the storable cent range instead of failing the query", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+
+    // 99999999999.99 is 9,999,999,999,999 cents — far past the int32 the
+    // amountCents column holds. It used to reach Prisma and fail the request.
+    const req = new NextRequest("http://localhost/api/admin/payments?amountExact=99999999999.99");
+    const res = await getPayments(req);
+
+    expect(res.status).toBe(400);
+    expect(prisma.payment.findMany).not.toHaveBeenCalled();
+  });
+
+  it("filters payments by source and failed Xero activity", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany)
+      .mockResolvedValueOnce([
+        makePaymentCandidate({
+          id: "pay_failed",
+          source: "INTERNET_BANKING",
+          stripePaymentIntentId: null,
+        }),
+        makePaymentCandidate({
+          id: "pay_clean",
+          source: "INTERNET_BANKING",
+          stripePaymentIntentId: null,
+        }),
+      ] as any)
+      .mockResolvedValueOnce([
+        makePaymentRow({
+          id: "pay_failed",
+          source: "INTERNET_BANKING",
+          stripePaymentIntentId: null,
+        }),
+      ] as any);
+    vi.mocked(prisma.xeroSyncOperation.findMany).mockResolvedValue([
+      {
+        id: "op_failed",
+        localModel: "Payment",
+        localId: "pay_failed",
+        status: "FAILED",
+        createdAt: new Date("2026-04-03T11:00:00.000Z"),
+      },
+    ] as any);
+
+    const req = new NextRequest(
+      "http://localhost/api/admin/payments?source=INTERNET_BANKING&xeroState=operationFailed"
+    );
+    const res = await getPayments(req);
+
+    const body = await res.json();
+    expect(body.total).toBe(1);
+    expect(body.data[0]).toMatchObject({
+      id: "pay_failed",
+      xeroState: "operationFailed",
+      xeroActivity: {
+        failed: 1,
+      },
+    });
+    expect(vi.mocked(prisma.payment.findMany).mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          source: "INTERNET_BANKING",
+        }),
+      })
+    );
+  });
+
+  it("filters payments by settlement kind", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    vi.mocked(prisma.payment.findMany)
+      .mockResolvedValueOnce([
+        makePaymentCandidate({
+          id: "pay_credit",
+          refundedAmountCents: 5000,
+          booking: {
+            id: "b_credit",
+            status: "CANCELLED",
+            checkIn: new Date("2026-04-10"),
+            creditsFromCancellation: [
+              {
+                amountCents: 5000,
+                description: "Cancellation refund for booking b_credit",
+              },
+            ],
+            member: {
+              id: "m1",
+              firstName: "Bob",
+              lastName: "Jones",
+              email: "bob@test.com",
+            },
+          },
+        }),
+        makePaymentCandidate({
+          id: "pay_none",
+        }),
+      ] as any)
+      .mockResolvedValueOnce([
+        makePaymentRow({
+          id: "pay_credit",
+          refundedAmountCents: 5000,
+          booking: {
+            id: "b_credit",
+            status: "CANCELLED",
+            checkIn: new Date("2026-04-10"),
+            checkOut: new Date("2026-04-12"),
+            creditsFromCancellation: [
+              {
+                amountCents: 5000,
+                description: "Cancellation refund for booking b_credit",
+              },
+            ],
+            member: {
+              id: "m1",
+              firstName: "Bob",
+              lastName: "Jones",
+              email: "bob@test.com",
+            },
+          },
+        }),
+      ] as any);
+
+    const req = new NextRequest("http://localhost/api/admin/payments?settlement=accountCredit");
+    const res = await getPayments(req);
+    const body = await res.json();
+
+    expect(body.total).toBe(1);
+    expect(body.data[0]).toMatchObject({
+      id: "pay_credit",
+      settlementKind: "accountCredit",
+    });
+  });
+});
+
+describe("Admin Audit Log API", () => {
+  function auditLog(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      id: "log1",
+      action: "booking.payment.confirmed",
+      memberId: "admin-1",
+      targetId: "booking-1",
+      details: JSON.stringify({ bookingId: "booking-1", amountCents: 10000 }),
+      ipAddress: "203.0.113.10",
+      createdAt: new Date("2026-04-05T10:00:00"),
+      actorMemberId: "admin-1",
+      subjectMemberId: "member-1",
+      entityType: "Booking",
+      entityId: "booking-1",
+      category: "payment",
+      severity: "critical",
+      outcome: "success",
+      summary: "Payment confirmed",
+      metadata: { bookingId: "booking-1", amountCents: 10000 },
+      requestId: "req-1",
+      userAgent: "Unit Test",
+      retentionClass: "critical",
+      ...overrides,
+    };
+  }
+
+  function mockAuditLogResponse(logs: unknown[] = [], total = logs.length) {
+    vi.mocked(prisma.auditLog.findMany)
+      .mockResolvedValueOnce(logs as any)
+      .mockResolvedValueOnce([
+        { action: "booking.payment.confirmed" },
+        { action: "LOGIN" },
+      ] as any)
+      .mockResolvedValueOnce([{ category: "payment" }] as any)
+      .mockResolvedValueOnce([{ entityType: "Booking" }] as any)
+      .mockResolvedValueOnce([{ outcome: "success" }] as any)
+      .mockResolvedValueOnce([{ severity: "critical" }] as any);
+    vi.mocked(prisma.auditLog.count).mockResolvedValue(total);
+    vi.mocked(prisma.member.findMany).mockResolvedValue([
+      {
+        id: "admin-1",
+        firstName: "Ada",
+        lastName: "Admin",
+        email: "ada@example.com",
+        role: "ADMIN",
+      },
+      {
+        id: "member-1",
+        firstName: "Mara",
+        lastName: "Member",
+        email: "mara@example.com",
+        role: "MEMBER",
+      },
+    ] as any);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRequireAdmin.mockImplementation(async (options) =>
+      (await import("./helpers/require-admin-mock")).evaluateRequireAdminMock(
+        options,
+      )
+    );
+    vi.mocked(prisma.member.count).mockResolvedValue(1 as any);
+  });
+
+  it("returns 401 for unauthenticated requests", async () => {
+    mockedAuth.mockResolvedValue(null as any);
+    const req = new NextRequest("http://localhost/api/admin/audit-log");
+    const res = await getAuditLog(req);
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("returns 403 for non-admin users", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "m1", role: "MEMBER", accessRoles: [{ role: "USER" }] } } as any);
+    const req = new NextRequest("http://localhost/api/admin/audit-log");
+    const res = await getAuditLog(req);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe("Forbidden");
+  });
+
+  it("returns 403 for deactivated admin sessions", async () => {
+    mockRequireActiveSessionUser.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "Account is deactivated" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+
+    const req = new NextRequest("http://localhost/api/admin/audit-log");
+    const res = await getAuditLog(req);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe("Account is deactivated");
+  });
+
+  it("returns readable audit timeline data and filter facets for admin", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockAuditLogResponse([auditLog()], 1);
+
+    const req = new NextRequest("http://localhost/api/admin/audit-log?page=1&pageSize=25");
+    const res = await getAuditLog(req);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.total).toBe(1);
+    expect(body.page).toBe(1);
+    expect(body.pageSize).toBe(25);
+    expect(body.data[0]).toEqual(
+      expect.objectContaining({
+        summary: "Payment confirmed",
+        description: "Amount $100.00 · Booking Id booking-1",
+        actorDisplayName: "Ada Admin",
+        subjectDisplayName: "Mara Member",
+        entityType: "Booking",
+        entityId: "booking-1",
+      })
+    );
+    expect(body.data[0].drilldowns).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ href: "/admin/members/member-1" }),
+        expect.objectContaining({ href: "/bookings/booking-1" }),
+      ])
+    );
+    expect(body.facets.eventTypes).toEqual(["booking.payment.confirmed", "LOGIN"]);
+    expect(body.actions).toEqual(["booking.payment.confirmed", "LOGIN"]);
+  });
+
+  it("filters by event type alias and member scope", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockAuditLogResponse();
+
+    const req = new NextRequest(
+      "http://localhost/api/admin/audit-log?action=LOGIN&memberId=member-1&memberScope=subject"
+    );
+    await getAuditLog(req);
+
+    const callArgs = vi.mocked(prisma.auditLog.findMany).mock.calls[0][0] as any;
+    expect(callArgs.where.AND).toEqual(
+      expect.arrayContaining([
+        { action: "LOGIN" },
+        expect.objectContaining({
+          OR: expect.arrayContaining([{ subjectMemberId: "member-1" }]),
+        }),
+      ])
+    );
+  });
+
+  it("filters by date range", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockAuditLogResponse();
+
+    const req = new NextRequest("http://localhost/api/admin/audit-log?from=2026-04-01&to=2026-04-30");
+    await getAuditLog(req);
+
+    const callArgs = vi.mocked(prisma.auditLog.findMany).mock.calls[0][0] as any;
+    const dateWhere = callArgs.where.AND.find(
+      (clause: any) => Boolean(clause.createdAt)
+    );
+    expect(dateWhere.createdAt.gte).toEqual(new Date("2026-03-31T11:00:00.000Z"));
+    // #3123: the upper bound is HALF-OPEN — `lt` against the next club
+    // midnight rather than `lte` against the day's last millisecond. Postgres
+    // keeps microseconds, so the inclusive form could drop a row written in
+    // that final millisecond.
+    expect(dateWhere.createdAt.lt).toEqual(new Date("2026-04-30T12:00:00.000Z"));
+  });
+
+  it("filters by category, outcome, severity, entity, and text search", async () => {
+    mockedAuth.mockResolvedValue({ user: { id: "a1", role: "ADMIN", accessRoles: [{ role: "ADMIN" }] } } as any);
+    mockAuditLogResponse();
+
+    const req = new NextRequest(
+      "http://localhost/api/admin/audit-log?category=payment&outcome=success&severity=critical&entityType=Booking&q=req-1"
+    );
+    await getAuditLog(req);
+
+    const callArgs = vi.mocked(prisma.auditLog.findMany).mock.calls[0][0] as any;
+    expect(callArgs.where.AND).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          OR: expect.arrayContaining([{ category: "payment" }]),
+        }),
+        { outcome: "success" },
+        { severity: "critical" },
+        { entityType: "Booking" },
+        expect.objectContaining({
+          OR: expect.arrayContaining([
+            { requestId: { contains: "req-1", mode: "insensitive" } },
+          ]),
+        }),
+      ])
+    );
+  });
+});

@@ -1,0 +1,927 @@
+import { releaseSavedCardChargeClaim, runSavedCardClaimRelease } from "@/lib/saved-card-charge-claim";
+import { receiptCaptureTime } from "@/lib/stripe-capture-date";
+import { NextRequest, NextResponse } from "next/server";
+import { parseOptionalJsonRequestBody } from "@/lib/api-json";
+import { handOffSupersededCaptureAfterRefusal } from "@/lib/superseded-paid-intent";
+import { SUPERSEDED_CHARGE_NOT_SETTLED_BODY } from "@/lib/payment-recovery-contract";
+import { bookingOwner } from "@/lib/booking-owner";
+import { hostingCoverageParticipantRetryResponse } from "@/lib/adult-member-hosting-retry-response";
+import { BookingStatus, PaymentStatus } from "@prisma/client";
+
+import { requireAdmin } from "@/lib/session-guards";
+import {
+  TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE,
+  transactionContendedResponse,
+} from "@/lib/transaction-contended-response";
+import { prisma } from "@/lib/prisma";
+import { stripeReferenceId } from "@/lib/stripe-references";
+import { readStripeErrorFields } from "@/lib/stripe-errors";
+import { markBookingPaymentSucceeded } from "@/lib/payment-reconciliation";
+import { settledByAnotherCapture } from "@/lib/duplicate-capture-outcome";
+import {
+  beginSavedCardChargeAttempt,
+  SAVED_CARD_CHARGE_REASON,
+  SavedCardChargeRefusedError,
+} from "@/lib/saved-card-charge-attempt";
+import { chargeSavedCardAttempt } from "@/lib/saved-card-charge-request";
+import { savedCardChargeCents } from "@/lib/booking-payment-state";
+import { writeZeroWorthConfirmPayment } from "@/lib/zero-worth-confirm-payment";
+import { postStoredBookingConfirmationLedgerLines } from "@/lib/booking-ledger-confirmation-sync";
+import { resolveBookingMoneyPostingContext } from "@/lib/member-money/doors";
+import {
+  describeUnsettledPaymentIntent,
+  settleSavedCardChargeAttempt,
+  type SavedCardChargeAnswer,
+} from "@/lib/saved-card-charge-settle";
+import { settleHostingCoverageAfterCommit } from "@/lib/adult-member-hosting-coverage-drain";
+import { enqueueOwnHostingCoverageReevaluation } from "@/lib/adult-member-hosting-review";
+import {
+  reconcileBedAllocationsForBooking,
+  reconcileBedAllocationsForBookingWithLodgeLockHeld,
+} from "@/lib/bed-allocation-lifecycle";
+import {
+  acquireLodgeCapacityLock,
+  checkCapacityForGuestRanges,
+} from "@/lib/capacity";
+import { wholeLodgeBlockedNights } from "@/lib/over-capacity-confirmation";
+import {
+  enqueueXeroBookingInvoiceOperation,
+  kickQueuedXeroOutboxOperationsIfConnected,
+} from "@/lib/xero-operation-outbox";
+import {
+  sendAdminPaymentFailureAlert,
+  sendBookingConfirmedEmail,
+} from "@/lib/email";
+import { bookingPromoEmailOptions } from "@/lib/booking-promo-email-options";
+import { createStructuredAuditLog, getAuditRequestContext } from "@/lib/audit";
+import logger from "@/lib/logger";
+import {
+  savedPaymentMethodForBooking,
+  savedPaymentMethodRowStamp,
+} from "@/lib/saved-payment-method";
+import { clubFormatValues } from "@/lib/club-format-server";
+import { chargeCurrencyRefusal, UNSUPPORTED_CHARGE_CURRENCY_ADMIN_MESSAGE as CURRENCY_REFUSED } from "@/lib/stripe-charge-currency";
+import { requireRecentAuth } from "@/lib/require-recent-auth";
+import { LOCK1_HOLDER_TRANSACTION_BUDGET } from "@/lib/db-transaction";
+import {
+  confirmPendingGuestsSchema,
+  getOverbookedNightDates,
+  lockedClaimRefusalBody,
+  chargeFailedMessage,
+} from "@/lib/admin-confirm-pending-guests-shapes";
+
+/**
+ * Admin override: "Confirm pending guests now".
+ *
+ * Reuses the pending-booking cron confirm logic for a single booking that
+ * still has non-member guests on hold: charge the saved payment method (->
+ * PAID), or, when there is no saved method (e.g. a #707 request-origin
+ * booking), move it to a payment-owed status instead of charging. Either way
+ * the hold is cleared so the non-member guests are locked in and the cron will
+ * no longer bump them.
+ *
+ * The charge branch follows the cron's claim-first pattern (#1418): claim
+ * PENDING -> CONFIRMED under the advisory lock, charge outside it, then
+ * promote. A failed or requires-action charge releases the claim; a captured
+ * charge is durably recorded as a PRIMARY payment transaction BEFORE
+ * reconciliation so a promotion failure can always be finished by the Stripe
+ * webhook, with an admin payment-failure alert either way — captured money is
+ * never silent.
+ */
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const guard = await requireAdmin({
+    permission: { area: "bookings", level: "edit" },
+  });
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+  const { id: bookingId } = await params;
+
+  const recent = await requireRecentAuth();
+  if (!recent.ok) return recent.response;
+  const jsonBody = await parseOptionalJsonRequestBody(request, { whenAbsent: {} });
+  if (!jsonBody.ok) return jsonBody.response;
+  const parsedBody = confirmPendingGuestsSchema.safeParse(jsonBody.body);
+  if (!parsedBody.success) {
+    return NextResponse.json({ error: "Invalid input", details: parsedBody.error.flatten() }, { status: 400 });
+  }
+  const allowOverbook = parsedBody.data.allowOverbook ?? false;
+  const notifyMember = parsedBody.data.notifyMember;
+  // The club's format (#3565), resolved once, before any transaction or
+  // lock below — never per amount and never inside a transaction.
+  const format = await clubFormatValues();
+
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    include: {
+      member: true,
+      // #3369: the owner may be an Organisation; bookingOwner() reads both.
+      organisation: { select: { name: true, email: true } },
+      // Per-night sets (issue #713) so the capacity re-check counts
+      // non-contiguous stays on the nights they actually occupy.
+      guests: { include: { nights: true } },
+      payment: true,
+      // #3269: a split child (#738) may be charged on its parent's saved card;
+      // the parent's row is what proves the card was saved for reuse.
+      parentBooking: { include: { payment: true } },
+      promoRedemptions: { include: { promoCode: true } },
+    },
+  });
+
+  if (!booking) {
+    return NextResponse.json({ error: "Booking not found" }, { status: 404 });
+  }
+
+  if (
+    booking.status !== BookingStatus.PENDING ||
+    !booking.hasNonMembers ||
+    !booking.nonMemberHoldUntil
+  ) {
+    return NextResponse.json(
+      { error: "This booking has no pending non-member guests to confirm" },
+      { status: 409 }
+    );
+  }
+
+  const previousRange = {
+    checkIn: booking.checkIn,
+    checkOut: booking.checkOut,
+  };
+  const promoEmailOptions = bookingPromoEmailOptions(booking);
+  // The one home for "may this booking's saved card be charged off-session"
+  // (#3269, `INV-PAY-053`): own row first, then the split parent's, each gated
+  // on SetupIntent provenance. A one-off checkout card on either row is not a
+  // saved card, so the booking takes the payment-owed branch below instead of a
+  // charge Stripe would refuse.
+  const savedPayment = savedPaymentMethodForBooking({
+    payment: booking.payment,
+    parentBooking: booking.parentBooking,
+  });
+
+  const auditRequest = getAuditRequestContext(request);
+
+  const audit = (outcome: string, charged: boolean) =>
+    createStructuredAuditLog({
+      action: "booking.confirm_pending_guests",
+      actor: { memberId: session.user.id },
+      subject: { memberId: bookingOwner(booking).memberId },
+      entity: { type: "booking", id: bookingId },
+      category: "booking",
+      severity: "important",
+      summary: `Admin confirmed pending non-member guests (${outcome})`,
+      metadata: {
+        outcome,
+        charged,
+        guestCount: booking.guests.length,
+        finalPriceCents: booking.finalPriceCents,
+        // #1769b honesty rule: record the notify choice only for the two
+        // outcomes that actually send a member email (zero-amount and charged
+        // card). The payment-owed and failure outcomes send none, so a
+        // suppression there is not real and no field is recorded.
+        ...((outcome === "paid_zero" || outcome === "paid_charged") &&
+        notifyMember === false
+          ? { notifyMember: false }
+          : {}),
+      },
+      request: auditRequest,
+    }).catch((err) =>
+      logger.error({ err, bookingId }, "Failed to audit confirm-pending-guests")
+    );
+
+  const queueXeroInvoice = async () => {
+    try {
+      const queued = await enqueueXeroBookingInvoiceOperation(bookingId, {
+        invoiceEmailDelivery: null,
+      });
+      if (queued.queueOperationId) {
+        await kickQueuedXeroOutboxOperationsIfConnected({ limit: 1 });
+      }
+    } catch (xeroErr) {
+      logger.error(
+        { err: xeroErr, bookingId },
+        "Failed to queue Xero invoice after admin confirm-pending-guests"
+      );
+    }
+  };
+
+  try {
+    // Zero-dollar booking: confirm without Stripe. Because a generic
+    // non-member-hold PENDING booking does NOT hold capacity (#737), the beds
+    // may already be taken by the time an admin confirms it. Re-check capacity
+    // under the per-lodge capacity lock (acquireLodgeCapacityLock — the same
+    // hashtextextended(lodgeId) key every admission, the cron/force-confirm
+    // paths, and the exclusive-hold route take, #172) and only flip
+    // PENDING -> PAID (a capacity-holding status) inside that lock. The lodgeId
+    // comes from the pre-lock booking snapshot; a booking never changes lodge,
+    // so the lock key is stable.
+    // #4357 (`INV-PAY-119`): "nothing to charge" is decided on the booking's
+    // worth, the figure the charge branch charges - a change fee recorded on a
+    // $0 booking's payment is still owed - and re-checked under the locks.
+    if (savedCardChargeCents(booking) === 0) {
+      // #4738: the confirmation's journal context, resolved before the
+      // transaction opens (`INV-LOCK-004`).
+      const journal = await resolveBookingMoneyPostingContext();
+      const zeroResult = await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+        // Two-tier protocol (#1881): this branch CLAIMS capacity (PENDING -> a
+        // capacity-holding status), so it takes BOTH locks — global lock(1)
+        // first (mutual exclusion with cancel/settlement), then the per-lodge
+        // capacity lock so the re-check below serialises against per-lodge
+        // booking creators. lodgeId is immutable, so keying from the pre-tx
+        // read is safe.
+        await acquireLodgeCapacityLock(tx, booking.lodgeId);
+
+        // Re-read this booking's own capacity inputs INSIDE the lock (mirroring
+        // cron-confirm-pending / force-confirm). Using the pre-lock findUnique
+        // snapshot would let a concurrent guest-count increase slip through: we
+        // would validate the smaller party but promote the larger one to a
+        // capacity-holding status (same-booking TOCTOU).
+        const locked = await tx.booking.findUnique({
+          where: { id: bookingId },
+          include: { guests: { include: { nights: true } }, payment: true },
+        });
+        if (!locked || locked.status !== BookingStatus.PENDING) {
+          return { error: "Booking is no longer pending" as const, status: 409 };
+        }
+        if (savedCardChargeCents(locked) !== 0) {
+          return {
+            error: "This booking's amount changed while you were confirming it - refresh and try again." as const,
+            status: 409,
+          };
+        }
+
+        const { available, nightDetails } = await checkCapacityForGuestRanges(
+          locked.lodgeId,
+          locked.checkIn,
+          locked.checkOut,
+          locked.guests,
+          bookingId,
+          tx
+        );
+
+        // Exclusive whole-lodge hold (ADR-001 decision 5, issue #118): refuse
+        // even under allowOverbook, before any status advance. Held nights are
+        // pinned to 0 so they never appear in overbookDates — this is the only
+        // guard that catches them.
+        const blockedNights = wholeLodgeBlockedNights({ nightDetails });
+        if (blockedNights.length > 0) {
+          return {
+            error: "WHOLE_LODGE_HOLD_BLOCKED" as const,
+            code: "WHOLE_LODGE_HOLD_BLOCKED" as const,
+            blockedNights,
+            status: 409,
+          };
+        }
+
+        if (!available && !allowOverbook) {
+          return {
+            error: "CAPACITY_EXCEEDED" as const,
+            overbookDates: getOverbookedNightDates(nightDetails),
+            status: 409,
+          };
+        }
+
+        const claimed = await tx.booking.updateMany({
+          where: { id: bookingId, status: BookingStatus.PENDING },
+          data: {
+            status: BookingStatus.PAID,
+            nonMemberHoldUntil: null,
+            // Persisted capacity override (#1771): an admin "confirm now" that
+            // advances a $0 booking over the ceiling (allowOverbook past the
+            // gate) stamps the acting admin. Guarded — never set in-capacity.
+            ...(!available
+              ? {
+                  capacityOverriddenAt: new Date(),
+                  capacityOverriddenByMemberId: session.user.id,
+                }
+              : {}),
+          },
+        });
+        if (claimed.count === 0) {
+          return { error: "Booking is no longer pending" as const, status: 409 };
+        }
+
+        await reconcileBedAllocationsForBookingWithLodgeLockHeld({
+          bookingId,
+          db: tx,
+          previousRange,
+        });
+        await enqueueOwnHostingCoverageReevaluation(bookingId, tx, {
+          cause: "SYSTEM_CHANGE",
+          actorMemberId: session.user.id,
+        });
+        await writeZeroWorthConfirmPayment(tx, bookingId);
+        // #4738: the $0 booking's nights post once, under the won claim's locks.
+        await postStoredBookingConfirmationLedgerLines(tx, bookingId, journal);
+
+        return { ok: true as const };
+      }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+
+      if ("error" in zeroResult) {
+        return NextResponse.json(lockedClaimRefusalBody(zeroResult), { status: zeroResult.status });
+      }
+
+      await settleHostingCoverageAfterCommit({ bookingId });
+      await queueXeroInvoice();
+      await audit("paid_zero", false);
+      if (notifyMember !== false) {
+        sendBookingConfirmedEmail(
+          { bookingId: booking.id, recipientMemberId: bookingOwner(booking).memberId },
+          bookingOwner(booking).member.email,
+          bookingOwner(booking).member.firstName,
+          booking.checkIn,
+          booking.checkOut,
+          booking.guests.length,
+          savedCardChargeCents(booking),
+          format,
+          promoEmailOptions
+        ).catch((err) =>
+          logger.error({ err, bookingId }, "Failed to send confirmation email")
+        );
+      }
+      return NextResponse.json({ success: true, status: "PAID", charged: false });
+    }
+
+    // No saved payment method (request-origin): never charge — move to a
+    // payment-owed status and let payment be arranged separately.
+    if (!savedPayment) {
+      const claimed = await prisma.booking.updateMany({
+        where: { id: bookingId, status: BookingStatus.PENDING },
+        data: {
+          status: BookingStatus.PAYMENT_PENDING,
+          nonMemberHoldUntil: null,
+        },
+      });
+      if (claimed.count === 0) {
+        return NextResponse.json(
+          { error: "Booking is no longer pending" },
+          { status: 409 }
+        );
+      }
+      try {
+        await reconcileBedAllocationsForBooking({ bookingId, previousRange });
+      } catch (err) {
+        // `INV-LOCK-006`: the move to PAYMENT_PENDING has already committed.
+        const contended = transactionContendedResponse(
+          err,
+          "Admin confirm-pending-guests bed reconcile contended for the lock(1) budget",
+          { message: TRANSACTION_CONTENDED_STATUS_CHECK_MESSAGE, context: { bookingId } },
+        );
+        if (contended) return contended;
+        throw err;
+      }
+      await audit("payment_owed", false);
+      return NextResponse.json({
+        success: true,
+        status: "PAYMENT_PENDING",
+        charged: false,
+      });
+    }
+
+    // #3567: refused before the claim, the attempt row or any Stripe call.
+    if (chargeCurrencyRefusal(format)) return NextResponse.json({ error: CURRENCY_REFUSED }, { status: 409 });
+
+    // Claim-first (#1418, the cron's pattern in `resolveHoldWindowUnderLock`):
+    // claim PENDING -> CONFIRMED under the advisory lock BEFORE the Stripe
+    // call. CONFIRMED holds capacity and is out of the cron's bump scope, so a
+    // successful charge can no longer race a concurrent cron cancel into
+    // markBookingPaymentSucceeded's "not payable" throw, and the pre-#1418
+    // charge-then-refund churn window is gone. The lock is released before
+    // Stripe — never hold a DB lock across a payment-provider network call.
+    //
+    // #3267 (`INV-PAY-055`): the same transaction now also makes the charge
+    // ATTEMPT durable (`beginSavedCardChargeAttempt`), which is what stops this
+    // route and the cron double-charging one booking now that they no longer
+    // share a Stripe key. A payment already holding captured cash throws
+    // `SavedCardChargeRefusedError`, rolling the whole claim back.
+    const runClaim = () => prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(1)`;
+      // Two-tier protocol (#1881): this branch CLAIMS capacity (PENDING ->
+      // CONFIRMED), so it takes BOTH locks — global lock(1) first, then the
+      // per-lodge capacity lock so the re-check serialises against per-lodge
+      // creators. lodgeId is immutable.
+      await acquireLodgeCapacityLock(tx, booking.lodgeId);
+      // Re-read this booking's own capacity inputs INSIDE the lock (see the
+      // zero-dollar branch) so a concurrent guest-count change can't gate the
+      // charge on a stale, smaller party — and (#3267) its card columns, own
+      // row and split parent's, so the card CHARGED is the one on the rows
+      // under the locks rather than the pre-lock snapshot: a replacement mint
+      // (#3266) or a retire (#3268) between the two reads must change what is
+      // charged and what the attempt row records, as the cron's own post-lock
+      // re-read already does.
+      const locked = await tx.booking.findUnique({
+        where: { id: bookingId },
+        include: {
+          guests: { include: { nights: true } },
+          payment: true,
+          parentBooking: { include: { payment: true } },
+        },
+      });
+      if (!locked || locked.status !== BookingStatus.PENDING) {
+        return { error: "Booking is no longer pending" as const, status: 409 };
+      }
+      const lockedCard = savedPaymentMethodForBooking({
+        payment: locked.payment,
+        parentBooking: locked.parentBooking,
+      });
+      if (!lockedCard) {
+        // The card the pre-lock read saw is gone (replaced mid-flight, or
+        // retired). Nothing is claimed; a retry takes the payment-owed branch.
+        return {
+          error: "The saved card is no longer available for this booking" as const,
+          status: 409,
+        };
+      }
+      const { available, nightDetails } = await checkCapacityForGuestRanges(
+        locked.lodgeId,
+        locked.checkIn,
+        locked.checkOut,
+        locked.guests,
+        bookingId,
+        tx
+      );
+      // Exclusive whole-lodge hold (ADR-001 decision 5, issue #118): refuse even
+      // under allowOverbook, before the CONFIRMED claim and any Stripe charge.
+      const blockedNights = wholeLodgeBlockedNights({ nightDetails });
+      if (blockedNights.length > 0) {
+        return {
+          error: "WHOLE_LODGE_HOLD_BLOCKED" as const,
+          code: "WHOLE_LODGE_HOLD_BLOCKED" as const,
+          blockedNights,
+          status: 409,
+        };
+      }
+      if (!available && !allowOverbook) {
+        return {
+          error: "CAPACITY_EXCEEDED" as const,
+          overbookDates: getOverbookedNightDates(nightDetails),
+          status: 409,
+        };
+      }
+
+      const claimed = await tx.booking.updateMany({
+        where: { id: bookingId, status: BookingStatus.PENDING },
+        data: {
+          status: BookingStatus.CONFIRMED, savedCardClaimAt: new Date(),
+          nonMemberHoldUntil: null,
+          // Persisted capacity override (#1771): an admin "confirm now" that
+          // claims a priced booking CONFIRMED over the ceiling (allowOverbook
+          // past the gate) stamps the acting admin so the later charge's
+          // markBookingPaymentSucceeded re-check honours it. Guarded — never
+          // set in-capacity.
+          ...(!available
+            ? {
+                capacityOverriddenAt: new Date(),
+                capacityOverriddenByMemberId: session.user.id,
+              }
+            : {}),
+        },
+      });
+      if (claimed.count === 0) {
+        return { error: "Booking is no longer pending" as const, status: 409 };
+      }
+      await reconcileBedAllocationsForBookingWithLodgeLockHeld({
+        bookingId,
+        db: tx,
+        previousRange,
+      });
+      // #2576 §9. "Officer approval" on the owner's list of confirming paths. It is
+      // an OFFICER acting, so §7/§8 apply rather than §6: the confirmation is never
+      // refused, the obligation to re-read the hosting facts is recorded inside this
+      // transaction (under the per-lodge capacity lock the coverage-removing paths
+      // also take, which is what closes the confirm-while-source-removed race), and
+      // an uncovered booking becomes an urgent compliance incident after commit.
+      //
+      // Safe against `releaseChargeClaim` below: an incident is only ever opened for
+      // a booking whose status is confirmed active attendance, so a claim released
+      // back to PENDING when the charge fails drains to nothing.
+      await enqueueOwnHostingCoverageReevaluation(bookingId, tx, {
+        cause: "SYSTEM_CHANGE",
+        actorMemberId: session.user.id,
+      });
+      // #3269: the card is charged from `lockedCard`; the claim writes only
+      // the customer onto this row (`savedPaymentMethodRowStamp`), so it can
+      // neither launder a parent's pm nor resurrect one a concurrent
+      // replacement mint just cleared.
+      const rowStamp = savedPaymentMethodRowStamp(lockedCard);
+      // #4357 (`INV-PAY-119`): the booking's worth, as the cron charges it - a
+      // change fee recorded on this unsettled payment is collected too.
+      const chargeCents = savedCardChargeCents(locked);
+      const payment = await tx.payment.upsert({
+        where: { bookingId },
+        create: {
+          bookingId,
+          amountCents: chargeCents,
+          status: PaymentStatus.PENDING,
+          ...rowStamp,
+        },
+        update: {
+          amountCents: chargeCents,
+          status: PaymentStatus.PENDING,
+          ...rowStamp,
+        },
+      });
+      const attempt = await beginSavedCardChargeAttempt(tx, {
+        paymentId: payment.id,
+        bookingId,
+        amountCents: chargeCents,
+        card: lockedCard,
+        reason: SAVED_CARD_CHARGE_REASON.adminConfirmPendingGuests,
+      });
+      return {
+        ok: true as const,
+        paymentId: payment.id,
+        attempt,
+        card: lockedCard,
+        amountCents: chargeCents,
+      };
+    }, LOCK1_HOLDER_TRANSACTION_BUDGET);
+
+    let claim: Awaited<ReturnType<typeof runClaim>>;
+    try {
+      claim = await runClaim();
+    } catch (claimErr) {
+      if (claimErr instanceof SavedCardChargeRefusedError) {
+        // Nothing was claimed and nothing charged; a person has to look. The
+        // message is the typed domain error's own plain English, written for
+        // this response (#1888 F31 permits a typed error's message; never a
+        // bare `Error`'s).
+        logger.error(
+          {
+            bookingId,
+            why: claimErr.why,
+            paymentIntentId: claimErr.paymentIntentId,
+            attemptRowId: claimErr.attemptRowId,
+          },
+          "Admin confirm-pending-guests: refused to charge (#3267)"
+        );
+        // #4300: a superseded capture with no refund started yet is handed off now.
+        await handOffSupersededCaptureAfterRefusal(claimErr);
+        sendAdminPaymentFailureAlert({
+          memberName: `${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName}`,
+          checkIn: booking.checkIn,
+          checkOut: booking.checkOut,
+          amountCents: savedCardChargeCents(booking),
+          errorMessage: claimErr.message,
+          paymentIntentId: claimErr.paymentIntentId ?? "N/A",
+        }, format).catch((alertErr) =>
+          logger.error(
+            { err: alertErr, bookingId },
+            "Failed to send admin payment failure alert"
+          )
+        );
+        await audit(`charge_refused_${claimErr.why}`, false);
+        return NextResponse.json(
+          { error: claimErr.message, paymentIntentId: claimErr.paymentIntentId },
+          { status: 409 }
+        );
+      }
+      throw claimErr;
+    }
+
+    if ("error" in claim) {
+      return NextResponse.json(lockedClaimRefusalBody(claim), { status: claim.status });
+    }
+
+    // #2576 §9: drain what the claim recorded, now that it has committed.
+    await settleHostingCoverageAfterCommit({ bookingId });
+
+    // Mirror of the cron's release: only touched while Stripe has NOT captured
+    // money. Once a charge succeeds the claim is never released — CONFIRMED
+    // keeps holding the beds the member just paid for. `answer` is the intent a
+    // non-captured branch records on the attempt row inside this same locked
+    // transaction, forward only, BEFORE the booking's status is re-read: a
+    // `succeeded` webhook that has settled the booking between the retrieve and
+    // these locks leaves it PAID, in which case there is nothing to hand back
+    // and the release is skipped rather than aimed at a status that is gone.
+    // Data, not a callback, so the helper is a plain function of its argument
+    // (the transaction-wrapper population in
+    // `lock-bound-club-zone-outside-transaction.test.ts` is derived from
+    // callback parameters).
+    const receiptJournal = await resolveBookingMoneyPostingContext();
+    const releaseChargeClaim = async (answer?: {
+      attemptRowId: string;
+      paymentIntent: SavedCardChargeAnswer;
+    }) => {
+      const outcome = await runSavedCardClaimRelease(async (tx) => {
+        if (answer) {
+          await settleSavedCardChargeAttempt({ journal: receiptJournal,
+            ...answer,
+            paymentId: claim.paymentId,
+            store: tx,
+          });
+        }
+        const current = await tx.booking.findUnique({
+          where: { id: bookingId },
+          select: { status: true },
+        });
+        if (current?.status !== BookingStatus.CONFIRMED) {
+          // PAID is the expected loser of the race with a settling webhook and
+          // is not an anomaly; any other status means another actor took the
+          // claim mid-charge, which is what the fence must still shout about
+          // (before #3267 that case threw). Same split in the cron and
+          // `charge-saved-method`.
+          const releaseLog = {
+            bookingId,
+            bookingStatus: current?.status ?? null,
+          };
+          if (current?.status === BookingStatus.PAID) {
+            logger.warn(
+              releaseLog,
+              "Admin confirm-pending-guests: the booking is already PAID at release; leaving it — the webhook settled it while the charge was in flight (#3267)"
+            );
+          } else {
+            logger.error(
+              releaseLog,
+              "Admin confirm-pending-guests: the booking lost its CONFIRMED claim to another actor before the release; leaving it as it is (#3267)"
+            );
+          }
+          return { released: false };
+        }
+        return releaseSavedCardChargeClaim(tx, {
+          bookingId,
+          restoreHoldUntil: booking.nonMemberHoldUntil,
+          previousRange,
+        });
+      }, { bookingId, lodgeId: booking.lodgeId });
+      // Never rejects. `false` (#4993): still CONFIRMED for the cron's recovery (#5279).
+      return outcome.ok;
+    };
+
+    // Charge the saved payment method through the one attempt contract every
+    // path uses (#3267, `INV-PAY-055`): earlier attempts the claim ended (a
+    // replaced card) have their intents cancelled best-effort first, after
+    // commit; a fresh attempt charges under the row's own key; an unresolved
+    // earlier attempt (the cron's, or a previous click) is asked about instead
+    // of repeated. The never-double-charge property the
+    // shared `pending_charge_<bookingId>` key used to provide is now enforced by
+    // the ledger inside the claim transaction above, so this route no longer
+    // meets Stripe's idempotency parameter-mismatch error — what comes back is
+    // the attempt's true outcome. The card and amount are the claim's
+    // post-lock reads.
+    let paymentIntent;
+    try {
+      paymentIntent = await chargeSavedCardAttempt({
+        format,
+        attempt: claim.attempt,
+        bookingId,
+        memberId: bookingOwner(booking).memberId,
+        amountCents: claim.amountCents,
+        card: claim.card,
+      });
+    } catch (chargeErr) {
+      // Charge attempt failed with nothing captured: release the claim and
+      // alert admins, exactly like the cron path (#1418). A definite Stripe
+      // refusal has already ended the attempt row, so the next click starts a
+      // fresh one; an ambiguous failure leaves it to be asked about.
+      const claimReleased = await releaseChargeClaim();
+      const stripeFields = readStripeErrorFields(chargeErr);
+      // The claim's POST-LOCK amount — the one the charge asked Stripe for. A
+      // price that moved between the pre-lock read and the claim would
+      // otherwise make this alert name a figure nobody was ever charged.
+      sendAdminPaymentFailureAlert({
+        memberName: `${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName}`,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        amountCents: claim.amountCents,
+        errorMessage: stripeFields.message,
+        paymentIntentId:
+          (claim.attempt.kind === "replay" ? claim.attempt.paymentIntentId : null) ??
+          booking.payment?.stripePaymentIntentId ??
+          "N/A",
+      }, format).catch((alertErr) =>
+        logger.error(
+          { err: alertErr, bookingId },
+          "Failed to send admin payment failure alert"
+        )
+      );
+      await audit("charge_failed", false);
+      logger.error(
+        { err: chargeErr, bookingId },
+        "Admin confirm-pending-guests: Stripe charge failed"
+      );
+      // Say what Stripe actually said when Stripe said it; a local failure's
+      // message is not for the response body.
+      const detail =
+        stripeFields.apiType !== null
+          ? ` Stripe said: "${stripeFields.message}".`
+          : "";
+      return NextResponse.json(
+        {
+          error: `${chargeFailedMessage(claimReleased)}${detail}`,
+        },
+        { status: 502 }
+      );
+    }
+
+    if (paymentIntent.status !== "succeeded") {
+      // The intent exists but did not capture (3DS challenge outstanding, still
+      // processing, or — on a replay — an earlier attempt that has since died).
+      // Record what Stripe answered on the attempt row inside the locked
+      // release, forward only, so the next click or cron run asks about this
+      // intent rather than minting a second one (or, for a dead intent, starts
+      // fresh), then release the claim if it is still ours and leave the
+      // booking pending for the Stripe webhook to resolve rather than
+      // confirming optimistically.
+      const claimReleased = await releaseChargeClaim({
+        attemptRowId: claim.attempt.attemptRowId,
+        paymentIntent,
+      });
+      return NextResponse.json(
+        {
+          error: describeUnsettledPaymentIntent(paymentIntent.status, { claimReleased }),
+          paymentStatus: paymentIntent.status,
+        },
+        { status: 409 }
+      );
+    }
+
+    const paymentMethodId = stripeReferenceId(paymentIntent.payment_method);
+
+    // Durably record the captured charge BEFORE reconciliation (#1418). markBookingPaymentSucceeded writes this
+    // same PRIMARY transaction inside its own transaction, so a throw there rolls the row back — and the
+    // payment_intent.succeeded webhook refuses to act without it ("no primary payment transaction"), which is
+    // exactly how captured money used to go silent. With the row committed here, the webhook can always finish
+    // the promotion (or route a cancelled booking through the #1350 refund guard). Since #3267 the row already
+    // exists (the attempt); this stamps the intent and SUCCEEDED onto it, and (#5240) flags new money the
+    // settle has not seen, so the settle - or the next arrival, if this one stops - never reads it as a replay.
+    try {
+      await settleSavedCardChargeAttempt({ journal: receiptJournal,
+        attemptRowId: claim.attempt.attemptRowId,
+        paymentId: claim.paymentId,
+        paymentIntent,
+      });
+    } catch (recordErr) {
+      // Non-fatal: reconciliation below upserts the identical row.
+      logger.error(
+        { err: recordErr, bookingId, paymentIntentId: paymentIntent.id },
+        "Failed to pre-record captured charge before reconciliation"
+      );
+    }
+
+    let reconciliation;
+    try {
+      reconciliation = await markBookingPaymentSucceeded({
+      capturedAt: receiptCaptureTime(paymentIntent),
+        format,
+        bookingId,
+        paymentIntentId: paymentIntent.id,
+        amountCents: paymentIntent.amount,
+        paymentMethodId,
+      });
+    } catch (reconcileErr) {
+      // Money is captured but the promotion failed (transient DB error, or a
+      // concurrent admin action moved the booking). Do NOT refund and do NOT
+      // release the claim: CONFIRMED keeps holding the beds the member paid
+      // for, the pre-recorded transaction row lets the Stripe webhook retry
+      // the promotion idempotently, and admins are alerted for manual review —
+      // the cron makes the same leave-claimed choice (#1418).
+      logger.error(
+        { err: reconcileErr, bookingId, paymentIntentId: paymentIntent.id },
+        "Admin confirm-pending-guests: charge captured but reconciliation failed; leaving booking claimed"
+      );
+      sendAdminPaymentFailureAlert({
+        memberName: `${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName}`,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        amountCents: paymentIntent.amount,
+        errorMessage: `Charge ${paymentIntent.id} was captured but the booking could not be finalised: ${
+          reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr)
+        }. The booking remains CONFIRMED holding its beds; the Stripe webhook will retry the promotion, or review manually.`,
+        paymentIntentId: paymentIntent.id,
+      }, format).catch((alertErr) =>
+        logger.error(
+          { err: alertErr, bookingId },
+          "Failed to send admin payment failure alert"
+        )
+      );
+      await audit("charged_finalisation_pending", true);
+      const hostingRetry = hostingCoverageParticipantRetryResponse(
+        reconcileErr,
+        {
+          paymentReceived: true,
+          finalisationPending: true,
+        },
+      );
+      if (hostingRetry) return hostingRetry;
+      return NextResponse.json(
+        {
+          error:
+            "The charge succeeded but the booking could not be finalised yet; it stays confirmed and admins have been alerted.",
+          paymentReceived: true,
+          finalisationPending: true,
+        },
+        { status: 500 }
+      );
+    }
+
+    if (reconciliation.outcome === "cancelled_refunded") {
+      // The final capacity claim failed (only reachable here if the booking
+      // lost its CONFIRMED claim to a concurrent actor): the reconciler has
+      // already cancelled the booking and auto-refunded the charge in full.
+      await audit("charged_capacity_refunded", true);
+      return NextResponse.json(
+        {
+          error:
+            "The dates filled before the booking could be finalised; the charge was refunded in full and the booking cancelled.",
+        },
+        { status: 409 }
+      );
+    }
+
+    // #4300 (`INV-PAY-138`): superseded, so going back; nothing paid, so the claim is released.
+    if (reconciliation.outcome === "superseded_capture") {
+      await releaseChargeClaim().catch((err) => logger.error({ err, bookingId }, "Could not release the claim of a refused superseded charge (#4300)"));
+      await audit("charged_superseded_capture", true);
+      return NextResponse.json(SUPERSEDED_CHARGE_NOT_SETTLED_BODY, { status: 409 });
+    }
+
+    if (settledByAnotherCapture(reconciliation.outcome)) {
+      // #1992 — the booking had ALREADY been settled by a different capture
+      // (e.g. the member paid an in-flight /pay link intent in the same
+      // window), so the charge this route just made was duplicate money. The
+      // reconciler auto-refunded it (or, on an inline failure, left a durable
+      // refund operation for the recovery cron) and alerted admins either
+      // way. The booking IS finalised — by the other capture — so a 500
+      // "could not be finalised" here was inaccurate; report the settled
+      // booking and the duplicate refund truthfully. The settling path
+      // already sent the confirmation email and queued the Xero invoice, so
+      // neither is repeated for the duplicate.
+      await audit(`charged_${reconciliation.outcome}`, true);
+      return NextResponse.json({
+        success: true,
+        status: "PAID",
+        charged: reconciliation.outcome === "duplicate_capture_kept", // #4211: kept, so it stands charged
+        duplicateChargeRefunded:
+          reconciliation.outcome === "duplicate_capture_refunded",
+        message:
+          reconciliation.outcome === "duplicate_capture_refunded"
+            ? "The booking was already paid by another payment; this duplicate charge was automatically refunded in full."
+            : reconciliation.outcome === "duplicate_capture_kept"
+              ? "The booking was already paid by another payment, and the app cannot tell which of the payments to keep, so this charge was kept and nothing was refunded. Admins have been asked to check by hand."
+              : "The booking was already paid by another payment; the refund of this duplicate charge failed inline and has been queued for automatic retry. Admins have been alerted.",
+      });
+    }
+
+    if (reconciliation.outcome === "cancelled_refund_failed") {
+      // The final capacity claim failed and the reconciler has already
+      // committed the cancellation together with a durable refund-recovery
+      // operation. This is not booking finalisation pending: the booking is
+      // definitively CANCELLED and only the captured charge's refund remains
+      // unresolved.
+      logger.error(
+        { bookingId, outcome: reconciliation.outcome },
+        "Admin confirm-pending-guests: booking cancelled and captured-charge refund recovery is pending"
+      );
+      await audit(`charged_${reconciliation.outcome}`, true);
+      return NextResponse.json(
+        {
+          error:
+            "The booking was cancelled because lodge capacity was no longer available. The saved-card charge was captured, but its refund could not be confirmed; automatic refund recovery is pending and admins have been alerted.",
+          status: "CANCELLED",
+          refunded: false,
+          refundRecoveryPending: true,
+          paymentReceived: true,
+        },
+        { status: 409 }
+      );
+    }
+
+    await queueXeroInvoice();
+    await audit("paid_charged", true);
+    if (notifyMember !== false) {
+      sendBookingConfirmedEmail(
+        { bookingId: booking.id, recipientMemberId: bookingOwner(booking).memberId },
+        bookingOwner(booking).member.email,
+        bookingOwner(booking).member.firstName,
+        booking.checkIn,
+        booking.checkOut,
+        booking.guests.length,
+        claim.amountCents,
+        format,
+        promoEmailOptions
+      ).catch((err) =>
+        logger.error({ err, bookingId }, "Failed to send confirmation email")
+      );
+    }
+    return NextResponse.json({ success: true, status: "PAID", charged: true });
+  } catch (err) {
+    // The $0 confirm or the charge claim rolled back before any charge; a
+    // failure after a capture answers in its own branch above.
+    const contended = transactionContendedResponse(
+      err,
+      "Admin confirm-pending-guests contended for the lock(1) budget",
+      { context: { bookingId } },
+    );
+    if (contended) return contended;
+    const hostingRetry = hostingCoverageParticipantRetryResponse(err);
+    if (hostingRetry) return hostingRetry;
+    logger.error({ err, bookingId }, "Failed to confirm pending guests");
+    return NextResponse.json(
+      { error: "Failed to confirm pending guests" },
+      { status: 500 }
+    );
+  }
+}

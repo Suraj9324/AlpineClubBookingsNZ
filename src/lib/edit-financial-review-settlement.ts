@@ -1,0 +1,685 @@
+import "server-only";
+
+import {
+  BookingEventType,
+  BookingStatus,
+  ManualRefundTaskDirection,
+  ManualRefundTaskKind,
+  Prisma,
+} from "@prisma/client";
+
+import { bookingOwner } from "@/lib/booking-owner";
+import { handsBackByHand } from "@/lib/manual-refund-hand-back-route";
+import { isLateCaptureHandBackTask } from "@/lib/late-capture-hand-back-task";
+import { recordBookingEvent } from "@/lib/booking-events";
+import { editReviewRefundGoesBackOnCard, editReviewRefundSettlementPayment } from "@/lib/booking-payment-state";
+import { readBookingHasEnded } from "@/lib/booking-ended";
+import {
+  chooseEditReviewChargeRoute,
+  executeEditReviewCharge,
+  finishEditReviewChargeInvoice,
+  type QueuedEditReviewChargeInvoice,
+  type EditReviewChargeRoute,
+} from "@/lib/edit-financial-review-charge";
+// #3947: re-exported so the completion reaches the charge's in-transaction invoice through its one settlement import.
+export { queueEditReviewChargeInvoiceInTransaction } from "@/lib/edit-financial-review-charge";
+import { REVIEW_CHARGE_WRONG_KIND_MESSAGE } from "@/lib/edit-financial-review-charge-refusals";
+import {
+  REVIEW_CREDIT_ANCHOR_TAKEN_MESSAGE,
+  REVIEW_SETTLEMENT_ANCHOR_MISSING_MESSAGE,
+} from "@/lib/edit-financial-review-refund-refusals";
+import { assertByHandReviewRefundWithinUnpromisedCash } from "@/lib/edit-refund-hand-back";
+import { parseEditFinancialReviewContext } from "@/lib/edit-financial-review-context";
+import { ManualBookingPaymentError } from "@/lib/manual-booking-payment-error";
+import { executeEditReviewCardRefund } from "@/lib/edit-financial-review-card-refund";
+import type { RefundAllocationSlice } from "@/lib/payment-transactions";
+import { planEditReviewCardRefund } from "@/lib/edit-financial-review-card-plan";
+import { dispatchEditReviewXeroSettlement, type EditReviewHandBackXeroFacts } from "@/lib/edit-financial-review-xero-leg";
+import {
+  finishEditReviewAccountCredit,
+  type EditReviewAccountCreditOutcome,
+} from "@/lib/edit-financial-review-account-credit";
+import {
+  assertLateCaptureHandBackStillOwed,
+  executeLateCaptureApprovalRefund,
+  planLateCaptureApprovalRefund,
+  type LateCaptureRefundRoute,
+} from "@/lib/late-capture-refund-approval";
+import type { ClubFormat } from "@/lib/club-format";
+import type { ClubTimeZone } from "@/lib/club-time";
+import { capturedShareOwedAfterCancellation } from "@/lib/edit-financial-review-cancel-netting";
+import type { EditReviewSettlementTask } from "@/lib/edit-financial-review-settlement-task";
+import { reviewCreditAllocationPaymentId } from "@/lib/edit-financial-review-credit-dispute";
+import { cardShortfallSettlement } from "@/lib/cancel-card-refund-shortfall-settle";
+import type { CapacityRaceStripeRefunded } from "@/lib/capacity-race-refunded-total-correction";
+import { alertGroupMirrorRefundXeroByHand, chooseGroupSettlementMirrorRoute, chooseReviewGroupSettlementMirrorRoute, type GroupSettlementMirrorRoute } from "@/lib/group-settlement-mirror-hand-back";
+import { reviewRefundGoesToGroupOrganiser } from "@/lib/group-settlement-mirror-kinds";
+
+/**
+ * #3032 (epic #2797): WHERE a confirmed review amount goes when the task is
+ * closed, and what is refused before anything is claimed.
+ *
+ * ## Why this is a separate module from the completion itself
+ *
+ * `manual-refund-task-resolution.ts` is the completion DOOR: it validates the
+ * operator's input, claims the task and audits the decision, and it ends at the
+ * commit. Where an amount goes and how it gets there is a different question - a
+ * question about the BOOKING's money rather than about the task's status - and it
+ * is the one an adversarial reader needs to be able to check in isolation.
+ *
+ * ## Two halves, and the boundary between them is the CLAIM
+ *
+ * `chooseEditReviewSettlementRoute` runs BEFORE the claim, inside the caller's
+ * transaction. It moves no money: it returns a plan or throws, and that is the
+ * point - a refusal that fired after the claim would leave a task COMPLETED with
+ * nothing moved, which is the "pretends money moved" failure `INV-PAY-051` exists
+ * to prevent. (`planStripeRefundAllocation` may backfill legacy
+ * `PaymentTransaction` rows as a side effect of reading them; that is a read made
+ * durable on the caller's own transaction, not a settlement.)
+ *
+ * `executeEditReviewSettlement` runs AFTER the commit, and is where the provider
+ * call, the member-facing events for the routes whose money moves out there, and
+ * the Xero leg happen. Nothing between the two writes a settlement: the ledger
+ * writes the transaction owns sit in the caller, immediately downstream of the
+ * claim.
+ *
+ * ## WHY THIS IS NOT `calculateModificationSettlementOptions`
+ *
+ * `booking-modify-settlement.ts` already answers "where does a reduction's money
+ * go" for a booking EDIT, and `INV-SSOT` says route to the existing answer rather
+ * than write a second one. It was weighed and it cannot serve this path, for one
+ * decisive reason: that function TIERS the amount. It takes a price delta, caps
+ * it at the refundable balance and then runs it through
+ * `calculateDualRefundAmounts`, so on a 50% tier a $50 basis becomes a $25 card
+ * refund. Here the $50 IS the answer - an authorised admin priced it from the
+ * booking's own evidence under owner decision D2, with the club's policy already
+ * in their hand, and the figure is recorded in the audit entry. Tier it again and
+ * the club silently hands back half of what the person who decided it authorised.
+ * No argument reaches the right number through that function, so this is a
+ * different question rather than a duplicated one.
+ *
+ * FOUR OF THE FIVE PROTECTIONS THAT FUNCTION CARRIES ARE STILL HERE, and this is
+ * where they live now:
+ *
+ *  1. `hasSettledPayment && source === STRIPE` - the card route is taken only
+ *     when the card money is genuinely there. Enforced below through
+ *     `planStripeRefundAllocation`'s refundable total, which is derived from the
+ *     captured `PaymentTransaction` rows themselves rather than from the
+ *     `Payment.source` column - whose schema DEFAULT is `STRIPE`, so a
+ *     hand-settled booking can carry it with nothing captured behind it.
+ *  2. the cap at the refundable balance - enforced below, BEFORE the claim, so an
+ *     over-cap amount leaves the task OPEN rather than COMPLETED-and-unpaid.
+ *  3. the Xero delta - queued by the caller after the commit, from this same
+ *     confirmed amount and the same `BookingModification` anchor.
+ *  4. an explicit card-vs-credit `settlementMethod` - NOT reproduced, and this is
+ *     the one deliberate omission. There is no choice to make here: the routes
+ *     below are mutually exclusive on facts rather than on preference. Money that
+ *     came in on a card goes back to that card; money with no card behind it can
+ *     only become account credit, because there is nothing to reverse. The edit
+ *     path needs an election because a captured card reduction may legitimately
+ *     go either way at the member's choice; a review completion has one lawful
+ *     destination per task, and offering a choice there would let an admin turn a
+ *     member's card refund into club credit with no policy basis at all.
+ *  5. the cancellation-policy tier itself - deliberately omitted, for the reason
+ *     above: the confirmed amount has already been decided by a person.
+ */
+
+/**
+ * The settlement paths that already exist, and this issue picks between rather
+ * than adding a new one.
+ *
+ * #3170 ADDED A DIRECTION, NOT A MECHANISM. The three routes below all hand money
+ * BACK, which was sufficient while only guest REMOVALS could park - a removal can
+ * only ever owe the member. #3170 is the first change that parks an edit which
+ * can move the price UP, so a fourth route, `additional-charge`, asks for money
+ * instead; it re-enters `createModificationAdditionalPaymentIntent`, which is the
+ * same function every ordinary price increase already goes through, so the
+ * instrument, the ledger row, the chasing and the Xero leg are all the existing
+ * ones - and, since the fix round, one such request per EDIT rather than per
+ * task. Which route a completion takes is a function of the officer's stated
+ * direction and the booking's own facts, never of a preference:
+ *
+ *  - `stripe-refund` - the booking was paid by card, so the money goes back the
+ *    way it came. `executeEditReviewCardRefund` sends the plan persisted during
+ *    completion under its TASK-scoped Stripe prefix plus transaction and amount.
+ *    Its recovery replays that same plan. It writes the ledger allocation through
+ *    `refundPaymentTransactions`, which is why this route writes none in the
+ *    transaction - doing both would consume the refundable headroom twice.
+ *  - `local-allocation` - a payment the club settles by hand (internet banking,
+ *    or a cash hand-back). Only the ledger mirror moves, which is exactly what
+ *    every pre-#3032 task did and is left byte-identical.
+ *  - `account-credit` - no captured money behind the adjustment, so there is
+ *    nothing to reverse and the amount is returned as account credit through
+ *    `createBookingModificationCredit`, whose exactly-once key is the
+ *    `BookingModification` id (owner decision D-3032-1).
+ *
+ * WHICH OF THE THREE IS A QUESTION ABOUT THE BOOKING, ASKED NOW (#3194) - not
+ * about the TASK's `paymentId`, written when the review is raised and never
+ * again, so a review parked before the member paid could only ever reach
+ * `account-credit` even once their card money was in the club's account.
+ *
+ * `null` is the fourth outcome and means "nothing moves": a DISMISSED task, and
+ * a legacy hand-back with no payment behind it.
+ */
+export type EditReviewSettlementRoute =
+  | {
+      kind: "stripe-refund";
+      paymentId: string;
+      bookingModificationId: string;
+      /**
+       * The per-transaction slices frozen INSIDE the completion transaction,
+       * before any Stripe call (booking-cancel's #1349 pattern). The caller
+       * persists them on a recovery operation in that same transaction and then
+       * executes exactly these slices inline, so the inline attempt and any cron
+       * replay send byte-identical Stripe requests and converge on one refund.
+       */
+      allocation: RefundAllocationSlice[];
+      /** What goes back to the card: the share, or on a cancelled booking the card's part of what is still owed (#3835). */
+      refundCents: number;
+      /** #3835: the applied-credit part of what is still owed, given back as credit, never to the card. */
+      creditBackCents: number;
+    }
+  | {
+      kind: "local-allocation";
+      paymentId: string;
+      /** The `BookingModification` anchor, for the Xero credit note the caller queues after the commit. NULL on
+       * every pre-#3032 task kind, which were raised with no edit behind them and no invoice line to correct. */
+      bookingModificationId: string | null;
+      /** What is handed back: the share, or on a cancelled booking the capture's part of what is still owed (#3835). */
+      refundCents: number;
+      /** #3835: the applied-credit part of what is still owed, given back as credit. */
+      creditBackCents: number;
+      /** #3536 (`INV-PAY-116`): the officer said this went back in cash, never inferred from
+       * "marked paid by hand". Words on the Xero note only; settlement and ledger unchanged. */
+      handedBackInCash?: true;
+      /** #4097 (`INV-PAY-129`): a card refund shortfall settles on its non-card charges first; its refusal names dismissing.
+       * #4154 (`INV-PAY-135`): a capacity race's, on the race's own charge only, with its own refusal. */
+      cardShortfall?: { preferTransactionIds: string[]; onlyTransactionIds?: string[]; nothingToAllocateMessage?: string };
+    }
+  | {
+      kind: "account-credit";
+      bookingModificationId: string;
+      /**
+       * The booking's captured payment, when it has one. An account credit
+       * consumes refundable value exactly like a card refund does, so the
+       * allocation has to be written or a later cancellation refunds the same
+       * cents a second time (#1031, and the reason
+       * `createBookingModificationCredit` takes a payment id at all). Null when
+       * there is no captured payment to allocate against.
+       *
+       * DELIBERATELY A LOOSER TEST than the one that picks this route (#3194),
+       * and NOT a stray copy of `editReviewSettlementPayment` to be converged
+       * with it: `hasCapturedPayment` alone, with no settled-status gate. A
+       * captured payment on a booking still inside its payment lifecycle now
+       * takes the card or ledger route, so what arrives here holding money is
+       * the booking that has LEFT it - cancelled, most obviously - whose cents
+       * are just as capable of being refunded twice. Matching the route gate
+       * would drop the allocation on the one shape that still needs it.
+       *
+       * NULL also decides HOW the share is credited (#3791): with no captured
+       * payment, what the member paid is their applied account credit, so
+       * `writeEditReviewAccountCredit` gives that back rather than minting new
+       * credit beside it.
+       */
+      allocateAgainstPaymentId: string | null;
+    }
+  /**
+   * #3170: the direction that did not exist before this issue - the MEMBER owes
+   * the CLUB. Defined in `edit-financial-review-charge.ts`, which is the whole of
+   * what a charge is; the three above are the whole of what a refund is; and this
+   * union is the one place that picks between them.
+   */
+  | EditReviewChargeRoute
+  /**
+   * #3639: a treasurer approving the refund of a late capture on a cancelled
+   * booking. Defined in `late-capture-refund-approval.ts`, which is the whole of
+   * what that refund is: the automatic refund of the same capture, under the
+   * same Stripe keys.
+   */
+  | LateCaptureRefundRoute
+  /** #3949 (`INV-PAY-137`): recorded on a group child's payment mirror (`group-settlement-mirror-hand-back.ts`). */
+  | GroupSettlementMirrorRoute;
+
+/**
+ * Choose the settlement route for a completion, or throw the refusal that stops
+ * it.
+ *
+ * MUST be called BEFORE the status claim and inside the caller's transaction.
+ * The first is what makes a refusal safe - the task is left OPEN, still holding
+ * the money question. The second is because the anchor-collision read has to see
+ * the same snapshot the credit write will.
+ *
+ * Every kind other than `EDIT_FINANCIAL_REVIEW` keeps its pre-#3032 behaviour
+ * byte for byte: allocate against the task's payment when it has one, and
+ * otherwise move nothing. Those tasks are raised for cash-settled bookings with
+ * no card charge to reverse, so there is no Stripe route to send them down and
+ * no anchor to credit against.
+ */
+export async function chooseEditReviewSettlementRoute({
+  task,
+  amountCents,
+  hasIssuedXeroInvoice,
+  direction,
+  handedBackInCash = false,
+  club,
+  store,
+  actingMemberId,
+  capacityRace,
+  readOnlyPreview = false,
+}: {
+  task: EditReviewSettlementTask;
+  /**
+   * The confirmed amount this completion will settle, in integer cents. Always a
+   * POSITIVE magnitude: `direction` says which way it goes, so no amount on this
+   * path is ever negative and the sign is never overloaded to mean a direction
+   * (`INV-MONEY-001`, and the magic-value rule this epic is built on).
+   *
+   * The card route needs it before the claim: the cap and the frozen allocation
+   * are both functions of it, and both have to be answered while a refusal is
+   * still free.
+   */
+  amountCents: number;
+  /**
+   * #3170: whether this booking already has an issued primary Xero invoice, from
+   * the caller's own `hasIssuedPrimaryXeroInvoice` read on the same transaction.
+   * The CHARGE direction needs it BEFORE the claim, because it is one of the two
+   * instruments a charge can use and its absence is a refusal rather than a
+   * silent no-op.
+   */
+  hasIssuedXeroInvoice: boolean;
+  /**
+   * #3170: WHICH WAY the money goes, and it is the officer's decision rather than
+   * anything the system can derive - the amount is precisely the figure it could
+   * not work out. It arrives as an explicit value with no default: before this
+   * issue the direction was implicit in the word "refund", which is exactly how
+   * an officer who correctly concluded "they owe us $200" could have $200 sent to
+   * the member's card.
+   */
+  direction: ManualRefundTaskDirection;
+  /** #3536 (`INV-PAY-116`): the officer's cash answer, read only on the `local-allocation` route;
+   * absent or false keeps the bank-transfer wording. */
+  handedBackInCash?: boolean;
+  /** #3835: the club's zone (`INV-LOCK-004`) and format, resolved before the transaction. */
+  club: { zone: ClubTimeZone; format: ClubFormat };
+  store: Prisma.TransactionClient;
+  /** #4154: the officer completing it, for a capacity race's audited correction; absent on a read-only preview. */
+  actingMemberId?: string;
+  /** #4154 review (M1, M4): a capacity race's Stripe read, made before the transaction, and whether its note has an invoice. */
+  capacityRace?: { stripe: CapacityRaceStripeRefunded | null; invoiced: boolean };
+  /** #5171 review: the still-owed preview's rolled-back read, which holds no lock(1) and so takes no row or member lock. */
+  readOnlyPreview?: boolean;
+}): Promise<EditReviewSettlementRoute | null> {
+  if (task.kind !== ManualRefundTaskKind.EDIT_FINANCIAL_REVIEW) {
+    if (direction === ManualRefundTaskDirection.CHARGE_TO_MEMBER) {
+      throw new ManualBookingPaymentError(REVIEW_CHARGE_WRONG_KIND_MESSAGE, 400);
+    }
+    // #3639: an approved late-capture refund goes back to the card through Stripe - never a hand-back
+    // ledger mirror, which would count one refund twice once `charge.refunded` synced a dashboard refund.
+    // #4824: planned under the booking's Payment row, which the plan takes before it reads what the capture holds.
+    if (task.lateCaptureApprovalIntentId) {
+      return planLateCaptureApprovalRefund({ task, amountCents, store });
+    }
+    // #3639: and a #2700 hand-back is refused once its capture was refunded.
+    // #4843: and a legacy row raised before `kind` existed, which only its reason sentence identifies.
+    if (isLateCaptureHandBackTask(task)) {
+      await assertLateCaptureHandBackStillOwed({ task, amountCents, store });
+    }
+    // #3949 (`INV-PAY-137`): an edit's or appeal's hand-back on a joiner the organiser paid for by bank transfer.
+    const groupMirror = await chooseGroupSettlementMirrorRoute({ task, amountCents, store });
+    if (groupMirror) return groupMirror;
+    const cardShortfall = await cardShortfallSettlement(task, store, { amountCents, actingMemberId: actingMemberId ?? null, format: club.format, capacityRace }); // #4097: null unless a card refund shortfall
+    return handsBackByHand(task) && task.paymentId !== null
+      ? {
+          kind: "local-allocation",
+          paymentId: task.paymentId,
+          bookingModificationId: null,
+          refundCents: amountCents,
+          creditBackCents: 0, ...(cardShortfall ? { cardShortfall } : {}),
+        }
+      : null;
+  }
+
+  // Parsed through the one parser (`INV-SSOT`, #3030) rather than indexed into
+  // as JSON. Null here means the row's evidence is unreadable, which is a
+  // legitimate state for a task an admin must still be able to SEE - but not one
+  // that can be settled automatically, so it falls into the anchor-missing
+  // refusal below with a message that says what to do instead.
+  const reviewContext = parseEditFinancialReviewContext(task.reviewContext);
+  const bookingModificationId = reviewContext?.bookingModificationId ?? null;
+
+  if (direction === ManualRefundTaskDirection.CHARGE_TO_MEMBER) {
+    // #3170. Everything below hands money BACK; this is the one arm that asks for
+    // it, and it delegates rather than branching inline - a charge shares none of
+    // the refund machinery, and the strongest guard against one quietly taking a
+    // refund path is that the two share no code at all.
+    return chooseEditReviewChargeRoute({
+      bookingModificationId,
+      booking: task.booking, bookingPayment: task.booking.payment, // #3653: booking for the organiser-paid refusal
+      member: bookingOwner(task.booking).member,
+      hasIssuedXeroInvoice,
+      // #3170: the same transaction the claim runs in, because the charge route
+      // asks whether this EDIT already has a request open to a further share and
+      // that read must see the snapshot the claim commits against - the reason
+      // the credit-anchor read below takes the store too.
+      store,
+    });
+  }
+
+  /**
+   * #3194 (epic #2797): WHERE the money can go, asked AT COMPLETION rather than
+   * read off a column frozen when the review was raised.
+   *
+   * `task.paymentId` is a snapshot: both raise sites record the booking's
+   * captured payment at that instant, and nothing backfills it. A review parked
+   * on a booking nobody had paid yet therefore carries NULL for ever - and the
+   * member CAN still pay, deliberately, because a parked change can surrender
+   * unpriceable nights while the stay itself goes ahead. So the ordinary
+   * sequence "edit parks, then the member pays by card" ended with a task whose
+   * column said there was no card, and the officer's confirmed refund could only
+   * ever become club credit, on money that arrived on a card.
+   *
+   * A task WITHOUT a payment id therefore re-asks the question here, against the
+   * booking's own row on this same transaction, through the gate the raise sites
+   * use (`editReviewSettlementPayment`, `INV-SSOT`). That answers exactly "what would
+   * have been recorded had the review been raised now", which is the point: a
+   * refund must not depend on whether the member paid before or after an
+   * unrelated edit was parked.
+   *
+   * THE STORED ID STILL WINS WHERE IT EXISTS, and re-deriving unconditionally
+   * was weighed and rejected: it would not only add the missing route, it would
+   * REMOVE routes the stored id reaches. A booking whose manual settlement was
+   * reversed, or whose status left the settled set, keeps its `paymentId` and
+   * takes the card or ledger route, where the amount is capped and an over-cap
+   * is REFUSED with the task left OPEN. Re-deriving turns each of those
+   * refusals into account credit - a quieter answer to a case an officer should
+   * be looking at. Every stale direction the stored id can take is already
+   * caught by a cap; the one it cannot recover from is the NULL, so the NULL is
+   * the only thing widened.
+   *
+   * Nothing is written and nothing is backfilled, which is what makes this
+   * idempotent by construction: a replayed completion is refused by the status
+   * claim, and a capture or webhook replay cannot duplicate a backfill that does
+   * not exist.
+   */
+  // #3536 (`INV-SSOT`): this payment and the card-or-by-hand test are shared with
+  // `editReviewRefundIsPaidBackByHand`, which decides whether the settle queue asks cash-or-bank.
+  const settlementPayment = editReviewRefundSettlementPayment(task);
+  const settlementPaymentId = settlementPayment?.id ?? null;
+
+  // #3835: on a cancelled booking a captured payment's share - by card or by
+  // hand - is netted against what the cancellation returned (owner decision 2
+  // on #3791), and only that is planned, capped and handed back.
+  const owed = () =>
+    task.booking.status === BookingStatus.CANCELLED
+      ? capturedShareOwedAfterCancellation({
+          bookingId: task.bookingId, taskId: task.id, booking: task.booking, shareCents: amountCents, clubZone: club.zone, store,
+        })
+      : Promise.resolve({ captureCents: amountCents, creditCents: 0 });
+
+  // #3949 review: on a joiner the organiser paid for by Internet Banking the share goes to the organiser, onto the
+  // child's mirror (`INV-PAY-137`); a cancelled one is refused by the netting first, as the card twin is.
+  if (settlementPayment !== null && reviewRefundGoesToGroupOrganiser(task)) {
+    const reviewMirror = await chooseReviewGroupSettlementMirrorRoute({ task, paymentId: settlementPayment.id, amountCents: (await owed()).captureCents, store });
+    if (reviewMirror) return reviewMirror;
+  }
+  if (settlementPayment !== null && editReviewRefundGoesBackOnCard(settlementPayment)) {
+    if (!bookingModificationId) {
+      throw new ManualBookingPaymentError(
+        REVIEW_SETTLEMENT_ANCHOR_MISSING_MESSAGE,
+        409,
+      );
+    }
+    const { captureCents: refundCents, creditCents: creditBackCents } = await owed();
+    // #4879 (`INV-PAY-150`), #5171 review: the frozen plan and both caps, under the owner's member key and
+    // the Payment row, around a live superseded capture's hold-back (`edit-financial-review-card-plan.ts`).
+    const slices = await planEditReviewCardRefund({
+      paymentId: settlementPayment.id, bookingId: task.bookingId, ownerMemberId: bookingOwner(task.booking).memberId,
+      refundCents, format: club.format, store, readOnlyPreview,
+    });
+    return {
+      kind: "stripe-refund",
+      paymentId: settlementPayment.id,
+      bookingModificationId,
+      allocation: slices,
+      refundCents,
+      creditBackCents,
+    };
+  }
+
+  if (settlementPaymentId !== null) {
+    // Internet banking, or any non-card capture: the club moves the money by hand
+    // and this records the ledger mirror of it, exactly as the legacy hand-back
+    // does. The cap lives inside `applyLocalRefundAllocation`, which runs INSIDE
+    // the caller's transaction - so its refusal rolls the claim back and leaves
+    // the task OPEN, which is the guarantee the pre-claim card cap above has to
+    // buy by hand.
+    const handBack = await owed();
+    // #3827 (`INV-PAY-117`): and, before the claim, the cash that actually goes
+    // back is net of open hand-backs. (#3835's netting can only shrink it.)
+    await assertByHandReviewRefundWithinUnpromisedCash(store, settlementPaymentId, handBack.captureCents);
+    return {
+      kind: "local-allocation",
+      paymentId: settlementPaymentId,
+      bookingModificationId,
+      refundCents: handBack.captureCents,
+      creditBackCents: handBack.creditCents,
+      ...(handedBackInCash ? { handedBackInCash: true as const } : {}),
+    };
+  }
+
+  if (!bookingModificationId) {
+    throw new ManualBookingPaymentError(
+      REVIEW_SETTLEMENT_ANCHOR_MISSING_MESSAGE,
+      409,
+    );
+  }
+
+  // Owner decision D-3032-1's obliged edge case - see
+  // `REVIEW_CREDIT_ANCHOR_TAKEN_MESSAGE` for why any pre-existing credit on the
+  // anchor is refused rather than treated as a replay.
+  const anchorCredit = await store.memberCredit.findUnique({
+    where: { sourceBookingModificationId: bookingModificationId },
+    select: { id: true },
+  });
+  if (anchorCredit) {
+    throw new ManualBookingPaymentError(REVIEW_CREDIT_ANCHOR_TAKEN_MESSAGE, 409);
+  }
+
+  return {
+    kind: "account-credit",
+    bookingModificationId,
+    // #5061 follow-up (`INV-PAY-154`): refused while a dispute holds that payment.
+    allocateAgainstPaymentId: await reviewCreditAllocationPaymentId(store, task.booking.payment),
+  };
+}
+
+/**
+ * #3032: everything a completed review has to do AFTER its transaction commits.
+ *
+ * The transaction is closed by the time this runs, which is the point:
+ * `AGENTS.md` and `docs/CONCURRENCY_AND_LOCKING.md` both forbid a provider round
+ * trip inside a database transaction, and this path is the one the locking guide
+ * singles out as deliberately holding no advisory lock for exactly that reason.
+ * The single-flight guarantee is the caller's status claim, which has already
+ * committed: a second completion of the task is refused by the status check, so
+ * nothing here can run twice for one task.
+ *
+ * A crash between that commit and these calls is NOT an accepted loss. The card
+ * route persisted its refund debt - the frozen per-transaction slices and the
+ * task-scoped Stripe key prefix - inside the caller's transaction, so the
+ * recovery cron replays exactly what this function would have sent. That is
+ * booking-cancel's #1349 arrangement and the reasoning transfers verbatim.
+ *
+ * Returns the Stripe refund id when one actually issued, and `null` otherwise -
+ * including when the provider call failed, because the caller turns that null
+ * into an honest message rather than a receipt. #3170 returns the additional
+ * PaymentIntent id on the same terms, for the same reason: "the member has been
+ * asked for $200" over an intent that was never minted is a false receipt in the
+ * opposite direction.
+ */
+export async function executeEditReviewSettlement({
+  bookingId,
+  taskId,
+  actingMemberId,
+  route,
+  amountCents,
+  accountCredit,
+  hasIssuedXeroInvoice,
+  bookingPaymentStatus,
+  bookingXeroInvoiceId = null,
+  format,
+  chargeInvoice = null,
+  ...handBackXero
+}: {
+  bookingId: string;
+  taskId: string;
+  actingMemberId: string;
+  route: EditReviewSettlementRoute | null;
+  amountCents: number | null;
+  /** #3791: what the account-credit route gave back and minted, else null. */
+  accountCredit: EditReviewAccountCreditOutcome | null;
+  /** #3791: the booking's primary invoice, which a cancelled booking still has. */
+  bookingXeroInvoiceId?: string | null;
+  hasIssuedXeroInvoice: boolean;
+  bookingPaymentStatus: string | null;
+  /** The club's format (#3565), resolved once by the caller, before its transaction. */
+  format: ClubFormat;
+  /** #3947: the `invoice` route's invoice, queued inside the completion's transaction. */
+  chargeInvoice?: QueuedEditReviewChargeInvoice | null;
+} & EditReviewHandBackXeroFacts): Promise<{
+  stripeRefundId: string | null;
+  additionalPaymentIntentId: string | null;
+  /** #4272: cancelled before the ask; `recorded` = this run wrote the record. */
+  chargeBookingCancelled?: { recorded: boolean };
+}> {
+  let stripeRefundId: string | null = null;
+
+  if (route?.kind === "late-capture-refund") {
+    stripeRefundId = await executeLateCaptureApprovalRefund({
+      bookingId,
+      taskId,
+      actingMemberId,
+      route,
+      amountCents: amountCents ?? 0,
+      format,
+    });
+  }
+
+  // #3949 review M1: no Xero note can be placed for a group child's refund to the organiser; the officers are told.
+  if (route?.kind === "group-settlement-mirror") await alertGroupMirrorRefundXeroByHand({ bookingId, taskId, refundCents: route.refundCents, format });
+
+  if (route?.kind === "stripe-refund" && route.refundCents > 0) {
+    // The card refund, its recovery row's close and its REFUNDED event (#3032, #4103).
+    stripeRefundId = await executeEditReviewCardRefund({ bookingId, taskId, actingMemberId, route, format });
+  }
+
+  // #3835: the applied-credit part of a cancelled booking's share, given back
+  // inside the completion's transaction (`giveBackCancelledShareCredit`).
+  if ((route?.kind === "stripe-refund" || route?.kind === "local-allocation") && route.creditBackCents > 0) {
+    await recordBookingEvent({
+      bookingId,
+      type: BookingEventType.CREDITED,
+      actorMemberId: actingMemberId,
+      amountCents: route.creditBackCents,
+      reason: "edit_financial_review_credited",
+    });
+  }
+
+  /**
+   * #3170: the charge direction, executed AFTER the commit for the same reason
+   * the refund is - the Stripe call is a provider round trip and the locking
+   * guide forbids one inside a transaction.
+   *
+   * NOTHING IS TAKEN FROM THE MEMBER'S CARD HERE. This raises the REQUEST: one
+   * additional PaymentIntent per EDIT and the PENDING `ADDITIONAL`
+   * PaymentTransaction row the club's whole additional-payment machinery keys off
+   * - the chase reminders, the resend service, the member's pay link. The member
+   * pays it themselves, exactly as they would for an ordinary check-out
+   * extension. That is why a failure here is recoverable rather than a lost
+   * charge: the debt is durable and the recovery cron replays the same
+   * re-derivation under the same edit-scoped key.
+   */
+  let additionalPaymentIntentId: string | null = null;
+  // #3170 (owner decision, 30 Aug 2026): the combined total of every share
+  // settled as money owed to the club against THIS EDIT - not `amountCents`,
+  // which is this one task's share. Both legs of the edit read it, so they can
+  // never disagree. Null on every route that is not a charge.
+  let chargeTotalCents: number | null = null;
+  if (route?.kind === "additional-charge") {
+    const charged = await executeEditReviewCharge({
+      format,
+      bookingId,
+      taskId,
+      route,
+    });
+    additionalPaymentIntentId = charged.paymentIntentId;
+    chargeTotalCents = charged.totalCents;
+    // #4272: a booking cancelled after the commit gets no Xero leg, whatever the
+    // sync answered: its invoice would wait on a request never raised. The
+    // share is recorded by the sync or the recovery row's cancelled path.
+    if (charged.outcome === "booking-cancelled") {
+      return { stripeRefundId, additionalPaymentIntentId, chargeBookingCancelled: { recorded: charged.recordedUncollected === true } };
+    }
+    if (route.collectVia === "stripe" && (await readBookingHasEnded(bookingId)) /* #4272, #4316: ended now, after the commit */) return { stripeRefundId, additionalPaymentIntentId };
+  }
+
+  // #3791: an account-credit share's event and Xero leg - given back, minted,
+  // or on a cancelled booking - are its own, after the commit as everything here.
+  if (route?.kind === "account-credit" && accountCredit) {
+    await finishEditReviewAccountCredit({
+      bookingId,
+      taskId,
+      actingMemberId,
+      bookingModificationId: route.bookingModificationId,
+      outcome: accountCredit,
+      hasIssuedXeroInvoice,
+      bookingXeroInvoiceId,
+      bookingPaymentStatus,
+    });
+    return { stripeRefundId, additionalPaymentIntentId };
+  }
+
+  // #3947: the `invoice` route's invoice was queued inside the completion's
+  // transaction, so the dispatch below must not restate or enqueue it again;
+  // what is left is the kick and the short-ask record.
+  if (route?.kind === "additional-charge" && route.collectVia === "invoice" && chargeInvoice) {
+    await finishEditReviewChargeInvoice({
+      queued: chargeInvoice,
+      bookingId,
+      taskId,
+      bookingModificationId: route.bookingModificationId,
+      shareCents: amountCents,
+      memberId: route.member?.id ?? null,
+      actingMemberId,
+      format,
+    });
+    return { stripeRefundId, additionalPaymentIntentId };
+  }
+
+  /**
+   * The Xero leg, which the issue's "through the existing canonical settlement
+   * path" includes: the officer's direction becomes a signed delta, an invoice
+   * this edit already has queued is raised rather than duplicated, and a share
+   * the accounting ask could not take is recorded. It lives in
+   * `edit-financial-review-xero-leg.ts` because those three are one decision
+   * about one edit's one invoice, while everything above here is money MOVING.
+   *
+   * Awaited, but nothing inside it holds the request open: the dispatch itself
+   * is fire-and-forget, exactly as it was inline.
+   */
+  await dispatchEditReviewXeroSettlement({
+    format,
+    bookingId,
+    taskId,
+    actingMemberId,
+    route,
+    amountCents,
+    chargeTotalCents,
+    hasIssuedXeroInvoice,
+    bookingPaymentStatus,
+    ...handBackXero,
+    additionalPaymentIntentId,
+  });
+
+  return { stripeRefundId, additionalPaymentIntentId };
+}

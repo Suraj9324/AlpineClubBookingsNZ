@@ -1,0 +1,321 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { AlertTriangle, Bug, Camera, LoaderCircle, Send, X } from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import { captureViewportScreenshotWithFallbacks } from "@/lib/report-issue-screenshot-capture";
+
+const SCROLL_KEYS = new Set([
+  " ",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "End",
+  "Home",
+  "PageDown",
+  "PageUp",
+]);
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+export function ReportIssueWidget({
+  avoidDesktopSidebar = false,
+}: {
+  avoidDesktopSidebar?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [capturing, setCapturing] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [description, setDescription] = useState("");
+  const [pageUrl, setPageUrl] = useState("");
+  const [pageTitle, setPageTitle] = useState("");
+  const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
+  const [captureError, setCaptureError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!capturing) {
+      return;
+    }
+
+    const preventScroll = (event: Event) => {
+      if (event.cancelable) {
+        event.preventDefault();
+      }
+    };
+    const preventKeyboardScroll = (event: KeyboardEvent) => {
+      if (SCROLL_KEYS.has(event.key) && event.cancelable) {
+        event.preventDefault();
+      }
+    };
+    const options = { capture: true, passive: false } as AddEventListenerOptions;
+
+    document.addEventListener("wheel", preventScroll, options);
+    document.addEventListener("touchmove", preventScroll, options);
+    document.addEventListener("keydown", preventKeyboardScroll, true);
+
+    return () => {
+      document.removeEventListener("wheel", preventScroll, options);
+      document.removeEventListener("touchmove", preventScroll, options);
+      document.removeEventListener("keydown", preventKeyboardScroll, true);
+    };
+  }, [capturing]);
+
+  function resetForm() {
+    setDescription("");
+    setPageUrl("");
+    setPageTitle("");
+    setScreenshotDataUrl(null);
+    setCaptureError(null);
+  }
+
+  async function runCapture(options?: { closeDialogFirst?: boolean }) {
+    setCapturing(true);
+    setCaptureError(null);
+
+    try {
+      if (options?.closeDialogFirst) {
+        setOpen(false);
+        await sleep(180);
+      }
+
+      setPageUrl(window.location.href);
+      setPageTitle(document.title);
+
+      await nextFrame();
+      await nextFrame();
+      const dataUrl = await captureViewportScreenshotWithFallbacks();
+      setScreenshotDataUrl(dataUrl);
+    } catch (error) {
+      setCaptureError(
+        error instanceof Error
+          ? error.message
+          : "Automatic screenshot capture failed. You can still submit the report."
+      );
+    } finally {
+      setCapturing(false);
+      setOpen(true);
+    }
+  }
+
+  async function startReport() {
+    resetForm();
+    await runCapture();
+  }
+
+  async function handleSubmit() {
+    const trimmedDescription = description.trim();
+    if (trimmedDescription.length < 10) {
+      toast.error("Please describe the issue in a bit more detail.");
+      return;
+    }
+
+    setSubmitting(true);
+
+    try {
+      const response = await fetch("/api/issue-reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pageUrl,
+          pageTitle,
+          description: trimmedDescription,
+          screenshotDataUrl: screenshotDataUrl ?? undefined,
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(data?.error ?? "Failed to submit issue report");
+      }
+
+      toast.success("Issue report submitted.");
+      resetForm();
+      setOpen(false);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to submit issue report"
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <>
+      {capturing ? (
+        <div
+          className="fixed inset-0 z-[49] cursor-progress touch-none"
+          aria-hidden="true"
+          data-report-issue-ignore="true"
+        />
+      ) : null}
+      <div
+        className={
+          avoidDesktopSidebar
+            ? "fixed bottom-20 right-5 z-50 sm:bottom-6 sm:left-6 sm:right-auto md:left-[16.5rem]"
+            : "fixed bottom-20 right-5 z-50 sm:bottom-6 sm:left-6 sm:right-auto"
+        }
+        data-report-issue-ignore="true"
+      >
+        <Button
+          type="button"
+          size="sm"
+          className="gap-2 rounded-full px-4 shadow-lg"
+          disabled={capturing}
+          onClick={startReport}
+          // The words are hidden below `sm:`, which left the icon-only phone
+          // button unnamed (#4466, axe button-name).
+          aria-label={capturing ? "Capturing..." : "Report issue"}
+        >
+          {capturing ? (
+            <LoaderCircle className="h-4 w-4 animate-spin" />
+          ) : (
+            <Bug className="h-4 w-4" />
+          )}
+          <span className="hidden sm:inline">
+            {capturing ? "Capturing..." : "Report issue"}
+          </span>
+        </Button>
+      </div>
+
+      <Dialog open={open} onOpenChange={(nextOpen) => !submitting && setOpen(nextOpen)}>
+        <DialogContent
+          className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"
+          data-report-issue-ignore="true"
+        >
+          <DialogHeader>
+            <DialogTitle>Report an Issue</DialogTitle>
+            <DialogDescription>
+              Describe what went wrong on this page. The current view is captured automatically when possible.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="rounded-lg border border-border bg-card p-3 text-sm text-muted-foreground">
+              <p className="font-medium text-foreground">{pageTitle || "Current page"}</p>
+              <p className="mt-1 break-all text-xs text-muted-foreground">{pageUrl}</p>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                  <Camera className="h-4 w-4" />
+                  Screenshot
+                </div>
+                <div className="flex items-center gap-2">
+                  {screenshotDataUrl ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
+                      onClick={() => setScreenshotDataUrl(null)}
+                      disabled={capturing || submitting}
+                    >
+                      <X className="h-4 w-4" />
+                      Remove
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => runCapture({ closeDialogFirst: true })}
+                    disabled={capturing || submitting}
+                  >
+                    {capturing ? "Retaking..." : "Retake"}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-warning-6 bg-warning-3 p-3 text-sm text-warning-11">
+                Screenshots may include names, booking details, or payment context visible on the page.
+              </div>
+
+              {screenshotDataUrl ? (
+                <div className="overflow-hidden rounded-lg border border-border bg-muted">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={screenshotDataUrl}
+                    alt="Page screenshot preview"
+                    className="block w-full"
+                  />
+                </div>
+              ) : (
+                <div className="rounded-lg border border-dashed border-border bg-card p-4 text-sm text-muted-foreground">
+                  No screenshot captured yet.
+                </div>
+              )}
+
+              {captureError ? (
+                <div className="flex items-start gap-2 rounded-lg border border-warning-6 bg-warning-3 p-3 text-sm text-warning-11">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <p>{captureError}</p>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="issue-description" className="text-sm font-medium text-foreground">
+                What happened?
+              </label>
+              <Textarea
+                id="issue-description"
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                placeholder="Tell us what you expected, what happened instead, and any steps that reproduce it."
+                className="min-h-32"
+                maxLength={2000}
+                disabled={submitting}
+              />
+              <p className="text-xs text-muted-foreground">{description.length}/2000</p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setOpen(false)}
+              disabled={submitting}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              className="gap-2"
+              onClick={handleSubmit}
+              disabled={submitting || capturing}
+            >
+              {submitting ? (
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+              ) : (
+                <Send className="h-4 w-4" />
+              )}
+              {submitting ? "Submitting..." : "Submit report"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}

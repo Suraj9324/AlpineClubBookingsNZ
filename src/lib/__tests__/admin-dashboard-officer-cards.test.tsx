@@ -1,0 +1,702 @@
+import { renderToStaticMarkup } from "react-dom/server";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    // #3372 (owner, 7 Oct 2026): Refunds owed / Credits owed, as at today.
+    manualRefundTask: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    memberCredit: { groupBy: vi.fn(async (): Promise<unknown[]> => []) },
+    // #3372 (7 Oct 2026): card refunds not yet paid, for "Refunds owed".
+    paymentRecoveryOperation: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+    // The club-time delegate. `loadPersistedClubTimeSettings` returns `null`
+    // when it is ABSENT, and the page then falls back to the environment — the
+    // very defect CT-4 removes, silently, with nothing able to tell. Every test
+    // here leaves it resolving `null`, which reproduces the no-row fallback and
+    // keeps their expectations unchanged; the zone-authority test supplies a row.
+    clubTimeSettings: { findUnique: vi.fn() },
+    member: { count: vi.fn(), findUnique: vi.fn() },
+    booking: { count: vi.fn(), findMany: vi.fn() },
+    choreAssignment: { findMany: vi.fn() },
+    bedAllocation: { findMany: vi.fn() },
+    // #3372: the revenue card reads the month's payment rows with each
+    // booking's `deletedAt`, which the one Net Collected booking scope reads.
+    // The write delegates exist only so the display-only pin below can assert
+    // they were never reached; a call on a missing delegate would throw
+    // instead, which is a crash rather than an assertion.
+    payment: {
+      findMany: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+      create: vi.fn(),
+      upsert: vi.fn(),
+      delete: vi.fn(),
+    },
+    lodge: { count: vi.fn() },
+  },
+}));
+
+vi.mock("@/lib/auth", () => ({
+  auth: vi.fn(),
+}));
+
+// #4962: the attention cards read the one work-queue counter the sidebar's
+// Needs Attention badges read; its queries are pinned in
+// admin-pending-counts.test.ts.
+vi.mock("@/lib/admin-pending-counts", () => ({
+  getAdminPendingCounts: vi.fn(),
+}));
+
+// Partial mock: only the query is faked. coverageNeedsLodgeContext and
+// coverageLodgeLabel are pure functions over the rows and the lodge count this
+// suite supplies, so mocking them would only let the suite disagree with
+// production about when a lodge name is shown (#2917).
+vi.mock("@/lib/hut-leader-coverage", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/hut-leader-coverage")),
+  // #3818: the amber card and "Handovers this week" come from one read.
+  getHutLeaderDashboardCoverage: vi.fn(),
+}));
+
+// The Bed Allocation card needs the module on as well as the permission
+// (#3841). On by default here; the module-off test turns it off.
+vi.mock("@/lib/module-settings", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/module-settings")),
+  loadEffectiveModuleFlags: vi.fn(),
+}));
+
+import AdminDashboardPage from "@/app/(admin)/admin/dashboard/page";
+import { getAdminPendingCounts } from "@/lib/admin-pending-counts";
+import { ZERO_ADMIN_PENDING_COUNTS } from "@/lib/admin-work-queues";
+import { loadEffectiveModuleFlags } from "@/lib/module-settings";
+import type { AdminPermissionMatrix } from "@/lib/admin-permissions";
+import { auth } from "@/lib/auth";
+import { addDaysDateOnly, getTodayDateOnly } from "@/lib/date-only";
+import {
+  getHutLeaderDashboardCoverage,
+} from "@/lib/hut-leader-coverage";
+import { prisma } from "@/lib/prisma";
+import {
+  NET_COLLECTED_SCOPE_FIXTURE,
+  NET_COLLECTED_SCOPE_PAYMENTS,
+  creditBalanceGroupRows,
+  refundsOwedTaskRows,
+  netCollectedFixtureBooking,
+  netCollectedFixtureEvidence,
+} from "@/lib/__tests__/helpers/net-collected-scope-fixture";
+import {
+  netCollectedBookingSelect,
+  netCollectedCaptureEvidenceSelect,
+  netCollectedCardRefundSelect,
+} from "@/lib/additional-ledger-gap";
+
+/*
+ * The club's day the fixtures below are built in (#3123). The dashboard takes
+ * its own from `clubTime()` and `getUnassignedHutLeaderDates` from
+ * `clubTodayDateOnlyInstant()`; this suite's `clubTimeSettings.findUnique`
+ * resolves `null`, so both fall back to `APP_TIME_ZONE` — `Pacific/Auckland`
+ * under test. The roster fixtures have to sit in the same zone as the window
+ * they are counted against. Zone authority is not this file's subject.
+ */
+const CLUB_ZONE = "Pacific/Auckland";
+
+// getStats booking.count call order (roster + bed counts no longer use
+// booking.count — they now run through window-scoped helpers that findMany
+// bookings + choreAssignments / bedAllocations): totalBookings, activeBookings,
+// upcomingCheckIns. Every work-queue count comes from getAdminPendingCounts
+// (#4962), all zero unless a test says otherwise.
+function mockPendingCounts(
+  counts: Partial<Awaited<ReturnType<typeof getAdminPendingCounts>>>,
+) {
+  vi.mocked(getAdminPendingCounts).mockResolvedValue({
+    ...ZERO_ADMIN_PENDING_COUNTS,
+    unavailable: [],
+    ...counts,
+  });
+}
+
+function mockStats() {
+  vi.mocked(auth).mockResolvedValue({ user: { id: "admin-1" } } as any);
+  vi.mocked(prisma.member.count)
+    .mockResolvedValueOnce(50) // totalMembers
+    .mockResolvedValueOnce(42) // activeMembers
+    .mockResolvedValueOnce(8); // inactiveMembers
+  vi.mocked(prisma.booking.count)
+    .mockResolvedValueOnce(120) // totalBookings
+    .mockResolvedValueOnce(15) // activeBookings
+    .mockResolvedValueOnce(7); // upcomingCheckIns
+  mockPendingCounts({});
+
+  // The reworked officer-card counts compute over real fixtures so the headline
+  // reconciles with each surface's own semantics (#2091 review). A single guest
+  // stays THREE of the next seven nights with no chore assignment → 4 roster
+  // days needing chores (#2631: the three nights plus the checkout morning,
+  // when the beds get stripped and the kitchen shut down); three guests each
+  // have an unallocated bed-night in the window → 3 guests awaiting a bed.
+  //
+  // #2628: BOTH helpers expand the canonical `BookingGuestNight` rows, not the
+  // derived stayStart/stayEnd envelope, so every guest below carries the night
+  // rows a real guest has. The envelope stays alongside them because it is what
+  // the Prisma where-clauses select on, and because the two must agree for a
+  // contiguous stay — which is the whole point of writing both out here.
+  const today = getTodayDateOnly(CLUB_ZONE);
+  const plus1 = addDaysDateOnly(today, 1);
+  const plus2 = addDaysDateOnly(today, 2);
+  const plus3 = addDaysDateOnly(today, 3);
+
+  const rosterBookings = [
+    {
+      id: "rb1",
+      checkIn: today,
+      checkOut: plus3,
+      guests: [
+        {
+          stayStart: today,
+          stayEnd: plus3,
+          ageTier: null,
+          // The three nights the envelope [today, plus3) describes. This used to
+          // be `[]`, which made the count come out right only by falling through
+          // to the legacy envelope branch — the branch a guest with real night
+          // rows never reaches — so the fixture agreed with the assertion while
+          // exercising none of the code the roster card actually runs (#2628).
+          nights: [{ stayDate: today }, { stayDate: plus1 }, { stayDate: plus2 }],
+        },
+      ],
+    },
+  ];
+  const bedBookings = [
+    // One night each (the envelope [today, plus1) is a single night), none of
+    // them allocated below, so all three guests are awaiting a bed.
+    {
+      id: "bb1",
+      guests: [
+        {
+          id: "g1",
+          stayStart: today,
+          stayEnd: plus1,
+          nights: [{ stayDate: today }],
+        },
+        {
+          id: "g2",
+          stayStart: today,
+          stayEnd: plus1,
+          nights: [{ stayDate: today }],
+        },
+        {
+          id: "g3",
+          stayStart: today,
+          stayEnd: plus1,
+          nights: [{ stayDate: today }],
+        },
+      ],
+    },
+  ];
+
+  // booking.findMany serves three callers; route by the where-clause each uses:
+  // the bed helper is the only one filtering wholeLodgeHold, the roster helper
+  // the only other one carrying a status set, and Recent Bookings carries
+  // neither.
+  vi.mocked(prisma.booking.findMany).mockImplementation((args: any) => {
+    const where = args?.where ?? {};
+    if (where.wholeLodgeHold === false) return Promise.resolve(bedBookings) as any;
+    if (where.status) return Promise.resolve(rosterBookings) as any;
+    return Promise.resolve([]) as any; // Recent Bookings
+  });
+  vi.mocked(prisma.choreAssignment.findMany).mockResolvedValue([] as any);
+  vi.mocked(prisma.bedAllocation.findMany).mockResolvedValue([] as any);
+
+  // #3372: the month's payments. The default fixture is the partly-refunded
+  // booking behind the #3340 misreading: $130.00 captured, $65.00 refunded.
+  // The card's headline must be the $65.00 net, never the $130.00 it took. A
+  // PENDING payment rides along so the card is seen to leave uncaptured money
+  // out.
+  vi.mocked(prisma.payment.findMany).mockResolvedValue([
+    {
+      status: "PARTIALLY_REFUNDED",
+      amountCents: 13_000,
+      refundedAmountCents: 6_500,
+      // Paid by card, with a captured ledger row: the capture evidence a
+      // refunded status needs to count (#3372).
+      source: "STRIPE",
+      _count: { transactions: 1 },
+      recoveryOperations: [],
+      refunds: [],
+      booking: { deletedAt: null, manualRefundTasks: [] },
+    },
+    {
+      status: "PENDING",
+      amountCents: 90_000,
+      refundedAmountCents: 0,
+      recoveryOperations: [],
+      refunds: [],
+      booking: { deletedAt: null, manualRefundTasks: [] },
+    },
+  ] as any);
+  // A single-lodge club unless a test says otherwise: the Presentation Rule is
+  // keyed on the club's active-lodge count (#2917 review), so this is what
+  // decides whether the card names lodges at all.
+  vi.mocked(prisma.lodge.count).mockResolvedValue(1);
+  // Empty so the "assignment required" attention card stays hidden — this suite
+  // isolates the officer key cards, and /admin/hut-leaders would otherwise also
+  // be linked from that attention card.
+  vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({
+    unassignedDates: [],
+    handovers: [],
+  });
+}
+
+// Resolve the actor through the accessRoles-derivation path production actually
+// uses (the dashboard's actor select carries accessRoles only — never an
+// embedded adminPermissionMatrix), by attaching a definition-backed custom role
+// whose per-area levels produce the requested matrix (#2091 review).
+function mockActorMatrix(matrix: Partial<AdminPermissionMatrix>) {
+  const roleDefinition = Object.fromEntries(
+    Object.entries(matrix).map(([area, level]) => [
+      `${area}Level`,
+      level === "edit" ? "EDIT" : level === "view" ? "VIEW" : "NONE",
+    ]),
+  );
+  vi.mocked(prisma.member.findUnique).mockResolvedValue({
+    id: "admin-1",
+    canLogin: true,
+    accessRoles: [{ role: null, roleDefinition }],
+  } as any);
+}
+
+describe("admin dashboard officer key cards", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prisma.clubTimeSettings.findUnique).mockResolvedValue(null);
+    vi.mocked(loadEffectiveModuleFlags).mockResolvedValue({
+      bedAllocation: true,
+    } as Awaited<ReturnType<typeof loadEffectiveModuleFlags>>);
+    mockStats();
+  });
+
+  it("hides the Bed Allocation card and skips its count when the module is off (#3841)", async () => {
+    vi.mocked(loadEffectiveModuleFlags).mockResolvedValue({
+      bedAllocation: false,
+    } as Awaited<ReturnType<typeof loadEffectiveModuleFlags>>);
+    mockActorMatrix({
+      overview: "edit",
+      bookings: "edit",
+      membership: "edit",
+      finance: "edit",
+      lodge: "edit",
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).not.toContain('href="/admin/bed-allocation"');
+    expect(html).not.toContain("awaiting a bed");
+    // The count's own read never runs, so no guest is reported as awaiting.
+    expect(prisma.bedAllocation.findMany).not.toHaveBeenCalled();
+    // The other officer cards are unaffected.
+    expect(html).toContain('href="/admin/roster"');
+  });
+
+  it("renders all four officer cards with actionable counts for a full admin", async () => {
+    mockActorMatrix({
+      overview: "edit",
+      bookings: "edit",
+      membership: "edit",
+      finance: "edit",
+      lodge: "edit",
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    // Four officer surfaces linked from the primary row.
+    expect(html).toContain('href="/admin/bookings?upcoming=7"');
+    expect(html).toContain('href="/admin/hut-leaders"');
+    expect(html).toContain('href="/admin/roster"');
+    expect(html).toContain('href="/admin/bed-allocation"');
+
+    // Officer-card-unique copy and headline counts.
+    expect(html).toContain("checking in within 7 days");
+    expect(html).toContain("Roster Assignment");
+    // #2631: DAYS, not nights. A changeover morning whose guests all leave
+    // before midday is a real day of chores and is counted here.
+    expect(html).toContain("days in the next 7 days with no chores assigned");
+    expect(html).toContain("Bed Allocation");
+    expect(html).toContain("guests in the next 7 days awaiting a bed");
+    expect(html).toContain(">7</div>"); // upcoming check-ins
+    expect(html).toContain(">4</div>"); // roster days needing chores (#2631)
+    expect(html).toContain(">3</div>"); // guests awaiting a bed
+
+    // Slim secondary row keeps Members + Net Collected.
+    expect(html).toContain("Net Collected This Month");
+    expect(html).toContain("active of 50 total");
+  });
+
+  /*
+    #3372 — the rendered half of #3340. In the live incident the officer read a
+    partly-refunded booking as "paid $130, $300 to pay" because a screen showed
+    the gross figure under a label that meant net. This card is titled "Net
+    Collected", so its headline is captured less refunded and credited, through
+    the `summarizeCollectedCash` derivation the payments board and Reports also
+    read. The gross and the refund print beneath, in exact cents, so the
+    arithmetic is on the card.
+  */
+  it("headlines Net Collected This Month NET of refunds, with gross and refunded beneath", async () => {
+    mockActorMatrix({ overview: "edit", finance: "edit" });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    // $130.00 captured, $65.00 refunded → $65.00 net. The headline is exact
+    // cents (`money.cents`), like the breakdown beneath it, so the card's
+    // arithmetic adds up; `$130.00` may appear only in the breakdown line.
+    expect(html).toContain(">$65.00</div>");
+    expect(html).not.toContain(">$65</div>");
+    expect(html).not.toContain(">$130.00</div>");
+    // The breakdown is EXACT cents, never two rounded figures that could
+    // disagree with the headline by a dollar.
+    expect(html).toContain(">$130.00 paid, $65.00 refunded or credited</p>");
+    // The subline says what the figure is, makes no claim about when the money
+    // arrived, and no longer claims "succeeded payments" — the status set that
+    // dropped a partly-refunded payment.
+    expect(html).toContain("payments recorded this month, less refunds and credits on them");
+    expect(html).not.toContain("from succeeded payments");
+    expect(html).not.toContain("Revenue This Month");
+    // The $900.00 PENDING group is uncaptured money and never reaches the card.
+    expect(html).not.toContain("$900");
+    expect(html).not.toContain("$965");
+
+    // The one query reads the month's payments; the status AND booking-scope
+    // decisions are the derivation's, not the page's, so the query passes no
+    // `status` or booking filter and loads the booking's `deletedAt`.
+    expect(vi.mocked(prisma.payment.findMany)).toHaveBeenCalledTimes(1);
+    const [findManyArgs] = vi.mocked(prisma.payment.findMany).mock.calls[0] as unknown as [
+      { select: Record<string, unknown>; where: Record<string, unknown> },
+    ];
+    expect(findManyArgs.select).toEqual({
+      status: true,
+      amountCents: true,
+      refundedAmountCents: true,
+      // Net Collected's capture evidence (#3372, owner's rule on PR #3811).
+      ...netCollectedCaptureEvidenceSelect,
+      // Card refunds not yet paid, and the refunds that net them (#3372, 7 Oct 2026).
+      ...netCollectedCardRefundSelect,
+      // The one shared booking select (#3372, owner decision 3 Oct 2026).
+      booking: { select: netCollectedBookingSelect },
+    });
+    expect(findManyArgs.where).not.toHaveProperty("status");
+    expect(findManyArgs.where).not.toHaveProperty("booking");
+
+    // Display only (#3372 acceptance): the render changes no stored value.
+    expect(prisma.payment.update).not.toHaveBeenCalled();
+    expect(prisma.payment.updateMany).not.toHaveBeenCalled();
+    expect(prisma.payment.create).not.toHaveBeenCalled();
+    expect(prisma.payment.upsert).not.toHaveBeenCalled();
+    expect(prisma.payment.delete).not.toHaveBeenCalled();
+  });
+
+  it("omits the breakdown line when nothing on the month's payments was refunded", async () => {
+    mockActorMatrix({ overview: "edit", finance: "edit" });
+    vi.mocked(prisma.payment.findMany).mockResolvedValue([
+      {
+        status: "SUCCEEDED",
+        amountCents: 123_400,
+        refundedAmountCents: 0,
+        recoveryOperations: [],
+        refunds: [],
+        booking: { deletedAt: null, manualRefundTasks: [] },
+      },
+    ] as any);
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain(">$1,234.00</div>");
+    expect(html).not.toContain(" paid, ");
+    expect(html).not.toContain("refunded or credited");
+  });
+
+  /*
+    #3372, owner decision A: the one Net Collected booking scope. The shared
+    fixture - a cancelled booking that kept a $50.00 fee, and a soft-deleted
+    booking's $70.00 capture - reads $50.00 here, on the payments tile and on
+    Reports. The dashboard used to count the deleted booking too ($120.00).
+  */
+  it("counts a cancelled booking's kept fee and leaves a deleted booking out, like every Net Collected figure", async () => {
+    mockActorMatrix({ overview: "edit", finance: "edit" });
+    vi.mocked(prisma.manualRefundTask.findMany).mockResolvedValue(refundsOwedTaskRows() as any);
+    vi.mocked(prisma.memberCredit.groupBy).mockResolvedValue(creditBalanceGroupRows() as any);
+    vi.mocked(prisma.payment.findMany).mockResolvedValue(
+      NET_COLLECTED_SCOPE_PAYMENTS.map((payment) => ({
+        status: payment.status,
+        amountCents: payment.amountCents,
+        refundedAmountCents: payment.refundedAmountCents,
+        ...netCollectedFixtureEvidence(payment),
+        booking: netCollectedFixtureBooking(payment),
+      })) as any,
+    );
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(NET_COLLECTED_SCOPE_FIXTURE.expectedNetCollectedCents).toBe(24_500);
+    expect(html).toContain(">$245.00</div>");
+    // The breakdown is over the same in-scope payments: the deleted booking's
+    // $70.00 is in no figure, the never-paid booking's $200.00 and its $30.00
+    // mirror refund in none either, the fully refunded booking's $120.00 is
+    // paid and refunded alike, the live booking's open $50.00 edit refund is
+    // owed back like the cancellation's $75.00, and the line adds up to the
+    // headline: 620 - 270 - 125 + 20 = 245.
+    expect(html).toContain(
+      ">$620.00 paid, $270.00 refunded or credited, $125.00 owed back by hand, plus $20.00 account credit kept on cancellation</p>",
+    );
+    // Beside it, as at today and club-wide (owner, 7 Oct 2026).
+    expect(html).toContain('<dt class="text-muted-foreground">Refunds owed</dt><dd class="font-medium text-foreground">$165.00</dd>');
+    expect(html).toContain('<dt class="text-muted-foreground">Credits owed</dt><dd class="font-medium text-foreground">$85.00</dd>');
+    expect(html).toContain("As at today, across the club");
+  });
+
+  it("hides officer cards whose target page the actor cannot open", async () => {
+    // Lodge-only officer: sees Hut Leader + Roster (lodge area), never the
+    // Bookings / Bed Allocation cards (bookings area) or the Members / Revenue
+    // secondary row (membership / finance areas).
+    mockActorMatrix({ overview: "view", lodge: "edit" });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain('href="/admin/hut-leaders"');
+    expect(html).toContain("Roster Assignment");
+    // Bookings-area officer cards are gone.
+    expect(html).not.toContain('href="/admin/bed-allocation"');
+    expect(html).not.toContain("Bed Allocation");
+    expect(html).not.toContain('href="/admin/bookings?upcoming=7"');
+    expect(html).not.toContain("checking in within 7 days");
+    // Secondary row is entirely hidden.
+    expect(html).not.toContain("Net Collected This Month");
+  });
+
+  it("renders with no officer or secondary cards when the actor has no area access", async () => {
+    mockActorMatrix({ overview: "view" });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    // Page still renders its shell and Recent Bookings without throwing.
+    expect(html).toContain("Admin Dashboard");
+    expect(html).toContain("Recent Bookings");
+    expect(html).not.toContain("Roster Assignment");
+    expect(html).not.toContain("Bed Allocation");
+    expect(html).not.toContain("checking in within 7 days");
+    expect(html).not.toContain("Net Collected This Month");
+  });
+});
+
+/**
+ * The officer-facing half of #2917: the coverage result is now one row per
+ * uncovered LODGE-night, and the card has to be readable for both club shapes.
+ */
+describe("admin dashboard hut-leader coverage card", () => {
+  function uncoveredLodgeNight(
+    date: string,
+    lodgeId: string,
+    lodgeName: string,
+    lodgeActive = true,
+  ) {
+    return {
+      date,
+      lodgeId,
+      lodgeName,
+      lodgeActive,
+      bookingCount: 1,
+      guestCount: 2,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prisma.clubTimeSettings.findUnique).mockResolvedValue(null);
+    mockStats();
+    // #4962: the card shows only to an actor who can open the queue it links
+    // to, the same rule the sidebar's Needs Attention entry follows.
+    mockActorMatrix({ overview: "view", lodge: "view" });
+    // ...and only while the hut-leaders module is on.
+    vi.mocked(loadEffectiveModuleFlags).mockResolvedValue({
+      hutLeaders: true,
+    } as Awaited<ReturnType<typeof loadEffectiveModuleFlags>>);
+  });
+
+  it("names each lodge and counts lodge-nights when two lodges are uncovered on one night", async () => {
+    vi.mocked(prisma.lodge.count).mockResolvedValue(2);
+    // The sidebar badge's number, from the same coverage read (#4962).
+    mockPendingCounts({ unassignedHutLeaderDates: 2 });
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({
+      unassignedDates: [
+        uncoveredLodgeNight("2026-07-05", "lodge-a", "Alpine Lodge"),
+        uncoveredLodgeNight("2026-07-05", "lodge-b", "Basin Lodge"),
+      ],
+      handovers: [],
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    // One night, two lodges, two pieces of work — and the officer is told
+    // where to send someone rather than just how many.
+    expect(html).toContain("2 upcoming lodge-nights");
+    expect(html).toContain(
+      "5 Jul · 2 guests (Alpine Lodge); 5 Jul · 2 guests (Basin Lodge)",
+    );
+  });
+
+  it("STILL NAMES THE LODGE ON A MULTI-LODGE CLUB WHOSE GAPS ALL SIT AT ONE LODGE", async () => {
+    // Three active lodges; Basin and Ridge are covered for the whole lookahead,
+    // so every row is Alpine's. Keying the label on the result would print bare
+    // dates here — the rejected Option B outcome — and would flip the wording the
+    // moment Basin lost cover (#2917 review). It is keyed on the club instead.
+    vi.mocked(prisma.lodge.count).mockResolvedValue(3);
+    // The sidebar badge's number, from the same coverage read (#4962).
+    mockPendingCounts({ unassignedHutLeaderDates: 2 });
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({
+      unassignedDates: [
+        uncoveredLodgeNight("2026-07-05", "lodge-a", "Alpine Lodge"),
+        uncoveredLodgeNight("2026-07-06", "lodge-a", "Alpine Lodge"),
+      ],
+      handovers: [],
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain("2 upcoming lodge-nights");
+    expect(html).toContain(
+      "5 Jul · 2 guests (Alpine Lodge); 6 Jul · 2 guests (Alpine Lodge)",
+    );
+  });
+
+  it("marks a night at an ARCHIVED lodge, even on a club with one active lodge", async () => {
+    // The lodge was deactivated with `force` while it still had future bookings,
+    // so its guests still arrive and still need a leader — and the workspace's
+    // lodge selector cannot offer it, which is why the label says so.
+    vi.mocked(prisma.lodge.count).mockResolvedValue(1);
+    // The sidebar badge's number, from the same coverage read (#4962).
+    mockPendingCounts({ unassignedHutLeaderDates: 1 });
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({
+      unassignedDates: [
+        uncoveredLodgeNight("2026-07-05", "lodge-b", "Basin Lodge", false),
+      ],
+      handovers: [],
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain("5 Jul · 2 guests (Basin Lodge, archived)");
+  });
+
+  it("holds ONE number for uncovered nights: the attention card, the officer card and the list agree (#4962 review)", async () => {
+    vi.mocked(prisma.lodge.count).mockResolvedValue(1);
+    // A counter that scanned for itself would answer 99 here. The dashboard hands
+    // the counter the coverage read it already holds, so the registry's number is
+    // that read's length, and the page cannot show 3 beside a list of 2.
+    vi.mocked(getAdminPendingCounts).mockImplementation(async (input) => ({
+      ...ZERO_ADMIN_PENDING_COUNTS,
+      unassignedHutLeaderDates:
+        (await input?.supplied?.unassignedHutLeaderDates) ?? 99,
+      unavailable: [],
+    }));
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({
+      unassignedDates: [
+        uncoveredLodgeNight("2026-07-05", "lodge-a", "Alpine Lodge"),
+        uncoveredLodgeNight("2026-07-06", "lodge-a", "Alpine Lodge"),
+        uncoveredLodgeNight("2026-07-07", "lodge-a", "Alpine Lodge"),
+      ],
+      handovers: [],
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain("3 upcoming nights with guests but no hut leader who counts");
+    expect(html).toContain('aria-label="3 waiting"');
+    expect(html).not.toContain('aria-label="99 waiting"');
+    // The Hut Leader Assignment officer card beside it: the same 3.
+    expect(html).toMatch(
+      />3<\/div><p[^>]*>upcoming nights with guests but no hut leader staying/,
+    );
+    // One read of the coverage for the whole page.
+    expect(vi.mocked(getHutLeaderDashboardCoverage)).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a single-lodge club the bare dates and the plain wording it saw before", async () => {
+    vi.mocked(prisma.lodge.count).mockResolvedValue(1);
+    // The sidebar badge's number, from the same coverage read (#4962).
+    mockPendingCounts({ unassignedHutLeaderDates: 2 });
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({
+      unassignedDates: [
+        uncoveredLodgeNight("2026-07-05", "lodge-a", "Alpine Lodge"),
+        uncoveredLodgeNight("2026-07-06", "lodge-a", "Alpine Lodge"),
+      ],
+      handovers: [],
+    });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    // #3818: the night and how many guests are on site with nobody in charge.
+    expect(html).toContain("Nights without a hut leader who counts");
+    expect(html).toContain("2 upcoming nights with guests but no hut leader who counts");
+    // Dates in the club's format, as the handovers card beside it shows them.
+    expect(html).toContain("5 Jul · 2 guests; 6 Jul · 2 guests");
+    // ADR-002 Presentation Rule: a club with one lodge is never shown a lodge
+    // name it cannot act on, and never the multi-lodge noun.
+    expect(html).not.toContain("Alpine Lodge");
+    expect(html).not.toContain("lodge-night");
+  });
+});
+
+/** #3818: the changeovers in the coming week, from the presence-aware cover. */
+describe("admin dashboard handovers this week", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prisma.clubTimeSettings.findUnique).mockResolvedValue(null);
+    mockStats();
+  });
+
+  const handover = {
+    date: "2026-07-03",
+    lodgeId: "lodge-a",
+    lodgeName: "Alpine Lodge",
+    lodgeActive: true,
+    from: [{ memberId: "ann", name: "Ann Smith" }],
+    to: [{ memberId: "ben", name: "Ben Jones" }],
+  };
+
+  it("lists each handover for an officer who can open the hut-leaders page", async () => {
+    mockActorMatrix({ overview: "view", lodge: "edit" });
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({ unassignedDates: [], handovers: [handover] });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain("Handovers this week");
+    // The arrow is drawn; a screen reader hears "to" (#3818 review).
+    expect(html).toContain('Ann Smith <span aria-hidden="true">→</span><span class="sr-only">to</span> Ben Jones at midday');
+    // One lodge: never named (ADR-002 Presentation Rule).
+    expect(html).not.toContain("(Alpine Lodge)");
+    // The week is the club's today through today + 6, read from one cover.
+    const today = getTodayDateOnly(CLUB_ZONE);
+    expect(vi.mocked(getHutLeaderDashboardCoverage)).toHaveBeenCalledWith({
+      scope: { kind: "all" },
+      today,
+      handovers: { from: today, to: addDaysDateOnly(today, 6) },
+    });
+  });
+
+  it("names the lodge on a multi-lodge club", async () => {
+    mockActorMatrix({ overview: "view", lodge: "edit" });
+    vi.mocked(prisma.lodge.count).mockResolvedValue(2);
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({ unassignedDates: [], handovers: [handover] });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).toContain('Ann Smith <span aria-hidden="true">→</span><span class="sr-only">to</span> Ben Jones at midday (Alpine Lodge)');
+  });
+
+  it("is hidden from an actor who cannot open the hut-leaders page", async () => {
+    mockActorMatrix({ overview: "view" });
+    vi.mocked(getHutLeaderDashboardCoverage).mockResolvedValue({ unassignedDates: [], handovers: [handover] });
+
+    const html = renderToStaticMarkup(await AdminDashboardPage());
+
+    expect(html).not.toContain("Handovers this week");
+    // Nor are the handovers (and the names they need) read for this actor.
+    expect(vi.mocked(getHutLeaderDashboardCoverage)).toHaveBeenCalledWith(
+      expect.objectContaining({ handovers: null }),
+    );
+  });
+});

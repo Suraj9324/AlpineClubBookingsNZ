@@ -1,0 +1,1316 @@
+import { AccessRole } from "@prisma/client";
+import { describe, expect, it } from "vitest";
+import { DEFAULT_ACCESS_ROLE_DEFINITIONS } from "@/lib/access-role-definitions";
+import {
+  ADMIN_PERMISSION_AREAS,
+  ADMIN_ROUTE_MAP,
+  ANY_ADMIN_ADMISSION_PATHS,
+  canOpenAdminPath,
+  canViewAdminHrefWithMatrix,
+  getAdminPermissionMatrix,
+  getAdminRouteRequirement,
+  getFirstAccessibleAdminHref,
+  type AdminAccessRequirement,
+  type AdminPermissionArea,
+  type AdminPermissionInput,
+  type AdminPermissionMatrix,
+} from "@/lib/admin-permissions";
+import {
+  FEATURE_ROUTE_RULES,
+  getRequiredFeaturesForPath,
+} from "@/config/feature-routes";
+import type { FeatureFlagKey } from "@/config/schema";
+import { ADMIN_HUBS, ADMIN_PAGES, ADMIN_RETIRED_PAGES } from "@/lib/admin-hubs";
+import { hubRoot, type AdminHubPage } from "@/lib/admin-hubs/define";
+import {
+  ADMIN_PAGE_ADMISSION_PATHS,
+  ADMIN_PAGE_MODULE_GATES,
+  ADMIN_PAGE_ROUTE_AREAS,
+  buildAdmissionPaths,
+} from "@/lib/admin-hubs/security-map";
+import { SWEEP_GRIDS } from "@/lib/__tests__/helpers/admin-sweep-grids";
+
+// ---------------------------------------------------------------------------
+// THE ADMIN HUB ROUTE PARITY CENSUS (epic #4468, C2 #4799).
+//
+// C2 stopped writing the page half of the security map by hand: the route-map
+// prefixes, the fee console, Rooms & Beds and any-admin admission paths, the
+// first-accessible landing and the admin page module gates are all generated
+// from the hub registry, for each page's old path AND its hub path. This census
+// is the proof that doing so changed nothing an officer can observe.
+//
+// THE ORACLE is the hand-written page half as it stood on `main` at 06cfa84,
+// copied below verbatim together with the resolution rules that read it. It is
+// deliberately NOT derived from the registry or from the functions under test:
+// an oracle computed from the thing it checks would agree with any mistake.
+// The old-path half of this census was committed first, against the unchanged
+// hand-written code, and passed there — which is what makes the oracle a
+// faithful copy of `main` rather than a second guess at it.
+//
+// For every registry page, for its old path and (once generated) its hub twin,
+// each of these must answer exactly as the oracle answers for the OLD path:
+//   - `canOpenAdminPath` (the layout guard's admission), for the sixteen sweep
+//     grids of `admin-route-authorization-proof.test.ts` and every seeded role;
+//   - `getAdminRouteRequirement` for GET and for POST;
+//   - sidebar visibility (`canViewAdminHrefWithMatrix`, the per-href half of the
+//     sidebar's and command palette's filter), for the same subjects;
+//   - the module block: `getRequiredFeaturesForPath`, in order, which is all the
+//     proxy's 404 gate and `isFeatureHrefVisible` read.
+// The probes are each page's path, a child below it, its trailing-slash
+// spelling, and every static directory above it.
+//
+// A page added after C2 in a NEW directory has no row in the frozen tables, so
+// the oracle sends it to its catch-all and this census fails: give the oracle
+// its reviewed answer, the same review a hand-written route-map entry always
+// had. A page added beneath an existing directory is held to that directory's.
+// ---------------------------------------------------------------------------
+
+/** `main`'s page half of `ROUTE_AREA_PREFIXES` at 06cfa84, in resolution order. */
+const ORACLE_ROUTE_AREAS: ReadonlyArray<{
+  area: AdminPermissionArea;
+  prefixes: readonly string[];
+}> = [
+  {
+    area: "finance",
+    prefixes: [
+      "/admin/setup/finance",
+      "/admin/integrations",
+      "/admin/xero",
+      "/admin/stripe",
+      "/admin/google",
+      "/admin/alpine-server",
+      "/admin/video-meetings",
+      "/admin/payments",
+      "/admin/internet-banking",
+      "/admin/refund-requests",
+      "/admin/reports",
+      "/admin/subscriptions",
+      "/admin/fee-configuration",
+    ],
+  },
+  {
+    area: "bookings",
+    prefixes: [
+      "/admin/bookings-setup",
+      "/admin/setup/booking-rules",
+      "/admin/bookings",
+      "/admin/booking-requests",
+      "/admin/book",
+      "/admin/bed-allocation",
+      "/admin/waitlist",
+      "/admin/booking-approvals",
+      "/admin/booking-change-requests",
+      "/admin/booking-policies",
+      "/admin/seasons",
+      "/admin/fees",
+      "/admin/age-tier-settings",
+      "/admin/promo-codes",
+    ],
+  },
+  {
+    area: "membership",
+    prefixes: [
+      "/admin/membership-setup",
+      "/admin/members",
+      "/admin/member-applications",
+      "/admin/membership-cancellation",
+      "/admin/membership-cancellations",
+      "/admin/membership-types",
+      "/admin/member-fields",
+      "/admin/induction",
+      "/admin/communications",
+      "/admin/notices",
+      "/admin/lockers",
+      // Subscription categories (#4496), added after C2: a new directory, so it
+      // has no row in the frozen oracle above and needs its own reviewed answer,
+      // per this file's own header comment — membership, beside membership-types.
+      "/admin/subscription-categories",
+      "/admin/subscription-lockout",
+      "/admin/message-board",
+      "/admin/family-groups",
+      "/admin/family-suggestions",
+      "/admin/deletion-requests",
+      "/admin/committee",
+    ],
+  },
+  {
+    area: "lodge",
+    prefixes: [
+      "/admin/hut-leaders",
+      "/admin/roster",
+      "/admin/chores",
+      "/admin/lodge",
+      "/admin/lodges",
+      "/admin/work-parties",
+      "/admin/lodge-instructions",
+      "/admin/rooms-beds",
+      "/admin/calendar",
+      "/admin/display",
+      "/admin/maintenance-reports",
+      // Fork triyder/AlpineClubBookingsNZ#121: the Food Orders settings card.
+      "/admin/food-orders",
+    ],
+  },
+  {
+    area: "content",
+    prefixes: [
+      "/admin/appearance",
+      "/admin/page-content",
+      "/admin/site-banners",
+      "/admin/site-content",
+      "/admin/image-manager",
+      "/admin/site-style",
+      "/admin/mountain-conditions",
+    ],
+  },
+  {
+    area: "support",
+    prefixes: [
+      "/admin/access-roles",
+      "/admin/config-transfer",
+      "/admin/setup",
+      "/admin/modules",
+      "/admin/club-time",
+      "/admin/club-format",
+      "/admin/environment",
+      "/admin/security",
+      "/admin/privacy-retention",
+      "/admin/notifications",
+      "/admin/notification-rules",
+      "/admin/notification-recipients",
+      "/admin/booking-messages",
+      "/admin/email-messages",
+      "/admin/email-deliverability",
+      "/admin/health",
+      "/admin/background-jobs",
+      "/admin/backups",
+      "/admin/stuck-states",
+      "/admin/issue-reports",
+      "/admin/audit-log",
+      "/admin/ai-assistant",
+      // ALP-653: AI app connections, added after C2 in a new directory. The
+      // reviewed answer is support, the area its /api/admin/mcp routes use.
+      "/admin/ai-connections",
+    ],
+  },
+  { area: "overview", prefixes: ["/admin"] },
+];
+
+/**
+ * The oracle's prefixes whose pages S1 (#4796) retired, merging each into
+ * another page (`ADMIN_RETIRED_PAGES`). The oracle above stays `main`'s,
+ * verbatim; these three are left out only where the generated map is compared
+ * with it entry for entry, because a retired page has no entry. Nothing is
+ * served at a retired URL: its permanent redirect in `next.config.ts` runs
+ * before the proxy (`next-config-admin-hub-urls.test.ts`). The other two
+ * retired pages, `/admin/setup/cancellation` and `/admin/setup/integrations`,
+ * never had a prefix of their own (they were `/admin/setup`'s `support`).
+ */
+const ORACLE_RETIRED_PREFIXES: readonly string[] = [
+  "/admin/setup/booking-rules",
+  "/admin/membership-cancellation",
+  "/admin/family-suggestions",
+];
+
+/** `main`'s `ANY_ADMIN_ADMISSION_PATHS`, `CONSOLIDATED_FEES_PATH` and `ROOMS_BEDS_PATH`. */
+const ORACLE_ANY_ADMIN_PATHS = ["/admin/ai-diagnostics", "/admin/club-format"];
+const ORACLE_FEES_PATH = "/admin/fees";
+const ORACLE_ROOMS_BEDS_PATH = "/admin/rooms-beds";
+
+/**
+ * `main`'s admin page prefixes in `FEATURE_ROUTE_RULES`, in rule order, with the
+ * one admin page exemption. Every other prefix in a rule is an API or member
+ * path, which an `/admin/...` path can never match.
+ */
+const ORACLE_MODULE_GATES: ReadonlyArray<{
+  flag: FeatureFlagKey;
+  prefixes: readonly string[];
+  exemptPaths?: readonly string[];
+}> = [
+  { flag: "kiosk", prefixes: ["/admin/lodge"] },
+  { flag: "chores", prefixes: ["/admin/chores", "/admin/roster"] },
+  { flag: "waitlist", prefixes: ["/admin/waitlist"] },
+  { flag: "xeroIntegration", prefixes: ["/admin/xero", "/admin/internet-banking"] },
+  { flag: "bedAllocation", prefixes: ["/admin/bed-allocation", "/admin/rooms-beds"] },
+  { flag: "internetBankingPayments", prefixes: ["/admin/internet-banking"] },
+  { flag: "lockers", prefixes: ["/admin/lockers"] },
+  { flag: "induction", prefixes: ["/admin/induction"] },
+  { flag: "workParties", prefixes: ["/admin/work-parties"] },
+  { flag: "promoCodes", prefixes: ["/admin/promo-codes"] },
+  { flag: "hutLeaders", prefixes: ["/admin/hut-leaders"] },
+  { flag: "communications", prefixes: ["/admin/communications"] },
+  { flag: "memberNotices", prefixes: ["/admin/notices"] },
+  { flag: "eventsCalendar", prefixes: ["/admin/calendar"] },
+  { flag: "skifieldWhakapapa", prefixes: ["/admin/mountain-conditions"] },
+  {
+    flag: "lobbyDisplay",
+    prefixes: ["/admin/display"],
+    exemptPaths: ["/admin/display/setup"],
+  },
+  { flag: "aiAssistant", prefixes: ["/admin/ai-assistant"] },
+  { flag: "aiDiagnostics", prefixes: ["/admin/ai-diagnostics"] },
+  { flag: "maintenanceReports", prefixes: ["/admin/maintenance-reports"] },
+  { flag: "foodOrders", prefixes: ["/admin/food-orders"] },
+  { flag: "mcpServer", prefixes: ["/admin/ai-connections"] },
+  { flag: "commsPortal", prefixes: ["/admin/message-board"] },
+  { flag: "alpineCentralServer", prefixes: ["/admin/alpine-server"] },
+];
+
+/** `main`'s `getFirstAccessibleAdminHref`, as its if-chain read. */
+const ORACLE_FIRST_ACCESSIBLE: ReadonlyArray<[AdminPermissionArea, string]> = [
+  ["overview", "/admin/dashboard"],
+  ["bookings", "/admin/bookings"],
+  ["membership", "/admin/members"],
+  ["finance", "/admin/payments"],
+  ["lodge", "/admin/hut-leaders"],
+  ["content", "/admin/page-content"],
+  ["support", "/admin/health"],
+];
+
+// --- the oracle's resolution rules, copied from `main` ---------------------
+
+const RANK = { none: 0, view: 1, edit: 2 } as const;
+
+/** `normalizePathname` in `admin-permissions.ts`. */
+function oracleNormalize(pathname: string): string {
+  const candidate = pathname.split(/[?#]/)[0] || "/";
+  return candidate.endsWith("/") && candidate !== "/"
+    ? candidate.replace(/\/+$/, "")
+    : candidate;
+}
+
+function underPrefix(pathname: string, prefix: string): boolean {
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+/** `getAdminRouteRequirement` for a page path: the first AREA with a matching prefix. */
+function oracleRequirement(pathname: string, method: string): AdminAccessRequirement {
+  const normalized = oracleNormalize(pathname);
+  const route = ORACLE_ROUTE_AREAS.find(({ prefixes }) =>
+    prefixes.some((prefix) => underPrefix(normalized, prefix)),
+  );
+  if (!route) throw new Error(`oracle: ${pathname} is not an admin page path`);
+  const edit = !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+  return { area: route.area, level: edit ? "edit" : "view" };
+}
+
+function anyArea(matrix: AdminPermissionMatrix): boolean {
+  return ADMIN_PERMISSION_AREAS.some((area) => matrix[area.key] !== "none");
+}
+
+function oracleIsAnyAdmin(pathname: string): boolean {
+  return ORACLE_ANY_ADMIN_PATHS.some((p) => underPrefix(oracleNormalize(pathname), p));
+}
+
+/** `canOpenAdminPath`: the three special rules in their order, then the map at view. */
+function oracleCanOpen(matrix: AdminPermissionMatrix, pathname: string): boolean {
+  const normalized = oracleNormalize(pathname);
+  if (oracleIsAnyAdmin(pathname)) return anyArea(matrix);
+  if (underPrefix(normalized, ORACLE_FEES_PATH)) {
+    return matrix.bookings !== "none" || matrix.finance !== "none";
+  }
+  if (underPrefix(normalized, ORACLE_ROOMS_BEDS_PATH)) {
+    return matrix.lodge !== "none" || matrix.bookings !== "none";
+  }
+  const requirement = oracleRequirement(pathname, "GET");
+  return RANK[matrix[requirement.area]] >= RANK[requirement.level];
+}
+
+/** `canViewAdminHrefWithMatrix`: admission paths, then the map. No OR rules. */
+function oracleCanView(matrix: AdminPermissionMatrix, pathname: string): boolean {
+  if (oracleIsAnyAdmin(pathname)) return anyArea(matrix);
+  const requirement = oracleRequirement(pathname, "GET");
+  return RANK[matrix[requirement.area]] >= RANK[requirement.level];
+}
+
+/** `normaliseForRules` in `feature-routes.ts`: one trailing slash, one data suffix. */
+function oracleNormaliseForRules(pathname: string): string {
+  const strip = (p: string) => (p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p);
+  const trimmed = strip(pathname);
+  const suffix = [".rsc", ".json"].find(
+    (candidate) => trimmed.length > candidate.length && trimmed.endsWith(candidate),
+  );
+  return suffix ? strip(trimmed.slice(0, -suffix.length)) : trimmed;
+}
+
+/** `getRequiredFeaturesForPath` for an admin page path, in rule order. */
+function oracleFlags(pathname: string): FeatureFlagKey[] {
+  const path = oracleNormaliseForRules(pathname);
+  return ORACLE_MODULE_GATES.filter(
+    (rule) =>
+      !(rule.exemptPaths ?? []).includes(path) &&
+      rule.prefixes.some((prefix) => underPrefix(path, prefix)),
+  ).map((rule) => rule.flag);
+}
+
+function oracleFirstAccessible(matrix: AdminPermissionMatrix): string | null {
+  return ORACLE_FIRST_ACCESSIBLE.find(([area]) => matrix[area] !== "none")?.[1] ?? null;
+}
+
+// --- subjects ----------------------------------------------------------------
+
+type Subject = { label: string; input: AdminPermissionInput };
+
+/**
+ * The sixteen sweep grids, then every seeded role both ways it can reach the
+ * resolver: a bare enum value (the legacy bundle, and the protected roles), and
+ * each seeded definition joined as the database row.
+ */
+const SUBJECTS: Subject[] = [
+  ...SWEEP_GRIDS.map((grid) => ({ label: grid.label, input: grid.member })),
+  ...Object.values(AccessRole).map((role) => ({
+    label: `enum ${role}`,
+    input: { canLogin: true, accessRoles: [role] },
+  })),
+  ...DEFAULT_ACCESS_ROLE_DEFINITIONS.map((definition) => ({
+    label: `seeded definition ${definition.key}`,
+    input: {
+      canLogin: true,
+      accessRoles: [
+        {
+          role: definition.systemRole,
+          roleDefinitionId: definition.id,
+          roleDefinition: definition,
+        },
+      ],
+    },
+  })),
+];
+
+// --- probes ------------------------------------------------------------------
+
+/** A concrete URL for a registry path: every `[name]` filled with `x123`. */
+function concrete(registryPath: string): string {
+  return registryPath.replace(/\[[^\]/]+\]/g, "x123");
+}
+
+/**
+ * Every path probed for one page: the page itself, a child below it, its
+ * trailing-slash spelling, and every static directory above it below `/admin`.
+ */
+function probesFor(pagePath: string): string[] {
+  const segments = pagePath.split("/").slice(2);
+  const ancestors = segments.map((_, index) => `/admin/${segments.slice(0, index + 1).join("/")}`);
+  return [...ancestors, `${pagePath}/x123`, `${pagePath}/`];
+}
+
+/** One path's whole observable answer, as the real functions give it. */
+function actualAnswer(pathname: string) {
+  return {
+    get: getAdminRouteRequirement(pathname, "GET"),
+    post: getAdminRouteRequirement(pathname, "POST"),
+    flags: getRequiredFeaturesForPath(pathname),
+    open: SUBJECTS.map((subject) => canOpenAdminPath(subject.input, pathname)),
+    sidebar: SUBJECTS.map((subject) =>
+      canViewAdminHrefWithMatrix(getAdminPermissionMatrix(subject.input), pathname),
+    ),
+  };
+}
+
+/** The same answer from the oracle. */
+function oracleAnswer(pathname: string) {
+  return {
+    get: oracleRequirement(pathname, "GET"),
+    post: oracleRequirement(pathname, "POST"),
+    flags: oracleFlags(pathname),
+    open: SUBJECTS.map((subject) =>
+      oracleCanOpen(getAdminPermissionMatrix(subject.input), pathname),
+    ),
+    sidebar: SUBJECTS.map((subject) =>
+      oracleCanView(getAdminPermissionMatrix(subject.input), pathname),
+    ),
+  };
+}
+
+/** Each field that differs, with the subjects it differs for. */
+function differences(
+  label: string,
+  actual: ReturnType<typeof actualAnswer>,
+  expected: ReturnType<typeof oracleAnswer>,
+): string[] {
+  const found: string[] = [];
+  for (const key of ["get", "post", "flags"] as const) {
+    if (JSON.stringify(actual[key]) !== JSON.stringify(expected[key])) {
+      found.push(`${label} ${key}: ${JSON.stringify(actual[key])}, oracle ${JSON.stringify(expected[key])}`);
+    }
+  }
+  for (const key of ["open", "sidebar"] as const) {
+    const who = SUBJECTS.filter((_, index) => actual[key][index] !== expected[key][index]);
+    if (who.length > 0) {
+      found.push(`${label} ${key} differs for ${who.map((subject) => subject.label).join(", ")}`);
+    }
+  }
+  return found;
+}
+
+function pageLabel(page: AdminHubPage, probe: string): string {
+  return `${page.id} (${probe})`;
+}
+
+/**
+ * Each old-path probe of a page beside its twin in the page's hub. Relocation
+ * keeps the part of the path below each directory, so a directory's twin is the
+ * hub path with that same tail removed.
+ */
+function twinProbes(page: AdminHubPage): Array<[old: string, hub: string]> {
+  const oldPath = concrete(page.oldPath);
+  const hubPath = concrete(page.hubPath);
+  const twin = (probe: string) => {
+    if (!probe.startsWith(oldPath)) {
+      const tail = oldPath.slice(probe.length);
+      if (!hubPath.endsWith(tail)) throw new Error(`${page.id}: no twin for ${probe}`);
+      return hubPath.slice(0, hubPath.length - tail.length);
+    }
+    return `${hubPath}${probe.slice(oldPath.length)}`;
+  };
+  return [oldPath, ...probesFor(oldPath)].map((probe) => [probe, twin(probe)]);
+}
+
+/** `candidate` is `root` or sits beneath it, `/`-anchored as every resolver matches. */
+function nestsUnder(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}/`);
+}
+
+const HUB_ROOTS = ADMIN_HUBS.map((hub) => hubRoot(hub.prefix));
+
+/** A generated path that sits beneath a hub's root rather than at an old path. */
+function isHubHalf(path: string): boolean {
+  return HUB_ROOTS.some((root) => path !== root && nestsUnder(path, root));
+}
+
+/** The route-map entry the resolver takes for a path: the FIRST that matches. */
+function firstMatch(pathname: string) {
+  return ADMIN_ROUTE_MAP.find(({ prefix }) => nestsUnder(oracleNormalize(pathname), prefix));
+}
+
+describe("the census covers what it says", () => {
+  it("sweeps the sixteen grids and every seeded role", () => {
+    expect(SWEEP_GRIDS).toHaveLength(16);
+    expect(SUBJECTS.length).toBe(16 + Object.values(AccessRole).length + DEFAULT_ACCESS_ROLE_DEFINITIONS.length);
+    expect(DEFAULT_ACCESS_ROLE_DEFINITIONS.length).toBeGreaterThanOrEqual(6);
+  });
+
+  it("probes every registry page, and nearly every one has a hub path of its own", () => {
+    expect(ADMIN_PAGES.length).toBeGreaterThan(100);
+    // Only Home's dashboard is its hub's root, so its hub path is its old path.
+    expect(ADMIN_PAGES.filter((page) => page.hubPath === page.oldPath).map((page) => page.id)).toEqual([
+      "dashboard",
+    ]);
+  });
+
+  it("has an oracle that refuses and admits, rather than one answer for everyone", () => {
+    // Non-vacuous: across the census some subject is refused a page and some
+    // subject is admitted to every page, so `open` cannot pass by being constant.
+    const answers = ADMIN_PAGES.map((page) => oracleAnswer(concrete(page.oldPath)).open);
+    expect(answers.every((open) => open.some(Boolean))).toBe(true);
+    expect(answers.every((open) => open.some((admitted) => !admitted))).toBe(true);
+  });
+});
+
+describe("every page's OLD path answers exactly as main's hand-written map did", () => {
+  it("for the page, a child, its trailing slash and every directory above it", () => {
+    const drift = ADMIN_PAGES.flatMap((page) =>
+      [concrete(page.oldPath), ...probesFor(concrete(page.oldPath))].flatMap((probe) =>
+        differences(pageLabel(page, probe), actualAnswer(probe), oracleAnswer(probe)),
+      ),
+    );
+    expect(drift).toEqual([]);
+  });
+
+  it("lands every subject, and every permission grid, where main's getFirstAccessibleAdminHref did", () => {
+    // Every grid, not just the subjects: the landing is an ORDER over the
+    // areas, and only a grid holding two areas without the earlier ones can
+    // tell two adjacent steps apart (no seeded role holds membership and
+    // finance without overview, for one).
+    const grids: AdminPermissionMatrix[] = ADMIN_PERMISSION_AREAS.reduce<AdminPermissionMatrix[]>(
+      (acc, area) =>
+        acc.flatMap((partial) =>
+          (["none", "view", "edit"] as const).map((level) => ({ ...partial, [area.key]: level })),
+        ),
+      [{} as AdminPermissionMatrix],
+    );
+    expect(grids).toHaveLength(3 ** ADMIN_PERMISSION_AREAS.length);
+    const drift = [
+      ...SUBJECTS,
+      ...grids.map((grid) => ({
+        label: JSON.stringify(grid),
+        input: { canLogin: true, accessRoles: [], adminPermissionMatrix: grid },
+      })),
+    ].flatMap((subject) => {
+      const actual = getFirstAccessibleAdminHref(subject.input);
+      const expected = oracleFirstAccessible(getAdminPermissionMatrix(subject.input));
+      return actual === expected ? [] : [`${subject.label}: ${actual}, oracle ${expected}`];
+    });
+    expect(drift).toEqual([]);
+  });
+});
+
+describe("every page's HUB path answers exactly as its old path did on main", () => {
+  it("for the page, a child, its trailing slash and every directory above it", () => {
+    const drift = ADMIN_PAGES.flatMap((page) =>
+      twinProbes(page).flatMap(([oldProbe, hubProbe]) =>
+        differences(
+          `${pageLabel(page, hubProbe)} (twin of ${oldProbe})`,
+          actualAnswer(hubProbe),
+          oracleAnswer(oldProbe),
+        ),
+      ),
+    );
+    expect(drift).toEqual([]);
+  });
+});
+
+describe("no registered page falls through to the overview catch-all", () => {
+  it("resolves every page's old and hub path through an entry generated for it", () => {
+    const fallsThrough = ADMIN_PAGES.flatMap((page) =>
+      [page.oldPath, page.hubPath].map(concrete).flatMap((pathname) => {
+        const entry = firstMatch(pathname);
+        if (!entry || entry.prefix === "/admin") return [`${page.id}: ${pathname} reaches the catch-all`];
+        // The first-match read here must be the real resolver's.
+        const actual = getAdminRouteRequirement(pathname, "GET")?.area;
+        return actual === entry.area ? [] : [`${page.id}: ${pathname} resolves ${actual}, first entry ${entry.prefix} says ${entry.area}`];
+      }),
+    );
+    expect(fallsThrough).toEqual([]);
+  });
+
+  it("keeps the catch-all itself, last", () => {
+    expect(ADMIN_ROUTE_MAP.at(-1)?.area).toBe("overview");
+    expect(ADMIN_ROUTE_MAP.filter(({ area }) => area === "overview").slice(-2).map(({ prefix }) => prefix)).toEqual([
+      "/admin",
+      "/api/admin",
+    ]);
+  });
+});
+
+/**
+ * THE ORDERING CENSUS. The resolver takes the FIRST matching prefix, not the
+ * longest, so an entry that precedes a LONGER entry nested beneath it, with a
+ * different area, would capture that entry's paths. Nothing else guards this:
+ * the generator sorts deepest first, and the hand-written `/api/admin` half is
+ * kept in its reviewed order.
+ */
+describe("the route map's order", () => {
+  function shadowed(map: ReadonlyArray<{ area: string; prefix: string }>): string[] {
+    return map.flatMap((earlier, i) =>
+      map
+        .slice(i + 1)
+        .filter(
+          (later) =>
+            later.prefix !== earlier.prefix &&
+            nestsUnder(later.prefix, earlier.prefix) &&
+            later.area !== earlier.area,
+        )
+        .map((later) => `${earlier.prefix} (${earlier.area}) precedes ${later.prefix} (${later.area})`),
+    );
+  }
+
+  it("never puts a shorter prefix of another area ahead of a longer one beneath it", () => {
+    expect(shadowed(ADMIN_ROUTE_MAP)).toEqual([]);
+  });
+
+  it("has nested prefixes of different areas to order, old and hub alike", () => {
+    // Non-vacuous: the census really is deciding something.
+    const nested = ADMIN_ROUTE_MAP.flatMap((outer) =>
+      ADMIN_ROUTE_MAP.filter(
+        (inner) =>
+          inner.prefix !== outer.prefix &&
+          outer.prefix !== "/admin" &&
+          outer.prefix !== "/api/admin" &&
+          nestsUnder(inner.prefix, outer.prefix) &&
+          inner.area !== outer.area,
+      ).map((inner) => inner.prefix),
+    );
+    expect(nested).toEqual(
+      expect.arrayContaining(["/admin/setup/finance", "/admin/settings/setup/finance"]),
+    );
+  });
+
+  it("catches a shorter prefix moved ahead", () => {
+    const setup = ADMIN_ROUTE_MAP.find(({ prefix }) => prefix === "/admin/setup")!;
+    const reordered = [setup, ...ADMIN_ROUTE_MAP.filter((entry) => entry !== setup)];
+    expect(shadowed(reordered)).toEqual(
+      expect.arrayContaining(["/admin/setup (support) precedes /admin/setup/finance (finance)"]),
+    );
+  });
+});
+
+/**
+ * The C2 transition, stated structurally as well as behaviourally: the OLD half
+ * the generator emits IS main's hand-written page half, entry for entry, plus an
+ * explicit `overview` entry for each of the three directories that used to rely
+ * on the catch-all (which answers `overview` too). Set equality plus the
+ * ordering census means every old path resolves as it did, not just the probes.
+ */
+describe("the generated old half is main's hand-written page half", () => {
+  const EXPLICIT_OVERVIEW = ["/admin/ai-diagnostics", "/admin/dashboard", "/admin/testing"];
+
+  it("leaves out of the comparison only prefixes of retired pages", () => {
+    const retired: readonly string[] = ADMIN_RETIRED_PAGES.map((page) => page.oldPath);
+    expect(ORACLE_RETIRED_PREFIXES.filter((prefix) => !retired.includes(prefix))).toEqual([]);
+    const oraclePrefixes = ORACLE_ROUTE_AREAS.flatMap(({ prefixes }) => prefixes);
+    expect(ORACLE_RETIRED_PREFIXES.filter((prefix) => !oraclePrefixes.includes(prefix))).toEqual([]);
+  });
+
+  it("has the same route-map entries", () => {
+    const generated = ADMIN_PAGE_ROUTE_AREAS.filter(({ prefix }) => !isHubHalf(prefix))
+      .map(({ prefix, area }) => `${prefix} ${area}`)
+      .sort();
+    const oracle = [
+      ...ORACLE_ROUTE_AREAS.flatMap(({ area, prefixes }) =>
+        prefixes
+          .filter((prefix) => prefix !== "/admin" && !ORACLE_RETIRED_PREFIXES.includes(prefix))
+          .map((prefix) => `${prefix} ${area}`),
+      ),
+      ...EXPLICIT_OVERVIEW.map((prefix) => `${prefix} overview`),
+    ].sort();
+    expect(generated).toEqual(oracle);
+    // The page half precedes the hand-written half and is all of `/admin/*`.
+    const pageHalf = ADMIN_ROUTE_MAP.slice(0, ADMIN_PAGE_ROUTE_AREAS.length);
+    expect(pageHalf).toEqual(ADMIN_PAGE_ROUTE_AREAS);
+    expect(
+      ADMIN_ROUTE_MAP.slice(ADMIN_PAGE_ROUTE_AREAS.length).filter(
+        ({ prefix }) => prefix.startsWith("/admin/"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("has the same module gates, and the one exemption at both paths", () => {
+    const generated = [...ADMIN_PAGE_MODULE_GATES].flatMap(([flag, prefixes]) =>
+      prefixes.filter((prefix) => !isHubHalf(prefix)).map((prefix) => `${flag} ${prefix}`),
+    );
+    const oracle = ORACLE_MODULE_GATES.flatMap(({ flag, prefixes }) =>
+      prefixes.map((prefix) => `${flag} ${prefix}`),
+    );
+    expect(generated.sort()).toEqual(oracle.sort());
+    const exempt = FEATURE_ROUTE_RULES.flatMap((rule) =>
+      (rule.exemptPaths ?? [])
+        .filter((path) => path.startsWith("/admin/"))
+        .map((path) => `${rule.flag} ${path}`),
+    );
+    expect(exempt).toEqual([
+      "lobbyDisplay /admin/display/setup",
+      "lobbyDisplay /admin/lodge-ops/display/setup",
+    ]);
+  });
+
+  it("has the same admission paths, each with its hub twin", () => {
+    expect(ADMIN_PAGE_ADMISSION_PATHS["any-admin"].filter((path) => !isHubHalf(path))).toEqual(
+      ORACLE_ANY_ADMIN_PATHS,
+    );
+    expect(ADMIN_PAGE_ADMISSION_PATHS["fees-or"].filter((path) => !isHubHalf(path))).toEqual([
+      ORACLE_FEES_PATH,
+    ]);
+    expect(ADMIN_PAGE_ADMISSION_PATHS["rooms-beds-or"].filter((path) => !isHubHalf(path))).toEqual([
+      ORACLE_ROOMS_BEDS_PATH,
+    ]);
+    expect(ANY_ADMIN_ADMISSION_PATHS).toEqual(ADMIN_PAGE_ADMISSION_PATHS["any-admin"]);
+    for (const paths of Object.values(ADMIN_PAGE_ADMISSION_PATHS)) {
+      expect(paths.filter(isHubHalf)).toHaveLength(paths.length / 2);
+    }
+  });
+});
+
+/**
+ * A special admission matches by PREFIX, so it reaches every page beneath the
+ * path it names. The generator refuses any shape that would hand it to a page
+ * that did not ask for it, rather than widen (#4799 security review, H1).
+ */
+describe("a special admission never reaches another page", () => {
+  const page = (id: string): AdminHubPage => {
+    const found = ADMIN_PAGES.find((candidate) => candidate.id === id);
+    if (!found) throw new Error(`no registry page ${id}`);
+    return found;
+  };
+
+  it("accepts today's registry, where no page sits beneath a special one", () => {
+    expect(buildAdmissionPaths(ADMIN_PAGES)).toEqual(ADMIN_PAGE_ADMISSION_PATHS);
+  });
+
+  it("refuses a hub landing page with a special admission over its hub's pages", () => {
+    // The C13 shape: a landing page AT the hub root, admitted on any-admin,
+    // would admit every administrator to every page of the hub.
+    const landing: AdminHubPage = {
+      ...page("payments"),
+      id: "finance-landing",
+      oldPath: "/admin/finance-landing",
+      hubPath: hubRoot("finance"),
+      admission: "any-admin",
+    };
+    expect(() => buildAdmissionPaths([landing, page("payments")])).toThrow(
+      /finance-landing has a any-admin admission over payments, which sits beneath it/,
+    );
+  });
+
+  it("refuses a special admission with another page beneath its old path", () => {
+    const history: AdminHubPage = {
+      ...page("fees"),
+      id: "fees-history",
+      oldPath: "/admin/fees/history",
+      hubPath: "/admin/rules/fees/history",
+      admission: "area",
+    };
+    expect(() => buildAdmissionPaths([page("fees"), history])).toThrow(
+      /fees has a fees-or admission over fees-history/,
+    );
+  });
+
+  it("refuses one with a dynamic page beneath it, and one on a dynamic path", () => {
+    const detail: AdminHubPage = {
+      ...page("rooms-beds"),
+      id: "rooms-beds-room",
+      oldPath: "/admin/rooms-beds/[id]",
+      hubPath: "/admin/lodge-ops/rooms-beds/[id]",
+      admission: "area",
+    };
+    expect(() => buildAdmissionPaths([page("rooms-beds"), detail])).toThrow(
+      /rooms-beds has a rooms-beds-or admission over rooms-beds-room/,
+    );
+    expect(() =>
+      buildAdmissionPaths([{ ...detail, admission: "rooms-beds-or" }]),
+    ).toThrow(/rooms-beds-room has a rooms-beds-or admission on a dynamic path/);
+  });
+
+  it("still accepts a special page beside, not over, another page", () => {
+    // `/admin/club-format-x` shares a string prefix with `/admin/club-format`
+    // but does not sit beneath it.
+    const sibling: AdminHubPage = {
+      ...page("club-format"),
+      id: "club-format-x",
+      oldPath: "/admin/club-format-x",
+      hubPath: "/admin/settings/club-format-x",
+      admission: "area",
+    };
+    expect(buildAdmissionPaths([page("club-format"), sibling])["any-admin"]).toEqual([
+      "/admin/club-format",
+      "/admin/settings/club-format",
+    ]);
+  });
+});
+
+/**
+ * The generated tables are read on every request, so they are frozen: nothing
+ * can widen an admission by mutating one after load (#4799 security review, H2).
+ */
+describe("the generated tables are frozen", () => {
+  it("freezes the route map's page half, entry by entry", () => {
+    expect(Object.isFrozen(ADMIN_PAGE_ROUTE_AREAS)).toBe(true);
+    expect(ADMIN_PAGE_ROUTE_AREAS.filter((entry) => !Object.isFrozen(entry))).toEqual([]);
+    expect(Object.isFrozen(ADMIN_ROUTE_MAP)).toBe(true);
+    expect(ADMIN_ROUTE_MAP.filter((entry) => !Object.isFrozen(entry))).toEqual([]);
+  });
+
+  it("freezes the admission paths, the record and each list", () => {
+    expect(Object.isFrozen(ADMIN_PAGE_ADMISSION_PATHS)).toBe(true);
+    for (const [rule, paths] of Object.entries(ADMIN_PAGE_ADMISSION_PATHS)) {
+      expect(Object.isFrozen(paths), rule).toBe(true);
+    }
+    expect(Object.isFrozen(ANY_ADMIN_ADMISSION_PATHS)).toBe(true);
+    expect(() => (ADMIN_PAGE_ADMISSION_PATHS["fees-or"] as string[]).push("/admin")).toThrow(TypeError);
+  });
+
+  it("freezes each module gate list", () => {
+    expect(ADMIN_PAGE_MODULE_GATES.size).toBeGreaterThan(15);
+    for (const [flag, prefixes] of ADMIN_PAGE_MODULE_GATES) {
+      expect(Object.isFrozen(prefixes), flag).toBe(true);
+    }
+  });
+});
+
+/**
+ * C8 (#4805): the Messages & email hub mixes two permission areas (membership
+ * and support) and three module gates, so its pages are named here one by one
+ * rather than only reached through the loops above. Each answers at its hub
+ * path exactly as at its old path; a grid holding only the hub's OTHER area is
+ * refused at both; and the hub's root, which holds pages of both areas, has no
+ * rule of its own, so no page beneath it inherits another page's area. The
+ * `/api/admin` routes the pages call are not under the hub and answer as before.
+ */
+describe("the Messages & email hub keeps each page's own admission (C8 #4805)", () => {
+  type Row = readonly [
+    id: string,
+    oldPath: string,
+    hubPath: string,
+    area: "membership" | "support",
+    flags: readonly FeatureFlagKey[],
+  ];
+  const MESSAGES: readonly Row[] = [
+    ["notifications", "/admin/notifications", "/admin/messages/notifications", "support", []],
+    ["communications", "/admin/communications", "/admin/messages/communications", "membership", ["communications"]],
+    ["notices", "/admin/notices", "/admin/messages/notices", "membership", ["memberNotices"]],
+    ["notice-detail", "/admin/notices/[id]", "/admin/messages/notices/[id]", "membership", ["memberNotices"]],
+    ["notice-new", "/admin/notices/new", "/admin/messages/notices/new", "membership", ["memberNotices"]],
+    ["message-board", "/admin/message-board", "/admin/messages/message-board", "membership", ["commsPortal"]],
+    ["email-messages", "/admin/email-messages", "/admin/messages/email-messages", "support", []],
+    ["booking-messages", "/admin/booking-messages", "/admin/messages/booking-messages", "support", []],
+    ["notification-rules", "/admin/notification-rules", "/admin/messages/notification-rules", "support", []],
+    [
+      "notification-recipients",
+      "/admin/notification-recipients",
+      "/admin/messages/notification-recipients",
+      "support",
+      [],
+    ],
+  ];
+
+  const only = (area: AdminPermissionArea, level: "view" | "edit"): AdminPermissionInput => ({
+    canLogin: true,
+    accessRoles: [],
+    adminPermissionMatrix: {
+      ...(Object.fromEntries(
+        ADMIN_PERMISSION_AREAS.map((entry) => [entry.key, "none"]),
+      ) as AdminPermissionMatrix),
+      [area]: level,
+    },
+  });
+
+  it("names every page of the hub, each moved, on its own area's ordinary admission", () => {
+    expect(
+      ADMIN_PAGES.filter((page) => page.hub === "messages").map((page) => [
+        page.id,
+        page.oldPath,
+        page.hubPath,
+        page.area,
+        page.flags,
+      ]),
+    ).toEqual(MESSAGES);
+    for (const page of ADMIN_PAGES.filter((candidate) => candidate.hub === "messages")) {
+      expect(page.moved, page.id).toBe(true);
+      expect(page.admission, page.id).toBe("area");
+    }
+  });
+
+  it.each(MESSAGES)("%s answers at %s and at %s as main did at the old path", (id, oldPath, hubPath, area, flags) => {
+    for (const pathname of [oldPath, hubPath].map(concrete)) {
+      expect(getAdminRouteRequirement(pathname, "GET"), pathname).toEqual({ area, level: "view" });
+      expect(getAdminRouteRequirement(pathname, "POST"), pathname).toEqual({ area, level: "edit" });
+      expect(getRequiredFeaturesForPath(pathname), pathname).toEqual([...flags]);
+      expect(differences(id, actualAnswer(pathname), oracleAnswer(concrete(oldPath)))).toEqual([]);
+      // Its own area admits, view-only included; the hub's other area does not.
+      const other = area === "membership" ? "support" : "membership";
+      expect(canOpenAdminPath(only(area, "view"), pathname), pathname).toBe(true);
+      expect(canOpenAdminPath(only(other, "edit"), pathname), pathname).toBe(false);
+      expect(canOpenAdminPath(only("overview", "edit"), pathname), pathname).toBe(false);
+    }
+  });
+
+  it("gives the hub's root no rule, so each hub path resolves through its own page's", () => {
+    expect(ADMIN_ROUTE_MAP.map(({ prefix }) => prefix)).not.toContain("/admin/messages");
+    expect(firstMatch("/admin/messages")?.prefix).toBe("/admin");
+    expect(getRequiredFeaturesForPath("/admin/messages")).toEqual([]);
+    for (const [id, oldPath, hubPath, area] of MESSAGES) {
+      const entry = firstMatch(concrete(hubPath));
+      expect(entry && nestsUnder(entry.prefix, "/admin/messages") && entry.prefix !== "/admin/messages", id).toBe(true);
+      expect(entry?.area, id).toBe(area);
+      expect(entry?.prefix, id).toBe(firstMatch(concrete(oldPath))!.prefix.replace(/^\/admin/, "/admin/messages"));
+    }
+  });
+
+  it.each([
+    ["/api/admin/notifications", "support", []],
+    ["/api/admin/notification-delivery-policies", "support", []],
+    ["/api/admin/email-settings", "support", []],
+    ["/api/admin/email-templates", "support", []],
+    ["/api/admin/booking-messages", "support", []],
+    ["/api/admin/communications/send", "membership", ["communications"]],
+    ["/api/admin/notices/x123/reads", "membership", ["memberNotices"]],
+    ["/api/admin/club-posts/x123", "membership", ["commsPortal"]],
+  ] as const)("leaves the API %s on %s", (pathname, area, flags) => {
+    expect(getAdminRouteRequirement(pathname, "GET")).toEqual({ area, level: "view" });
+    expect(getAdminRouteRequirement(pathname, "POST")).toEqual({ area, level: "edit" });
+    expect(getRequiredFeaturesForPath(pathname)).toEqual([...flags]);
+  });
+});
+
+/**
+ * C10 (#4807): every Bookings page is the `bookings` area. Bed Allocation and
+ * the Waitlist also carry their module gates. Each answers at its hub path
+ * exactly as at its old path. A grid holding any other area, including
+ * overview at edit, is refused at both. The hub root has no rule of its own.
+ * `/admin/book` does not swallow `/admin/bookings` or `/admin/booking-requests`.
+ * The `/api/admin` routes these pages call stay where they were.
+ *
+ * Moving one of these pages into another area fails the equality below.
+ */
+describe("the Bookings hub keeps each page's own admission (C10 #4807)", () => {
+  type Row = readonly [
+    id: string,
+    oldPath: string,
+    hubPath: string,
+    flags: readonly FeatureFlagKey[],
+  ];
+  const BOOKINGS: readonly Row[] = [
+    ["bookings", "/admin/bookings", "/admin/booking-desk/bookings", []],
+    ["booking-requests", "/admin/booking-requests", "/admin/booking-desk/booking-requests", []],
+    ["booking-approvals", "/admin/booking-approvals", "/admin/booking-desk/booking-approvals", []],
+    [
+      "booking-change-requests",
+      "/admin/booking-change-requests",
+      "/admin/booking-desk/booking-change-requests",
+      [],
+    ],
+    ["book", "/admin/book", "/admin/booking-desk/book", []],
+    ["bed-allocation", "/admin/bed-allocation", "/admin/booking-desk/bed-allocation", ["bedAllocation"]],
+    ["waitlist", "/admin/waitlist", "/admin/booking-desk/waitlist", ["waitlist"]],
+  ];
+
+  const only = (area: AdminPermissionArea, level: "view" | "edit"): AdminPermissionInput => ({
+    canLogin: true,
+    accessRoles: [],
+    adminPermissionMatrix: {
+      ...(Object.fromEntries(
+        ADMIN_PERMISSION_AREAS.map((entry) => [entry.key, "none"]),
+      ) as AdminPermissionMatrix),
+      [area]: level,
+    },
+  });
+
+  it("names every page of the hub, each moved, on the bookings area's ordinary admission", () => {
+    expect(
+      ADMIN_PAGES.filter((page) => page.hub === "bookings").map((page) => [
+        page.id,
+        page.oldPath,
+        page.hubPath,
+        page.flags,
+      ]),
+    ).toEqual(BOOKINGS);
+    for (const page of ADMIN_PAGES.filter((candidate) => candidate.hub === "bookings")) {
+      expect(page.moved, page.id).toBe(true);
+      expect(page.admission, page.id).toBe("area");
+      expect(page.area, page.id).toBe("bookings");
+    }
+  });
+
+  it.each(BOOKINGS)("%s answers at %s and at %s as main did at the old path", (id, oldPath, hubPath, flags) => {
+    for (const pathname of [oldPath, hubPath].map(concrete)) {
+      expect(getAdminRouteRequirement(pathname, "GET"), pathname).toEqual({
+        area: "bookings",
+        level: "view",
+      });
+      expect(getAdminRouteRequirement(pathname, "POST"), pathname).toEqual({
+        area: "bookings",
+        level: "edit",
+      });
+      expect(getRequiredFeaturesForPath(pathname), pathname).toEqual([...flags]);
+      expect(differences(id, actualAnswer(pathname), oracleAnswer(concrete(oldPath)))).toEqual([]);
+      expect(canOpenAdminPath(only("bookings", "view"), pathname), pathname).toBe(true);
+      for (const area of ADMIN_PERMISSION_AREAS.map((entry) => entry.key)) {
+        if (area === "bookings") continue;
+        expect(canOpenAdminPath(only(area, "edit"), pathname), `${pathname} ${area}`).toBe(false);
+      }
+    }
+  });
+
+  it("gives the hub's root no rule, and matching stops at a segment boundary", () => {
+    expect(ADMIN_ROUTE_MAP.map(({ prefix }) => prefix)).not.toContain("/admin/booking-desk");
+    expect(firstMatch("/admin/booking-desk")?.prefix).toBe("/admin");
+    expect(getRequiredFeaturesForPath("/admin/booking-desk")).toEqual([]);
+    expect(firstMatch("/admin/book")?.prefix).toBe("/admin/book");
+    expect(firstMatch("/admin/bookings")?.prefix).toBe("/admin/bookings");
+    expect(firstMatch("/admin/booking-requests")?.prefix).toBe("/admin/booking-requests");
+    for (const [id, oldPath, hubPath] of BOOKINGS) {
+      const entry = firstMatch(concrete(hubPath));
+      expect(
+        entry && nestsUnder(entry.prefix, "/admin/booking-desk") && entry.prefix !== "/admin/booking-desk",
+        id,
+      ).toBe(true);
+      expect(entry?.area, id).toBe("bookings");
+      expect(entry?.prefix, id).toBe(
+        firstMatch(concrete(oldPath))!.prefix.replace(/^\/admin/, "/admin/booking-desk"),
+      );
+    }
+  });
+
+  it.each([
+    ["/api/admin/bookings", []],
+    ["/api/admin/booking-requests", []],
+    ["/api/admin/booking-change-requests", []],
+    ["/api/admin/bed-allocation", ["bedAllocation"]],
+    ["/api/admin/waitlist", ["waitlist"]],
+  ] as const)("leaves the API %s on bookings", (pathname, flags) => {
+    expect(getAdminRouteRequirement(pathname, "GET")).toEqual({ area: "bookings", level: "view" });
+    expect(getAdminRouteRequirement(pathname, "POST")).toEqual({ area: "bookings", level: "edit" });
+    expect(getRequiredFeaturesForPath(pathname)).toEqual([...flags]);
+  });
+});
+
+/**
+ * C11 part 1 (#4808): Lobby Display and Lodges moved under `/admin/lodge-ops`;
+ * the other eleven Lodge pages have not. Every moved page is on the lodge
+ * area's ordinary admission, the eight display pages other than setup need the
+ * Lobby Display module, and setup is exempt at its old path and its hub path
+ * and nowhere else. `/admin/lodge-ops` gets no rule of its own, and the kiosk
+ * prefix `/admin/lodge` stops at a segment boundary, so it covers none of the
+ * hub's paths. The `/api/admin` routes these pages call stay where they are.
+ */
+describe("the Lodge hub's Lobby Display and Lodges pages keep their admission (C11 part 1 #4808)", () => {
+  type Row = readonly [
+    id: string,
+    oldPath: string,
+    hubPath: string,
+    flags: readonly FeatureFlagKey[],
+  ];
+  const LODGE_PART_ONE: readonly Row[] = [
+    ["lodges", "/admin/lodges", "/admin/lodge-ops/lodges", []],
+    ["lodge-detail", "/admin/lodges/[id]", "/admin/lodge-ops/lodges/[id]", []],
+    [
+      "lodge-central-lodge",
+      "/admin/lodges/[id]/central-lodge",
+      "/admin/lodge-ops/lodges/[id]/central-lodge",
+      [],
+    ],
+    ["lodge-display", "/admin/lodges/[id]/display", "/admin/lodge-ops/lodges/[id]/display", []],
+    ["lodge-roster", "/admin/lodges/[id]/roster", "/admin/lodge-ops/lodges/[id]/roster", []],
+    ["lodge-setup", "/admin/lodges/[id]/setup", "/admin/lodge-ops/lodges/[id]/setup", []],
+    ["display", "/admin/display", "/admin/lodge-ops/display", ["lobbyDisplay"]],
+    ["display-builder", "/admin/display/builder", "/admin/lodge-ops/display/builder", ["lobbyDisplay"]],
+    ["display-devices", "/admin/display/devices", "/admin/lodge-ops/display/devices", ["lobbyDisplay"]],
+    ["display-layouts", "/admin/display/layouts", "/admin/lodge-ops/display/layouts", ["lobbyDisplay"]],
+    ["display-preview", "/admin/display/preview", "/admin/lodge-ops/display/preview", ["lobbyDisplay"]],
+    [
+      "display-reference",
+      "/admin/display/reference",
+      "/admin/lodge-ops/display/reference",
+      ["lobbyDisplay"],
+    ],
+    ["display-settings", "/admin/display/settings", "/admin/lodge-ops/display/settings", ["lobbyDisplay"]],
+    ["display-setup", "/admin/display/setup", "/admin/lodge-ops/display/setup", []],
+    [
+      "display-templates",
+      "/admin/display/templates",
+      "/admin/lodge-ops/display/templates",
+      ["lobbyDisplay"],
+    ],
+  ];
+  const UNMOVED = [
+    "rooms-beds",
+    "lodge-kiosk",
+    "hut-leaders",
+    "roster",
+    "roster-print",
+    "chores",
+    "work-parties",
+    "lodge-instructions",
+    "maintenance-reports",
+    "lockers",
+    "calendar",
+    "food-orders", // #5143: the Food Orders settings page, not yet moved into the hub
+  ];
+
+  const only = (area: AdminPermissionArea, level: "view" | "edit"): AdminPermissionInput => ({
+    canLogin: true,
+    accessRoles: [],
+    adminPermissionMatrix: {
+      ...(Object.fromEntries(
+        ADMIN_PERMISSION_AREAS.map((entry) => [entry.key, "none"]),
+      ) as AdminPermissionMatrix),
+      [area]: level,
+    },
+  });
+
+  it("names the fifteen moved pages, each on the lodge area's ordinary admission, and leaves the rest unmoved", () => {
+    const lodge = ADMIN_PAGES.filter((page) => page.hub === "lodge-ops");
+    expect(
+      lodge.filter((page) => page.moved).map((page) => [page.id, page.oldPath, page.hubPath, page.flags]),
+    ).toEqual(LODGE_PART_ONE);
+    for (const page of lodge.filter((candidate) => candidate.moved)) {
+      expect(page.admission, page.id).toBe("area");
+      expect(page.area, page.id).toBe("lodge");
+    }
+    expect(lodge.filter((page) => !page.moved).map((page) => page.id).sort()).toEqual([...UNMOVED].sort());
+  });
+
+  it.each(LODGE_PART_ONE)("%s answers at %s and at %s as main did at the old path", (id, oldPath, hubPath, flags) => {
+    for (const pathname of [oldPath, hubPath].map(concrete)) {
+      expect(getAdminRouteRequirement(pathname, "GET"), pathname).toEqual({ area: "lodge", level: "view" });
+      expect(getAdminRouteRequirement(pathname, "POST"), pathname).toEqual({ area: "lodge", level: "edit" });
+      expect(getRequiredFeaturesForPath(pathname), pathname).toEqual([...flags]);
+      expect(differences(id, actualAnswer(pathname), oracleAnswer(concrete(oldPath)))).toEqual([]);
+      expect(canOpenAdminPath(only("lodge", "view"), pathname), pathname).toBe(true);
+      for (const area of ["bookings", "membership", "overview"] as const) {
+        expect(canOpenAdminPath(only(area, "edit"), pathname), `${pathname} ${area}`).toBe(false);
+      }
+    }
+  });
+
+  it("exempts Display Setup from the Lobby Display module at its two paths, and nothing else", () => {
+    expect(getRequiredFeaturesForPath("/admin/display/setup")).toEqual([]);
+    expect(getRequiredFeaturesForPath("/admin/lodge-ops/display/setup")).toEqual([]);
+    for (const pathname of [
+      "/admin/display",
+      "/admin/display/devices",
+      "/admin/display/templates",
+      "/admin/display/builder",
+      "/admin/lodge-ops/display",
+      "/admin/lodge-ops/display/devices",
+      "/admin/lodge-ops/display/templates",
+      "/admin/lodge-ops/display/builder",
+      "/admin/display/setup/child",
+      "/admin/lodge-ops/display/setup/child",
+      "/admin/display/setupfoo",
+      "/admin/lodge-ops/display/setup-extra",
+      "/api/admin/display/setup",
+    ]) {
+      expect(getRequiredFeaturesForPath(pathname), pathname).toEqual(["lobbyDisplay"]);
+    }
+  });
+
+  it("gives the hub's root no rule, and keeps the kiosk gate on the kiosk alone", () => {
+    expect(ADMIN_ROUTE_MAP.map(({ prefix }) => prefix)).not.toContain("/admin/lodge-ops");
+    expect(firstMatch("/admin/lodge-ops")?.prefix).toBe("/admin");
+    expect(getRequiredFeaturesForPath("/admin/lodge-ops")).toEqual([]);
+    expect(getRequiredFeaturesForPath("/admin/lodge")).toEqual(["kiosk"]);
+    for (const [id, , hubPath] of LODGE_PART_ONE) {
+      const pathname = concrete(hubPath);
+      expect(getRequiredFeaturesForPath(pathname), id).not.toContain("kiosk");
+      const entry = firstMatch(pathname);
+      expect(
+        entry && nestsUnder(entry.prefix, "/admin/lodge-ops") && entry.prefix !== "/admin/lodge-ops",
+        id,
+      ).toBe(true);
+    }
+  });
+
+  it.each([
+    ["/api/admin/display", ["lobbyDisplay"]],
+    ["/api/admin/display/templates", ["lobbyDisplay"]],
+    ["/api/admin/lodges", []],
+    ["/api/admin/lodges/lodge-1/display", []],
+  ] as const)("leaves the API %s on lodge", (pathname, flags) => {
+    expect(getAdminRouteRequirement(pathname, "GET")).toEqual({ area: "lodge", level: "view" });
+    expect(getAdminRouteRequirement(pathname, "POST")).toEqual({ area: "lodge", level: "edit" });
+    expect(getRequiredFeaturesForPath(pathname)).toEqual([...flags]);
+  });
+});
+
+/**
+ * C9 (#4806): the Members hub is one permission area, with the induction module
+ * on three of its pages and on nothing else. Moving the pages under
+ * `/admin/membership` must not give that root a rule of its own — a prefix
+ * without the trailing slash would swallow `membership-cancellations`,
+ * `membership-setup` and `membership-types` — and must not put the induction
+ * gate on the members list. Each page answers at its hub path exactly as at
+ * its old path. The `/api/admin` routes these pages call stay where they are.
+ */
+describe("the Members hub keeps each page's own admission (C9 #4806)", () => {
+  type Row = readonly [
+    id: string,
+    oldPath: string,
+    hubPath: string,
+    flags: readonly FeatureFlagKey[],
+  ];
+  const MEMBERS: readonly Row[] = [
+    ["members", "/admin/members", "/admin/membership/members", []],
+    ["member-detail", "/admin/members/[id]", "/admin/membership/members/[id]", []],
+    ["member-merge", "/admin/members/[id]/merge", "/admin/membership/members/[id]/merge", []],
+    ["member-applications", "/admin/member-applications", "/admin/membership/member-applications", []],
+    [
+      "membership-cancellations",
+      "/admin/membership-cancellations",
+      "/admin/membership/membership-cancellations",
+      [],
+    ],
+    ["family-groups", "/admin/family-groups", "/admin/membership/family-groups", []],
+    ["induction", "/admin/induction", "/admin/membership/induction", ["induction"]],
+    ["induction-print", "/admin/induction/[id]/print", "/admin/membership/induction/[id]/print", ["induction"]],
+    ["induction-settings", "/admin/induction/settings", "/admin/membership/induction/settings", ["induction"]],
+    ["deletion-requests", "/admin/deletion-requests", "/admin/membership/deletion-requests", []],
+    ["committee", "/admin/committee", "/admin/membership/committee", []],
+    ["membership-setup", "/admin/membership-setup", "/admin/membership/membership-setup", []],
+    ["membership-types", "/admin/membership-types", "/admin/membership/membership-types", []],
+    ["member-fields", "/admin/member-fields", "/admin/membership/member-fields", []],
+    ["subscription-lockout", "/admin/subscription-lockout", "/admin/membership/subscription-lockout", []],
+    [
+      "subscription-categories",
+      "/admin/subscription-categories",
+      "/admin/membership/subscription-categories",
+      [],
+    ],
+  ];
+
+  const only = (area: AdminPermissionArea, level: "view" | "edit"): AdminPermissionInput => ({
+    canLogin: true,
+    accessRoles: [],
+    adminPermissionMatrix: {
+      ...(Object.fromEntries(
+        ADMIN_PERMISSION_AREAS.map((entry) => [entry.key, "none"]),
+      ) as AdminPermissionMatrix),
+      [area]: level,
+    },
+  });
+
+  it("names every page of the hub, each moved, on ordinary membership admission", () => {
+    expect(ADMIN_PAGES.filter((page) => page.hub === "members")).toHaveLength(16);
+    expect(
+      ADMIN_PAGES.filter((page) => page.hub === "members").map((page) => [
+        page.id,
+        page.oldPath,
+        page.hubPath,
+        page.flags,
+      ]),
+    ).toEqual(MEMBERS);
+    for (const page of ADMIN_PAGES.filter((candidate) => candidate.hub === "members")) {
+      expect(page.moved, page.id).toBe(true);
+      expect(page.admission, page.id).toBe("area");
+      expect(page.area, page.id).toBe("membership");
+    }
+  });
+
+  it.each(MEMBERS)("%s answers at %s and at %s as main did at the old path", (id, oldPath, hubPath, flags) => {
+    for (const pathname of [oldPath, hubPath].map(concrete)) {
+      expect(getAdminRouteRequirement(pathname, "GET"), pathname).toEqual({
+        area: "membership",
+        level: "view",
+      });
+      expect(getAdminRouteRequirement(pathname, "POST"), pathname).toEqual({
+        area: "membership",
+        level: "edit",
+      });
+      expect(getRequiredFeaturesForPath(pathname), pathname).toEqual([...flags]);
+      expect(differences(id, actualAnswer(pathname), oracleAnswer(concrete(oldPath)))).toEqual([]);
+      expect(canOpenAdminPath(only("membership", "view"), pathname), pathname).toBe(true);
+      // Every other area at edit, overview included, is refused at both paths.
+      for (const area of ADMIN_PERMISSION_AREAS.map((entry) => entry.key)) {
+        if (area === "membership") continue;
+        expect(canOpenAdminPath(only(area, "edit"), pathname), `${pathname} ${area}`).toBe(false);
+      }
+    }
+  });
+
+  it("gives the hub's root no rule, and keeps the induction gate on induction alone", () => {
+    expect(ADMIN_ROUTE_MAP.map(({ prefix }) => prefix)).not.toContain("/admin/membership");
+    expect(firstMatch("/admin/membership")?.prefix).toBe("/admin");
+    expect(getRequiredFeaturesForPath("/admin/membership")).toEqual([]);
+    expect(getRequiredFeaturesForPath("/admin/membership/induction")).toEqual(["induction"]);
+    expect(getRequiredFeaturesForPath("/admin/membership/members")).toEqual([]);
+    // The matcher is slash-anchored. A prefix `/admin/membership` without that
+    // slash would swallow these three old paths.
+    for (const pathname of [
+      "/admin/membership-cancellations",
+      "/admin/membership-setup",
+      "/admin/membership-types",
+    ]) {
+      expect(firstMatch(pathname)?.prefix, pathname).toBe(pathname);
+    }
+    for (const [id, oldPath, hubPath] of MEMBERS) {
+      const entry = firstMatch(concrete(hubPath));
+      expect(entry && nestsUnder(entry.prefix, "/admin/membership") && entry.prefix !== "/admin/membership", id).toBe(
+        true,
+      );
+      expect(entry?.area, id).toBe("membership");
+      expect(entry?.prefix, id).toBe(firstMatch(concrete(oldPath))!.prefix.replace(/^\/admin/, "/admin/membership"));
+    }
+  });
+
+  it.each([
+    ["/api/admin/members", "membership", []],
+    ["/api/admin/family-groups", "membership", []],
+    ["/api/admin/deletion-requests", "membership", []],
+    ["/api/admin/membership-types", "membership", []],
+    ["/api/admin/membership-lockout-settings", "membership", []],
+  ] as const)("leaves the API %s on %s", (pathname, area, flags) => {
+    expect(getAdminRouteRequirement(pathname, "GET")).toEqual({ area, level: "view" });
+    expect(getAdminRouteRequirement(pathname, "POST")).toEqual({ area, level: "edit" });
+    expect(getRequiredFeaturesForPath(pathname)).toEqual([...flags]);
+  });
+});

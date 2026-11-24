@@ -1,0 +1,118 @@
+import { revalidateAdminPage } from "@/lib/admin-page-revalidation";
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import logger from "@/lib/logger";
+import { requireAdmin } from "@/lib/session-guards";
+import { nonNegativeCentsSchema } from "@/lib/cents-schema";
+import { transactionContendedResponse } from "@/lib/transaction-contended-response";
+import { MANUAL_PAYMENT_NOTE_MAX } from "@/lib/manual-payment-note";
+import { PAID_BACK_CHOICES, PAID_BACK_REST_CHOICES } from "@/lib/card-refund-paid-back";
+import { closeGroupCardRefundPaidAnotherWay } from "@/lib/card-refund-group-paid-another-way";
+import {
+  CardRefundPaidAnotherWayError,
+  closeCardRefundPaidAnotherWay,
+} from "@/lib/card-refund-paid-another-way";
+import { isGroupSettlementRefundRecoveryKey, isOrganiserChildRefundKey } from "@/lib/payment-recovery-keys";
+import { prisma } from "@/lib/prisma";
+import { requireRecentAuth } from "@/lib/require-recent-auth";
+
+/**
+ * Explicit confirmation, as the hand-back completion asks, so closing a money
+ * obligation is never a single-click accident; a note saying how the member
+ * was paid back; and the treasurer's own answer to "in full, or part of it?"
+ * (owner, 8 Oct 2026), never inferred from the amount. The close checks the
+ * answer against what is still owed and refuses an inconsistent one with a 400,
+ * and refuses with a 409 when what is still owed is no longer what the dialog
+ * showed (`expectedOwedCents`, #3924 round 7), so the page refreshes.
+ */
+const bodySchema = z
+  .object({
+    amountCents: nonNegativeCentsSchema,
+    paidBack: z.enum(PAID_BACK_CHOICES),
+    // #4516 (owner, 2 Nov 2026): a part close says what happens to the rest; no default (the close refuses without it).
+    rest: z.enum(PAID_BACK_REST_CHOICES).optional(),
+    // #3924 round 7 (C7): what the dialog showed still owed; a mismatch is a 409.
+    expectedOwedCents: nonNegativeCentsSchema,
+    note: z.string().max(MANUAL_PAYMENT_NOTE_MAX),
+    confirmed: z.literal(true),
+  })
+  .strict();
+
+/**
+ * POST /api/admin/payments/card-refunds/[id]/paid-another-way
+ *
+ * #3372 (owner, 7 Oct 2026: "Count + add close action"): close a card refund
+ * Stripe gave up on (`PaymentRecoveryOperation`, retries spent) because the
+ * treasurer paid the member back another way. Gated `finance:edit`, the
+ * permission that completes a refund paid back by hand
+ * (`/api/admin/payments/manual-refund-tasks/[id]`). Records the money on the
+ * payment, closes the refund so it leaves "Refunds owed" and Net Collected, and
+ * audits it; no Stripe call. The rules are `closeCardRefundPaidAnotherWay`'s.
+ */
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const guard = await requireAdmin({
+    permission: { area: "finance", level: "edit" },
+  });
+  if (!guard.ok) return guard.response;
+
+  const { id } = await params;
+
+  const recent = await requireRecentAuth();
+  if (!recent.ok) return recent.response;
+  const jsonBody = await parseJsonRequestBody(request, {
+    error: "Invalid JSON.",
+  });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+  const parsed = bodySchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid request.", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  try {
+    const keyRow = await prisma.paymentRecoveryOperation.findUnique({
+      where: { id },
+      select: { idempotencyKey: true },
+    });
+    const group =
+      keyRow !== null &&
+      (isOrganiserChildRefundKey(keyRow.idempotencyKey) || isGroupSettlementRefundRecoveryKey(keyRow.idempotencyKey));
+    const shared = {
+      operationId: id,
+      amountCents: parsed.data.amountCents,
+      paidBack: parsed.data.paidBack,
+      expectedOwedCents: parsed.data.expectedOwedCents,
+      note: parsed.data.note,
+      actingMemberId: guard.session.user.id,
+    };
+    const result = group
+      ? await closeGroupCardRefundPaidAnotherWay(shared)
+      : await closeCardRefundPaidAnotherWay({ ...shared, rest: parsed.data.rest ?? null });
+    revalidateAdminPage("stuck-states");
+    revalidateAdminPage("payments");
+    revalidateAdminPage("dashboard");
+    return NextResponse.json({ success: true, ...result });
+  } catch (error) {
+    if (error instanceof CardRefundPaidAnotherWayError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+    const contended = transactionContendedResponse(
+      error,
+      "Card refund paid-another-way close contended for the lock(1) budget",
+      { context: { operationId: id } },
+    );
+    if (contended) return contended;
+    logger.error({ err: error, operationId: id }, "Closing a card refund as paid another way failed");
+    return NextResponse.json(
+      { error: "Could not close the card refund." },
+      { status: 500 },
+    );
+  }
+}

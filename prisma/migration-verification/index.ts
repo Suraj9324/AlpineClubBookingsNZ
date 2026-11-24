@@ -1,0 +1,103 @@
+import addClubTimeSettings from "./20260822010000_add_club_time_settings";
+import addHutLeaderAssignmentSource from "./20260820020000_add_hut_leader_assignment_source";
+import addMemberEmailInheritanceChoice from "./20260813010000_add_member_email_inheritance_choice";
+import backfillBedAllocationAuditCategory from "./20260810020000_backfill_bed_allocation_audit_category";
+import backfillBookingRequestGuestNights from "./20260810010000_backfill_booking_request_guest_nights";
+import clearStarterFooterAffiliations from "./20260802140000_clear_starter_footer_affiliations";
+import clearWaldvogelLodgeAddress from "./20260802110000_clear_waldvogel_lodge_address";
+import contractSubscriptionLockoutDropEnabled from "./20260803010000_contract_subscription_lockout_drop_enabled";
+import narrowCalendarDateColumns from "./20260825010000_narrow_calendar_date_columns";
+import addBookingGuestNightPriceSource from "./20260911010000_add_booking_guest_night_price_source";
+import backfillBookingGuestNightPriceSource from "./20260911020000_backfill_booking_guest_night_price_source";
+import addBookingGuestNightAdjustment from "./20260913010000_add_booking_guest_night_adjustment";
+import addOrganisationRecord from "./20260928010000_add_organisation_record";
+import backfillHistoricalAuditCategories from "./20260923010000_backfill_historical_audit_categories";
+import backfillSchoolBookingsToOrganisations from "./20260928030000_backfill_school_bookings_to_organisations";
+import addMemberParentPartnerExclusion from "./20260929010000_add_member_parent_partner_exclusion";
+import repairLocalMidnightDatesOfBirth from "./20260814010000_repair_local_midnight_dates_of_birth";
+import updateStarterHomeGuestCopy from "./20260802150000_update_starter_home_guest_copy";
+import relocaleProofExceptionRequestIdentities from "./20260930010000_relocale_proof_exception_request_identities";
+import addMemberSessionsRevokedAt from "./20261009010000_add_member_sessions_revoked_at";
+import backfillMemberSessionsRevokedAt from "./20261009020000_backfill_member_sessions_revoked_at";
+import dropPaymentRefundCurrencyDefault from "./20261012010000_drop_payment_refund_currency_default";
+import addSchoolTeacherHutLeaderPolicy from "./20261101010000_add_school_teacher_hut_leader_policy";
+import addPendingSchoolAdultCapacity from "./20261101020000_add_pending_school_adult_capacity";
+import addLodgeSchoolHutLeaderKinds from "./20261114020000_add_lodge_school_hut_leader_kinds";
+import addPaymentTransactionInsertionSeq from "./20261117010000_add_payment_transaction_insertion_seq";
+import correctStarterPrivacyAuditRetention from "./20261119010000_correct_starter_privacy_audit_retention";
+import addXeroConnection from "./20261124010000_add_xero_connection";
+import memberMoneyApplications from "./20261210080000_member_money_applications";
+import memberMoneyExportManifest from "./20261221030000_member_money_export_manifest";
+import memberMoneyJournal from "./20261127010000_member_money_journal";
+import stripeBalanceEvidence from "./20261211010000_stripe_balance_evidence";
+import releaseCancelledBookingPromos from "./20261217010000_release_cancelled_booking_promos";
+import correctStarterPrivacyRetentionAndHosting from "./20261214010000_correct_starter_privacy_retention_and_hosting";
+import summariseStarterFaqPersonalData from "./20261218070000_summarise_starter_faq_personal_data";
+import correctStarterPrivacySubjectAccess from "./20261220010000_correct_starter_privacy_subject_access";
+import addSkifieldWhakapapaModule from "./20261221010000_add_skifield_whakapapa_module";
+import rewriteStarterPrivacyRecipients from "./20261222030000_rewrite_starter_privacy_recipients";
+import clubTaxSchedule from "./20261223020000_club_tax_schedule";
+import addAiAppsToStarterPrivacy from "./20270101020000_add_ai_apps_to_starter_privacy";
+import memberMoneyExportCoverageRelease from "./20270105100100_member_money_export_coverage_release";
+import type { DataMigrationVerification } from "./types";
+
+/**
+ * The registry of data-migration verification fixtures (#2418).
+ *
+ * `src/lib/__tests__/data-migration-verification.realdb.test.ts` executes
+ * everything listed here against a real PostgreSQL: it replays every earlier
+ * migration, seeds each case's pre-state, runs the real `migration.sql`, and
+ * asserts the rows — then re-runs each case against deliberately broken copies
+ * of the migration to prove the assertions have teeth.
+ *
+ * A fixture that is NOT listed here never runs, which is coverage that does not
+ * exist. `scripts/check-data-migration-verification.sh` fails on an unregistered
+ * fixture for that reason, and fails on a data-rewriting migration that ships no
+ * fixture at all.
+ *
+ * Listed oldest migration first — the runner replays the migration chain once,
+ * in order, and advances through it.
+ */
+export const DATA_MIGRATION_VERIFICATIONS: DataMigrationVerification[] = [
+  clearWaldvogelLodgeAddress,
+  clearStarterFooterAffiliations,
+  updateStarterHomeGuestCopy,
+  contractSubscriptionLockoutDropEnabled,
+  backfillBookingRequestGuestNights,
+  backfillBedAllocationAuditCategory,
+  addMemberEmailInheritanceChoice,
+  repairLocalMidnightDatesOfBirth,
+  addHutLeaderAssignmentSource,
+  addClubTimeSettings,
+  narrowCalendarDateColumns,
+  addBookingGuestNightPriceSource,
+  backfillBookingGuestNightPriceSource,
+  relocaleProofExceptionRequestIdentities,
+  addBookingGuestNightAdjustment,
+  addOrganisationRecord,
+  backfillHistoricalAuditCategories,
+  backfillSchoolBookingsToOrganisations,
+  addMemberParentPartnerExclusion,
+  addMemberSessionsRevokedAt,
+  backfillMemberSessionsRevokedAt,
+  dropPaymentRefundCurrencyDefault,
+  addSchoolTeacherHutLeaderPolicy,
+  addPendingSchoolAdultCapacity,
+  addLodgeSchoolHutLeaderKinds,
+  addPaymentTransactionInsertionSeq,
+  correctStarterPrivacyAuditRetention,
+  addXeroConnection,
+  memberMoneyJournal,
+  memberMoneyApplications,
+  stripeBalanceEvidence,
+  releaseCancelledBookingPromos,
+  correctStarterPrivacyRetentionAndHosting,
+  summariseStarterFaqPersonalData,
+  correctStarterPrivacySubjectAccess,
+  addSkifieldWhakapapaModule,
+  memberMoneyExportManifest,
+  rewriteStarterPrivacyRecipients,
+  clubTaxSchedule,
+  addAiAppsToStarterPrivacy,
+  memberMoneyExportCoverageRelease,
+];

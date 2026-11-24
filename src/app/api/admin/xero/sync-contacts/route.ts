@@ -1,0 +1,63 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { requireAdmin } from "@/lib/session-guards";
+import { syncContactsFromXero } from "@/lib/xero-bulk-contact-sync";
+import { getXeroApiErrorInfo } from "@/lib/xero-api-errors";
+import logger from "@/lib/logger";
+
+const syncContactsSchema = z.object({
+  fullResync: z.boolean().optional(),
+  backfillJoinedDates: z.boolean().optional(),
+});
+
+/**
+ * POST /api/admin/xero/sync-contacts
+ * Triggers an incremental contact sync from Xero by default.
+ * Accepts optional JSON repair flags for explicit full rescans/backfills.
+ * Matches Xero contacts to local members by email and links xeroContactId.
+ * Returns a detailed SyncReport with categorized results.
+ */
+export async function POST(request?: Request) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+  let options: z.infer<typeof syncContactsSchema> = {};
+  const contentType = request?.headers.get("content-type") ?? "";
+  // `request` is optional only for callers that invoke POST() bare; with none the
+  // content type is empty and this branch never ran, so the `request &&` changes nothing.
+  if (request && contentType.includes("application/json")) {
+    const jsonBody = await parseJsonRequestBody(request, {
+      error: "Invalid JSON",
+    });
+    if (!jsonBody.ok) return jsonBody.response;
+    const body = jsonBody.body;
+
+    const parsed = syncContactsSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+        { status: 422 }
+      );
+    }
+    options = parsed.data;
+  }
+
+  try {
+    const report = await syncContactsFromXero({
+      ...options,
+      auditActorMemberId: session.user.id,
+      auditSource: "admin-xero-sync-contacts",
+    });
+    return NextResponse.json({ syncReport: report });
+  } catch (error) {
+    const xeroError = getXeroApiErrorInfo(error, "Contact sync failed");
+    if (!xeroError.handled) {
+      logger.error(
+        { err: error, xeroDiagnosticMessage: xeroError.diagnosticMessage },
+        "Failed to sync contacts from Xero"
+      );
+    }
+    return NextResponse.json({ error: xeroError.clientMessage }, { status: xeroError.status });
+  }
+}

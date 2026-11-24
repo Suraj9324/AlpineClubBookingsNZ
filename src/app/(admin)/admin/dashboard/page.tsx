@@ -1,0 +1,771 @@
+import Link from "next/link";
+import { bookingOwner } from "@/lib/booking-owner";
+import { prisma } from "@/lib/prisma";
+import {
+  netCollectedBookingSelect,
+  netCollectedCaptureEvidenceSelect,
+  netCollectedCardRefundSelect,
+} from "@/lib/additional-ledger-gap";
+import { formatNetCollectedBreakdown, summarizeCollectedCash } from "@/lib/payment-net-collected";
+import { readRefundsAndCreditsOwed } from "@/lib/refunds-and-credits-owed";
+import { RefundsAndCreditsOwedList } from "@/components/admin/refunds-and-credits-owed";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import {
+  Users,
+  CalendarRange,
+  BookOpen,
+  BedDouble,
+  Tag,
+  ClipboardList,
+  ArrowRight,
+  DollarSign,
+  UserCheck,
+} from "lucide-react";
+import { auth } from "@/lib/auth";
+import { MEMBER_ACCESS_ROLE_SELECT } from "@/lib/access-role-definitions";
+import {
+  canViewAdminHrefWithMatrix,
+  emptyAdminPermissionMatrix,
+  getAdminPermissionMatrix,
+  type AdminPermissionMatrix,
+} from "@/lib/admin-permissions";
+import { clubFormat } from "@/lib/club-format-server";
+import { bookingStatusClass, bookingStatusLabel } from "@/lib/status-colors";
+import { buildHrefWithReturnTo } from "@/lib/internal-return-path";
+import { CLUB_HUT_LEADER_LABEL, CLUB_NAME } from "@/config/club-identity";
+import {
+  ACTIVE_BOOKING_STATUSES,
+  UPCOMING_CHECK_IN_BOOKING_STATUSES,
+} from "@/lib/booking-status";
+import {
+  addCalendarDays,
+  calendarDateFromParts,
+  calendarDateOfDateOnlyInstant,
+  calendarDateParts,
+  dateOnlyInstantOf,
+  daysInCalendarMonth,
+  formatClubDayMonth,
+  requireCalendarDate,
+} from "@/lib/club-time";
+import { clubTime } from "@/lib/club-time/server";
+import { countRosterDaysNeedingChores } from "@/lib/roster-status";
+import { countGuestsAwaitingBed } from "@/lib/bed-allocation-board";
+import { loadEffectiveModuleFlags } from "@/lib/module-settings";
+import {
+  coverageNeedsLodgeContext,
+  getHutLeaderDashboardCoverage,
+  uncoveredNightLabel,
+} from "@/lib/hut-leader-coverage";
+import { HutLeaderHandoversCard } from "@/components/admin/hut-leader-handovers-card";
+import { countActiveLodges } from "@/lib/lodges";
+import { adminHref } from "@/lib/admin-hubs";
+import { getAdminPendingCounts } from "@/lib/admin-pending-counts";
+import { AdminWorkQueueCards } from "@/components/admin/admin-work-queue-cards";
+
+// #2264: the upcoming check-ins list renders its date range in a fixed-width
+// column, so it stays compact — day plus short month, no year. F3 (#3079)
+// declared that bag as the kernel's `dayMonth` shape, which is what the local
+// formatter here has become.
+//
+// CT-4 (#2870): `checkIn` and `checkOut` are CALENDAR DATES — `@db.Date` columns
+// Prisma hands back as UTC midnight — and a calendar date has no timezone, so the
+// shape takes none. Reading them through APP_TIME_ZONE was a projection that
+// named the night before for any club behind UTC (INV-DATE-019).
+
+async function getStats(permissionMatrix: Promise<AdminPermissionMatrix>) {
+  // CT-4 (#2870): every derivation below now starts from the club's PERSISTED
+  // timezone rather than `APP_TIME_ZONE` (INV-CONFIG-002), and the month bounds
+  // are calendar arithmetic on a `CalendarDate` rather than string slicing plus
+  // `Date.UTC(y, m + 1, 0)`. The values handed to Prisma are unchanged in kind:
+  // `today` and `sevenDaysFromNow` are `@db.Date` date-only bounds, and the
+  // month pair are real instants bracketing the club's civil month.
+  const club = await clubTime();
+  const todayKey = club.today();
+  const today = dateOnlyInstantOf(todayKey);
+  const { year, month } = calendarDateParts(todayKey);
+  const startOfMonth = club.startOfDay(calendarDateFromParts(year, month, 1));
+  // Inclusive end — the millisecond before the next club day begins — because
+  // these bound an `lte` filter. The kernel offers only the half-open
+  // `endOfDayExclusive`; an `endOfClubDayInclusive` helper is reported on #2870
+  // as wanted in `src/lib`, where three other lanes have written this same
+  // `getTime() - 1`.
+  const endOfMonth = new Date(
+    club
+      .endOfDayExclusive(
+        calendarDateFromParts(year, month, daysInCalendarMonth(year, month)),
+      )
+      .getTime() - 1,
+  );
+  const sevenDaysFromNow = dateOnlyInstantOf(addCalendarDays(todayKey, 7));
+  const features = await loadEffectiveModuleFlags();
+  const bedAllocationEnabled = features.bedAllocation;
+
+  // `today` IS STILL PASSED, and the reason changed with #3123 —
+  // `getUnassignedHutLeaderDates` no longer falls back to `getTodayDateOnly()`
+  // and `APP_TIME_ZONE`, so this is no longer the difference between the
+  // container's day and the club's. What it is now is the difference between
+  // ONE reading of the club's day and TWO. The two officer cards either side
+  // of this one (roster, bed allocation) are windowed from `today` above; let
+  // the coverage card resolve its own and a request that crosses club midnight
+  // between the two reads paints one card a day ahead of its neighbours, which
+  // is the same defect CT-4 (#2870) found here wearing a different cause. It
+  // also saves the extra settings read the fallback would perform
+  // (INV-CONFIG-002).
+  //
+  // #3818: the amber card and "Handovers this week" (today and the six days
+  // after it) read ONE cover. The handovers, and the names they need, are
+  // read only when the actor can see that card — the same gate the page
+  // applies when rendering it.
+  const hutLeaderCoverage = permissionMatrix.then((matrix) =>
+    getHutLeaderDashboardCoverage({
+      scope: { kind: "all" },
+      today,
+      handovers: canViewAdminHrefWithMatrix(matrix, "/admin/hut-leaders")
+        ? { from: today, to: dateOnlyInstantOf(addCalendarDays(todayKey, 6)) }
+        : null,
+    }),
+  );
+
+  const [
+    totalMembers,
+    activeMembers,
+    inactiveMembers,
+    totalBookings,
+    activeBookings,
+    netCollectedResult,
+    refundsAndCreditsOwed,
+    upcomingCheckIns,
+    recentBookings,
+    workQueueCounts,
+    { unassignedDates: unassignedHutLeaderDates, handovers: hutLeaderHandovers },
+    activeLodgeCount,
+    rosterDaysNeedingChores,
+    bedGuestsAwaiting,
+  ] = await Promise.all([
+    prisma.member.count(),
+    prisma.member.count({ where: { active: true } }),
+    prisma.member.count({ where: { active: false } }),
+    prisma.booking.count({ where: { deletedAt: null } }),
+    prisma.booking.count({
+      where: { deletedAt: null, status: { in: [...ACTIVE_BOOKING_STATUSES] } },
+    }),
+    // #3372: every payment recorded this month, whatever its status, so the
+    // net-collected-cash derivation (`summarizeCollectedCash`) decides which
+    // statuses count as captured AND which bookings count (the one Net
+    // Collected booking scope, owner decision A: every booking not
+    // soft-deleted; a cancelled booking adds only what it kept of what was paid,
+    // nil if never paid). The shared booking select loads what the rule reads.
+    // This used to sum `SUCCEEDED` alone: a partly-refunded payment left the
+    // figure entirely, and nothing subtracted a refund on the ones that stayed.
+    //
+    // By `createdAt`, the moment the payment RECORD was made - not when money
+    // arrived. A bank-transfer row is created PENDING with the booking and paid
+    // later, so it counts in the month it was recorded once it is paid.
+    prisma.payment.findMany({
+      where: { createdAt: { gte: startOfMonth, lte: endOfMonth } },
+      select: {
+        status: true,
+        amountCents: true,
+        refundedAmountCents: true,
+        // #3372: a refunded status counts only with capture evidence.
+        ...netCollectedCaptureEvidenceSelect,
+        // #3372 (7 Oct 2026): card refunds not yet paid come off straight away.
+        ...netCollectedCardRefundSelect,
+        booking: { select: netCollectedBookingSelect },
+      },
+    }),
+    // #3372 (owner, 7 Oct 2026): beside Net Collected, what is still owed back
+    // as at today - club-wide, not this month's.
+    readRefundsAndCreditsOwed(),
+    // Bookings officer card headline (#2091): check-ins in the next 7 days.
+    // Uses UPCOMING_CHECK_IN_BOOKING_STATUSES (not the wider
+    // ACTIVE_BOOKING_STATUSES) so the count equals the list the card deep links
+    // to — /admin/bookings?upcoming=7 applies the same status set — rather than
+    // over-counting AWAITING_REVIEW bookings the list hides.
+    prisma.booking.count({
+      where: {
+        status: { in: [...UPCOMING_CHECK_IN_BOOKING_STATUSES] },
+        deletedAt: null,
+        checkIn: { gte: today, lte: sevenDaysFromNow },
+      },
+    }),
+    prisma.booking.findMany({
+      where: { deletedAt: null },
+      orderBy: { createdAt: "desc" },
+      take: 10,
+      select: {
+        id: true,
+        checkIn: true,
+        checkOut: true,
+        status: true,
+        finalPriceCents: true,
+        createdAt: true,
+        member: { select: { firstName: true, lastName: true } },
+        // #3369: the owner may be an Organisation; bookingOwner() reads both.
+        organisation: { select: { name: true, email: true } },
+        _count: { select: { guests: true } },
+      },
+    }),
+    // Every officer work queue (#4962), from the one counter the sidebar's
+    // Needs Attention badges read, on this render's club day. The dashboard
+    // used to run its own copies of these queries and drifted from the sidebar.
+    //
+    // The uncovered-nights count is taken from the coverage read started above,
+    // not a second scan of the same window: the attention card's number, the Hut
+    // Leader Assignment card's number and the nights listed on both are then one
+    // array's length, so a leader assigned or a booking made mid-render cannot
+    // leave them disagreeing.
+    getAdminPendingCounts({
+      today,
+      supplied: {
+        unassignedHutLeaderDates: hutLeaderCoverage.then(
+          (coverage) => coverage.unassignedDates.length,
+        ),
+      },
+    }),
+    hutLeaderCoverage,
+    // Whether this club is multi-lodge, for the ADR-002 Presentation Rule below.
+    // Keyed on the CLUB, not on how many lodges happen to be uncovered (#2917
+    // review): a two-lodge club whose gaps all sit at one lodge must still be
+    // told which lodge, and the wording must not flip as lodges gain and lose
+    // cover. Same house predicate as the bookings calendar and quote copy. Cheap:
+    // a single indexed count, batched into this existing round-trip set.
+    countActiveLodges(prisma),
+    // Roster Assignment officer card (#2091, D-E2): DAYS in the next 7 days
+    // that still need a chore roster. Window-scoped to the roster surface's own
+    // needs-roster semantics (days with ≥1 guest in the lodge and no chore
+    // assignment, per src/lib/roster-status.ts computeRosterDayStatuses), so the
+    // headline reconciles with what the officer sees — a per-day count that
+    // neither drops a stay rostered on only some of its days nor inflates on
+    // guestless bookings. Days, not nights (#2631): a changeover morning whose
+    // guests all leave before midday still needs its chores done and is counted
+    // here exactly as the roster calendar paints it. Cheap: bounded 7-day
+    // window.
+    countRosterDaysNeedingChores({ from: today, to: sevenDaysFromNow }),
+    // Bed Allocation officer card (#2091, D-E2): guests in the next 7 days with a
+    // bed-night awaiting allocation, mirroring the bed board's own
+    // unallocatedGuestNights set (ADR-001). Skipped with the module off (#3841).
+    bedAllocationEnabled
+      ? countGuestsAwaitingBed({ from: today, to: sevenDaysFromNow })
+      : Promise.resolve(0),
+  ]);
+
+  // Payments RECORDED this month, less every refund and credit on them -
+  // whenever it was made. A cohort, not a cash-flow statement: a refund this
+  // month on last month's payment does not reduce it, and the card's subline
+  // says what it covers.
+  const netCollectedThisMonth = summarizeCollectedCash(netCollectedResult);
+  const unassignedNamesLodges = coverageNeedsLodgeContext({
+    activeLodgeCount,
+    rows: unassignedHutLeaderDates,
+  });
+
+  return {
+    todayKey,
+    totalMembers,
+    activeMembers,
+    inactiveMembers,
+    totalBookings,
+    activeBookings,
+    netCollectedThisMonth,
+    refundsAndCreditsOwed,
+    upcomingCheckIns,
+    recentBookings,
+    workQueueCounts,
+    features,
+    // One entry per uncovered LODGE-night (#2917): two lodges uncovered on one
+    // night is two pieces of work. The label names the lodge whenever the club
+    // has more than one active lodge, per the Presentation Rule (ADR-002), so a
+    // single-lodge club sees the same bare dates and count as before while a
+    // multi-lodge club is never handed a date it cannot place.
+    // #3818: each entry is a night with no leader STAYING, with its guest
+    // count; the page labels them with the club's date format.
+    unassignedHutLeaderDates,
+    unassignedNamesLodges,
+    hutLeaderHandovers,
+    handoversNameLodges: coverageNeedsLodgeContext({ activeLodgeCount, rows: hutLeaderHandovers }),
+    rosterDaysNeedingChores,
+    bedGuestsAwaiting,
+    bedAllocationEnabled,
+  };
+}
+
+
+// Officer key cards are permission-gated via the shared admin matrix (#2091,
+// D-E3): a card is hidden — never disabled — when the actor cannot open its
+// target page. The matrix is resolved server-side exactly as the admin layout
+// does (definition-backed roles cannot be resolved client-side).
+async function getPermissionMatrix() {
+  const session = await auth();
+  const actor = session?.user
+    ? await prisma.member.findUnique({
+        where: { id: session.user.id },
+        select: {
+          id: true,
+          canLogin: true,
+          accessRoles: { select: MEMBER_ACCESS_ROLE_SELECT },
+        },
+      })
+    : null;
+  return actor ? getAdminPermissionMatrix(actor) : emptyAdminPermissionMatrix();
+}
+
+export default async function AdminDashboardPage() {
+  // Resolve the stats batch and the actor's permission matrix concurrently —
+  // the auth() + member lookup no longer waits on the stats round-trip (#2091).
+  // The matrix promise is shared, so the hut-leader read inside getStats can
+  // skip what this actor cannot see without serialising the two.
+  const permissionMatrixPromise = getPermissionMatrix();
+  const [stats, permissionMatrix, money] = await Promise.all([
+    getStats(permissionMatrixPromise),
+    permissionMatrixPromise,
+    clubFormat(),
+  ]);
+  const unassignedDatesWithBookings = stats.unassignedHutLeaderDates.map((item) =>
+    uncoveredNightLabel(item, stats.unassignedNamesLodges, (date) =>
+      formatClubDayMonth(requireCalendarDate(date), money.format),
+    ),
+  );
+  // #3372: exact cents, never `money.dollars`, here and on the headline - a
+  // rounded figure can disagree with the line beneath it by a dollar.
+  const netCollectedBreakdown = formatNetCollectedBreakdown(
+    stats.netCollectedThisMonth,
+    money.cents,
+  );
+
+  const canViewBookings = canViewAdminHrefWithMatrix(
+    permissionMatrix,
+    adminHref("bookings"),
+  );
+  const canViewHutLeaders = canViewAdminHrefWithMatrix(
+    permissionMatrix,
+    "/admin/hut-leaders",
+  );
+  const canViewRoster = canViewAdminHrefWithMatrix(
+    permissionMatrix,
+    "/admin/roster",
+  );
+  const canViewBedAllocation =
+    stats.bedAllocationEnabled &&
+    canViewAdminHrefWithMatrix(permissionMatrix, adminHref("bed-allocation"));
+  const canViewMembers = canViewAdminHrefWithMatrix(
+    permissionMatrix,
+    adminHref("members"),
+  );
+  const canViewPayments = canViewAdminHrefWithMatrix(
+    permissionMatrix,
+    adminHref("payments"),
+  );
+  const showOfficerRow =
+    canViewBookings ||
+    canViewHutLeaders ||
+    canViewRoster ||
+    canViewBedAllocation;
+  const showSecondaryRow = canViewMembers || canViewPayments;
+
+  // The hut-leader card keeps its own wording: it names the uncovered nights.
+  // Its number is still the registry's (#4962); `getHutLeaderDashboardCoverage`
+  // reads the same predicate over the same window on the same club day.
+  const unassignedNightNoun = stats.unassignedNamesLodges ? "lodge-night" : "night";
+  const workQueueCardOverrides = {
+    "hut-leaders": {
+      title: `${stats.unassignedNamesLodges ? "Lodge-nights" : "Nights"} without a ${CLUB_HUT_LEADER_LABEL.toLowerCase()} who counts`,
+      describe: (count: number) =>
+        `${count} upcoming ${unassignedNightNoun}${count === 1 ? "" : "s"} with guests but no ${CLUB_HUT_LEADER_LABEL.toLowerCase()} who counts: ${unassignedDatesWithBookings.slice(0, 5).join("; ")}${unassignedDatesWithBookings.length > 5 ? ` and ${unassignedDatesWithBookings.length - 5} more` : ""}`,
+    },
+  };
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h1 className="text-2xl font-bold text-foreground">Admin Dashboard</h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {CLUB_NAME} — Administration
+        </p>
+      </div>
+
+      {/* Attention cards (#4962): one per officer work queue with something
+          in it, from the registry the sidebar's Needs Attention section
+          renders, gated on the same "may this viewer open it" rule. */}
+      <AdminWorkQueueCards
+        counts={stats.workQueueCounts}
+        clubToday={stats.todayKey}
+        features={stats.features}
+        permissionMatrix={permissionMatrix}
+        overrides={workQueueCardOverrides}
+      />
+
+      {canViewHutLeaders && (
+        <HutLeaderHandoversCard handovers={stats.hutLeaderHandovers} nameLodges={stats.handoversNameLodges} format={money.format} />
+      )}
+
+      {/* Bookings-officer key cards (#2091, D-E1/D-E2): the four surfaces a
+          bookings officer works every day, each headlining an actionable
+          "work to do" count. Permission-gated (D-E3) so an officer only sees
+          the cards whose target page they can open. */}
+      {showOfficerRow && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {canViewBookings && (
+            <Link href={`${adminHref("bookings")}?upcoming=7`} className="group">
+              <Card className="h-full hover:shadow-md transition-shadow cursor-pointer">
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">Bookings</CardTitle>
+                  <BookOpen className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-3xl font-bold">
+                    {stats.upcomingCheckIns}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    checking in within 7 days · {stats.activeBookings} active of{" "}
+                    {stats.totalBookings} all-time
+                  </p>
+                </CardContent>
+              </Card>
+            </Link>
+          )}
+
+          {canViewHutLeaders && (
+            <Link href="/admin/hut-leaders" className="group">
+              <Card className="h-full hover:shadow-md transition-shadow cursor-pointer">
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">
+                    {CLUB_HUT_LEADER_LABEL} Assignment
+                  </CardTitle>
+                  <UserCheck className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-3xl font-bold">
+                    {unassignedDatesWithBookings.length}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    upcoming{" "}
+                    {stats.unassignedNamesLodges ? "lodge-night" : "night"}
+                    {unassignedDatesWithBookings.length === 1
+                      ? ""
+                      : "s"}{" "}
+                    with guests but no{" "}
+                    {CLUB_HUT_LEADER_LABEL.toLowerCase()} staying
+                  </p>
+                </CardContent>
+              </Card>
+            </Link>
+          )}
+
+          {canViewRoster && (
+            <Link href="/admin/roster" className="group">
+              <Card className="h-full hover:shadow-md transition-shadow cursor-pointer">
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">
+                    Roster Assignment
+                  </CardTitle>
+                  <ClipboardList className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-3xl font-bold">
+                    {stats.rosterDaysNeedingChores}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    day
+                    {stats.rosterDaysNeedingChores === 1 ? "" : "s"} in the
+                    next 7 days with no chores assigned
+                  </p>
+                </CardContent>
+              </Card>
+            </Link>
+          )}
+
+          {canViewBedAllocation && (
+            <Link href={adminHref("bed-allocation")} className="group">
+              <Card className="h-full hover:shadow-md transition-shadow cursor-pointer">
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">
+                    Bed Allocation
+                  </CardTitle>
+                  <BedDouble className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-3xl font-bold">
+                    {stats.bedGuestsAwaiting}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    guest
+                    {stats.bedGuestsAwaiting === 1 ? "" : "s"} in the next 7 days
+                    awaiting a bed
+                  </p>
+                </CardContent>
+              </Card>
+            </Link>
+          )}
+        </div>
+      )}
+
+      {/* Slim secondary row (#2091, D-E1): committee-level glance metrics kept
+          in a visually lighter row beneath the officer cards. */}
+      {showSecondaryRow && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          {canViewMembers && (
+            <Link href={adminHref("members")} className="group">
+              <Card className="border-border bg-card hover:shadow-sm transition-shadow cursor-pointer">
+                <CardContent className="flex items-center justify-between gap-3 py-4">
+                  <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+                    <Users className="h-4 w-4 text-muted-foreground" />
+                    Members
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xl font-semibold text-foreground">
+                      {stats.activeMembers}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      active of {stats.totalMembers} total
+                    </p>
+                  </div>
+                </CardContent>
+              </Card>
+            </Link>
+          )}
+
+          {canViewPayments && (
+            <Link href={adminHref("payments")} className="group">
+              <Card className="border-border bg-card hover:shadow-sm transition-shadow cursor-pointer">
+                {/* #3372: on a narrow screen the figures stack under the
+                    title rather than squeezing beside it. */}
+                <CardContent className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+                    <DollarSign className="h-4 w-4 text-muted-foreground" />
+                    Net Collected This Month
+                  </div>
+                  {/* #3372: NET of refunds and credits, the shape #3364 gave
+                      the payments board - headline, gross and refunded all in
+                      exact cents, so the arithmetic on the card adds up. The subline
+                      makes no claim about when money arrived: the month is the
+                      one each payment record was created in. */}
+                  <div className="sm:text-right">
+                    <div className="text-xl font-semibold text-foreground">
+                      {money.cents(stats.netCollectedThisMonth.netCollectedCents)}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      payments recorded this month, less refunds and credits on them
+                    </p>
+                    {netCollectedBreakdown && (
+                      <p className="text-xs text-muted-foreground">
+                        {netCollectedBreakdown}
+                      </p>
+                    )}
+                    {/* #3372 (owner, 7 Oct 2026): still owed back, as at today. */}
+                    <RefundsAndCreditsOwedList
+                      owed={stats.refundsAndCreditsOwed}
+                      formatCents={money.cents}
+                      className="mt-1 flex flex-col sm:items-end"
+                      stacked
+                    />
+                  </div>
+                </CardContent>
+              </Card>
+            </Link>
+          )}
+        </div>
+      )}
+
+      {/* Recent Bookings */}
+      <div>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-foreground">
+            Recent Bookings
+          </h2>
+          <Button variant="outline" size="sm" asChild>
+            <Link href={adminHref("bookings")}>View all</Link>
+          </Button>
+        </div>
+        <Card>
+          <CardContent className="pt-4">
+            {stats.recentBookings.length === 0 ? (
+              <div className="py-8 text-center">
+                <BookOpen className="mx-auto h-10 w-10 text-muted-foreground mb-3" />
+                <p className="text-sm font-medium text-muted-foreground">
+                  No bookings yet
+                </p>
+              </div>
+            ) : (
+              <div className="divide-y">
+                {stats.recentBookings.map((booking) => (
+                  <Link
+                    key={booking.id}
+                    href={buildHrefWithReturnTo(
+                      `/bookings/${booking.id}`,
+                      "/admin/dashboard",
+                    )}
+                    className="flex items-center justify-between py-3 hover:bg-accent -mx-2 px-2 rounded"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-medium text-sm truncate">
+                        {bookingOwner(booking).member.firstName} {bookingOwner(booking).member.lastName}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {formatClubDayMonth(
+                          calendarDateOfDateOnlyInstant(booking.checkIn),
+                          money.format,
+                        )}
+                        {" — "}
+                        {formatClubDayMonth(
+                          calendarDateOfDateOnlyInstant(booking.checkOut),
+                          money.format,
+                        )}
+                        {" · "}
+                        {booking._count.guests} guest{booking._count.guests !== 1 ? "s" : ""}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3 flex-shrink-0">
+                      <span className="text-sm font-medium">
+                        {money.cents(booking.finalPriceCents)}
+                      </span>
+                      <Badge
+                        variant="secondary"
+                        className={bookingStatusClass(booking.status)}
+                      >
+                        {bookingStatusLabel(booking.status)}
+                      </Badge>
+                    </div>
+                  </Link>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Quick links */}
+      <div>
+        <h2 className="text-lg font-semibold text-foreground mb-4">
+          Quick Actions
+        </h2>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <Card className="hover:shadow-md transition-shadow">
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-info-3">
+                  <Users className="h-5 w-5 text-info-11" />
+                </div>
+                <div>
+                  <CardTitle className="text-base">Members</CardTitle>
+                  <CardDescription>View and manage members</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" size="sm" className="w-full">
+                <Link href={adminHref("members")}>
+                  Manage Members
+                  <ArrowRight className="ml-2 h-4 w-4" />
+                </Link>
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="hover:shadow-md transition-shadow">
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-success-3">
+                  <CalendarRange className="h-5 w-5 text-success-11" />
+                </div>
+                <div>
+                  <CardTitle className="text-base">Seasons</CardTitle>
+                  <CardDescription>Configure seasons and rates</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" size="sm" className="w-full">
+                <Link href={adminHref("seasons")}>
+                  Manage Seasons
+                  <ArrowRight className="ml-2 h-4 w-4" />
+                </Link>
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="hover:shadow-md transition-shadow">
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-cat1-3">
+                  <BookOpen className="h-5 w-5 text-cat1-11" />
+                </div>
+                <div>
+                  <CardTitle className="text-base">Bookings</CardTitle>
+                  <CardDescription>View all lodge bookings</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" size="sm" className="w-full">
+                <Link href={adminHref("bookings")}>
+                  View Bookings
+                  <ArrowRight className="ml-2 h-4 w-4" />
+                </Link>
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="hover:shadow-md transition-shadow">
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-warning-3">
+                  <Tag className="h-5 w-5 text-warning-11" />
+                </div>
+                <div>
+                  <CardTitle className="text-base">Promo Codes</CardTitle>
+                  <CardDescription>Discounts and vouchers</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" size="sm" className="w-full">
+                <Link href={adminHref("promo-codes")}>
+                  Manage Promos
+                  <ArrowRight className="ml-2 h-4 w-4" />
+                </Link>
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="hover:shadow-md transition-shadow">
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                {/* #2188 P2 (M9): the Chore Roster tile is the BRAND-accent one
+                    of the five quick-link tiles. It follows the club accent via
+                    the role tokens — a neutral-tint container (`bg-accent`) with
+                    a brand-accent icon (`text-primary`, which resolves to the
+                    app's AA-gated accent ink in `app-theme-scope`) — rather than
+                    a hardcoded teal. Its four siblings carry semantic hues on the
+                    step scales; this one carries the club brand. */}
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent">
+                  <ClipboardList className="h-5 w-5 text-primary" />
+                </div>
+                <div>
+                  <CardTitle className="text-base">Chore Roster</CardTitle>
+                  <CardDescription>Assign and manage chores</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="outline" size="sm" className="w-full">
+                <Link href="/admin/roster">
+                  View Roster
+                  <ArrowRight className="ml-2 h-4 w-4" />
+                </Link>
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}

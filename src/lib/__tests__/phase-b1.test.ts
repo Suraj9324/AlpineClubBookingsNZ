@@ -1,0 +1,1360 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFile } from "node:fs/promises";
+
+// ---------------------------------------------------------------------------
+// Mock Prisma
+// ---------------------------------------------------------------------------
+
+const mockPrisma = {
+  hutLeaderAssignment: {
+    count: vi.fn(),
+    findMany: vi.fn(),
+  },
+  booking: {
+    count: vi.fn(),
+    findMany: vi.fn(),
+    findUnique: vi.fn(),
+    update: vi.fn(),
+  },
+  // #2621: the arrival-time route now records what it changed. `logAudit` is
+  // fire-and-forget over this table, so without the double the write throws
+  // inside the swallowed catch and the audit entry is untestable.
+  auditLog: {
+    create: vi.fn(),
+  },
+  member: {
+    count: vi.fn(),
+    findUnique: vi.fn(),
+  },
+  // Kiosk lodge binding (multi-lodge): getStaffLodgeBinding reads STAFF grants
+  // and the /api/lodge/access route resolves the header lodge name from them.
+  memberLodgeAccess: {
+    findMany: vi.fn(),
+  },
+  lodge: {
+    count: vi.fn(),
+    findFirst: vi.fn(),
+    findUnique: vi.fn(),
+  },
+  // #2621: the arrival-time route re-reads the value it is about to replace
+  // INSIDE the write, so the audited old→new pair cannot be made stale by a
+  // concurrent save.
+  $transaction: vi.fn(),
+};
+
+// The interactive-transaction double hands the callback this SAME object, so a
+// test can tell the two reads apart with `mockResolvedValueOnce` while every
+// existing `mockPrisma.booking.update` assertion keeps working unchanged.
+// `vi.clearAllMocks()` clears calls but not implementations, so this survives
+// each suite's `beforeEach`.
+mockPrisma.$transaction.mockImplementation(
+  async (fn: (tx: typeof mockPrisma) => unknown) => await fn(mockPrisma)
+);
+
+vi.mock("@/lib/prisma", () => ({ prisma: mockPrisma }));
+vi.mock("@/lib/logger", () => ({
+  default: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}));
+
+// ---------------------------------------------------------------------------
+// Mock auth
+// ---------------------------------------------------------------------------
+
+const mockAuth = vi.fn();
+vi.mock("@/lib/auth", () => ({
+  auth: () => mockAuth(),
+}));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeDate(str: string): Date {
+  return new Date(`${str}T00:00:00.000Z`);
+}
+
+function subject(id: string, ...roles: string[]) {
+  return { id, canLogin: true, accessRoles: roles.map((role) => ({ role })) };
+}
+
+function authUser(id: string, role: "ADMIN" | "LODGE" | "USER" = "USER") {
+  return { ...subject(id, role), role };
+}
+
+function mockSessionMemberRoles(id: string, ...roles: string[]) {
+  mockPrisma.member.findUnique.mockResolvedValue({
+    id,
+    active: true,
+    forcePasswordChange: false,
+    accessRoles: roles.map((role) => ({ role })),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// #24: Kiosk Access Tier Resolution
+// ---------------------------------------------------------------------------
+
+describe("#24: Kiosk Access Tiers", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockSessionMemberRoles("session-member", "USER");
+  });
+
+  describe("getKioskAccessTier", () => {
+    it("returns 'admin' for ADMIN role regardless of date", async () => {
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "ADMIN"), makeDate("2026-04-08"));
+      expect(tier).toBe("admin");
+    });
+
+    it("returns 'lodge' for LODGE role regardless of date", async () => {
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "LODGE"), makeDate("2026-04-08"));
+      expect(tier).toBe("lodge");
+    });
+
+    it("returns 'hut-leader' for USER with active assignment on date", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(tier).toBe("hut-leader");
+    });
+
+    it("does not grant hut-leader access to membership category strings", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+
+      await expect(
+        getKioskAccessTier(subject("associate-1"), makeDate("2026-04-08")),
+      ).resolves.toBe("none");
+      await expect(
+        getKioskAccessTier(subject("life-1"), makeDate("2026-04-08")),
+      ).resolves.toBe("none");
+    });
+
+    it("returns 'hut-leader' for USER on day before assignment starts", async () => {
+      // Assignment starts 2026-04-09, checking access for 2026-04-08
+      // startDate <= nextDay (2026-04-09) && endDate >= date (2026-04-08)
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(tier).toBe("hut-leader");
+      // Verify the query used nextDay for startDate check
+      expect(mockPrisma.hutLeaderAssignment.count).toHaveBeenCalledWith({
+        where: {
+          memberId: "user-1",
+          startDate: { lte: expect.any(Date) },
+          endDate: { gte: expect.any(Date) },
+        },
+      });
+    });
+
+    it("returns 'staying-guest' for USER with visible booking covering date", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      mockPrisma.booking.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(tier).toBe("staying-guest");
+    });
+
+    it("does not grant staying-guest access to membership category strings", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      mockPrisma.booking.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+
+      await expect(
+        getKioskAccessTier(subject("associate-1"), makeDate("2026-04-08")),
+      ).resolves.toBe("none");
+      await expect(
+        getKioskAccessTier(subject("life-1"), makeDate("2026-04-08")),
+      ).resolves.toBe("none");
+    });
+
+    it("returns 'staying-guest' for USER on day before check-in", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      // Booking checkIn is 2026-04-09, querying for 2026-04-08
+      // checkIn <= nextDay (2026-04-09) && checkOut >= date (2026-04-08)
+      mockPrisma.booking.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(tier).toBe("staying-guest");
+    });
+
+    it("checks linked member guests as well as booking owners", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      mockPrisma.booking.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "USER"), makeDate("2026-04-08"));
+
+      expect(tier).toBe("staying-guest");
+      expect(mockPrisma.booking.count).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: [
+              { memberId: "user-1" },
+              {
+                guests: {
+                  some: expect.objectContaining({ memberId: "user-1" }),
+                },
+              },
+            ],
+          }),
+        })
+      );
+    });
+
+    it("returns 'none' for USER with no matching bookings or assignments", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      mockPrisma.booking.count.mockResolvedValue(0);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(tier).toBe("none");
+    });
+
+    it("hut-leader takes priority over staying-guest", async () => {
+      // When member has both an active assignment AND a paid booking
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(1);
+      mockPrisma.booking.count.mockResolvedValue(1);
+      const { getKioskAccessTier } = await import("@/lib/kiosk-access");
+      const tier = await getKioskAccessTier(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(tier).toBe("hut-leader");
+      // booking.count should NOT be called since hut-leader was found first
+      expect(mockPrisma.booking.count).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("getKioskDateRange", () => {
+    it("returns null for ADMIN", async () => {
+      const { getKioskDateRange } = await import("@/lib/kiosk-access");
+      const range = await getKioskDateRange(subject("user-1", "ADMIN"));
+      expect(range).toBeNull();
+    });
+
+    it("returns null for LODGE", async () => {
+      const { getKioskDateRange } = await import("@/lib/kiosk-access");
+      const range = await getKioskDateRange(subject("user-1", "LODGE"));
+      expect(range).toBeNull();
+    });
+
+    it("returns date range based on booking dates with one night either side", async () => {
+      mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+      mockPrisma.booking.findMany.mockResolvedValue([
+        {
+          memberId: "user-1",
+          checkIn: makeDate("2026-04-10"),
+          checkOut: makeDate("2026-04-13"),
+        },
+      ]);
+      const { getKioskDateRange } = await import("@/lib/kiosk-access");
+      const range = await getKioskDateRange(subject("user-1", "USER"));
+      expect(range).toEqual({
+        minDate: "2026-04-09", // day before check-in
+        maxDate: "2026-04-13", // one night after the last stay night
+      });
+    });
+
+    it("returns null when no bookings or assignments", async () => {
+      mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+      mockPrisma.booking.findMany.mockResolvedValue([]);
+      const { getKioskDateRange } = await import("@/lib/kiosk-access");
+      const range = await getKioskDateRange(subject("user-1", "USER"));
+      expect(range).toBeNull();
+    });
+  });
+
+  describe("getKioskAccessInfo", () => {
+    it("returns correct capabilities for admin tier", async () => {
+      mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+      mockPrisma.booking.findMany.mockResolvedValue([]);
+      const { getKioskAccessInfo } = await import("@/lib/kiosk-access");
+      const info = await getKioskAccessInfo(subject("user-1", "ADMIN"), makeDate("2026-04-08"));
+      expect(info.tier).toBe("admin");
+      expect(info.canManageRoster).toBe(true);
+      expect(info.canMarkAttendance).toBe(true);
+      expect(info.canCompleteChores).toBe(true);
+      expect(info.dateRange).toBeNull();
+    });
+
+    it("returns correct capabilities for lodge tier", async () => {
+      mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+      mockPrisma.booking.findMany.mockResolvedValue([]);
+      const { getKioskAccessInfo } = await import("@/lib/kiosk-access");
+      const info = await getKioskAccessInfo(subject("user-1", "LODGE"), makeDate("2026-04-08"));
+      expect(info.tier).toBe("lodge");
+      expect(info.canManageRoster).toBe(false);
+      expect(info.canMarkAttendance).toBe(true);
+      expect(info.canCompleteChores).toBe(true);
+    });
+
+    it("returns correct capabilities for hut-leader tier", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(1);
+      mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([
+        { startDate: makeDate("2026-04-05"), endDate: makeDate("2026-04-12") },
+      ]);
+      mockPrisma.booking.findMany.mockResolvedValue([]);
+      const { getKioskAccessInfo } = await import("@/lib/kiosk-access");
+      const info = await getKioskAccessInfo(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(info.tier).toBe("hut-leader");
+      expect(info.canManageRoster).toBe(true);
+      expect(info.canMarkAttendance).toBe(true);
+      expect(info.canCompleteChores).toBe(true);
+    });
+
+    it("returns correct capabilities for staying-guest tier", async () => {
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      mockPrisma.booking.count.mockResolvedValue(1);
+      mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+      mockPrisma.booking.findMany.mockResolvedValue([
+        {
+          memberId: "user-1",
+          checkIn: makeDate("2026-04-08"),
+          checkOut: makeDate("2026-04-11"),
+        },
+      ]);
+      const { getKioskAccessInfo } = await import("@/lib/kiosk-access");
+      const info = await getKioskAccessInfo(subject("user-1", "USER"), makeDate("2026-04-08"));
+      expect(info.tier).toBe("staying-guest");
+      expect(info.canManageRoster).toBe(false);
+      expect(info.canMarkAttendance).toBe(false);
+      expect(info.canCompleteChores).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #24: Lodge Auth Tier Checks
+// ---------------------------------------------------------------------------
+
+describe("#24: Lodge Auth Tier-Based Restrictions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockSessionMemberRoles("session-member", "USER");
+  });
+
+  describe("checkLodgeAuth", () => {
+    it("returns tier with session for ADMIN", async () => {
+      mockSessionMemberRoles("admin-1", "ADMIN");
+      mockAuth.mockResolvedValue({
+        user: authUser("admin-1", "ADMIN"),
+      });
+      const { checkLodgeAuth } = await import("@/lib/lodge-auth");
+      const result = await checkLodgeAuth("2026-04-08");
+      expect(result.tier).toBe("admin");
+      expect(result.session).toBeTruthy();
+      expect(result.error).toBeNull();
+    });
+
+    it("returns tier with session for LODGE", async () => {
+      mockSessionMemberRoles("lodge-1", "LODGE");
+      mockAuth.mockResolvedValue({
+        user: authUser("lodge-1", "LODGE"),
+      });
+      const { checkLodgeAuth } = await import("@/lib/lodge-auth");
+      const result = await checkLodgeAuth("2026-04-08");
+      expect(result.tier).toBe("lodge");
+      expect(result.session).toBeTruthy();
+    });
+
+    it("returns Forbidden for USER with no access", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockSessionMemberRoles("member-1");
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      mockPrisma.booking.count.mockResolvedValue(0);
+      const { checkLodgeAuth } = await import("@/lib/lodge-auth");
+      const result = await checkLodgeAuth("2026-04-08");
+      expect(result.tier).toBe("none");
+      expect(result.error).toBe("Forbidden");
+      expect(result.status).toBe(403);
+    });
+
+    it("returns Unauthorised when no session", async () => {
+      mockAuth.mockResolvedValue(null);
+      const { checkLodgeAuth } = await import("@/lib/lodge-auth");
+      const result = await checkLodgeAuth("2026-04-08");
+      expect(result.error).toBe("Unauthorised");
+      expect(result.status).toBe(401);
+    });
+
+    it("returns staying-guest tier for USER with PAID booking", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockSessionMemberRoles("member-1", "USER");
+      mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+      mockPrisma.booking.count.mockResolvedValue(1);
+      const { checkLodgeAuth } = await import("@/lib/lodge-auth");
+      const result = await checkLodgeAuth("2026-04-08");
+      expect(result.tier).toBe("staying-guest");
+      expect(result.session).toBeTruthy();
+    });
+
+    it("returns 400 for invalid date strings", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("admin-1", "ADMIN"),
+      });
+      const { checkLodgeAuth } = await import("@/lib/lodge-auth");
+      const result = await checkLodgeAuth("not-a-date");
+      expect(result.error).toBe("Invalid date format");
+      expect(result.status).toBe(400);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #24: the lodge kiosk account's 30-day session
+// ---------------------------------------------------------------------------
+
+// #4612 moved the kiosk window out of a dead `token.exp` line in auth.ts into
+// session-idle-expiry.ts, applied per request by buildRequestAuthConfig. The
+// end-to-end proof (real Auth.js, real JWT, frozen clock) is
+// auth-session-idle-expiry.test.ts; this keeps #24's own check on the rule and
+// on the wiring, since `@/lib/auth` is mocked in this file.
+describe("#24: lodge kiosk account 30-day session", () => {
+  it("gives the kiosk account, and only the kiosk account, a 30-day idle window", async () => {
+    const {
+      ACCOUNT_SESSION_IDLE_SECONDS,
+      KIOSK_ACCOUNT_SESSION_IDLE_SECONDS,
+      isKioskSessionMember,
+      sessionIdleSecondsForClaims,
+    } = (await vi.importActual(
+      "@/lib/session-idle-expiry",
+    )) as typeof import("@/lib/session-idle-expiry");
+    expect(KIOSK_ACCOUNT_SESSION_IDLE_SECONDS).toBe(30 * 24 * 60 * 60);
+    expect(ACCOUNT_SESSION_IDLE_SECONDS).toBe(8 * 60 * 60);
+    expect(sessionIdleSecondsForClaims({ kioskAccount: true })).toBe(
+      KIOSK_ACCOUNT_SESSION_IDLE_SECONDS,
+    );
+    expect(sessionIdleSecondsForClaims({ kioskAccount: false })).toBe(
+      ACCOUNT_SESSION_IDLE_SECONDS,
+    );
+    const kiosk = {
+      role: "USER",
+      canLogin: true,
+      financeAccessLevel: "NONE",
+      accessRoles: [{ role: "LODGE" }],
+    };
+    expect(isKioskSessionMember(kiosk)).toBe(true);
+    expect(
+      isKioskSessionMember({
+        ...kiosk,
+        accessRoles: [{ role: "ADMIN" }, { role: "LODGE" }],
+      }),
+    ).toBe(false);
+  });
+
+  it("auth.ts stamps the kiosk claim and applies the window per request", async () => {
+    const content = await readFile("src/lib/auth.ts", "utf-8");
+    // #4611: the fresh classification is held once and feeds both the claim
+    // and the maximum session age. ALP-653 moved the refresh half of the
+    // `jwt` callback to session-refresh.ts; auth.ts still runs it.
+    const refresh = await readFile("src/lib/session-refresh.ts", "utf-8");
+    expect(content).toContain("await refreshSessionToken(token, {");
+    expect(refresh).toContain("const kioskAccount = isKioskSessionMember(member);");
+    expect(refresh).toContain("token.kioskAccount = kioskAccount;");
+    const buildConfig = content.slice(
+      content.indexOf("export async function buildRequestAuthConfig("),
+    );
+    expect(buildConfig).toContain("resolveRequestSessionIdleSeconds(");
+    expect(buildConfig).toContain("session: { ...authConfig.session, maxAge }");
+    expect(content).toContain("NextAuth(buildRequestAuthConfig)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #31: Expected Arrival Time API
+// ---------------------------------------------------------------------------
+
+describe("#31: Expected Arrival Time", () => {
+  const futureCheckIn = new Date("2099-04-15");
+  const pastCheckIn = new Date("2000-04-01");
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockSessionMemberRoles("session-member", "USER");
+  });
+
+  describe("PUT /api/bookings/[id]/arrival-time", () => {
+    it("updates arrival time for booking owner", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: "14:00",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "14:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.expectedArrivalTime).toBe("14:00");
+    });
+
+    // #2621: this route wrote to a booking and recorded nothing. An admin or a
+    // Booking Officer may set the time on ANY member's booking (#1313 option
+    // A2), so without this the member had no way to learn who changed it.
+    it("records an audit entry naming the actor, the owner and the old and new values", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("admin-1", "ADMIN"),
+      });
+      mockSessionMemberRoles("admin-1", "ADMIN");
+      // An officer editing SOMEBODY ELSE'S booking — the case #1313 option A2
+      // created and the reason this row has to distinguish actor from subject.
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+        expectedArrivalTime: "09:30",
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: "17:00",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "17:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+
+      expect(mockPrisma.auditLog.create).toHaveBeenCalledTimes(1);
+      const entry = mockPrisma.auditLog.create.mock.calls[0][0].data;
+      expect(entry.action).toBe("booking.expected_arrival_time.set");
+      // The actor is the admin, the subject is the booking's owner — asserted for
+      // CONTENT, not presence: a row that named the officer as the affected member
+      // would be worse than no row, because it would answer "who is this about"
+      // wrongly for anyone filtering by Subject.
+      expect(entry.memberId).toBe("admin-1");
+      expect(entry.subjectMemberId).toBe("member-1");
+      expect(entry.targetId).toBe("booking-1");
+      expect(entry.entityType).toBe("Booking");
+      expect(entry.entityId).toBe("booking-1");
+      expect(entry.category).toBe("booking");
+      // The authority used, named rather than left to be inferred by comparing
+      // two ids: this was an officer acting for the owner.
+      expect(entry.metadata.onBehalf).toBe(true);
+      // The old->new pair is the reason the entry exists.
+      expect(entry.details).toContain("09:30");
+      expect(entry.details).toContain("17:00");
+      expect(entry.metadata.previousExpectedArrivalTime).toBe("09:30");
+      expect(entry.metadata.newExpectedArrivalTime).toBe("17:00");
+    });
+
+    // #2621: the same row for the OTHER author. Owner and officer are different
+    // facts about one field, and `onBehalf` is the only thing on the row that
+    // separates them without the reader comparing ids by eye.
+    it("marks the owner's own set as not on-behalf, with the owner as subject", async () => {
+      mockAuth.mockResolvedValue({ user: authUser("member-1", "USER") });
+      mockSessionMemberRoles("member-1", "USER");
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+        expectedArrivalTime: null,
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: "17:30",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "17:30" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+
+      const entry = mockPrisma.auditLog.create.mock.calls[0][0].data;
+      expect(entry.memberId).toBe("member-1");
+      expect(entry.subjectMemberId).toBe("member-1");
+      expect(entry.metadata.onBehalf).toBe(false);
+      // The first-ever set: there is no previous value, and that is recorded as
+      // a fact rather than as a missing key.
+      expect(entry.metadata.previousExpectedArrivalTime).toBeNull();
+      expect(entry.details).toBe("(not set) → 17:30");
+    });
+
+    // #2621: the old value is read INSIDE the write. Read outside it, two admins
+    // saving at the same instant both see the pre-existing value, both record it
+    // as the "old", and the audit log describes a change that never happened
+    // while losing one that did.
+    it("takes the audited old value from a read inside the write, not from the guard read", async () => {
+      mockAuth.mockResolvedValue({ user: authUser("member-1", "USER") });
+      mockSessionMemberRoles("member-1", "USER");
+      // First read is the permission/eligibility guard; the second is the one
+      // inside the transaction. They disagree here on purpose — that is what a
+      // concurrent writer looks like from in here — and only the transactional
+      // one may reach the audit row.
+      mockPrisma.booking.findUnique
+        .mockResolvedValueOnce({
+          memberId: "member-1",
+          checkIn: futureCheckIn,
+          status: "CONFIRMED",
+          expectedArrivalTime: "09:30",
+        })
+        .mockResolvedValueOnce({ expectedArrivalTime: "12:00" });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: "17:00",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "17:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+
+      // The write really did run in one transaction.
+      expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+      const entry = mockPrisma.auditLog.create.mock.calls[0][0].data;
+      expect(entry.details).toBe("12:00 → 17:00");
+      expect(entry.details).not.toContain("09:30");
+      expect(entry.metadata.previousExpectedArrivalTime).toBe("12:00");
+    });
+
+    it("records the clear as its own audit entry", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockSessionMemberRoles("member-1", "USER");
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+        expectedArrivalTime: "17:00",
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: null,
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { DELETE } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "DELETE",
+      });
+      const res = await DELETE(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+
+      expect(mockPrisma.auditLog.create).toHaveBeenCalledTimes(1);
+      const entry = mockPrisma.auditLog.create.mock.calls[0][0].data;
+      expect(entry.action).toBe("booking.expected_arrival_time.cleared");
+      expect(entry.details).toContain("17:00");
+      // #2621: the clear DESTROYS the value, so this row is the only surviving
+      // record of what the booking's arrival time used to say. It has to carry it.
+      expect(entry.metadata.previousExpectedArrivalTime).toBe("17:00");
+      expect(entry.metadata.newExpectedArrivalTime).toBeNull();
+      expect(entry.metadata.onBehalf).toBe(false);
+      expect(entry.subjectMemberId).toBe("member-1");
+    });
+
+    // #2621: the worst combination of the two — an officer clearing somebody
+    // else's time. Nothing else in the system will ever say what was removed or
+    // who removed it, so both have to be on this one row.
+    it("records an officer's clear as on-behalf, carrying the value it destroyed", async () => {
+      mockAuth.mockResolvedValue({ user: authUser("admin-1", "ADMIN") });
+      mockSessionMemberRoles("admin-1", "ADMIN");
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+        expectedArrivalTime: "18:00",
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: null,
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { DELETE } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "DELETE",
+      });
+      const res = await DELETE(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+
+      const entry = mockPrisma.auditLog.create.mock.calls[0][0].data;
+      expect(entry.action).toBe("booking.expected_arrival_time.cleared");
+      expect(entry.memberId).toBe("admin-1");
+      expect(entry.subjectMemberId).toBe("member-1");
+      expect(entry.metadata.onBehalf).toBe(true);
+      expect(entry.metadata.previousExpectedArrivalTime).toBe("18:00");
+      expect(entry.details).toBe("18:00 → (not set)");
+    });
+
+    // #2621: the minute values the old `[0-5]0` pattern let through. Each of
+    // these returned 200 and stored a time the picker could never show back.
+    it.each(["14:10", "14:20", "14:40", "14:50"])(
+      "rejects %s — a minute the picker can never round-trip",
+      async (badTime) => {
+        mockAuth.mockResolvedValue({
+          user: authUser("member-1", "USER"),
+        });
+        mockPrisma.booking.findUnique.mockResolvedValue({
+          memberId: "member-1",
+          checkIn: futureCheckIn,
+          status: "CONFIRMED",
+          expectedArrivalTime: null,
+        });
+
+        const { NextRequest } = await import("next/server");
+        const { PUT } = await import(
+          "@/app/api/bookings/[id]/arrival-time/route"
+        );
+        const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ expectedArrivalTime: badTime }),
+        });
+        const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+        expect(res.status).toBe(400);
+        expect(mockPrisma.booking.update).not.toHaveBeenCalled();
+        // A refused write records nothing.
+        expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+      }
+    );
+
+    it("rejects invalid time format, and SAYS WHAT THE RULE IS", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const { ARRIVAL_TIME_ERROR_MESSAGE } = await import("@/lib/arrival-time");
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "14:15" }), // not 30-min increment
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(400);
+      // #2621: the response used to say the bare words "Invalid input" and bury
+      // the real rule in `details`, which nothing reads — and the editor renders
+      // `error` verbatim, so the member was told nothing at all about the hour or
+      // half hour. `error` is the field the UI shows, so the truthful sentence
+      // has to be there.
+      const body = await res.json();
+      expect(body.error).toBe(ARRIVAL_TIME_ERROR_MESSAGE);
+      expect(body.error).not.toBe("Invalid input");
+    });
+
+    it("says the same truthful thing for a missing field, without pretending it was a time", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      // Some message about the field, from the validator itself — not the
+      // time-format sentence, which would not describe this problem.
+      expect(typeof body.error).toBe("string");
+      expect(body.error.length).toBeGreaterThan(0);
+      expect(mockPrisma.booking.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects non-owner non-admin", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("other-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "14:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(403);
+      // #2621: a refused caller writes nothing at all. The audit row is evidence
+      // of a change, so a permission refusal must not leave one behind claiming
+      // the field moved.
+      expect(mockPrisma.booking.update).not.toHaveBeenCalled();
+      expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+    });
+
+    it("allows admin to update any booking", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("admin-1", "ADMIN"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: "16:30",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "16:30" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+    });
+
+    it("rejects update after check-in has passed", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: pastCheckIn,
+        status: "CONFIRMED",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "14:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 404 for non-existent booking", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue(null);
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "14:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(404);
+    });
+
+    it("rejects cancelled bookings", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CANCELLED",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "14:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects deactivated members before mutating the booking", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.member.findUnique.mockResolvedValueOnce({
+        id: "member-1",
+        active: false,
+        forcePasswordChange: false,
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { PUT } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedArrivalTime: "14:00" }),
+      });
+      const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(403);
+      expect(mockPrisma.booking.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("DELETE /api/bookings/[id]/arrival-time", () => {
+    it("clears arrival time", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "CONFIRMED",
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        id: "booking-1",
+        expectedArrivalTime: null,
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { DELETE } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "DELETE",
+      });
+      const res = await DELETE(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.expectedArrivalTime).toBeNull();
+    });
+
+    it("rejects after check-in has passed", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: pastCheckIn,
+        status: "CONFIRMED",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { DELETE } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "DELETE",
+      });
+      const res = await DELETE(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects completed bookings", async () => {
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        memberId: "member-1",
+        checkIn: futureCheckIn,
+        status: "COMPLETED",
+      });
+
+      const { NextRequest } = await import("next/server");
+      const { DELETE } = await import(
+        "@/app/api/bookings/[id]/arrival-time/route"
+      );
+      const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+        method: "DELETE",
+      });
+      const res = await DELETE(req, { params: Promise.resolve({ id: "booking-1" }) });
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe("Arrival time Zod validation", () => {
+    it("accepts valid 30-minute increments", async () => {
+      const validTimes = ["06:00", "06:30", "12:00", "14:30", "23:00"];
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+
+      for (const time of validTimes) {
+        mockPrisma.booking.findUnique.mockResolvedValue({
+          memberId: "member-1",
+          checkIn: futureCheckIn,
+          status: "CONFIRMED",
+        });
+        mockPrisma.booking.update.mockResolvedValue({
+          id: "booking-1",
+          expectedArrivalTime: time,
+        });
+
+        const { NextRequest } = await import("next/server");
+        const { PUT } = await import(
+          "@/app/api/bookings/[id]/arrival-time/route"
+        );
+        const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ expectedArrivalTime: time }),
+        });
+        const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+        expect(res.status).toBe(200);
+      }
+    });
+
+    it("rejects invalid time formats", async () => {
+      const invalidTimes = ["14:15", "14:45", "25:00", "abc", "1400"];
+      mockAuth.mockResolvedValue({
+        user: authUser("member-1", "USER"),
+      });
+
+      for (const time of invalidTimes) {
+        mockPrisma.booking.findUnique.mockResolvedValue({
+          memberId: "member-1",
+          checkIn: futureCheckIn,
+          status: "CONFIRMED",
+        });
+
+        const { NextRequest } = await import("next/server");
+        const { PUT } = await import(
+          "@/app/api/bookings/[id]/arrival-time/route"
+        );
+        const req = new NextRequest("http://localhost/api/bookings/booking-1/arrival-time", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ expectedArrivalTime: time }),
+        });
+        const res = await PUT(req, { params: Promise.resolve({ id: "booking-1" }) });
+        expect(res.status).toBe(400);
+      }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #31: Booking creation with expectedArrivalTime
+// ---------------------------------------------------------------------------
+
+describe("#31: Booking creation schema accepts expectedArrivalTime", () => {
+  // #2621: this test used to declare `const pattern = /^([01]\d|2[0-3]):[0-5]0$/`
+  // — its OWN copy of the rule it was meant to be checking. So it agreed with
+  // the routes about `:15` and `24:00` while all three of them were wrong about
+  // `:10`, `:20`, `:40` and `:50`, and no amount of running it could ever have
+  // said so. It now imports the one pattern the routes import.
+  it("accepts only the canonical 30-minute set: HH:00 and HH:30", async () => {
+    const { ARRIVAL_TIME_PATTERN, isValidArrivalTime } = await import(
+      "@/lib/arrival-time"
+    );
+
+    for (const valid of ["00:00", "00:30", "06:30", "14:00", "23:00", "23:30"]) {
+      expect(isValidArrivalTime(valid)).toBe(true);
+    }
+
+    // The four the old `[0-5]0` pattern accepted and the picker can never show
+    // back. Each of these PASSED before the fix — they are the mutation proof
+    // that the shared pattern is not the old one under a new name.
+    for (const wrongMinute of ["14:10", "14:20", "14:40", "14:50"]) {
+      expect(ARRIVAL_TIME_PATTERN.test(wrongMinute)).toBe(false);
+      expect(isValidArrivalTime(wrongMinute)).toBe(false);
+    }
+
+    // Still refused, exactly as before.
+    for (const invalid of ["14:15", "24:00", "25:00", "9:00", "", "1400", "14:00:00"]) {
+      expect(isValidArrivalTime(invalid)).toBe(false);
+    }
+  });
+
+  it("is the SAME rule the booking-create schema and the arrival-time route enforce", async () => {
+    const { ARRIVAL_TIME_PATTERN } = await import("@/lib/arrival-time");
+    const createSource = await readFile(
+      new URL("../../app/api/bookings/route.ts", import.meta.url),
+      "utf8"
+    );
+    const arrivalSource = await readFile(
+      new URL("../../app/api/bookings/[id]/arrival-time/route.ts", import.meta.url),
+      "utf8"
+    );
+    // Neither route may carry a regex literal for this field again: three
+    // copies of one rule is what let the minute bug live in all three.
+    for (const source of [createSource, arrivalSource]) {
+      expect(source).toContain("ARRIVAL_TIME_PATTERN");
+      // The literal itself, not the prose about it: the comments in both files
+      // quote the old pattern by way of explaining why it is gone.
+      expect(source).not.toMatch(/:\[0-5\]0\$\//);
+    }
+    expect(ARRIVAL_TIME_PATTERN.source).toContain("(00|30)");
+  });
+
+  it("renders a stored time as a 12-hour clock, including a legacy off-half-hour value", async () => {
+    const { formatArrivalTime } = await import("@/lib/arrival-time");
+    expect(formatArrivalTime("00:00")).toBe("12:00 AM");
+    expect(formatArrivalTime("00:30")).toBe("12:30 AM");
+    expect(formatArrivalTime("09:30")).toBe("9:30 AM");
+    expect(formatArrivalTime("12:00")).toBe("12:00 PM");
+    expect(formatArrivalTime("17:30")).toBe("5:30 PM");
+    expect(formatArrivalTime("23:00")).toBe("11:00 PM");
+    // A row written before the minute rule was tightened is still a perfectly
+    // readable time, and the per-surface formatters this module replaced always
+    // showed it in 12-hour form. Rendering it raw would show one member a
+    // 24-hour string beside everyone else's 12-hour one — a regression, not
+    // caution. The DISPLAY rule is therefore wider than the STORAGE rule.
+    expect(formatArrivalTime("14:10")).toBe("2:10 PM");
+    expect(formatArrivalTime("00:07")).toBe("12:07 AM");
+    expect(formatArrivalTime("23:59")).toBe("11:59 PM");
+    // Genuinely unparseable text is the only thing returned unchanged: a corrupt
+    // row shows as itself rather than as a confidently wrong time.
+    for (const junk of ["", "tea time", "24:00", "1400", "14:60", "14:00:00"]) {
+      expect(formatArrivalTime(junk)).toBe(junk);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #24: Lodge Access API endpoint
+// ---------------------------------------------------------------------------
+
+describe("#24: Lodge Access API", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.member.count.mockResolvedValue(1);
+    mockPrisma.member.findUnique.mockResolvedValue({
+      id: "session-member",
+      active: true,
+      forcePasswordChange: false,
+    });
+    // Default: no STAFF grants (unbound → default lodge) and a single active
+    // lodge, so the kiosk header lodge name stays hidden (ADR-002).
+    mockPrisma.memberLodgeAccess.findMany.mockResolvedValue([]);
+    mockPrisma.lodge.count.mockResolvedValue(1);
+  });
+
+  it("returns access info for authenticated user", async () => {
+    mockAuth.mockResolvedValue({
+      user: authUser("admin-1", "ADMIN"),
+    });
+    mockSessionMemberRoles("admin-1", "ADMIN");
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const req = new NextRequest("http://localhost/api/lodge/access?date=2026-04-08");
+    const res = await GET(req);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.tier).toBe("admin");
+    expect(data.canManageRoster).toBe(true);
+    expect(data.canMarkAttendance).toBe(true);
+    expect(data.dateRange).toBeNull();
+  });
+
+  it("requires authentication for lodge access info", async () => {
+    mockAuth.mockResolvedValue(null);
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const req = new NextRequest("http://localhost/api/lodge/access?date=2026-04-08");
+    const res = await GET(req);
+    expect(res.status).toBe(401);
+    const data = await res.json();
+    expect(data.error).toBe("Unauthorised");
+  });
+
+  it("returns 403 for deactivated user with a stale session", async () => {
+    mockAuth.mockResolvedValue({
+      user: authUser("admin-1", "ADMIN"),
+    });
+    mockPrisma.member.findUnique.mockResolvedValueOnce({
+      id: "admin-1",
+      active: false,
+      forcePasswordChange: false,
+    });
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const req = new NextRequest("http://localhost/api/lodge/access?date=2026-04-08");
+    const res = await GET(req);
+    expect(res.status).toBe(403);
+    const data = await res.json();
+    expect(data.error).toBe("Account is deactivated");
+  });
+
+  it("returns 400 for missing date parameter", async () => {
+    mockAuth.mockResolvedValue({
+      user: authUser("admin-1", "ADMIN"),
+    });
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const req = new NextRequest("http://localhost/api/lodge/access");
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("refuses a day that does not exist (2026-02-30) before querying", async () => {
+    mockAuth.mockResolvedValue({
+      user: authUser("admin-1", "ADMIN"),
+    });
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const req = new NextRequest("http://localhost/api/lodge/access?date=2026-02-30");
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+    expect(mockPrisma.member.findUnique).not.toHaveBeenCalled();
+  });
+
+  // Item 4 (#1587): a kiosk (STAFF) account granted at more than one lodge is
+  // denied everywhere data is served (M5). The access route surfaces that up
+  // front so the kiosk shows a fix-the-assignment message instead of enabled
+  // UI that then hits clean 403s.
+  it("returns a misconfigured payload for an ambiguous multi-lodge kiosk account", async () => {
+    mockAuth.mockResolvedValue({ user: authUser("kiosk-1", "LODGE") });
+    mockSessionMemberRoles("kiosk-1", "LODGE");
+    mockPrisma.memberLodgeAccess.findMany.mockResolvedValue([
+      { lodgeId: "lodge-A" },
+      { lodgeId: "lodge-B" },
+    ]);
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const res = await GET(
+      new NextRequest("http://localhost/api/lodge/access?date=2026-04-08"),
+    );
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data).toEqual({
+      tier: "none",
+      misconfigured: true,
+      error:
+        "This kiosk account is assigned to multiple lodges — an admin must fix the assignment.",
+      dateRange: null,
+      canManageRoster: false,
+      canMarkAttendance: false,
+      canCompleteChores: false,
+      lodgeName: null,
+    });
+    // No lodge name or guest/roster data is leaked: the lodge name is never
+    // resolved for an ambiguous account.
+    expect(mockPrisma.lodge.count).not.toHaveBeenCalled();
+    expect(mockPrisma.lodge.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("returns normal lodge access for a single-lodge kiosk account (not misconfigured)", async () => {
+    mockAuth.mockResolvedValue({ user: authUser("kiosk-1", "LODGE") });
+    mockSessionMemberRoles("kiosk-1", "LODGE");
+    mockPrisma.memberLodgeAccess.findMany.mockResolvedValue([
+      { lodgeId: "lodge-A" },
+    ]);
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const res = await GET(
+      new NextRequest("http://localhost/api/lodge/access?date=2026-04-08"),
+    );
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.tier).toBe("lodge");
+    expect(data.misconfigured).toBeUndefined();
+    expect(data.canMarkAttendance).toBe(true);
+    expect(data.canManageRoster).toBe(false);
+  });
+
+  it("does not flag a staying-guest (member) tier as misconfigured", async () => {
+    mockAuth.mockResolvedValue({ user: authUser("guest-1", "USER") });
+    mockSessionMemberRoles("guest-1", "USER");
+    mockPrisma.hutLeaderAssignment.count.mockResolvedValue(0);
+    mockPrisma.booking.count.mockResolvedValue(1);
+    mockPrisma.hutLeaderAssignment.findMany.mockResolvedValue([]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+
+    const { NextRequest } = await import("next/server");
+    const { GET } = await import("@/app/api/lodge/access/route");
+    const res = await GET(
+      new NextRequest("http://localhost/api/lodge/access?date=2026-04-08"),
+    );
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.tier).toBe("staying-guest");
+    expect(data.misconfigured).toBeUndefined();
+    // Members are not lodge-bound via STAFF grants, so the binding is never read.
+    expect(mockPrisma.memberLodgeAccess.findMany).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #31: Lodge guests API includes expectedArrivalTime
+// ---------------------------------------------------------------------------
+
+describe("#31: Lodge guests API includes expectedArrivalTime", () => {
+  it("guests API response should include expectedArrivalTime in schema", async () => {
+    // Verify the schema.prisma has the field
+    const fs = await import("fs");
+    const schema = fs.readFileSync("prisma/schema.prisma", "utf-8");
+    expect(schema).toContain("expectedArrivalTime");
+    expect(schema).toContain("@db.VarChar(5)");
+  });
+});

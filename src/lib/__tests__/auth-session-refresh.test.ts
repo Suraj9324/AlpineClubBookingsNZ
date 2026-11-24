@@ -1,0 +1,1254 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const {
+  mockFindUnique,
+  mockFindFirst,
+  mockUpdate,
+  mockNextAuth,
+  mockRawAuth,
+  mockLoadEffectiveModuleFlags,
+  mockConsumeTwoFactorSessionChallenge,
+  mockConsumeSessionReauthChallenge,
+} = vi.hoisted(() => ({
+  mockFindUnique: vi.fn(),
+  mockFindFirst: vi.fn(),
+  mockUpdate: vi.fn(),
+  mockRawAuth: vi.fn(),
+  mockLoadEffectiveModuleFlags: vi.fn(),
+  mockConsumeTwoFactorSessionChallenge: vi.fn(),
+  mockConsumeSessionReauthChallenge: vi.fn(),
+  mockNextAuth: vi.fn(() => ({
+    handlers: {},
+    signIn: vi.fn(),
+    signOut: vi.fn(),
+    auth: mockRawAuth,
+    unstable_update: vi.fn(),
+  })),
+}));
+
+// The refresh's member read is projected through its real `select` (#3603), so
+// a field the refresh stops selecting stops reaching the callback.
+vi.mock("@/lib/prisma", async () => {
+  const { honourSelect } = await import("@/lib/__tests__/helpers/prisma-mocks");
+  return {
+    prisma: {
+      member: {
+        findUnique: honourSelect(mockFindUnique, "Member"),
+        findFirst: mockFindFirst,
+        update: mockUpdate,
+      },
+      // #4611: the maximum session age is read on every refresh; no row, so the
+      // 7-day default applies.
+      loginSecuritySetting: { findUnique: vi.fn().mockResolvedValue(null) },
+    },
+  };
+});
+
+vi.mock("@/lib/runtime-config", () => ({
+  getAuthSecret: vi.fn(() => "test-secret"),
+  getAuthTrustHost: vi.fn(() => true),
+}));
+
+// #4609: the per-account throttle is its own subject (login-throttle-auth.test.ts);
+// here every attempt is admitted so a refusal can only be this suite's guard.
+vi.mock("@/lib/login-throttle", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/login-throttle")),
+  claimPasswordAttempt: vi.fn().mockResolvedValue({ allowed: true }),
+  clearPasswordAttempts: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("next-auth/providers/credentials", () => ({
+  default: vi.fn((config) => config),
+}));
+
+vi.mock("@/lib/password-hashing", async (importOriginal) => {
+  const { passwordHashingModuleMock } = await import("@/lib/__tests__/helpers/password-hashing-mock");
+  return passwordHashingModuleMock(await importOriginal(), { verifyPassword: vi.fn().mockResolvedValue(true) });
+});
+
+vi.mock("next-auth", () => {
+  class CredentialsSignin extends Error {
+    code = "CREDENTIALS_SIGNIN";
+  }
+
+  return {
+    default: mockNextAuth,
+    CredentialsSignin,
+  };
+});
+
+vi.mock("@/lib/logger", () => ({
+  default: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
+
+// #4618 review: lets one test stand in a required officer's refresh claims
+// while the release switch stays off; every other test uses the real resolver.
+const officerClaimsOverride = vi.hoisted(() => ({
+  claims: null as null | Record<string, unknown>,
+}));
+vi.mock("@/lib/officer-two-factor", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/officer-two-factor");
+  return {
+    ...actual,
+    resolveOfficerTwoFactorClaims: async (
+      input: Parameters<typeof actual.resolveOfficerTwoFactorClaims>[0],
+    ) =>
+      officerClaimsOverride.claims ?? actual.resolveOfficerTwoFactorClaims(input),
+  };
+});
+
+vi.mock("@/lib/module-settings", () => ({
+  loadEffectiveModuleFlags: mockLoadEffectiveModuleFlags,
+}));
+
+vi.mock("@/lib/two-factor", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/two-factor");
+  return {
+    ...actual,
+    consumeTwoFactorSessionChallenge: mockConsumeTwoFactorSessionChallenge,
+  };
+});
+
+vi.mock("@/lib/session-reauth", () => ({
+  consumeSessionReauthChallenge: mockConsumeSessionReauthChallenge,
+}));
+
+// #2087: auth.ts now resolves the Google provider from the C1 store. The jwt
+// callback under test never touches Google, so stub the resolver modules to keep
+// this suite isolated from the credential store.
+vi.mock("@/lib/google-config", () => ({
+  getGoogleOAuthConfig: vi.fn().mockResolvedValue(null),
+  recordGoogleVerified: vi.fn(),
+}));
+
+vi.mock("@/lib/google-oauth", () => ({
+  resolveGoogleProfile: vi.fn(),
+  readGoogleLinkIntent: vi.fn().mockResolvedValue(null),
+  readGoogleVerifyIntent: vi.fn().mockResolvedValue(null),
+  linkGoogleAccount: vi.fn(),
+}));
+
+import { auth, authConfig } from "@/lib/auth";
+import { MEMBER_ACCESS_ROLE_SELECT } from "@/lib/access-role-definitions";
+import { hasAdminAreaAccess } from "@/lib/admin-permissions";
+import { hasAdminAccess } from "@/lib/access-roles";
+
+const ALL_NONE_MATRIX = {
+  overview: "none",
+  bookings: "none",
+  membership: "none",
+  finance: "none",
+  lodge: "none",
+  content: "none",
+  support: "none",
+};
+
+describe("auth session refresh", () => {
+  beforeEach(() => {
+    mockFindUnique.mockReset();
+    mockFindFirst.mockReset();
+    mockUpdate.mockReset();
+    mockRawAuth.mockReset();
+    mockLoadEffectiveModuleFlags.mockReset();
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: false });
+    mockConsumeTwoFactorSessionChallenge.mockReset();
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(false);
+    mockConsumeSessionReauthChallenge.mockReset();
+    mockConsumeSessionReauthChallenge.mockResolvedValue(false);
+  });
+
+  it("refreshes a stale admin JWT role from the database", async () => {
+    mockFindUnique.mockResolvedValue({
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt: null,
+      twoFactorEnabled: false,
+      twoFactorMethod: null,
+    });
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "ADMIN",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now(),
+      },
+    } as never);
+
+    expect(mockFindUnique).toHaveBeenCalledWith({
+      where: { id: "member-1" },
+      select: {
+        role: true,
+        canLogin: true,
+        // Joined definitions (#1367) so the refresh can compute the merged
+        // admin-permission matrix over definition-backed roles.
+        accessRoles: { select: MEMBER_ACCESS_ROLE_SELECT },
+        // #2620/#3542: the refresh invalidates a deleted account's session.
+        // The canonical predicate needs the structural timestamp plus the
+        // permanently reserved address for adopter-era rows. This also kills a
+        // session minted BEFORE deletion, which would otherwise outlive it.
+        email: true,
+        deletedAt: true,
+        passwordHash: true,
+        forcePasswordChange: true,
+        emailVerified: true,
+        passwordChangedAt: true,
+        // #3603 (D1): a session issued before the member's login was switched
+        // off is refused, like one issued before a newer password.
+        sessionsRevokedAt: true,
+        twoFactorEnabled: true,
+        twoFactorMethod: true,
+        webAuthnCredentials: { select: { id: true }, take: 1 },
+        postLoginLanding: true,
+        // #4612: with role and the rows, the record's classification, which
+        // decides the lodge kiosk account's longer idle window.
+        financeAccessLevel: true,
+        // #4618: the officer grace stamp and the last factor reset.
+        twoFactorGraceStartedAt: true,
+        factorsResetAt: true,
+      },
+    });
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        id: "member-1",
+        role: "MEMBER",
+        accessRoles: ["USER"],
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionInvalidated: false,
+      })
+    );
+  });
+
+  // #4611: both instants sit within an hour or two of the frozen clock, well
+  // inside the 7-day maximum session age, so only the password-change rule can
+  // end the session here; the control below proves the cap is not the reason.
+  function passwordChangedMember(passwordChangedAt: Date) {
+    return {
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt,
+      twoFactorEnabled: false,
+      twoFactorMethod: null,
+    };
+  }
+
+  it("marks the session invalid when the password changed after issuance", async () => {
+    mockFindUnique.mockResolvedValue(
+      passwordChangedMember(new Date(Date.now() - 60 * 60 * 1000)),
+    );
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now() - 2 * 60 * 60 * 1000,
+      },
+    } as never);
+
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        sessionInvalidated: true,
+      })
+    );
+  });
+
+  it("keeps the session live when the password changed before issuance", async () => {
+    mockFindUnique.mockResolvedValue(
+      passwordChangedMember(new Date(Date.now() - 2 * 60 * 60 * 1000)),
+    );
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now() - 60 * 60 * 1000,
+      },
+    } as never);
+
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        sessionInvalidated: false,
+      })
+    );
+  });
+
+  it("invalidates a session whose token id resolves to NO live member (dangling id, #2229)", async () => {
+    // The dashboard <-> /login white-flash loop breaker: a token id that matches
+    // no member row (deleted member, or a fallback-user substitution) must mark
+    // the session invalidated so the shared auth() helper nulls it EVERYWHERE —
+    // including /login, which then renders the form instead of bouncing back.
+    mockFindUnique.mockResolvedValue(null);
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "dangling-uuid",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now(),
+      },
+    } as never);
+
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        sessionInvalidated: true,
+      }),
+    );
+  });
+
+  it("propagates a transient DB error from the refresh rather than invalidating a live session (#2229)", async () => {
+    // Only a genuinely absent row (null) invalidates. A connection blip THROWS
+    // from loadSessionMemberSecurity — it must propagate (existing behaviour),
+    // never be mistaken for a dangling id and silently log the member out.
+    mockFindUnique.mockRejectedValue(new Error("connection reset"));
+
+    await expect(
+      authConfig.callbacks.jwt?.({
+        token: {
+          id: "member-1",
+          role: "MEMBER",
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          sessionIssuedAt: Date.now(),
+        },
+      } as never),
+    ).rejects.toThrow("connection reset");
+  });
+
+  it("does not trust a password-only JWT when two-factor is later enabled", async () => {
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    mockFindUnique.mockResolvedValue({
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt: null,
+      twoFactorEnabled: true,
+      twoFactorMethod: "TOTP",
+    });
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now(),
+        twoFactorVerified: true,
+      },
+    } as never);
+
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        twoFactorRequired: true,
+        twoFactorEnrolled: true,
+        twoFactorMethod: "TOTP",
+        twoFactorVerified: false,
+        twoFactorVerifiedByChallenge: false,
+      }),
+    );
+  });
+
+  it("ignores a forged session update that claims twoFactorVerified without a challenge token", async () => {
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    mockFindUnique.mockResolvedValue({
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt: null,
+      twoFactorEnabled: true,
+      twoFactorMethod: "EMAIL",
+    });
+
+    // The exact payload an attacker can POST to /api/auth/session.
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now(),
+      },
+      trigger: "update",
+      session: { user: { twoFactorVerified: true } },
+    } as never);
+
+    expect(mockConsumeTwoFactorSessionChallenge).not.toHaveBeenCalled();
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        twoFactorRequired: true,
+        twoFactorEnrolled: true,
+        twoFactorMethod: "EMAIL",
+        twoFactorVerified: false,
+        twoFactorVerifiedByChallenge: false,
+      }),
+    );
+
+    // A forged update must not seed verification into later refreshes either.
+    const subsequentToken = await authConfig.callbacks.jwt?.({
+      token: { ...(refreshedToken as object) },
+    } as never);
+
+    expect(subsequentToken).toEqual(
+      expect.objectContaining({
+        twoFactorVerified: false,
+        twoFactorVerifiedByChallenge: false,
+      }),
+    );
+  });
+
+  it("ignores a session update whose challenge token is invalid or already consumed", async () => {
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(false);
+    mockFindUnique.mockResolvedValue({
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt: null,
+      twoFactorEnabled: true,
+      twoFactorMethod: "EMAIL",
+    });
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now(),
+      },
+      trigger: "update",
+      session: {
+        user: { twoFactorVerified: true, twoFactorChallengeToken: "guessed" },
+      },
+    } as never);
+
+    expect(mockConsumeTwoFactorSessionChallenge).toHaveBeenCalledWith(
+      "member-1",
+      "guessed",
+    );
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        twoFactorVerified: false,
+        twoFactorVerifiedByChallenge: false,
+      }),
+    );
+  });
+
+  it("verifies the session when the update carries a valid server-minted challenge token", async () => {
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(true);
+    mockFindUnique.mockResolvedValue({
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt: null,
+      twoFactorEnabled: true,
+      twoFactorMethod: "EMAIL",
+    });
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now(),
+      },
+      trigger: "update",
+      session: {
+        user: {
+          twoFactorVerified: true,
+          twoFactorChallengeToken: "server-minted-token",
+        },
+      },
+    } as never);
+
+    expect(mockConsumeTwoFactorSessionChallenge).toHaveBeenCalledWith(
+      "member-1",
+      "server-minted-token",
+    );
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        twoFactorRequired: true,
+        twoFactorEnrolled: true,
+        twoFactorMethod: "EMAIL",
+        twoFactorVerified: true,
+        twoFactorVerifiedByChallenge: true,
+      }),
+    );
+
+    // Verification persists across later refreshes of the same session.
+    const subsequentToken = await authConfig.callbacks.jwt?.({
+      token: { ...(refreshedToken as object) },
+    } as never);
+
+    expect(subsequentToken).toEqual(
+      expect.objectContaining({
+        twoFactorVerified: true,
+        twoFactorVerifiedByChallenge: true,
+      }),
+    );
+  });
+
+  it("keeps a passkey-only member verified after the challenge", async () => {
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    mockFindUnique.mockResolvedValue({
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt: null,
+      twoFactorEnabled: false,
+      twoFactorMethod: null,
+      webAuthnCredentials: [{ id: "passkey-1" }],
+    });
+
+    const refreshedToken = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionIssuedAt: Date.now(),
+        twoFactorVerified: true,
+        twoFactorVerifiedByChallenge: true,
+      },
+    } as never);
+
+    expect(refreshedToken).toEqual(
+      expect.objectContaining({
+        hasPasskey: true,
+        twoFactorEnrolled: true,
+        twoFactorVerified: true,
+        twoFactorVerifiedByChallenge: true,
+      }),
+    );
+  });
+
+  it("projects the refreshed token role into the session", async () => {
+    const session = await authConfig.callbacks.session?.({
+      session: {
+        user: {
+          id: "member-1",
+          email: "admin@example.com",
+          name: "Admin User",
+          role: "ADMIN",
+          accessRoles: ["ADMIN"],
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          sessionInvalidated: false,
+        },
+      },
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        accessRoles: ["USER"],
+        forcePasswordChange: true,
+        isEmailVerified: true,
+        sessionInvalidated: true,
+      },
+    } as never);
+
+    expect(session?.user).toEqual({
+      id: "member-1",
+      email: "admin@example.com",
+      name: "Admin User",
+      role: "MEMBER",
+      accessRoles: ["USER"],
+      // The token carried no canLogin, so the projection fails closed (#3603).
+      canLogin: false,
+      // The token carried no matrix, so the projection fails closed (#1367).
+      adminPermissionMatrix: ALL_NONE_MATRIX,
+      forcePasswordChange: true,
+      isEmailVerified: true,
+      sessionInvalidated: true,
+      twoFactorRequired: false,
+      twoFactorVerified: false,
+      twoFactorEnrolled: false,
+      hasPasskey: false,
+      twoFactorMethod: null,
+      postLoginLanding: null,
+      // #4618: a token without the officer claims projects as not required.
+      officerTwoFactorRequired: false,
+      officerTwoFactorGraceEndsAt: null,
+      twoFactorSatisfiesOfficer: false,
+    });
+  });
+
+  it("projects sessionIssuedAt into the session for auth-bounce diagnostics (#1669)", async () => {
+    const session = await authConfig.callbacks.session?.({
+      session: {
+        user: {
+          id: "member-1",
+          email: "member@example.com",
+          name: "Member User",
+          role: "MEMBER",
+          accessRoles: ["USER"],
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          sessionInvalidated: false,
+        },
+      },
+      token: {
+        id: "member-1",
+        role: "MEMBER",
+        accessRoles: ["USER"],
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionInvalidated: false,
+        sessionIssuedAt: 1_723_456_789_000,
+      },
+    } as never);
+
+    expect(session?.user.sessionIssuedAt).toBe(1_723_456_789_000);
+  });
+
+  // ---------------------------------------------------------------------------
+  // #1367 (F14): definition-backed custom access roles must reach every
+  // session.user-based admin check. The enum-only accessRoles claim drops them
+  // (role: null), so the jwt callback embeds the merged admin-permission
+  // matrix computed from the DB-joined member, and the session projects it.
+  // ---------------------------------------------------------------------------
+  describe("definition-backed custom roles in the session (#1367)", () => {
+    const customBookingOfficerRow = {
+      role: null,
+      roleDefinitionId: "def-custom-bookings",
+      roleDefinition: {
+        id: "def-custom-bookings",
+        key: "custom-booking-officer",
+        systemRole: null,
+        label: "Custom Booking Officer",
+        description: "Club-defined booking role",
+        overviewLevel: "NONE",
+        bookingsLevel: "EDIT",
+        membershipLevel: "NONE",
+        financeLevel: "NONE",
+        lodgeLevel: "NONE",
+        contentLevel: "NONE",
+        supportLevel: "NONE",
+        sortOrder: 10,
+      },
+    };
+
+    it("embeds the custom role's matrix in the token even though the enum claim drops it", async () => {
+      mockFindUnique.mockResolvedValue({
+        role: "USER",
+        canLogin: true,
+        accessRoles: [customBookingOfficerRow],
+        forcePasswordChange: false,
+        emailVerified: true,
+        passwordChangedAt: null,
+        twoFactorEnabled: false,
+        twoFactorMethod: null,
+      });
+
+      const token = await authConfig.callbacks.jwt?.({
+        token: {
+          id: "member-custom",
+          role: "USER",
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          sessionIssuedAt: Date.now(),
+        },
+      } as never);
+
+      // The enum-only claim still drops the custom role (documented)...
+      expect(token?.accessRoles).toEqual([]);
+      // ...but the matrix carries its definition levels.
+      expect(token?.adminPermissionMatrix).toEqual({
+        ...ALL_NONE_MATRIX,
+        bookings: "edit",
+      });
+    });
+
+    it("passes the #1289/#1313 session.user gates exactly as a seeded Booking Officer does", async () => {
+      mockFindUnique.mockResolvedValue({
+        role: "USER",
+        canLogin: true,
+        accessRoles: [customBookingOfficerRow],
+        forcePasswordChange: false,
+        emailVerified: true,
+        passwordChangedAt: null,
+        twoFactorEnabled: false,
+        twoFactorMethod: null,
+      });
+
+      const token = await authConfig.callbacks.jwt?.({
+        token: {
+          id: "member-custom",
+          role: "USER",
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          sessionIssuedAt: Date.now(),
+        },
+      } as never);
+
+      const session = await authConfig.callbacks.session?.({
+        session: {
+          user: {
+            id: "member-custom",
+            email: "custom@example.com",
+            name: "Custom Officer",
+          },
+        },
+        token,
+      } as never);
+
+      // The exact predicates the booking detail page (#1289) and the widened
+      // member-facing booking APIs (#1313) evaluate on session.user:
+      expect(
+        hasAdminAreaAccess(session!.user, { area: "bookings", level: "view" }),
+      ).toBe(true);
+      expect(
+        hasAdminAreaAccess(session!.user, { area: "bookings", level: "edit" }),
+      ).toBe(true);
+      // Not a Full Admin: separation-of-duties gates stay closed.
+      expect(hasAdminAccess(session!.user)).toBe(false);
+      // No leakage into other areas.
+      expect(
+        hasAdminAreaAccess(session!.user, { area: "finance", level: "view" }),
+      ).toBe(false);
+    });
+
+    it("keeps a plain member's matrix all-none end to end", async () => {
+      mockFindUnique.mockResolvedValue({
+        role: "USER",
+        canLogin: true,
+        accessRoles: [{ role: "USER", roleDefinitionId: null, roleDefinition: null }],
+        forcePasswordChange: false,
+        emailVerified: true,
+        passwordChangedAt: null,
+        twoFactorEnabled: false,
+        twoFactorMethod: null,
+      });
+
+      const token = await authConfig.callbacks.jwt?.({
+        token: {
+          id: "member-plain",
+          role: "USER",
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          sessionIssuedAt: Date.now(),
+        },
+      } as never);
+
+      expect(token?.adminPermissionMatrix).toEqual(ALL_NONE_MATRIX);
+
+      const session = await authConfig.callbacks.session?.({
+        session: {
+          user: { id: "member-plain", email: "m@example.com", name: "M" },
+        },
+        token,
+      } as never);
+      expect(
+        hasAdminAreaAccess(session!.user, { area: "bookings", level: "view" }),
+      ).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // #3603: every sign-in provider requires `canLogin: true`, so a session whose
+  // member has since had login switched off is ended on its next refresh, the
+  // same kill switch as a deleted account (#2620). Until it is, the role claim
+  // and the matrix are empty too. Each case is paired with the same member at
+  // `canLogin: true`.
+  // ---------------------------------------------------------------------------
+  describe("a member whose login is switched off (#3603)", () => {
+    function memberRow(canLogin: boolean, sessionsRevokedAt: Date | null = null) {
+      return {
+        role: "ADMIN",
+        canLogin,
+        accessRoles: [{ role: "ADMIN", roleDefinitionId: null, roleDefinition: null }],
+        forcePasswordChange: false,
+        emailVerified: true,
+        passwordChangedAt: null,
+        sessionsRevokedAt,
+        twoFactorEnabled: false,
+        twoFactorMethod: null,
+      };
+    }
+
+    async function refresh(token: Record<string, unknown> = {}) {
+      return authConfig.callbacks.jwt?.({
+        token: {
+          id: "admin-1",
+          role: "ADMIN",
+          accessRoles: ["ADMIN"],
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          sessionIssuedAt: Date.now(),
+          ...token,
+        },
+      } as never);
+    }
+
+    it("invalidates the session and empties the role claims and matrix", async () => {
+      mockFindUnique.mockResolvedValue(memberRow(false));
+
+      const token = await refresh();
+
+      expect(token?.sessionInvalidated).toBe(true);
+      expect(token?.accessRoles).toEqual([]);
+      // The legacy role column is a claim too, and grants nothing once login is off.
+      expect(token?.role).toBe("USER");
+      expect(token?.canLogin).toBe(false);
+      expect(token?.adminPermissionMatrix).toEqual(ALL_NONE_MATRIX);
+    });
+
+    it("keeps the session, roles and matrix of the same member with login enabled", async () => {
+      mockFindUnique.mockResolvedValue(memberRow(true));
+
+      const token = await refresh();
+
+      expect(token?.sessionInvalidated).toBe(false);
+      expect(token?.accessRoles).toEqual(["ADMIN"]);
+      expect(token?.role).toBe("ADMIN");
+      expect(token?.canLogin).toBe(true);
+      expect(token?.adminPermissionMatrix).toEqual(
+        Object.fromEntries(Object.keys(ALL_NONE_MATRIX).map((area) => [area, "edit"])),
+      );
+    });
+
+    // D1: the revocation time is read from the member row on every refresh, so
+    // the refusal holds for ANY copy of a token issued before the switch-off,
+    // whatever the token itself says. The end-to-end proof with real Auth.js
+    // cookies is `auth-session-revocation-replay.test.ts`.
+    it("refuses a session issued before the switch-off once login is back on", async () => {
+      const issuedAt = Date.now() - 60_000;
+      mockFindUnique.mockResolvedValue(
+        memberRow(true, new Date(issuedAt + 1_000)),
+      );
+
+      const token = await refresh({ sessionIssuedAt: issuedAt, sessionInvalidated: false });
+
+      expect(token?.sessionInvalidated).toBe(true);
+    });
+
+    it("keeps a session issued after the switch-off live once login is back on", async () => {
+      const issuedAt = Date.now() - 60_000;
+      mockFindUnique.mockResolvedValue(
+        memberRow(true, new Date(issuedAt - 1_000)),
+      );
+
+      const token = await refresh({ sessionIssuedAt: issuedAt });
+
+      expect(token?.sessionInvalidated).toBe(false);
+      expect(token?.accessRoles).toEqual(["ADMIN"]);
+    });
+
+    // The in-token term: a session whose issue time is NOT before the stored
+    // revocation time (a sign-in racing the switch-off, or clock skew) is still
+    // refused while login is off, and must stay refused once it is back on.
+    it("keeps a token invalidated while login was off ended after login is back on", async () => {
+      const switchedOffAt = new Date(Date.now() - 60_000);
+      // Issued AFTER the stamp: the stored time alone would not refuse it.
+      const issuedAt = switchedOffAt.getTime() + 1_000;
+
+      mockFindUnique.mockResolvedValue(memberRow(false, switchedOffAt));
+      const whileOff = await refresh({ sessionIssuedAt: issuedAt });
+      expect(whileOff?.sessionInvalidated).toBe(true);
+
+      mockFindUnique.mockResolvedValue(memberRow(true, switchedOffAt));
+      const later = await authConfig.callbacks.jwt?.({ token: whileOff } as never);
+      expect(later?.sessionInvalidated).toBe(true);
+    });
+
+    it("gives a fresh sign-in a live session once login is enabled again", async () => {
+      // The member was switched off a minute ago and back on since.
+      mockFindUnique.mockResolvedValue(
+        memberRow(true, new Date(Date.now() - 60_000)),
+      );
+
+      const token = await authConfig.callbacks.jwt?.({
+        // A stale flag on the incoming token is cleared by sign-in.
+        token: { sessionInvalidated: true },
+        user: {
+          id: "admin-1",
+          role: "ADMIN",
+          forcePasswordChange: false,
+          isEmailVerified: true,
+          twoFactorEnabled: false,
+          twoFactorMethod: null,
+        },
+      } as never);
+
+      expect(token?.sessionInvalidated).toBe(false);
+    });
+
+    it("projects canLogin onto session.user, so privilege checks over it apply the rule", async () => {
+      mockFindUnique.mockResolvedValue(memberRow(true));
+      const token = await refresh();
+
+      const session = await authConfig.callbacks.session?.({
+        session: { user: { id: "admin-1", email: "a@example.com", name: "A" } },
+        token,
+      } as never);
+
+      expect(session?.user.canLogin).toBe(true);
+      expect(hasAdminAccess(session!.user)).toBe(true);
+
+      const disabled = await authConfig.callbacks.session?.({
+        session: { user: { id: "admin-1", email: "a@example.com", name: "A" } },
+        token: { ...token, canLogin: false },
+      } as never);
+      expect(disabled?.user.canLogin).toBe(false);
+      expect(hasAdminAccess(disabled!.user)).toBe(false);
+    });
+
+    it("makes auth() return no session for the login-disabled member", async () => {
+      mockFindUnique.mockResolvedValue(memberRow(false));
+      const token = await refresh();
+      const session = await authConfig.callbacks.session?.({
+        session: { user: { id: "admin-1", email: "a@example.com", name: "A" } },
+        token,
+      } as never);
+      mockRawAuth.mockResolvedValue(session);
+
+      await expect(auth()).resolves.toBeNull();
+    });
+  });
+
+  it("returns null when the shared auth helper sees an invalidated session", async () => {
+    mockRawAuth.mockResolvedValue({
+      user: {
+        id: "member-1",
+        email: "member@example.com",
+        name: "Member User",
+        role: "MEMBER",
+        forcePasswordChange: false,
+        isEmailVerified: true,
+        sessionInvalidated: true,
+      },
+    });
+
+    await expect(auth()).resolves.toBeNull();
+  });
+
+  it("records lastLoginAt on a successful credentials sign-in", async () => {
+    mockFindFirst.mockResolvedValue({
+      id: "member-1",
+      email: "member@example.com",
+      firstName: "Member",
+      lastName: "User",
+      role: "MEMBER",
+      active: true,
+      canLogin: true,
+      // Test fixture: a static bcrypt hash used as mock member data; not a real credential.
+      passwordHash: "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+      forcePasswordChange: false,
+      emailVerified: true,
+      twoFactorEnabled: false,
+      twoFactorMethod: null,
+    });
+    mockUpdate.mockResolvedValue({ id: "member-1" });
+
+    const credentialsProvider = authConfig.providers[0] as unknown as {
+      authorize: (credentials: Record<string, string>) => Promise<unknown>;
+    };
+
+    const user = await credentialsProvider.authorize({
+      email: "member@example.com",
+      password: "password",
+    });
+
+    expect(user).toEqual(
+      expect.objectContaining({
+        id: "member-1",
+        email: "member@example.com",
+        role: "MEMBER",
+      })
+    );
+    expect(mockUpdate).toHaveBeenCalledWith({
+      where: { id: "member-1" },
+      data: { lastLoginAt: expect.any(Date) },
+    });
+  });
+
+  function signedInMember(security?: {
+    twoFactorEnabled?: boolean;
+    twoFactorMethod?: "TOTP" | "EMAIL" | null;
+    passkey?: boolean;
+  }) {
+    mockFindUnique.mockResolvedValue({
+      role: "MEMBER",
+      accessRoles: [{ role: "USER" }],
+      forcePasswordChange: false,
+      emailVerified: true,
+      passwordChangedAt: null,
+      twoFactorEnabled: security?.twoFactorEnabled ?? false,
+      twoFactorMethod: security?.twoFactorMethod ?? null,
+      webAuthnCredentials: security?.passkey ? [{ id: "passkey-1" }] : [],
+    });
+  }
+
+  const signingInUser = {
+    id: "member-1",
+    role: "MEMBER",
+    forcePasswordChange: false,
+    isEmailVerified: true,
+    twoFactorEnabled: false,
+    twoFactorMethod: null,
+  };
+
+  function signIn(provider: string) {
+    return authConfig.callbacks.jwt?.({
+      token: {},
+      user: signingInUser,
+      account: { provider },
+    } as never);
+  }
+
+  it("stamps a password sign-in when no authenticator is owed, and a refresh does not move it", async () => {
+    signedInMember();
+    const signedIn = await signIn("credentials");
+    expect(signedIn).toEqual(
+      expect.objectContaining({ lastAuthenticatedAt: Date.now() }),
+    );
+
+    const refreshed = await authConfig.callbacks.jwt?.({
+      token: { id: "member-1", sessionIssuedAt: Date.now(), lastAuthenticatedAt: 1_000 },
+    } as never);
+    expect(refreshed).toEqual(expect.objectContaining({ lastAuthenticatedAt: 1_000 }));
+    expect(mockConsumeSessionReauthChallenge).not.toHaveBeenCalled();
+  });
+
+  it("stamps a password sign-in when the second factor is email", async () => {
+    signedInMember({ twoFactorEnabled: true, twoFactorMethod: "EMAIL" });
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    const signedIn = await signIn("credentials");
+    expect(signedIn).toEqual(
+      expect.objectContaining({ lastAuthenticatedAt: Date.now() }),
+    );
+  });
+
+  it("does not stamp a password sign-in while an authenticator app is still owed", async () => {
+    signedInMember({ twoFactorEnabled: true, twoFactorMethod: "TOTP" });
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    const signedIn = await signIn("credentials");
+    expect(signedIn?.id).toBe("member-1");
+    expect(signedIn).not.toHaveProperty("lastAuthenticatedAt");
+  });
+
+  it("does not stamp a required officer's password sign-in when they hold a passkey (#4618 review)", async () => {
+    signedInMember({ passkey: true });
+    officerClaimsOverride.claims = {
+      officerTwoFactorRequired: true,
+      twoFactorSatisfiesOfficer: true,
+      officerTwoFactorGraceEndsAt: null,
+      shouldStampGrace: false,
+    };
+    try {
+      const signedIn = await signIn("credentials");
+      expect(signedIn?.id).toBe("member-1");
+      expect(signedIn).not.toHaveProperty("lastAuthenticatedAt");
+    } finally {
+      officerClaimsOverride.claims = null;
+    }
+  });
+
+  it("still stamps a passkey holder's password sign-in when only the module is on", async () => {
+    signedInMember({ passkey: true });
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    const signedIn = await signIn("credentials");
+    expect(signedIn).toEqual(expect.objectContaining({ lastAuthenticatedAt: Date.now() }));
+  });
+
+  it("does not stamp an emailed-link sign-in", async () => {
+    signedInMember();
+    const signedIn = await signIn("magic-link");
+    expect(signedIn?.id).toBe("member-1");
+    expect(signedIn).not.toHaveProperty("lastAuthenticatedAt");
+  });
+
+  it("does not stamp a Google sign-in", async () => {
+    signedInMember();
+    const signedIn = await signIn("google");
+    expect(signedIn?.id).toBe("member-1");
+    expect(signedIn).not.toHaveProperty("lastAuthenticatedAt");
+  });
+
+  it("stamps when an authenticator-app challenge is consumed", async () => {
+    signedInMember();
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(true);
+    const stamped = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        sessionIssuedAt: Date.now(),
+        lastAuthenticatedAt: 1_000,
+      },
+      trigger: "update",
+      session: {
+        user: {
+          twoFactorChallengeToken: `TOTP.${"ab".repeat(32)}`,
+          lastAuthenticatedAt: 9_999,
+          proof: "recovery",
+        },
+      },
+    } as never);
+    expect(mockConsumeTwoFactorSessionChallenge).toHaveBeenCalledWith(
+      "member-1",
+      `TOTP.${"ab".repeat(32)}`,
+    );
+    expect(stamped).toEqual(
+      expect.objectContaining({
+        lastAuthenticatedAt: Date.now(),
+        twoFactorVerified: true,
+      }),
+    );
+  });
+
+  it("does not stamp a recovery-code sign-in, and does not read a proof kind off the session", async () => {
+    signedInMember({ twoFactorEnabled: true, twoFactorMethod: "TOTP" });
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    const signedIn = await signIn("credentials");
+    expect(signedIn).not.toHaveProperty("lastAuthenticatedAt");
+
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(true);
+    const finished = await authConfig.callbacks.jwt?.({
+      token: signedIn,
+      trigger: "update",
+      session: {
+        user: {
+          twoFactorChallengeToken: `RECOVERY.${"ab".repeat(32)}`,
+          lastAuthenticatedAt: Date.now(),
+          proof: "TOTP",
+        },
+      },
+    } as never);
+    expect(finished?.twoFactorVerified).toBe(true);
+    expect(finished).not.toHaveProperty("lastAuthenticatedAt");
+  });
+
+  it("an emailed code does not stamp and does not clear a password stamp", async () => {
+    signedInMember();
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(true);
+    const token = `EMAIL.${"ab".repeat(32)}`;
+    const kept = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        sessionIssuedAt: Date.now(),
+        lastAuthenticatedAt: 1_000,
+      },
+      trigger: "update",
+      session: {
+        user: {
+          twoFactorChallengeToken: token,
+          lastAuthenticatedAt: Date.now(),
+          proof: "TOTP",
+        },
+      },
+    } as never);
+    expect(kept).toEqual(
+      expect.objectContaining({
+        lastAuthenticatedAt: 1_000,
+        twoFactorVerified: true,
+      }),
+    );
+
+    const fresh = await authConfig.callbacks.jwt?.({
+      token: { id: "member-1", sessionIssuedAt: Date.now() },
+      trigger: "update",
+      session: { user: { twoFactorChallengeToken: token } },
+    } as never);
+    expect(fresh?.twoFactorVerified).toBe(true);
+    expect(fresh).not.toHaveProperty("lastAuthenticatedAt");
+  });
+
+  it("does not stamp a challenge minted before the proof prefix existed", async () => {
+    signedInMember();
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(true);
+    const consumed = await authConfig.callbacks.jwt?.({
+      token: { id: "member-1", sessionIssuedAt: Date.now() },
+      trigger: "update",
+      session: { user: { twoFactorChallengeToken: "ab".repeat(32) } },
+    } as never);
+    expect(consumed?.twoFactorVerified).toBe(true);
+    expect(consumed).not.toHaveProperty("lastAuthenticatedAt");
+  });
+
+  it("does not stamp when the authenticator-app challenge is rejected", async () => {
+    signedInMember({ twoFactorEnabled: true, twoFactorMethod: "TOTP" });
+    mockLoadEffectiveModuleFlags.mockResolvedValue({ twoFactor: true });
+    mockConsumeTwoFactorSessionChallenge.mockResolvedValue(false);
+    const rejected = await authConfig.callbacks.jwt?.({
+      token: { id: "member-1", sessionIssuedAt: Date.now() },
+      trigger: "update",
+      session: { user: { twoFactorChallengeToken: `TOTP.${"ab".repeat(32)}` } },
+    } as never);
+    expect(rejected).not.toHaveProperty("lastAuthenticatedAt");
+    expect(rejected?.twoFactorVerified).toBe(false);
+  });
+
+  it("leaves a token with no lastAuthenticatedAt unstamped on refresh", async () => {
+    signedInMember();
+    const refreshed = await authConfig.callbacks.jwt?.({
+      token: { id: "member-1", sessionIssuedAt: Date.now() },
+    } as never);
+    expect(refreshed).not.toHaveProperty("lastAuthenticatedAt");
+  });
+
+  it("ignores a forged session update that carries lastAuthenticatedAt", async () => {
+    signedInMember();
+    const forgedStamp = Date.now();
+    const refreshed = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        sessionIssuedAt: Date.now(),
+        lastAuthenticatedAt: 1_000,
+      },
+      trigger: "update",
+      session: { user: { lastAuthenticatedAt: forgedStamp } },
+    } as never);
+
+    expect(mockConsumeSessionReauthChallenge).not.toHaveBeenCalled();
+    expect(refreshed).toEqual(expect.objectContaining({ lastAuthenticatedAt: 1_000 }));
+  });
+
+  it("refreshes lastAuthenticatedAt only when the reauthentication challenge is consumed", async () => {
+    signedInMember();
+    mockConsumeSessionReauthChallenge.mockResolvedValue(false);
+    const rejected = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        sessionIssuedAt: Date.now(),
+        lastAuthenticatedAt: 1_000,
+      },
+      trigger: "update",
+      session: {
+        user: { reauthChallengeToken: "forged", lastAuthenticatedAt: Date.now() },
+      },
+    } as never);
+    expect(mockConsumeSessionReauthChallenge).toHaveBeenCalledWith("member-1", "forged");
+    expect(rejected).toEqual(expect.objectContaining({ lastAuthenticatedAt: 1_000 }));
+
+    mockConsumeSessionReauthChallenge.mockResolvedValue(true);
+    const accepted = await authConfig.callbacks.jwt?.({
+      token: {
+        id: "member-1",
+        sessionIssuedAt: Date.now(),
+        lastAuthenticatedAt: 1_000,
+      },
+      trigger: "update",
+      session: {
+        user: { reauthChallengeToken: "minted", lastAuthenticatedAt: 9_999_999_999_999 },
+      },
+    } as never);
+    expect(accepted).toEqual(
+      expect.objectContaining({ lastAuthenticatedAt: Date.now() }),
+    );
+  });
+});

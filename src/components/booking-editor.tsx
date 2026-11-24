@@ -1,0 +1,486 @@
+"use client";
+
+import { useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { EditBookingPanel } from "@/components/edit-booking-panel";
+import { BookingInvoiceControl } from "@/components/download-invoice-button";
+import { BookingInvoiceAccountCard } from "@/components/booking-invoice-account-card";
+import type { BookingInvoiceAccount, BookingInvoiceOffer } from "@/lib/booking-invoice-access";
+import { bookingOwner } from "@/lib/booking-owner";
+import { WORKING_BEE_DISCOUNT_LABEL } from "@/lib/working-bee-discount-label";
+import { formatCents } from "@/lib/utils";
+import { bookingStatusClass, bookingStatusLabel } from "@/lib/status-colors";
+import { useClubTime } from "@/components/club-time-provider";
+import {
+  formatClubLongWeekdayDate,
+  requireCalendarDate,
+} from "@/lib/club-time";
+import { useClubFormat } from "@/components/club-format-provider";
+import { perCodePromoAdjustmentRows } from "@/lib/booking-promo-redemptions";
+
+/**
+ * The two headline stay dates, spelled out in full — long weekday, long month —
+ * because they are the thing the member checks before agreeing to a change, and
+ * "Friday 12 June 2026" is harder to misread than "Fri, 12 Jun 2026" (#2264).
+ *
+ * NO ZONE AT ALL, WHICH IS THE FIX (CT-4, #2870). `checkIn`/`checkOut` are
+ * `@db.Date` LODGE NIGHTS — calendar days, which have no timezone — so they are
+ * rendered by a calendar-date shape, which takes none. This file used to hold a
+ * local `Intl.DateTimeFormat` pinned to UTC over the UTC-midnight encoding, and
+ * before that one pinned to `APP_TIME_ZONE`, which was the identity only for a
+ * club east of Greenwich; west of it every member's stay dates printed a day
+ * early.
+ *
+ * IT IS ONE CALL NOW because CT-4's `src/lib` group added the missing shape:
+ * `HOUSE_SHAPES.longWeekdayDate` is the long weekday, long month AND the year,
+ * declared as one shape rather than composed from `longWeekdayDayMonth` plus the
+ * year — which is byte-identical for `en-NZ` and not safe for the club's
+ * persisted locale (#3566).
+ */
+
+interface Guest {
+  id: string;
+  firstName: string;
+  lastName: string;
+  ageTier: string;
+  isMember: boolean;
+  memberId?: string | null;
+  stayStart?: string | null;
+  stayEnd?: string | null;
+  nights?: string[] | null;
+  priceCents: number;
+  // Other Lodges epic: true when this NON-MEMBER guest is priced at the club's
+  // own member rate as a recognised member of the booking's partner lodge.
+  // Optional so pre-existing fixtures stay valid.
+  otherLodgeMember?: boolean;
+  // #2307 (owner decision MG2-M-2): the member-guest consent badge, composed
+  // server-side (`describeMemberGuestConsentBadge`). Absent — not null-valued —
+  // for family and non-member rows, which get no badge and no layout change.
+  consent?: {
+    tone: "pending" | "ok" | "blocked";
+    label: string;
+    // MG4 (#2309): the classified sub-state, threaded through for the edit
+    // panel's helper sentences. Not rendered here — the read view shows only
+    // the label — but carried so the panel does not have to guess "the club put
+    // this person here" from a tone that also covers an ordinary consent.
+    subState?: string | null;
+  };
+}
+
+const consentBadgeToneClasses: Record<"pending" | "ok" | "blocked", string> = {
+  pending: "border-warning-6 bg-warning-3 text-warning-11",
+  ok: "border-success-6 bg-success-3 text-success-11",
+  blocked: "border-danger-6 bg-danger-3 text-danger-11",
+};
+
+interface PromoInfo {
+  code: string;
+  type: string;
+  description: string | null;
+  // Set when this discount came from a work party (working bee) event's
+  // internal promo rather than a manually entered code.
+  workPartyEventName?: string | null;
+}
+
+interface EditPolicyInfo {
+  mode: "future" | "in-progress" | null;
+  today: string;
+  editableFrom: string | null;
+  checkInEditable: boolean;
+  // Issue #1668: an admin may override the date-window locks for this booking.
+  // Optional so pre-existing fixtures/serialisers stay valid; the booking page
+  // always sets it.
+  adminOverrideAvailable?: boolean;
+  // #4533: an officer on a FINISHED stay, where Save cannot apply and a promo
+  // code is sent as a correction request instead. Absent for everyone else.
+  finishedStayPromoCorrection?: boolean;
+}
+
+export interface BookingEditorData {
+  id: string;
+  /**
+   * INV-CAP-039: the name of THIS booking's lodge (`booking.lodge.name`), never
+   * the club default. Stay Details always shows it, as the wizard's review step
+   * does (#2701), so a member checking the booking before paying is told where
+   * the stay is in every club, one lodge or several.
+   */
+  lodgeName: string;
+  checkIn: string;
+  checkOut: string;
+  nights: number;
+  status: string;
+  guests: Guest[];
+  viewerRole: string;
+  /** #3451: see `BookingData.viewerIsBookingOwner`. */
+  viewerIsBookingOwner?: boolean;
+  totalPriceCents: number;
+  discountCents: number;
+  promoAdjustmentCents: number;
+  finalPriceCents: number;
+  promo: PromoInfo | null;
+  /**
+   * #3828: a booking carrying several codes — one money row per code, each
+   * with its own signed adjustment. Absent for one code or none.
+   */
+  promoLines?: Array<PromoInfo & { amountCents: number }>;
+  hasNonMembers: boolean;
+  nonMemberHoldUntil: string | null;
+  canEditNonMemberGuestNames: boolean;
+  canFixNonMemberGuestNameTypos: boolean;
+  editPolicy: EditPolicyInfo;
+  // #2104: threaded so the edit panel can skip the proactive justification field
+  // for a booking that is already flagged/reviewed (the server only demands a
+  // reason on the FIRST no-adult trip).
+  requiresAdminReview: boolean;
+  adminReviewStatus: string | null;
+  // #2259: threaded so the edit panel's admin notify dialog stops offering an
+  // email choice the mailer will not honour. Optional so pre-existing fixtures
+  // stay valid. Nothing on this member-facing editor renders from it — only
+  // the panel's admin-only dialog reads it.
+  noEmails?: boolean;
+  // #2266: the edit panel's account-credit card. Null when the booking cannot
+  // carry a credit election (settled, organiser-settled, or a status no
+  // pay-time consumer would honour) — the panel then renders no credit card.
+  // Optional so pre-existing fixtures stay valid.
+  credit?: {
+    availableCents: number;
+    electionCents: number | null;
+    appliedCents: number;
+  } | null;
+  // #2266: booking OWNER's member id, for on-behalf promo validation in the
+  // shared PromoCodeInput. Optional so pre-existing fixtures stay valid.
+  memberId?: string;
+  // #2266: the booking's lodge, so promo lodge restrictions validate against
+  // the right lodge. Optional so pre-existing fixtures stay valid.
+  lodgeId?: string | null;
+  // MG4 (#2309): the member-guest add surface's server-computed shape, read on
+  // the booking page and threaded here so the edit panel never guesses whether
+  // the module is on. Absent — not false-valued — for a club with the module
+  // off, so their payload is unchanged.
+  memberGuest?: {
+    enabled: boolean;
+    openSearchEnabled: boolean;
+    approvalRequired: boolean;
+  };
+  // #2337: true for an admin/officer viewing a MEMBER whole-lodge booking — the
+  // audience and booking class the placeholder→member link is fenced to.
+  // Server-computed on the booking page and threaded through unchanged.
+  memberWholeLodge?: boolean;
+  // Other Lodges epic: the partner lodge this booking claims, or null. Optional
+  // so pre-existing fixtures stay valid.
+  otherLodgeId?: string | null;
+  // Other Lodges epic: the partner-lodge registry the officer picks from, in
+  // name order. ADMIN-ONLY and absent — not empty-valued — for every other
+  // viewer, so a member's payload never carries the club list. Its presence is
+  // what offers the "Member of Other Lodge" control at all.
+  otherLodges?: Array<{ id: string; name: string; label: string }>;
+  /**
+   * #2978: the guests an officer may tick as an other-lodge member - resolved
+   * server-side by `resolveOtherLodgeRateEligibleGuestIds`, which is also what
+   * the save fences on, so the screen can never offer a tick the save refuses.
+   *
+   * ADMIN-ONLY, and a conditional spread for the same reason `otherLodges` is:
+   * ineligibility can mean "this member's unpaid subscription has repriced
+   * them", so shipping it to every viewer would leak subscription standing over
+   * the RSC wire.
+   */
+  otherLodgeRateEligibleGuestIds?: string[];
+  /**
+   * #5066: the page's `resolveBookingInvoiceOffer` answer — the route's own
+   * rule. Absent (a conditional spread) when nothing is offered.
+   */
+  invoiceOffer?: BookingInvoiceOffer;
+  /** #5066: the invoice's account lines, present only beside a `XERO_INVOICE` or `GENERATED` offer. */
+  invoiceAccount?: BookingInvoiceAccount;
+}
+
+
+/**
+ * One promotion money row: the booking's single adjustment, or (#3828) one
+ * code's own adjustment on a booking carrying several.
+ */
+function PromoAdjustmentRow({
+  promo,
+  amountCents,
+  format,
+}: {
+  promo: PromoInfo | null;
+  amountCents: number;
+  format: ReturnType<typeof useClubFormat>;
+}) {
+  return (
+    <div className={`flex justify-between ${amountCents > 0 ? "text-warning-11" : "text-success-11"}`}>
+      <span>
+        {promo?.workPartyEventName
+          ? WORKING_BEE_DISCOUNT_LABEL
+          : "Promo adjustment"}
+        {promo?.workPartyEventName ? (
+          <span className="ml-1 text-xs">
+            ({promo.workPartyEventName})
+          </span>
+        ) : (
+          promo?.code && (
+            <span className="ml-1 text-xs">({promo.code})</span>
+          )
+        )}
+      </span>
+      <span>
+        {amountCents > 0 ? "+" : "-"}
+        {formatCents(Math.abs(amountCents), format)}
+      </span>
+    </div>
+  );
+}
+
+export function BookingEditor({
+  booking,
+  canModify,
+  canAdminOverride = false,
+}: {
+  booking: BookingEditorData;
+  canModify: boolean;
+  // Issue #1668: admin override lets an admin open the editor even for a
+  // fully-past booking that renders no self-service editor at all.
+  canAdminOverride?: boolean;
+}) {
+  const format = useClubFormat();
+  // #3828: one row per code, or the one combined row — the email's own answer.
+  const perCodePromoRows = perCodePromoAdjustmentRows(
+    booking.promoLines,
+    booking.promoAdjustmentCents,
+  );
+  const searchParams = useSearchParams();
+  /**
+   * #2562: the open policy-exception request this visit is here to REPLACE, from
+   * the `?replaceRequest=<id>` link the member's request area renders. Its presence
+   * also OPENS the editor, because sending somebody to a page and asking them to
+   * find the Edit button is how a replacement never gets made.
+   */
+  const replaceExceptionRequestId =
+    searchParams?.get("replaceRequest")?.trim() || null;
+  const [editing, setEditing] = useState(Boolean(replaceExceptionRequestId));
+  const canOpenEditor = canModify || canAdminOverride;
+  // Capture "now" once at mount so the hold banner can honestly tell a future
+  // deadline (future-tense auto-confirm copy) from a lapsed one (awaiting
+  // processing copy). Day-scale deadlines make a single snapshot sufficient.
+  const [nowMs] = useState(() => Date.now());
+  /**
+   * `nonMemberHoldUntil` is a bare `DateTime` — a real INSTANT, not a lodge
+   * night — so the deadline below reads in the club's PERSISTED timezone (CT-4,
+   * #2870; INV-CONFIG-002). `nowMs` above stays a raw clock read on purpose: the
+   * lapsed test compares two instants, which needs no zone at all.
+   */
+  const clubTime = useClubTime();
+  const nonMemberHoldLapsed = booking.nonMemberHoldUntil
+    ? new Date(booking.nonMemberHoldUntil).getTime() <= nowMs
+    : false;
+
+  if (editing && canOpenEditor) {
+    return (
+      <EditBookingPanel
+        booking={{
+          id: booking.id,
+          checkIn: booking.checkIn,
+          checkOut: booking.checkOut,
+          guests: booking.guests,
+          viewerRole: booking.viewerRole,
+          viewerIsBookingOwner: booking.viewerIsBookingOwner,
+          finalPriceCents: booking.finalPriceCents,
+          totalPriceCents: booking.totalPriceCents,
+          discountCents: booking.discountCents,
+          promoAdjustmentCents: booking.promoAdjustmentCents,
+          promo: booking.promo,
+          promoLines: booking.promoLines,
+          canEditNonMemberGuestNames: booking.canEditNonMemberGuestNames,
+          canFixNonMemberGuestNameTypos: booking.canFixNonMemberGuestNameTypos,
+          editPolicy: booking.editPolicy,
+          requiresAdminReview: booking.requiresAdminReview,
+          adminReviewStatus: booking.adminReviewStatus,
+          noEmails: booking.noEmails,
+          credit: booking.credit,
+          memberId: bookingOwner(booking).memberId,
+          lodgeId: booking.lodgeId,
+          memberGuest: booking.memberGuest,
+          memberWholeLodge: booking.memberWholeLodge,
+          otherLodgeId: booking.otherLodgeId,
+          otherLodges: booking.otherLodges,
+          otherLodgeRateEligibleGuestIds: booking.otherLodgeRateEligibleGuestIds,
+        }}
+        canAdminOverride={canAdminOverride}
+        replaceExceptionRequestId={replaceExceptionRequestId}
+        onDone={() => setEditing(false)}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Stay Details */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <CardTitle headingLevel={2}>Stay Details</CardTitle>
+              {canOpenEditor && (
+                <Button variant="outline" onClick={() => setEditing(true)}>
+                  Edit Booking
+                </Button>
+              )}
+              <BookingInvoiceControl bookingId={booking.id} offer={booking.invoiceOffer ?? { kind: "NONE" }} />
+            </div>
+            <Badge variant="secondary" className={bookingStatusClass(booking.status)}>
+              {bookingStatusLabel(booking.status)}
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            {/* INV-CAP-039: unconditional, for the #2701 reason — the page must
+                not look the same whether or not the lodge is the right one. */}
+            <div className="col-span-2">
+              <p className="text-sm text-muted-foreground">Lodge</p>
+              <p className="font-medium">{booking.lodgeName}</p>
+            </div>
+            <div>
+              <p className="text-sm text-muted-foreground">Check-in</p>
+              <p className="font-medium">
+                {formatClubLongWeekdayDate(requireCalendarDate(booking.checkIn), format)}
+              </p>
+            </div>
+            <div>
+              <p className="text-sm text-muted-foreground">Check-out</p>
+              <p className="font-medium">
+                {formatClubLongWeekdayDate(requireCalendarDate(booking.checkOut), format)}
+              </p>
+            </div>
+            <div>
+              <p className="text-sm text-muted-foreground">Nights</p>
+              <p className="font-medium">{booking.nights}</p>
+            </div>
+            <div>
+              <p className="text-sm text-muted-foreground">Guests</p>
+              <p className="font-medium">{booking.guests.length}</p>
+            </div>
+          </div>
+
+          {booking.status === "PENDING" && booking.nonMemberHoldUntil && (
+            <div className="rounded-md bg-warning-3 p-3 text-sm text-warning-11">
+              {nonMemberHoldLapsed ? (
+                <>
+                  This booking includes non-members. The hold period ended on{" "}
+                  {clubTime.instantDate(new Date(booking.nonMemberHoldUntil))} and it is now
+                  awaiting confirmation, payment, or admin processing, subject to
+                  availability. Members have priority.
+                </>
+              ) : (
+                <>
+                  This booking includes non-members. It will be auto-confirmed on{" "}
+                  {clubTime.instantDate(new Date(booking.nonMemberHoldUntil))}, subject to
+                  availability. Members have priority.
+                </>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Guests */}
+      <Card>
+        <CardHeader>
+          <CardTitle headingLevel={2}>Guests</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="divide-y">
+            {booking.guests.map((guest) => (
+              <div key={guest.id} className="flex items-center justify-between py-3">
+                <div>
+                  <p className="font-medium">
+                    {guest.firstName} {guest.lastName}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    {guest.ageTier} &middot; {guest.isMember ? "Member" : "Non-member"}
+                    {/*
+                      Other Lodges epic: somebody the booking officer has
+                      recognised as a member of the club's partner lodge, and who
+                      is therefore charged this club's member rate. Said here, on
+                      the rate category, because this line is the only thing on
+                      the read view that explains why the fee beside it is not
+                      the one their category would otherwise buy.
+
+                      #2978: the category beside it is deliberately left alone.
+                      The tick now reaches people who read "Member" here — a
+                      member whose membership TYPE prices them at the non-member
+                      rate — and that word is still the truth about their
+                      standing in THIS club, which the tick never changes.
+                    */}
+                    {guest.otherLodgeMember ? " (Other Club Member)" : ""}
+                  </p>
+                  {(guest.stayStart && guest.stayStart !== booking.checkIn) ||
+                  (guest.stayEnd && guest.stayEnd !== booking.checkOut) ? (
+                    <p className="text-xs text-muted-foreground">
+                      Stay: {guest.stayStart ?? booking.checkIn} to{" "}
+                      {guest.stayEnd ?? booking.checkOut}
+                    </p>
+                  ) : null}
+                  {guest.consent ? (
+                    <Badge
+                      variant="outline"
+                      className={`mt-1 ${consentBadgeToneClasses[guest.consent.tone]}`}
+                    >
+                      {guest.consent.label}
+                    </Badge>
+                  ) : null}
+                </div>
+                <p className="font-medium">{formatCents(guest.priceCents, format)}</p>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Payment */}
+      <Card>
+        <CardHeader>
+          <CardTitle headingLevel={2}>Payment</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <div className="flex justify-between">
+            <span>Subtotal</span>
+            <span>{formatCents(booking.totalPriceCents, format)}</span>
+          </div>
+          {perCodePromoRows
+            ? perCodePromoRows.map((line) => (
+                <PromoAdjustmentRow
+                  key={line.code}
+                  promo={line}
+                  amountCents={line.amountCents}
+                  format={format}
+                />
+              ))
+            : booking.promoAdjustmentCents !== 0 && (
+                <PromoAdjustmentRow
+                  promo={booking.promo}
+                  amountCents={booking.promoAdjustmentCents}
+                  format={format}
+                />
+              )}
+          <div className="flex justify-between border-t pt-2 font-bold">
+            <span>Total</span>
+            <span>{formatCents(booking.finalPriceCents, format)}</span>
+          </div>
+        </CardContent>
+      </Card>
+
+      {(booking.invoiceOffer?.kind === "XERO_INVOICE" || booking.invoiceOffer?.kind === "GENERATED") && booking.invoiceAccount && (
+        <BookingInvoiceAccountCard
+          bookingId={booking.id}
+          creditNotes={booking.invoiceOffer.kind === "XERO_INVOICE" ? booking.invoiceOffer.creditNotes : []}
+          account={booking.invoiceAccount}
+        />
+      )}
+    </div>
+  );
+}

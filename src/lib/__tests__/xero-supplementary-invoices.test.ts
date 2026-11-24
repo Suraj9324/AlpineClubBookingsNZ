@@ -1,0 +1,1280 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  bookingFindUnique: vi.fn(),
+  groupBookingFindUnique: vi.fn(),
+  sendOrganiserEmail: vi.fn(),
+  // #4299 F4: the organiser extra state the notice is sized from.
+  bookingModificationFindMany: vi.fn(),
+  xeroSyncOperationFindMany: vi.fn(),
+  bookingModificationFindUnique: vi.fn(),
+  xeroSyncOperationUpdate: vi.fn(),
+  xeroSyncOperationFindUnique: vi.fn(),
+  startXeroSyncOperation: vi.fn(),
+  completeXeroSyncOperation: vi.fn(),
+  failXeroSyncOperation: vi.fn(),
+  getAuthenticatedXeroClient: vi.fn(),
+  callXeroApi: vi.fn(),
+  getResolvedAccountMapping: vi.fn(),
+  getAccountMapping: vi.fn(),
+  getHutFeeItemCodeMap: vi.fn(),
+  getHutFeeSeasonType: vi.fn(),
+  bookingFindUniqueOrThrow: vi.fn(),
+  manualRefundTaskFindMany: vi.fn(),
+  findOrCreateXeroContact: vi.fn(),
+  retryXeroWriteWithContactRepair: vi.fn(),
+  manualRefundTaskFindUnique: vi.fn(),
+  readStripeCaptureDocumentDate: vi.fn(),
+  queueWaitingPaidAnotherWayNote: vi.fn(),
+  // #4299 S1: the anchor-locked check just before the Xero call.
+  lockAnchor: vi.fn(),
+  xeroSyncOperationFindFirst: vi.fn(),
+  xeroSyncOperationUpdateMany: vi.fn(),
+  // #4494: the gap invoice's send-time check (resets to undefined: no overlap).
+  unpaidGapPayloadIfOverlapping: vi.fn(),
+  // ALP-436: the export manifest recorded once the operation completes.
+  recordSupplementaryInvoiceManifest: vi.fn(),
+}));
+
+vi.mock("@/lib/xero-tax-anchors", () => import("./support/xero-tax-anchors-baseline"));
+// #4525 (M13): the payment's capture receipt; the recorder has its own suite.
+const captureReceipts = vi.hoisted(() => ({ record: vi.fn() }));
+vi.mock("@/lib/member-money/doors", () => ({
+  recordSupplementaryInvoiceManifest: mocks.recordSupplementaryInvoiceManifest,
+  recordCaptureReceiptManifest: captureReceipts.record,
+}));
+
+vi.mock("@/lib/credit-release-xero-payment", () => ({
+  unpaidGapPayloadIfOverlapping: async (...a: unknown[]) => (await mocks.unpaidGapPayloadIfOverlapping(...a)) ?? null,
+}));
+
+vi.mock("@/lib/xero-supplementary-invoice-enqueue", () => ({ lockSupplementaryInvoiceAnchor: mocks.lockAnchor }));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    // #4299 S1: the organiser create's short anchor-locked transaction.
+    $transaction: async (run: (tx: unknown) => unknown) => run({
+      xeroSyncOperation: { findFirst: mocks.xeroSyncOperationFindFirst, updateMany: mocks.xeroSyncOperationUpdateMany },
+    }),
+    booking: {
+      findUnique: mocks.bookingFindUnique,
+      findUniqueOrThrow: mocks.bookingFindUniqueOrThrow,
+    },
+    groupBooking: { findUnique: mocks.groupBookingFindUnique },
+    bookingModification: {
+      findUnique: mocks.bookingModificationFindUnique,
+      findMany: mocks.bookingModificationFindMany,
+    },
+    xeroObjectLink: { findMany: async () => [] },
+    paymentTransaction: { findMany: async () => [] },
+    manualRefundTask: {
+      findMany: mocks.manualRefundTaskFindMany,
+      // #3635 round-3 R2: no kept late capture unless a test says so.
+      findUnique: async (...a: unknown[]) => (await mocks.manualRefundTaskFindUnique(...a)) ?? null,
+    },
+    xeroSyncOperation: {
+      update: mocks.xeroSyncOperationUpdate,
+      findUnique: mocks.xeroSyncOperationFindUnique,
+      findMany: mocks.xeroSyncOperationFindMany,
+    },
+  },
+}));
+
+vi.mock("@/lib/email/groups", () => ({ sendGroupOrganiserExtraInvoiceEmail: mocks.sendOrganiserEmail }));
+
+vi.mock("@/lib/logger", () => ({
+  default: {
+    error: vi.fn(),
+    warn: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+// #3635 round-3 R2: the Stripe charge day of a kept late capture.
+vi.mock("@/lib/stripe-capture-date", () => ({
+  readStripeCaptureDocumentDate: mocks.readStripeCaptureDocumentDate,
+}));
+
+// #3924 round 8: the note step a paid-another-way close waits on.
+vi.mock("@/lib/paid-another-way-receipt-note", () => ({
+  // No waiting close unless a test says so (the mocks reset to undefined).
+  queueWaitingPaidAnotherWayNote: async (...a: unknown[]) => (await mocks.queueWaitingPaidAnotherWayNote(...a)) ?? 0,
+}));
+
+vi.mock("@/lib/xero-links", () => ({
+  buildXeroInvoiceUrl: (id: string) => `https://xero.example/invoice/${id}`,
+}));
+
+// Keep buildXeroIdempotencyKey / sanitizeForJson real so we can assert the actual
+// key the operation records.
+vi.mock("@/lib/xero-sync", async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import("@/lib/xero-sync");
+  return {
+    ...actual,
+    startXeroSyncOperation: mocks.startXeroSyncOperation,
+    completeXeroSyncOperation: mocks.completeXeroSyncOperation,
+    failXeroSyncOperation: mocks.failXeroSyncOperation,
+  };
+});
+
+vi.mock("@/lib/xero-api-client", () => ({
+  getAuthenticatedXeroClient: mocks.getAuthenticatedXeroClient,
+  callXeroApi: mocks.callXeroApi,
+}));
+
+// Partial (#3530): the pure item-code precedence stays real; the loaders the
+// itemised branch reads are stubbed beside the account mappings.
+vi.mock("@/lib/xero-mappings", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/xero-mappings")),
+  getResolvedAccountMapping: mocks.getResolvedAccountMapping,
+  getAccountMapping: mocks.getAccountMapping,
+  getHutFeeItemCodeMap: mocks.getHutFeeItemCodeMap,
+  getHutFeeSeasonType: mocks.getHutFeeSeasonType,
+}));
+
+vi.mock("@/lib/xero-contacts", () => ({
+  findOrCreateXeroContact: mocks.findOrCreateXeroContact,
+  retryXeroWriteWithContactRepair: mocks.retryXeroWriteWithContactRepair,
+}));
+
+// This module no longer imports `xero-invoice-helpers` at all: #2834 moved both
+// of its dates onto the club calendar via `formatDateOnlyForTimeZone`, so the
+// stub that used to pin `formatDate` here would mock a module nothing loads. The
+// dates themselves are pinned at the NZ-morning boundary in
+// `xero-document-dates-club-calendar.test.ts`.
+
+import { createXeroSupplementaryInvoice } from "@/lib/xero-supplementary-invoices";
+import { readQueuedOutboxPayload } from "@/lib/xero-operation-outbox-payload";
+import { getXeroOperationRetryMeta } from "@/lib/xero-operation-retry";
+import type { Prisma } from "@prisma/client";
+import { lineTotalCents } from "@/lib/__tests__/helpers";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+import { xeroClaim } from "@/lib/__tests__/helpers/xero-claim";
+import { resolveXeroTaxRendering } from "@/lib/xero-tax-anchors";
+import type { XeroTaxRendering } from "@/lib/xero-tax-rendering";
+import { LineAmountTypes } from "xero-node";
+
+describe("createXeroSupplementaryInvoice idempotency-key discriminator (#1234, L2)", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // #3530 2c: no settled review shares unless a case says so.
+    mocks.manualRefundTaskFindMany.mockResolvedValue([]);
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "bk1",
+      memberId: "mem1",
+      payment: { xeroInvoiceId: "inv_orig" },
+    });
+    mocks.bookingModificationFindUnique.mockResolvedValue({
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    mocks.getAuthenticatedXeroClient.mockResolvedValue({
+      xero: { accountingApi: {} },
+      tenantId: "tenant_1",
+    });
+    mocks.findOrCreateXeroContact.mockResolvedValue("contact_1");
+    mocks.getResolvedAccountMapping.mockResolvedValue({
+      code: "200",
+      itemCode: undefined,
+      codeExplicitlyConfigured: false,
+    });
+    mocks.getAccountMapping.mockResolvedValue("606");
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "op_x" });
+    mocks.failXeroSyncOperation.mockResolvedValue(undefined);
+  });
+
+  it("throws when bookingModificationId is absent instead of collapsing the key to bookingId", async () => {
+    await expect(
+      createXeroSupplementaryInvoice({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "bk1",
+        priceDiffCents: 5000,
+        changeFeeCents: 2000,
+      })
+    ).rejects.toThrow(
+      "Supplementary invoice requires a bookingModificationId for a distinct Xero idempotency key"
+    );
+
+    // The guard fires before any Xero/DB work.
+    expect(mocks.bookingFindUnique).not.toHaveBeenCalled();
+    expect(mocks.startXeroSyncOperation).not.toHaveBeenCalled();
+  });
+
+  it("builds the Xero idempotency key from the bookingModificationId discriminator", async () => {
+    // Stop the operation right after the key is recorded so we can assert it
+    // without driving the full Xero write.
+    mocks.retryXeroWriteWithContactRepair.mockRejectedValue(
+      new Error("sentinel-stop")
+    );
+
+    await expect(
+      createXeroSupplementaryInvoice({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "bk1",
+        priceDiffCents: 5000,
+        changeFeeCents: 2000,
+        bookingModificationId: "mod_123",
+      })
+    ).rejects.toThrow("sentinel-stop");
+
+    expect(mocks.startXeroSyncOperation).toHaveBeenCalledTimes(1);
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    expect(enqueued.localModel).toBe("BookingModification");
+    expect(enqueued.localId).toBe("mod_123");
+    // The key is scoped by the modification, not the booking, so two same-amount
+    // deltas on one booking never collide.
+    expect(enqueued.idempotencyKey).toBe(
+      "booking-mod:mod_123:supplementary-invoice:5000:2000:v1"
+    );
+    expect(enqueued.correlationKey).toBe(enqueued.idempotencyKey);
+    // The failed operation is marked failed and the error re-thrown.
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_x" }),
+      expect.any(Error)
+    );
+  });
+});
+
+// #1356 (F16): a price reduction combined with a larger late-change fee must
+// invoice the SIGNED components so the line items sum exactly to the net the
+// member paid, and the recorded Xero payment must equal the Stripe capture —
+// not the gross fee.
+describe("createXeroSupplementaryInvoice mixed-sign components (#1356)", () => {
+  const createPayments = vi.fn();
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // #3530 2c: no settled review shares unless a case says so.
+    mocks.manualRefundTaskFindMany.mockResolvedValue([]);
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "bk1",
+      memberId: "mem1",
+      payment: { xeroInvoiceId: "inv_orig" },
+    });
+    mocks.bookingModificationFindUnique.mockResolvedValue({
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    createPayments.mockResolvedValue({
+      body: { payments: [{ paymentID: "pay_1" }] },
+    });
+    mocks.getAuthenticatedXeroClient.mockResolvedValue({
+      xero: { accountingApi: { createPayments } },
+      tenantId: "tenant_1",
+    });
+    mocks.findOrCreateXeroContact.mockResolvedValue("contact_1");
+    // Key-aware mapping: give-backs post to the hutFeeRefunds mapping (owner
+    // decision on #1356), income lines to hutFeesIncome.
+    mocks.getResolvedAccountMapping.mockImplementation(async (key: string) =>
+      key === "hutFeeRefunds"
+        ? { code: "201", itemCode: undefined, codeExplicitlyConfigured: true }
+        : { code: "200", itemCode: undefined, codeExplicitlyConfigured: false }
+    );
+    mocks.getAccountMapping.mockResolvedValue("606");
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "op_x" });
+    mocks.completeXeroSyncOperation.mockResolvedValue(undefined);
+    mocks.failXeroSyncOperation.mockResolvedValue(undefined);
+    // createInvoices goes through the contact-repair wrapper; createPayments
+    // calls callXeroApi directly, so run the thunk for real.
+    mocks.retryXeroWriteWithContactRepair.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_supp", invoiceNumber: "INV-0042" }] },
+    });
+    mocks.callXeroApi.mockImplementation((fn: () => unknown) => fn());
+  });
+
+  it("bills the signed net: negative price line + fee line, payment equals the Stripe capture", async () => {
+    const invoiceId = await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: -500,
+      changeFeeCents: 1000,
+      bookingModificationId: "mod_mixed",
+    });
+
+    expect(invoiceId).toBe("inv_supp");
+
+    // The queued operation's invoice carries BOTH signed component lines,
+    // summing exactly to the +500 net charge.
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    const lines = enqueued.requestPayload.invoices[0].lineItems;
+    expect(lines).toHaveLength(2);
+    expect(lines[0].description).toContain("price adjustment");
+    expect(lines[0].unitAmount).toBe(-5);
+    // The give-back line posts to the hutFeeRefunds mapping; the fee stays on
+    // hutFeesIncome (clubs may map both to one code to collapse the split).
+    expect(lines[0].accountCode).toBe("201");
+    expect(lines[1].description).toContain("change fee");
+    expect(lines[1].unitAmount).toBe(10);
+    expect(lines[1].accountCode).toBe("200");
+    expect(lineTotalCents(lines)).toBe(500);
+    // The idempotency key carries the signed component, not a clamped zero.
+    expect(enqueued.idempotencyKey).toBe(
+      "booking-mod:mod_mixed:supplementary-invoice:-500:1000:v1"
+    );
+
+    // The recorded Xero payment is the 500-cent net Stripe captured — never
+    // the 1000-cent gross fee.
+    expect(createPayments).toHaveBeenCalledTimes(1);
+    const [tenantId, paymentBody, , paymentIdempotencyKey] =
+      createPayments.mock.calls[0];
+    expect(tenantId).toBe("tenant_1");
+    expect(paymentBody.payments[0].amount).toBe(5);
+    expect(paymentIdempotencyKey).toBe(
+      "booking-mod:mod_mixed:supplementary-payment:500:v1"
+    );
+
+    // The payment link metadata mirrors the net for repair-pass evidence.
+    const completion = mocks.completeXeroSyncOperation.mock.calls[0][1];
+    const paymentLink = completion.extraLinks.find(
+      (link: { role: string }) => link.role === "SUPPLEMENTARY_INVOICE_PAYMENT"
+    );
+    expect(paymentLink.metadata).toEqual({
+      invoiceId: "inv_supp",
+      amountCents: 500,
+    });
+  });
+
+  // #3530 stage 2b: the edit's stored lines, when they explain exactly what
+  // this invoice bills; the single price-adjustment line otherwise.
+  const storedLines = [
+    {
+      v: 1, kind: "GUEST_NIGHTS", sign: 1, ageTier: "ADULT", isMember: false,
+      rateMembershipTypeId: "type-non-member", unitCents: 8000, nightCount: 1,
+      guestCount: 1, quantity: 1, startDate: "2026-08-14", endExclusive: "2026-08-15",
+      guestNames: ["Guest b"], amountCents: 8000,
+    },
+  ];
+  function itemisedFixtures() {
+    mocks.bookingModificationFindUnique.mockResolvedValue({
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      priceLines: storedLines,
+      priceDiffCents: 8000,
+      changeFeeCents: 1000,
+    });
+    mocks.bookingFindUniqueOrThrow.mockResolvedValue({
+      checkIn: new Date("2026-08-14T00:00:00Z"),
+      lodgeId: "lodge-1",
+      promoRedemption: null,
+      guests: [{ ageTier: "ADULT", isMember: false, rateMembershipTypeId: "type-non-member" }],
+    });
+    mocks.getHutFeeItemCodeMap.mockResolvedValue({
+      byKey: new Map([["type-non-member_WINTER_ADULT", "HUT-NONMEMBER-ADULT"]]),
+      fullTypeId: "type-full",
+      nonMemberTypeId: "type-non-member",
+      legacyItemCode: null,
+      size: 1,
+    });
+    mocks.getHutFeeSeasonType.mockResolvedValue("WINTER");
+  }
+
+  it("#4525 (M13): records the stored payment's capture receipt under its key, naming no capture when the call queued none", async () => {
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST, bookingId: "bk1", priceDiffCents: -500, changeFeeCents: 1000, bookingModificationId: "mod_mixed",
+    });
+    const [, paymentBody, , paymentIdempotencyKey] = createPayments.mock.calls[0];
+    expect(captureReceipts.record).toHaveBeenCalledWith({
+      bookingId: "bk1", paymentIntentId: null, paymentKey: paymentIdempotencyKey, amountCents: 500,
+      providerPaymentId: "pay_1", invoiceId: "inv_supp", reference: paymentBody.payments[0].reference, bankCode: "606",
+    });
+    expect(captureReceipts.record.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.completeXeroSyncOperation.mock.invocationCallOrder[0]!);
+  });
+
+  it("#4525 (M13): names the capture the queued payload names", async () => {
+    mocks.manualRefundTaskFindUnique.mockResolvedValue(null);
+    mocks.unpaidGapPayloadIfOverlapping.mockResolvedValue(null);
+    mocks.xeroSyncOperationFindUnique.mockResolvedValue({ requestPayload: {
+      queueType: "SUPPLEMENTARY_INVOICE", bookingId: "bk1", priceDiffCents: 3000, changeFeeCents: 0,
+      bookingModificationId: "mod_123", recordPayment: true, paymentIntentId: "pi_change",
+    } });
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST, bookingId: "bk1", priceDiffCents: 3000, changeFeeCents: 0, bookingModificationId: "mod_123",
+      recordPayment: true, syncOperation: xeroClaim("op_q"),
+    });
+    expect(captureReceipts.record).toHaveBeenCalledWith(expect.objectContaining({ paymentIntentId: "pi_change", amountCents: 3000, providerPaymentId: "pay_1" }));
+  });
+
+  it("#4525 review: an inline call names the capture its caller passes, and the queued payload's own capture wins over it", async () => {
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST, bookingId: "bk1", priceDiffCents: -500, changeFeeCents: 1000, bookingModificationId: "mod_mixed",
+      captureIntentId: "pi_from_retry",
+    });
+    expect(captureReceipts.record).toHaveBeenLastCalledWith(expect.objectContaining({ paymentIntentId: "pi_from_retry", amountCents: 500 }));
+
+    mocks.manualRefundTaskFindUnique.mockResolvedValue(null);
+    mocks.unpaidGapPayloadIfOverlapping.mockResolvedValue(null);
+    mocks.xeroSyncOperationFindUnique.mockResolvedValue({ requestPayload: {
+      queueType: "SUPPLEMENTARY_INVOICE", bookingId: "bk1", priceDiffCents: 3000, changeFeeCents: 0,
+      bookingModificationId: "mod_123", recordPayment: true, paymentIntentId: "pi_change",
+    } });
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST, bookingId: "bk1", priceDiffCents: 3000, changeFeeCents: 0, bookingModificationId: "mod_123",
+      recordPayment: true, syncOperation: xeroClaim("op_q"), captureIntentId: "pi_other",
+    });
+    expect(captureReceipts.record).toHaveBeenLastCalledWith(expect.objectContaining({ paymentIntentId: "pi_change", amountCents: 3000 }));
+  });
+
+  it("#4525 (M13): records no capture receipt when Xero refuses the payment", async () => {
+    createPayments.mockRejectedValue(new Error("Xero refused the payment"));
+    await expect(createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST, bookingId: "bk1", priceDiffCents: -500, changeFeeCents: 1000, bookingModificationId: "mod_mixed",
+    })).resolves.toBe("inv_supp");
+    expect(captureReceipts.record).not.toHaveBeenCalled();
+  });
+
+  it("itemises the invoice from the edit's stored lines, summing to the cent, and records STORED (#3530)", async () => {
+    itemisedFixtures();
+
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 8000,
+      changeFeeCents: 1000,
+      bookingModificationId: "mod_lines",
+    });
+
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    const lines = enqueued.requestPayload.invoices[0].lineItems;
+    expect(lines).toEqual([
+      {
+        description: "1 x Non-member Adult added - 1 night - 14 Aug 2026 - 15 Aug 2026",
+        quantity: 1,
+        unitAmount: 80,
+        taxType: "OUTPUT2",
+        itemCode: "HUT-NONMEMBER-ADULT",
+      },
+      { description: "Late notice booking change fee", quantity: 1, unitAmount: 10, taxType: "OUTPUT2", accountCode: "200" },
+    ]);
+    expect(lineTotalCents(lines)).toBe(9000);
+    expect(enqueued.requestPayload.priceLines).toEqual({
+      source: "STORED", reason: null, storedSumCents: 8000, sharesSumCents: null, billedCents: 9000, lineCount: 2, shareCount: 0,
+    });
+    // Identity is still amount-derived: lines enter no key (INV-PAY-070).
+    expect(enqueued.idempotencyKey).toBe("booking-mod:mod_lines:supplementary-invoice:8000:1000:v1");
+  });
+
+  it.each([
+    ["a registered period with another code", { lineAmountTypes: LineAmountTypes.Inclusive, taxType: "OUTPUT3" }],
+    ["an unregistered period", { lineAmountTypes: LineAmountTypes.NoTax }],
+  ] as Array<[string, XeroTaxRendering]>)(
+    "#4632: renders under the booking's own treatment (%s) and records that treatment on its manifest",
+    async (_label, rendering) => {
+      itemisedFixtures();
+      vi.mocked(resolveXeroTaxRendering).mockResolvedValueOnce(rendering);
+
+      await createXeroSupplementaryInvoice({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "bk1",
+        priceDiffCents: 8000,
+        changeFeeCents: 1000,
+        bookingModificationId: "mod_lines",
+      });
+
+      // The booking's anchor (when it was made), never today's treatment.
+      expect(resolveXeroTaxRendering).toHaveBeenCalledWith({ kind: "booking", bookingId: "bk1" });
+      const invoice = mocks.startXeroSyncOperation.mock.calls[0][0].requestPayload.invoices[0];
+      expect(invoice.lineAmountTypes).toBe(rendering.lineAmountTypes);
+      expect(invoice.lineItems.map((line: { taxType?: string }) => line.taxType)).toEqual([rendering.taxType, rendering.taxType]);
+      expect(mocks.recordSupplementaryInvoiceManifest).toHaveBeenCalledWith(expect.objectContaining({
+        lines: invoice.lineItems,
+        taxRendering: rendering,
+      }));
+    },
+  );
+
+  it("retrying renders identical lines: the row is the anchor and is re-read, immutable (#3530 acceptance)", async () => {
+    itemisedFixtures();
+    const run = async () => {
+      mocks.startXeroSyncOperation.mockClear();
+      await createXeroSupplementaryInvoice({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "bk1",
+        priceDiffCents: 8000,
+        changeFeeCents: 1000,
+        bookingModificationId: "mod_lines",
+      });
+      const payload = mocks.startXeroSyncOperation.mock.calls[0][0].requestPayload;
+      return { lines: payload.invoices[0].lineItems, record: payload.priceLines };
+    };
+    const first = await run();
+    const second = await run();
+    expect(second).toEqual(first);
+    expect(first.record.source).toBe("STORED");
+  });
+
+  it("a parked edit's invoice, restated to the combined total of two settled shares, lists both adjustments (#3530 2c, INV-PAY-070)", async () => {
+    itemisedFixtures();
+    // A parked edit stores no lines; two review tasks were settled against it.
+    mocks.bookingModificationFindUnique.mockResolvedValue({
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      priceLines: null,
+      priceDiffCents: 0,
+      changeFeeCents: 0,
+    });
+    const reviewContext = {
+      version: 1,
+      occurrence: {
+        bookingId: "bk1",
+        bookingGuestId: "guest-1",
+        cause: "NO_STORED_NIGHT_PRICES",
+        surrenderedNightDates: ["2026-08-14"],
+        addedNightDates: [],
+        storedEvidence: { guestTotalCents: null, nightPrices: [] },
+      },
+      guestMemberId: "member-1",
+      bookingCheckIn: "2026-08-14",
+      bookingCheckOut: "2026-08-16",
+      bookingModificationId: "mod_lines",
+    };
+    mocks.manualRefundTaskFindMany.mockResolvedValue([
+      { id: "t1", amountCents: 2275, settlementDirection: "CHARGE_TO_MEMBER", note: "INV owing $340, collected $317.25", completedAt: new Date("2026-06-01T00:00:00Z"), reviewContext },
+      { id: "t2", amountCents: 1000, settlementDirection: "CHARGE_TO_MEMBER", note: null, completedAt: new Date("2026-06-02T00:00:00Z"), reviewContext },
+    ]);
+
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 3275,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_lines",
+    });
+
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    const lines = enqueued.requestPayload.invoices[0].lineItems;
+    expect(lines.map((l: { description: string; unitAmount: number; accountCode?: string }) => [l.description, l.unitAmount, l.accountCode])).toEqual([
+      ["Adjustment agreed with member: INV owing $340, collected $317.25", 22.75, "200"],
+      ["Adjustment agreed with member", 10, "200"],
+    ]);
+    expect(lineTotalCents(lines)).toBe(3275);
+    expect(enqueued.requestPayload.priceLines).toEqual({
+      source: "STORED", reason: null, storedSumCents: null, sharesSumCents: 3275, billedCents: 3275, lineCount: 2, shareCount: 2,
+    });
+    expect(enqueued.idempotencyKey).toBe("booking-mod:mod_lines:supplementary-invoice:3275:0:v1");
+    // #4525 (ALP-436): the manifest covers exactly the shares these lines itemise.
+    expect(mocks.recordSupplementaryInvoiceManifest).toHaveBeenCalledWith(expect.objectContaining({
+      anchor: { kind: "MODIFICATION", modificationId: "mod_lines" },
+      itemisedShareTaskIds: ["t1", "t2"],
+    }));
+  });
+
+  it("a share settled between a failed send and its retry never renders a line the retry does not bill: it falls back, same total", async () => {
+    itemisedFixtures();
+    mocks.bookingModificationFindUnique.mockResolvedValue({
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      priceLines: null,
+      priceDiffCents: 0,
+      changeFeeCents: 0,
+    });
+    const reviewContext = {
+      version: 1,
+      occurrence: {
+        bookingId: "bk1",
+        bookingGuestId: "guest-1",
+        cause: "NO_STORED_NIGHT_PRICES",
+        surrenderedNightDates: ["2026-08-14"],
+        addedNightDates: [],
+        storedEvidence: { guestTotalCents: null, nightPrices: [] },
+      },
+      guestMemberId: "member-1",
+      bookingCheckIn: "2026-08-14",
+      bookingCheckOut: "2026-08-16",
+      bookingModificationId: "mod_lines",
+    };
+    const first = { id: "t1", amountCents: 2275, settlementDirection: "CHARGE_TO_MEMBER", note: "owing", completedAt: new Date("2026-06-01T00:00:00Z"), reviewContext };
+    const run = async () => {
+      mocks.startXeroSyncOperation.mockClear();
+      mocks.recordSupplementaryInvoiceManifest.mockClear();
+      await createXeroSupplementaryInvoice({ format: CLUB_FORMAT_TEST, bookingId: "bk1", priceDiffCents: 2275, changeFeeCents: 0, bookingModificationId: "mod_lines" });
+      const payload = mocks.startXeroSyncOperation.mock.calls[0][0].requestPayload;
+      const recorded = mocks.recordSupplementaryInvoiceManifest.mock.calls[0]?.[0];
+      return { lines: payload.invoices[0].lineItems, record: payload.priceLines, itemisedShareTaskIds: recorded?.itemisedShareTaskIds };
+    };
+
+    mocks.manualRefundTaskFindMany.mockResolvedValue([first]);
+    const attempt1 = await run();
+    expect(attempt1.record).toMatchObject({ source: "STORED", shareCount: 1 });
+    expect(attempt1.itemisedShareTaskIds).toEqual(["t1"]);
+
+    // A second share lands on the same anchor; the operation still bills 2275
+    // (the restate could not join it, INV-PAY-070).
+    mocks.manualRefundTaskFindMany.mockResolvedValue([first, { ...first, id: "t2", amountCents: 1000, note: "late", completedAt: new Date("2026-06-02T00:00:00Z") }]);
+    const attempt2 = await run();
+    expect(attempt2.record).toMatchObject({ source: "FALLBACK_SINGLE_LINE", reason: "STORED_LINES_DO_NOT_SUM", sharesSumCents: 3275, billedCents: 2275 });
+    expect(attempt2.lines[0].description).toBe("Booking modification - price adjustment (Booking bk1)");
+    expect(lineTotalCents(attempt2.lines)).toBe(lineTotalCents(attempt1.lines));
+    // The single line itemises no share, so its manifest claims none (#4525, ALP-436).
+    expect(attempt2.itemisedShareTaskIds).toEqual([]);
+  });
+
+  it("a restated operation billing a raised figure falls back to the single line, with the reason (INV-PAY-070)", async () => {
+    itemisedFixtures();
+
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 9500,
+      changeFeeCents: 1000,
+      bookingModificationId: "mod_lines",
+    });
+
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    const lines = enqueued.requestPayload.invoices[0].lineItems;
+    expect(lines).toHaveLength(2);
+    expect(lines[0].description).toBe("Booking modification - price adjustment (Booking bk1)");
+    expect(lines[0].unitAmount).toBe(95);
+    expect(lineTotalCents(lines)).toBe(10500);
+    expect(enqueued.requestPayload.priceLines).toEqual({
+      source: "FALLBACK_SINGLE_LINE", reason: "STORED_LINES_DO_NOT_SUM", storedSumCents: 8000, sharesSumCents: null, billedCents: 10500, lineCount: 0, shareCount: 0,
+    });
+    // Nothing the itemised branch needs was read for a fallback document.
+    expect(mocks.bookingFindUniqueOrThrow).not.toHaveBeenCalled();
+  });
+
+  it("completes as skipped without provider calls when the net is not positive", async () => {
+    const invoiceId = await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: -1500,
+      changeFeeCents: 1000,
+      bookingModificationId: "mod_negative_net",
+      syncOperation: xeroClaim("op_waiting"),
+    });
+
+    expect(invoiceId).toBeNull();
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(expect.objectContaining({ id: "op_waiting" }), {
+      responsePayload: {
+        skipped: true,
+        reason: expect.stringContaining("net amount is not positive"),
+      },
+    });
+    expect(mocks.bookingFindUnique).not.toHaveBeenCalled();
+    expect(mocks.getAuthenticatedXeroClient).not.toHaveBeenCalled();
+    expect(createPayments).not.toHaveBeenCalled();
+    expect(mocks.recordSupplementaryInvoiceManifest).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * #3193 (epic #2797): THE SECOND ASK'S DOCUMENT.
+ *
+ * When a booking change's supplementary invoice has already gone out, a review
+ * share settled afterwards is billed on its own small invoice. Three things about
+ * that document have to be right, and one flag decides all three so a caller
+ * cannot take one without the others: the link it writes must NOT land on the
+ * booking change (or the change's own "is an invoice already going out?" reads
+ * would find it and could raise it to the combined total), the Xero idempotency
+ * key must not be the change's (or Xero answers the create with the earlier
+ * invoice and the difference is never billed), and the member has to be told why
+ * a second invoice has arrived.
+ */
+describe("createXeroSupplementaryInvoice: the second ask (#3193)", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // #3530 2c: no settled review shares unless a case says so.
+    mocks.manualRefundTaskFindMany.mockResolvedValue([]);
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "bk1",
+      memberId: "mem1",
+      payment: { xeroInvoiceId: "inv_orig" },
+    });
+    mocks.bookingModificationFindUnique.mockResolvedValue({
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    mocks.getAuthenticatedXeroClient.mockResolvedValue({
+      xero: { accountingApi: {} },
+      tenantId: "tenant_1",
+    });
+    mocks.findOrCreateXeroContact.mockResolvedValue("contact_1");
+    mocks.getResolvedAccountMapping.mockResolvedValue({
+      code: "200",
+      itemCode: undefined,
+      codeExplicitlyConfigured: false,
+    });
+    mocks.getAccountMapping.mockResolvedValue("606");
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "op_x" });
+    mocks.completeXeroSyncOperation.mockResolvedValue(undefined);
+    mocks.failXeroSyncOperation.mockResolvedValue(undefined);
+    mocks.retryXeroWriteWithContactRepair.mockResolvedValue({
+      body: { invoices: [{ invoiceID: "inv_second", invoiceNumber: "INV-0043" }] },
+    });
+    mocks.callXeroApi.mockImplementation((fn: () => unknown) => fn());
+  });
+
+  it("anchors on the review task and keys the create so Xero cannot dedupe it", async () => {
+    const invoiceId = await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      shortfallReviewTaskId: "task_2",
+      recordPayment: false,
+    });
+
+    expect(invoiceId).toBe("inv_second");
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    expect(enqueued.localModel).toBe("ManualRefundTask");
+    expect(enqueued.localId).toBe("task_2");
+    expect(enqueued.idempotencyKey).toBe(
+      "review-task:task_2:supplementary-shortfall-invoice:3000:0:v1",
+    );
+    // Not the change's key, in either half. A shared key would have Xero answer
+    // this create with the invoice already sent.
+    expect(enqueued.idempotencyKey).not.toContain("mod_123");
+    expect(enqueued.idempotencyKey).not.toContain(":supplementary-invoice:");
+
+    // And the LINK follows the anchor, which is what keeps it out of the reads
+    // that decide whether the change already has an invoice going out.
+    const completion = mocks.completeXeroSyncOperation.mock.calls[0][1];
+    const invoiceLink = completion.extraLinks.find(
+      (link: { role: string }) => link.role === "SUPPLEMENTARY_INVOICE",
+    );
+    expect(invoiceLink.localModel).toBe("ManualRefundTask");
+    expect(invoiceLink.localId).toBe("task_2");
+  });
+
+  it("ALP-436: records its export manifest against the review task, after the operation completes", async () => {
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      shortfallReviewTaskId: "task_2",
+      recordPayment: false,
+    });
+
+    expect(mocks.recordSupplementaryInvoiceManifest).toHaveBeenCalledWith(expect.objectContaining({
+      bookingId: "bk1",
+      anchor: { kind: "SECOND_ASK", modificationId: "mod_123", taskId: "task_2" },
+      legacyKey: "review-task:task_2:supplementary-shortfall-invoice:3000:0:v1",
+      providerInvoiceId: "inv_second",
+      lines: mocks.startXeroSyncOperation.mock.calls[0][0].requestPayload.invoices[0].lineItems,
+    }));
+    expect(mocks.recordSupplementaryInvoiceManifest.mock.invocationCallOrder[0])
+      .toBeGreaterThan(mocks.completeXeroSyncOperation.mock.invocationCallOrder[0]!);
+  });
+
+  it("tells the member why a second invoice has arrived", async () => {
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      shortfallReviewTaskId: "task_2",
+      recordPayment: false,
+    });
+
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    const [line] = enqueued.requestPayload.invoices[0].lineItems;
+    expect(line.unitAmount).toBe(30);
+    expect(line.description).toContain("already been sent");
+    expect(line.description).toContain("covers the remainder");
+    // Plain English about THIS document, with no internal vocabulary and no
+    // claim about how the club prices or reviews a change - this is the generic
+    // product, and a club's policy is not a hard-coded string.
+    expect(line.description).not.toMatch(/review|task|shortfall|supplementary/i);
+    expect(enqueued.requestPayload.invoices[0].reference).toContain(
+      "Further supplementary",
+    );
+  });
+
+  /**
+   * CONTROL. The change's OWN invoice is unchanged in all three respects -
+   * without this, a change that simply broke the ordinary anchor, key or wording
+   * would pass every assertion above.
+   */
+  it("CONTROL: the booking change's own invoice keeps its anchor, key and wording", async () => {
+    await createXeroSupplementaryInvoice({
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      recordPayment: false,
+    });
+
+    const enqueued = mocks.startXeroSyncOperation.mock.calls[0][0];
+    expect(enqueued.localModel).toBe("BookingModification");
+    expect(enqueued.localId).toBe("mod_123");
+    expect(enqueued.idempotencyKey).toBe(
+      "booking-mod:mod_123:supplementary-invoice:3000:0:v1",
+    );
+    const [line] = enqueued.requestPayload.invoices[0].lineItems;
+    expect(line.description).toContain("price adjustment");
+    expect(line.description).not.toContain("already been sent");
+    const completion = mocks.completeXeroSyncOperation.mock.calls[0][1];
+    const invoiceLink = completion.extraLinks.find(
+      (link: { role: string }) => link.role === "SUPPLEMENTARY_INVOICE",
+    );
+    expect(invoiceLink.localModel).toBe("BookingModification");
+    expect(mocks.recordSupplementaryInvoiceManifest).toHaveBeenCalledWith(expect.objectContaining({
+      anchor: { kind: "MODIFICATION", modificationId: "mod_123" },
+      legacyKey: "booking-mod:mod_123:supplementary-invoice:3000:0:v1",
+      providerInvoiceId: "inv_second",
+    }));
+  });
+});
+
+/**
+ * A SECOND ASK REJECTED BY XERO IS STILL REPLAYABLE (#3193 fix round, second
+ * pass) - driven through the REAL create path, which is the whole point.
+ *
+ * The retry branch in `xero-operation-retry.ts` replays a second ask from its
+ * queued payload, and the first version of that branch was DEAD in the exact
+ * case it was written for: this function records the Xero invoice body on the
+ * operation BEFORE it calls Xero, so a rejection left a FAILED row holding only
+ * the request Xero refused, the eligibility check found no queued payload, and
+ * the officer whom the booking's own audit row had sent to the retry button was
+ * told the amounts were overwritten and to bill by hand. The share - the money
+ * this whole issue exists to bill - was back to hand collection.
+ *
+ * The test that pinned that branch handed it an operation whose payload was
+ * still the queued one, which is a state the system could not reach. These cases
+ * reach it from the cause the docblock names: a queued row, a real create, a
+ * Xero refusal, and then the SAME two predicates the retry screen uses, applied
+ * to the payload this run actually wrote.
+ */
+describe("a second ask survives a Xero rejection replayably (#3193)", () => {
+  const queuedSecondAsk = {
+    queueType: "SUPPLEMENTARY_INVOICE",
+    bookingId: "bk1",
+    priceDiffCents: 3000,
+    changeFeeCents: 0,
+    bookingModificationId: "mod_123",
+    shortfallReviewTaskId: "task_2",
+    recordPayment: false,
+    waitForConfirmedAdditionalPayment: false,
+    paymentIntentId: null,
+  };
+
+  const failedOperationRow = (requestPayload: unknown) => ({
+    id: "op_q",
+    status: "FAILED" as const,
+    replayable: true,
+    direction: "OUTBOUND" as const,
+    entityType: "INVOICE" as const,
+    operationType: "CREATE" as const,
+    localModel: "ManualRefundTask",
+    localId: "task_2",
+    requestPayload: requestPayload as Prisma.JsonValue,
+    responsePayload: null,
+    xeroObjectId: null,
+    xeroObjectNumber: null,
+    queueType: "SUPPLEMENTARY_INVOICE",
+    manuallyResolvedAt: null,
+  });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // #3530 2c: no settled review shares unless a case says so.
+    mocks.manualRefundTaskFindMany.mockResolvedValue([]);
+    mocks.bookingFindUnique.mockResolvedValue({
+      id: "bk1",
+      memberId: "mem1",
+      payment: { xeroInvoiceId: "inv_orig" },
+    });
+    mocks.bookingModificationFindUnique.mockResolvedValue({
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    mocks.getAuthenticatedXeroClient.mockResolvedValue({
+      xero: { accountingApi: {} },
+      tenantId: "tenant_1",
+    });
+    mocks.findOrCreateXeroContact.mockResolvedValue("contact_1");
+    mocks.getResolvedAccountMapping.mockResolvedValue({
+      code: "200",
+      itemCode: undefined,
+      codeExplicitlyConfigured: false,
+    });
+    mocks.getAccountMapping.mockResolvedValue("606");
+    mocks.xeroSyncOperationFindUnique.mockResolvedValue({
+      requestPayload: queuedSecondAsk,
+    });
+    mocks.xeroSyncOperationUpdate.mockResolvedValue({ id: "op_q" });
+    mocks.failXeroSyncOperation.mockResolvedValue(undefined);
+    mocks.callXeroApi.mockImplementation((fn: () => unknown) => fn());
+  });
+
+  const rejectTheCreateInXero = async () => {
+    // The real refusal shape: Xero accepts the request and rejects the document
+    // (archived contact, bad account code, a validation error), which is what
+    // makes this a FAILED row rather than a transport retry.
+    mocks.retryXeroWriteWithContactRepair.mockRejectedValue(
+      new Error("Account code 200 has been archived"),
+    );
+
+    await expect(
+      createXeroSupplementaryInvoice({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "bk1",
+        priceDiffCents: 3000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod_123",
+        shortfallReviewTaskId: "task_2",
+        recordPayment: false,
+        syncOperation: xeroClaim("op_q"),
+      }),
+    ).rejects.toThrow("Account code 200 has been archived");
+
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "op_q" }),
+      expect.any(Error),
+    );
+    expect(mocks.xeroSyncOperationUpdate).toHaveBeenCalledTimes(1);
+    return mocks.xeroSyncOperationUpdate.mock.calls[0][0].data.requestPayload;
+  };
+
+  it("leaves the FAILED row carrying the share it was queued with", async () => {
+    const written = await rejectTheCreateInXero();
+
+    // Still a diagnosable record of what Xero refused...
+    expect(written.invoices[0].lineItems[0].unitAmount).toBe(30);
+    // ...and still the instruction that says what to raise. This is the exact
+    // parser the replay branch calls.
+    expect(readQueuedOutboxPayload(written)).toMatchObject({
+      queueType: "SUPPLEMENTARY_INVOICE",
+      bookingId: "bk1",
+      // THE SHARE, NEVER THE TOTAL - the amount the replay will send.
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      shortfallReviewTaskId: "task_2",
+    });
+  });
+
+  it("and the retry screen accepts that row", async () => {
+    const written = await rejectTheCreateInXero();
+
+    expect(getXeroOperationRetryMeta(failedOperationRow(written))).toEqual({
+      supported: true,
+      reason: null,
+    });
+  });
+
+  /**
+   * #3641 review round: the change's OWN invoice keeps its queued payload too.
+   * The overwrite erased `paymentIntentId`, so the late-capture release could
+   * not see an invoice for the same payment request that was already sent and
+   * alerted an officer about a correct booking; and it erased the queued
+   * amounts the retry replays first (#1356) to keep the Xero key identical.
+   */
+  it("the change's own invoice keeps its queued payload, payment request included", async () => {
+    mocks.xeroSyncOperationFindUnique.mockResolvedValue({
+      requestPayload: {
+        queueType: "SUPPLEMENTARY_INVOICE",
+        bookingId: "bk1",
+        priceDiffCents: 3000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod_123",
+        recordPayment: true,
+        paymentIntentId: "pi_ask",
+        waitForConfirmedAdditionalPayment: true,
+      },
+    });
+    mocks.retryXeroWriteWithContactRepair.mockRejectedValue(
+      new Error("Account code 200 has been archived"),
+    );
+
+    await expect(
+      createXeroSupplementaryInvoice({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "bk1",
+        priceDiffCents: 3000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod_123",
+        recordPayment: true,
+        syncOperation: xeroClaim("op_q"),
+      }),
+    ).rejects.toThrow("Account code 200 has been archived");
+
+    const written = mocks.xeroSyncOperationUpdate.mock.calls[0][0].data.requestPayload;
+    // The document and the record of its lines, beside the queued instruction.
+    expect(written.invoices[0].lineItems[0].unitAmount).toBe(30);
+    expect(written.priceLines).toMatchObject({ source: "FALLBACK_SINGLE_LINE", reason: "NO_STORED_LINES" });
+    expect(written.paymentIntentId).toBe("pi_ask");
+    expect(readQueuedOutboxPayload(written)).toMatchObject({
+      queueType: "SUPPLEMENTARY_INVOICE",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      recordPayment: true,
+    });
+    // And the retry screen still accepts the FAILED row.
+    expect(
+      getXeroOperationRetryMeta({
+        ...failedOperationRow(written),
+        localModel: "BookingModification",
+        localId: "mod_123",
+      }),
+    ).toEqual({ supported: true, reason: null });
+  });
+
+  /**
+   * ALP-580: the kept-late-capture charge day this row stored is read back
+   * strictly. This code wrote it from a real Stripe charge day, so a right-shaped
+   * day that does not exist can only be corruption. It must not be dated onto the
+   * Xero invoice; the real day is re-read from Stripe and stored in its place.
+   */
+  describe("a stored kept-late-capture charge day (ALP-580)", () => {
+    const keptLate = (keptLateCaptureDay: string) => ({
+      queueType: "SUPPLEMENTARY_INVOICE",
+      bookingId: "bk1",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      recordPayment: false,
+      paymentIntentId: "pi_late",
+      keptLateCaptureDay,
+    });
+
+    const runWithStoredDay = async (keptLateCaptureDay: string) => {
+      mocks.xeroSyncOperationFindUnique.mockResolvedValue({
+        requestPayload: keptLate(keptLateCaptureDay),
+      });
+      mocks.manualRefundTaskFindUnique.mockResolvedValue({ status: "DISMISSED" });
+      mocks.readStripeCaptureDocumentDate.mockResolvedValue("2026-06-10");
+      mocks.retryXeroWriteWithContactRepair.mockRejectedValue(new Error("sentinel-stop"));
+
+      await expect(
+        createXeroSupplementaryInvoice({
+          format: CLUB_FORMAT_TEST,
+          bookingId: "bk1",
+          priceDiffCents: 3000,
+          changeFeeCents: 0,
+          bookingModificationId: "mod_123",
+          recordPayment: false,
+          syncOperation: xeroClaim("op_q"),
+        }),
+      ).rejects.toThrow("sentinel-stop");
+    };
+
+    it("re-reads the real day from Stripe when the stored one does not exist, and stores that instead", async () => {
+      await runWithStoredDay("2026-02-30");
+
+      expect(mocks.readStripeCaptureDocumentDate).toHaveBeenCalledWith("pi_late", expect.any(String));
+      // The first update is the corrected payload, stored before any Xero call.
+      const stored = mocks.xeroSyncOperationUpdate.mock.calls[0][0].data.requestPayload;
+      expect(stored.keptLateCaptureDay).toBe("2026-06-10");
+      // The last is the invoice the run recorded: dated the real day, never 30 February.
+      const recorded = mocks.xeroSyncOperationUpdate.mock.calls.at(-1)![0].data.requestPayload;
+      expect(recorded.invoices[0].date).toBe("2026-06-10");
+    });
+
+    it("uses a real stored day as it stands, without asking Stripe", async () => {
+      await runWithStoredDay("2026-06-09");
+
+      expect(mocks.readStripeCaptureDocumentDate).not.toHaveBeenCalled();
+      const recorded = mocks.xeroSyncOperationUpdate.mock.calls.at(-1)![0].data.requestPayload;
+      expect(recorded.invoices[0].date).toBe("2026-06-09");
+    });
+  });
+
+  describe("#4494: a gap invoice whose payment would overlap the credit-release sweep's share", () => {
+    const gapPayload = {
+      queueType: "SUPPLEMENTARY_INVOICE",
+      bookingId: "bk1",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      recordPayment: true,
+      primaryInvoiceGap: true,
+      coveredPaymentIntentIds: ["pi_release"],
+      coveredCaptureCents: { pi_release: 3000 },
+    };
+    // What the check answers on overlap (here, a row provably never sent: it names nothing).
+    const unpaid = { ...gapPayload, recordPayment: false, coveredPaymentIntentIds: [], coveredCaptureCents: {} };
+    const params = {
+      format: CLUB_FORMAT_TEST,
+      bookingId: "bk1",
+      priceDiffCents: 3000,
+      changeFeeCents: 0,
+      bookingModificationId: "mod_123",
+      recordPayment: true,
+      syncOperation: xeroClaim("op_q"),
+    };
+    const sendRejected = async () => {
+      mocks.xeroSyncOperationFindUnique.mockResolvedValue({ requestPayload: gapPayload });
+      mocks.retryXeroWriteWithContactRepair.mockRejectedValue(new Error("Account code 200 has been archived"));
+      await expect(createXeroSupplementaryInvoice(params)).rejects.toThrow("Account code 200 has been archived");
+      return mocks.xeroSyncOperationUpdate.mock.calls[0][0].data.requestPayload;
+    };
+
+    it("MUTATION: stores the payload the check answers, before the Xero call, so a retry replays it unpaid", async () => {
+      mocks.unpaidGapPayloadIfOverlapping.mockResolvedValue(unpaid);
+      const written = await sendRejected();
+      expect(mocks.unpaidGapPayloadIfOverlapping).toHaveBeenCalledWith({ operationId: "op_q", bookingId: "bk1", payload: gapPayload });
+      expect(written).toMatchObject({ recordPayment: false, primaryInvoiceGap: true, coveredPaymentIntentIds: [], coveredCaptureCents: {} });
+      expect(readQueuedOutboxPayload(written)).toMatchObject({ recordPayment: false });
+    });
+
+    it("MUTATION: sends no Xero payment for it on that same attempt", async () => {
+      mocks.unpaidGapPayloadIfOverlapping.mockResolvedValue(unpaid);
+      mocks.xeroSyncOperationFindUnique.mockResolvedValue({ requestPayload: gapPayload });
+      const createPayments = vi.fn().mockResolvedValue({ body: { payments: [{ paymentID: "pay_1" }] } });
+      mocks.getAuthenticatedXeroClient.mockResolvedValue({ xero: { accountingApi: { createPayments } }, tenantId: "tenant_1" });
+      mocks.retryXeroWriteWithContactRepair.mockResolvedValue({ body: { invoices: [{ invoiceID: "inv_gap", invoiceNumber: "INV-0043" }] } });
+      await createXeroSupplementaryInvoice(params);
+      expect(createPayments).not.toHaveBeenCalled();
+      // Control: the same send pays where nothing overlaps.
+      mocks.unpaidGapPayloadIfOverlapping.mockResolvedValue(null);
+      await createXeroSupplementaryInvoice(params);
+      expect(createPayments).toHaveBeenCalledTimes(1);
+    });
+
+    it("pays as queued where nothing overlaps", async () => {
+      mocks.unpaidGapPayloadIfOverlapping.mockResolvedValue(null);
+      const written = await sendRejected();
+      expect(written).toMatchObject({ recordPayment: true, coveredPaymentIntentIds: ["pi_release"], coveredCaptureCents: { pi_release: 3000 } });
+    });
+  });
+
+  describe("the note a paid-another-way close waits for", () => {
+    const sendReleasedChange = async (paymentIntentId: string | null) => {
+      mocks.manualRefundTaskFindUnique.mockResolvedValue(null);
+      mocks.xeroSyncOperationFindUnique.mockResolvedValue({
+        requestPayload: {
+          queueType: "SUPPLEMENTARY_INVOICE",
+          bookingId: "bk1",
+          priceDiffCents: 3000,
+          changeFeeCents: 0,
+          bookingModificationId: "mod_123",
+          recordPayment: false,
+          paymentIntentId,
+        },
+      });
+      mocks.getAuthenticatedXeroClient.mockResolvedValue({ xero: { accountingApi: {} }, tenantId: "tenant_1" });
+      mocks.retryXeroWriteWithContactRepair.mockResolvedValue({
+        body: { invoices: [{ invoiceID: "inv_supp", invoiceNumber: "INV-0042" }] },
+      });
+      return createXeroSupplementaryInvoice({
+        format: CLUB_FORMAT_TEST,
+        bookingId: "bk1",
+        priceDiffCents: 3000,
+        changeFeeCents: 0,
+        bookingModificationId: "mod_123",
+        recordPayment: false,
+        syncOperation: xeroClaim("op_q"),
+      });
+    };
+
+    it("MUTATION: runs the note step for the capture once the invoice's row has completed", async () => {
+      mocks.queueWaitingPaidAnotherWayNote.mockResolvedValue(1);
+      await expect(sendReleasedChange("pi_late")).resolves.toBe("inv_supp");
+      expect(mocks.queueWaitingPaidAnotherWayNote).toHaveBeenCalledWith("pi_late");
+      expect(mocks.completeXeroSyncOperation.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.queueWaitingPaidAnotherWayNote.mock.invocationCallOrder[0],
+      );
+      // #3924 round 9: on the queued row itself - the row that names the
+      // capture, which an officer's retry now sends back through the outbox -
+      // so the capture's receipt (`readLateCaptureXeroReceipt`) reads the invoice.
+      expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "op_q" }),
+        expect.objectContaining({ xeroObjectId: "inv_supp" }),
+      );
+    });
+
+    it("MUTATION: a failed note step never fails the invoice, which is in Xero; it is logged for the repair tool and the nightly retry", async () => {
+      mocks.queueWaitingPaidAnotherWayNote.mockRejectedValue(new Error("database blip"));
+      await expect(sendReleasedChange("pi_late")).resolves.toBe("inv_supp");
+      expect(mocks.failXeroSyncOperation).not.toHaveBeenCalled();
+    });
+
+    it("no note step for a change invoice that records no late capture", async () => {
+      await sendReleasedChange(null);
+      expect(mocks.queueWaitingPaidAnotherWayNote).not.toHaveBeenCalled();
+    });
+  });
+});
+
+
+describe("organiser-paid bank group supplementary invoice (#4299)", () => {
+  const createPayments = vi.fn();
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.manualRefundTaskFindMany.mockResolvedValue([]);
+    mocks.bookingFindUnique.mockResolvedValue({ id: "child", memberId: "joiner", organisationId: null,
+      member: { id: "joiner", firstName: "Place", lastName: "Member" }, organisation: null,
+      organiserSettled: true, parentBookingId: "organiser-booking", payment: { source: "INTERNET_BANKING", xeroInvoiceId: null } });
+    mocks.groupBookingFindUnique.mockResolvedValue({ organiserBookingId: "organiser-booking", organiserMemberId: "organiser",
+      organiserMember: { id: "organiser", firstName: "Group", lastName: "Organiser", email: "organiser@example.test" },
+      settlement: { id: "settlement", source: "INTERNET_BANKING", xeroInvoiceId: "combined" } });
+    mocks.bookingModificationFindUnique.mockResolvedValue({ createdAt: new Date("2026-07-01T00:00:00.000Z"), modificationType: "DATE_CHANGE" });
+    mocks.getAuthenticatedXeroClient.mockResolvedValue({ xero: { accountingApi: { createPayments } }, tenantId: "tenant" });
+    mocks.findOrCreateXeroContact.mockResolvedValue("organiser-contact");
+    mocks.getResolvedAccountMapping.mockResolvedValue({ code: "200", codeExplicitlyConfigured: true });
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "operation" });
+    mocks.retryXeroWriteWithContactRepair.mockResolvedValue({ body: { invoices: [{ invoiceID: "extra", invoiceNumber: "INV-EXTRA" }] } });
+    mocks.callXeroApi.mockImplementation((fn: () => unknown) => fn());
+    mocks.sendOrganiserEmail.mockResolvedValue({ status: "sent" });
+    mocks.bookingModificationFindMany.mockResolvedValue([{ id: "change", priceDiffCents: 5000, changeFeeCents: 1000 }]);
+    mocks.xeroSyncOperationFindFirst.mockResolvedValue(null);
+    waivers([]);
+  });
+  /** The invoice debts a cancel or reduction reserved while this invoice was queued. */
+  const waivers = (amounts: number[]) => mocks.xeroSyncOperationFindMany.mockImplementation(async ({ where }: { where: { queueType: string } }) =>
+    where.queueType === "SUPPLEMENTARY_INVOICE"
+      ? [{ localId: "change", requestPayload: {} }]
+      : amounts.map((amountCents, index) => ({ requestPayload: { queueType: "ORGANISER_EXTRA_ADJUSTMENT", bookingId: "child", scopeId: `cut-${index}`,
+        modificationId: "change", invoiceId: null, amountCents, purpose: "waive", cashAtPlanCents: 0, refundPercentage: 50 } })));
+  const create = () => createXeroSupplementaryInvoice({ format: CLUB_FORMAT_TEST, bookingId: "child", bookingModificationId: "change",
+    priceDiffCents: 5000, changeFeeCents: 1000, recordPayment: true });
+  it("bills organiser price plus fee against the combined reference, without recording payment, and emails the organiser", async () => {
+    expect(await create()).toBe("extra");
+    expect(mocks.findOrCreateXeroContact).toHaveBeenCalledWith("organiser", expect.any(Object));
+    const request = mocks.startXeroSyncOperation.mock.calls[0][0];
+    expect(request.localModel).toBe("BookingModification");
+    expect(request.localId).toBe("change");
+    const invoice = request.requestPayload.invoices[0];
+    expect(invoice.contact.contactID).toBe("organiser-contact");
+    expect(invoice.reference).toContain("combined");
+    expect(invoice.reference).toContain("child");
+    expect(invoice.lineItems.reduce((sum: number, line: { unitAmount: number }) => sum + line.unitAmount, 0)).toBe(60);
+    expect(createPayments).not.toHaveBeenCalled();
+    expect(mocks.sendOrganiserEmail).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 6000, invoiceId: "extra", invoiceNumber: "INV-EXTRA",
+      bookingModificationId: "change", placeName: "Place Member", modificationType: "DATE_CHANGE", billing: expect.objectContaining({ organiserMemberId: "organiser" }) }), CLUB_FORMAT_TEST);
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ extraLinks: expect.arrayContaining([
+      expect.objectContaining({ role: "SUPPLEMENTARY_INVOICE", metadata: expect.objectContaining({ organiserBilling: true, combinedInvoiceId: "combined", priceDiffCents: 5000, changeFeeCents: 1000 }) })]) }));
+  });
+  it("F4: names only what is still owed after a waiver reserved while the invoice was queued", async () => {
+    waivers([2000]);
+    expect(await create()).toBe("extra");
+    expect(mocks.sendOrganiserEmail).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 4000 }), CLUB_FORMAT_TEST);
+  });
+  it("F4: emails nothing when reserved waivers cover the whole invoice", async () => {
+    waivers([4000, 2000]);
+    expect(await create()).toBe("extra");
+    expect(mocks.sendOrganiserEmail).not.toHaveBeenCalled();
+    expect(mocks.completeXeroSyncOperation).toHaveBeenCalled();
+  });
+  it("S1: a retry or re-enqueue after a waiver retired the extra whole is refused under the anchor lock, before createInvoices", async () => {
+    const startedAt = new Date("2026-07-01T00:00:00.000Z");
+    mocks.startXeroSyncOperation.mockResolvedValue({ id: "retry-row", startedAt });
+    mocks.xeroSyncOperationFindFirst.mockResolvedValue({ id: "skipped-original" });
+    expect(await create()).toBeNull();
+    expect(mocks.lockAnchor).toHaveBeenCalledWith(expect.anything(), "change");
+    expect(mocks.xeroSyncOperationFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
+      localModel: "BookingModification", localId: "change", status: "SKIPPED", lastErrorCode: "ORGANISER_EXTRA_WAIVED_BEFORE_RAISED" }) }));
+    expect(mocks.retryXeroWriteWithContactRepair).not.toHaveBeenCalled();
+    expect(mocks.sendOrganiserEmail).not.toHaveBeenCalled();
+    // Its own row is closed with the waiver's code, so the state reads the extra waived, not owed.
+    expect(mocks.xeroSyncOperationUpdateMany).toHaveBeenCalledWith({ where: { id: "retry-row", status: "RUNNING", startedAt },
+      data: expect.objectContaining({ status: "SKIPPED", lastErrorCode: "ORGANISER_EXTRA_WAIVED_BEFORE_RAISED" }) });
+  });
+  it("S1: with no waiver on the change the anchor check passes and the invoice is raised", async () => {
+    mocks.xeroSyncOperationFindFirst.mockResolvedValue(null);
+    expect(await create()).toBe("extra");
+    expect(mocks.lockAnchor).toHaveBeenCalledOnce();
+    expect(mocks.xeroSyncOperationUpdateMany).not.toHaveBeenCalled();
+  });
+  it("refuses a missing combined record before contacting Xero", async () => {
+    mocks.groupBookingFindUnique.mockResolvedValue({ settlement: { source: "INTERNET_BANKING", xeroInvoiceId: null } });
+    await expect(create()).rejects.toThrow("combined invoice is not on record");
+    expect(mocks.getAuthenticatedXeroClient).not.toHaveBeenCalled();
+    expect(mocks.sendOrganiserEmail).not.toHaveBeenCalled();
+  });
+  it("keeps invoice work retryable when a durable organiser notice cannot be recorded", async () => {
+    mocks.sendOrganiserEmail.mockRejectedValue(new Error("email queue unavailable"));
+    await expect(create()).rejects.toThrow("email queue unavailable");
+    expect(mocks.failXeroSyncOperation).toHaveBeenCalled();
+    expect(mocks.completeXeroSyncOperation).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,390 @@
+import { AgeTier } from "@prisma/client";
+import { describe, it, expect } from "vitest";
+import {
+  isGroupDiscountApplicable,
+  calculateBookingPrice,
+  type SeasonRateData,
+  type GroupDiscountConfig,
+} from "../pricing";
+import { validatePromoCodeRules } from "../promo";
+import { AGE_TIER_VALUES, ageTierEnum } from "../age-tier-schema";
+import {
+  calculateRefundAmount,
+  calculateDualRefundAmounts,
+  getRefundTier,
+  type CancellationRule,
+} from "../cancellation";
+import { requireCalendarDate } from "@/lib/club-time";
+
+// #3123 — the CLUB's calendar day, which `validatePromoCodeRules` now requires
+// instead of defaulting an instant through `APP_TIME_ZONE`. These cases are
+// about the BOOKING-DATE window rather than the validity window, so any day
+// inside the promotion's own validity does; the frozen clock's is used.
+const CLUB_TODAY = requireCalendarDate("2026-07-01");
+
+// ─── Fixtures ────────────────────────────────────────────────────────────────
+
+// Membership-type-keyed rates (#1930, E4): the old isMember=true rows become
+// the FULL/member type's rows, isMember=false become the NON_MEMBER type's.
+const MEMBER_TYPE = "type-member";
+const NONMEMBER_TYPE = "type-nonmember";
+
+function nonMemberGuest(ageTier: AgeTier) {
+  return {
+    ageTier,
+    isMember: false,
+    rateMembershipTypeId: NONMEMBER_TYPE,
+    rateSource: "NON_MEMBER_DEFAULT" as const,
+  };
+}
+
+function makeWinterSeason(): SeasonRateData {
+  return {
+    seasonId: "season-winter",
+    startDate: new Date("2026-06-01"), // June 1
+    endDate: new Date("2026-09-30"), // Sep 30
+    type: "WINTER",
+    rates: [
+      { ageTier: "ADULT", membershipTypeId: MEMBER_TYPE, pricePerNightCents: 4500 },
+      { ageTier: "ADULT", membershipTypeId: NONMEMBER_TYPE, pricePerNightCents: 6500 },
+      { ageTier: "YOUTH", membershipTypeId: MEMBER_TYPE, pricePerNightCents: 3000 },
+      { ageTier: "YOUTH", membershipTypeId: NONMEMBER_TYPE, pricePerNightCents: 4500 },
+      { ageTier: "CHILD", membershipTypeId: MEMBER_TYPE, pricePerNightCents: 1500 },
+      { ageTier: "CHILD", membershipTypeId: NONMEMBER_TYPE, pricePerNightCents: 2500 },
+    ],
+  };
+}
+
+function makeSummerSeason(): SeasonRateData {
+  return {
+    seasonId: "season-summer",
+    startDate: new Date("2026-11-01"), // Nov 1
+    endDate: new Date("2027-03-31"), // Mar 31
+    type: "SUMMER",
+    rates: [
+      { ageTier: "ADULT", membershipTypeId: MEMBER_TYPE, pricePerNightCents: 3500 },
+      { ageTier: "ADULT", membershipTypeId: NONMEMBER_TYPE, pricePerNightCents: 5000 },
+      { ageTier: "YOUTH", membershipTypeId: MEMBER_TYPE, pricePerNightCents: 2500 },
+      { ageTier: "YOUTH", membershipTypeId: NONMEMBER_TYPE, pricePerNightCents: 3500 },
+      { ageTier: "CHILD", membershipTypeId: MEMBER_TYPE, pricePerNightCents: 1000 },
+      { ageTier: "CHILD", membershipTypeId: NONMEMBER_TYPE, pricePerNightCents: 2000 },
+    ],
+  };
+}
+
+const allSeasons = [makeWinterSeason(), makeSummerSeason()];
+
+const defaultGroupDiscount: GroupDiscountConfig = {
+  minGroupSize: 5,
+  summerOnly: true,
+  enabled: true,
+  // A qualifying group upgrades true non-members to the member type's rate.
+  rateMembershipTypeId: MEMBER_TYPE,
+};
+
+// ─── P5.1: Group Booking Discount ────────────────────────────────────────────
+
+describe("P5.1: Group booking discount", () => {
+  describe("isGroupDiscountApplicable", () => {
+    it("returns true when guest count meets threshold in summer", () => {
+      const summerNight = new Date("2026-12-15"); // Dec 15
+      expect(
+        isGroupDiscountApplicable(5, summerNight, allSeasons, defaultGroupDiscount)
+      ).toBe(true);
+    });
+
+    it("returns false when guest count is below threshold", () => {
+      const summerNight = new Date("2026-12-15");
+      expect(
+        isGroupDiscountApplicable(4, summerNight, allSeasons, defaultGroupDiscount)
+      ).toBe(false);
+    });
+
+    it("returns false for winter when summerOnly is enabled", () => {
+      const winterNight = new Date("2026-07-15"); // Jul 15
+      expect(
+        isGroupDiscountApplicable(5, winterNight, allSeasons, defaultGroupDiscount)
+      ).toBe(false);
+    });
+
+    it("returns true for winter when summerOnly is disabled", () => {
+      const winterNight = new Date("2026-07-15");
+      const config = { ...defaultGroupDiscount, summerOnly: false };
+      expect(
+        isGroupDiscountApplicable(5, winterNight, allSeasons, config)
+      ).toBe(true);
+    });
+
+    it("returns false when group discount is disabled", () => {
+      const summerNight = new Date("2026-12-15");
+      const config = { ...defaultGroupDiscount, enabled: false };
+      expect(
+        isGroupDiscountApplicable(10, summerNight, allSeasons, config)
+      ).toBe(false);
+    });
+
+    it("returns false when no config provided", () => {
+      const summerNight = new Date("2026-12-15");
+      expect(
+        isGroupDiscountApplicable(5, summerNight, allSeasons, undefined)
+      ).toBe(false);
+    });
+  });
+
+  describe("calculateBookingPrice with group discount", () => {
+    it("charges member rates for all guests when group discount applies in summer", () => {
+      const checkIn = new Date("2026-12-10"); // Dec 10 (summer)
+      const checkOut = new Date("2026-12-12"); // Dec 12 (2 nights)
+      const guests = [
+        nonMemberGuest("ADULT"),
+        nonMemberGuest("ADULT"),
+        nonMemberGuest("ADULT"),
+        nonMemberGuest("ADULT"),
+        nonMemberGuest("ADULT"),
+      ];
+
+      const result = calculateBookingPrice(
+        checkIn,
+        checkOut,
+        guests,
+        allSeasons,
+        defaultGroupDiscount
+      );
+
+      // All 5 non-members should get member rate of 3500/night x 2 nights = 7000 each
+      expect(result.totalPriceCents).toBe(5 * 3500 * 2);
+    });
+
+    it("charges non-member rates when below group threshold", () => {
+      const checkIn = new Date("2026-12-10");
+      const checkOut = new Date("2026-12-11"); // 1 night
+      const guests = [
+        nonMemberGuest("ADULT"),
+        nonMemberGuest("ADULT"),
+        nonMemberGuest("ADULT"),
+        nonMemberGuest("ADULT"),
+      ];
+
+      const result = calculateBookingPrice(
+        checkIn,
+        checkOut,
+        guests,
+        allSeasons,
+        defaultGroupDiscount
+      );
+
+      // 4 guests below threshold of 5: non-member rate 5000/night
+      expect(result.totalPriceCents).toBe(4 * 5000);
+    });
+
+    it("does not apply group discount in winter when summerOnly", () => {
+      const checkIn = new Date("2026-07-10"); // Jul 10 (winter)
+      const checkOut = new Date("2026-07-11"); // 1 night
+      const guests = Array(6).fill(nonMemberGuest("ADULT"));
+
+      const result = calculateBookingPrice(
+        checkIn,
+        checkOut,
+        guests,
+        allSeasons,
+        defaultGroupDiscount
+      );
+
+      // Winter, summerOnly = true, so non-member rate 6500
+      expect(result.totalPriceCents).toBe(6 * 6500);
+    });
+  });
+});
+
+describe("shared age tier validation", () => {
+  it("stays aligned with the Prisma AgeTier enum", () => {
+    expect(AGE_TIER_VALUES).toEqual(Object.values(AgeTier));
+
+    for (const ageTier of Object.values(AgeTier)) {
+      expect(ageTierEnum.safeParse(ageTier).success).toBe(true);
+    }
+  });
+});
+
+// ─── P5.3: Promo Code Date Gating ───────────────────────────────────────────
+
+describe("P5.3: Promo code booking date gating", () => {
+  const basePromo = {
+    id: "promo-1",
+    active: true,
+    validFrom: null as Date | null,
+    validUntil: null as Date | null,
+    maxRedemptionsTotal: null as number | null,
+    currentRedemptions: 0,
+    membersOnly: false,
+    maxUsesPerMember: null as number | null,
+    maxUniqueMembersTotal: null as number | null,
+    bookingStartFrom: new Date("2026-07-01") as Date | null,
+    bookingStartUntil: new Date("2026-08-01") as Date | null,
+  };
+
+  it("allows booking check-in within gated date range", () => {
+    const result = validatePromoCodeRules(
+      basePromo,
+      { memberId: "m1", bookingCheckIn: new Date("2026-07-15") },
+      CLUB_TODAY
+    );
+    expect(result).toBeNull();
+  });
+
+  it("rejects booking check-in before bookingStartFrom", () => {
+    const result = validatePromoCodeRules(
+      basePromo,
+      { memberId: "m1", bookingCheckIn: new Date("2026-06-30") },
+      CLUB_TODAY
+    );
+    expect(result).toBe("This promo code is not valid for your booking dates");
+  });
+
+  it("rejects booking check-in on or after bookingStartUntil", () => {
+    const result = validatePromoCodeRules(
+      basePromo,
+      { memberId: "m1", bookingCheckIn: new Date("2026-08-01") },
+      CLUB_TODAY
+    );
+    expect(result).toBe("This promo code is not valid for your booking dates");
+  });
+
+  it("allows any check-in when no booking date gating set", () => {
+    const promoNoGating = {
+      ...basePromo,
+      bookingStartFrom: null,
+      bookingStartUntil: null,
+    };
+    const result = validatePromoCodeRules(
+      promoNoGating,
+      { memberId: "m1", bookingCheckIn: new Date("2025-01-01") },
+      CLUB_TODAY
+    );
+    expect(result).toBeNull();
+  });
+
+  it("allows any check-in when bookingCheckIn not provided", () => {
+    const result = validatePromoCodeRules(
+      basePromo,
+      { memberId: "m1" },
+      CLUB_TODAY
+    );
+    expect(result).toBeNull();
+  });
+
+  it("validates only bookingStartFrom when bookingStartUntil is null", () => {
+    const promoFromOnly = {
+      ...basePromo,
+      bookingStartUntil: null,
+    };
+    expect(
+      validatePromoCodeRules(
+        promoFromOnly,
+        { memberId: "m1", bookingCheckIn: new Date("2026-07-15") },
+        CLUB_TODAY
+      )
+    ).toBeNull();
+    expect(
+      validatePromoCodeRules(
+        promoFromOnly,
+        { memberId: "m1", bookingCheckIn: new Date("2026-06-15") },
+        CLUB_TODAY
+      )
+    ).toBe("This promo code is not valid for your booking dates");
+  });
+});
+
+// ─── P5.5: Mixed Cancellation Fees ──────────────────────────────────────────
+
+describe("P5.5: Mixed cancellation fees (per refund method)", () => {
+  const policyRules: CancellationRule[] = [
+    { daysBeforeStay: 14, refundPercentage: 100, creditRefundPercentage: 100, fixedFeeCents: 1000, creditFixedFeeCents: 500 },
+    { daysBeforeStay: 7, refundPercentage: 50, creditRefundPercentage: 75, fixedFeeCents: 2000, creditFixedFeeCents: 1000 },
+    { daysBeforeStay: 0, refundPercentage: 0, creditRefundPercentage: 0, fixedFeeCents: 0, creditFixedFeeCents: 0 },
+  ];
+
+  describe("getRefundTier", () => {
+    it("returns both fixed-fee values from the matched tier", () => {
+      const tier = getRefundTier(20, policyRules);
+      expect(tier.fixedFeeCents).toBe(1000);
+      expect(tier.creditFixedFeeCents).toBe(500);
+      expect(tier.refundPercentage).toBe(100);
+    });
+
+    it("returns both fixed fees for mid tier", () => {
+      const tier = getRefundTier(10, policyRules);
+      expect(tier.fixedFeeCents).toBe(2000);
+      expect(tier.creditFixedFeeCents).toBe(1000);
+      expect(tier.refundPercentage).toBe(50);
+    });
+
+    it("returns 0 fixed fees when no rules", () => {
+      const tier = getRefundTier(10, []);
+      expect(tier.fixedFeeCents).toBe(0);
+      expect(tier.creditFixedFeeCents).toBe(0);
+    });
+  });
+
+  describe("calculateRefundAmount with method-specific fees", () => {
+    it("deducts the card fixed fee from card refunds", () => {
+      // 100% of 10000 = 10000, minus 1000 fee = 9000
+      const result = calculateRefundAmount(10000, 20, policyRules);
+      expect(result.refundAmountCents).toBe(9000);
+      expect(result.refundPercentage).toBe(100);
+    });
+
+    it("deducts fixed fee from 50% refund", () => {
+      // 50% of 10000 = 5000, minus 2000 fee = 3000
+      const result = calculateRefundAmount(10000, 10, policyRules);
+      expect(result.refundAmountCents).toBe(3000);
+      expect(result.refundPercentage).toBe(50);
+    });
+
+    it("floors refund at zero when fee exceeds percentage refund", () => {
+      // 50% of 2000 = 1000, minus 2000 fee = -1000 → clamped to 0
+      const result = calculateRefundAmount(2000, 10, policyRules);
+      expect(result.refundAmountCents).toBe(0);
+    });
+
+    it("credit refunds deduct the credit fixed fee", () => {
+      // credit: 75% of 10000 = 7500, minus 1000 fee = 6500
+      const result = calculateRefundAmount(10000, 10, policyRules, "credit");
+      expect(result.refundAmountCents).toBe(6500);
+    });
+
+    it("falls back to the card fee when credit fee is missing", () => {
+      const fallbackRules: CancellationRule[] = [
+        { daysBeforeStay: 0, refundPercentage: 50, creditRefundPercentage: 75, fixedFeeCents: 900 },
+      ];
+      const result = calculateRefundAmount(10000, 5, fallbackRules, "credit");
+      expect(result.refundAmountCents).toBe(6600);
+    });
+
+    it("works with zero fixed fees", () => {
+      const noFeeRules: CancellationRule[] = [
+        { daysBeforeStay: 0, refundPercentage: 50, creditRefundPercentage: 50, fixedFeeCents: 0, creditFixedFeeCents: 0 },
+      ];
+      const result = calculateRefundAmount(10000, 5, noFeeRules);
+      expect(result.refundAmountCents).toBe(5000);
+    });
+  });
+
+  describe("calculateDualRefundAmounts with method-specific fees", () => {
+    it("applies each method's fee independently", () => {
+      // Card: 50% of 10000 = 5000, minus 2000 = 3000
+      // Credit: 75% of 10000 = 7500, minus 1000 = 6500
+      const result = calculateDualRefundAmounts(10000, 10, policyRules);
+      expect(result.cardRefundAmountCents).toBe(3000);
+      expect(result.creditRefundAmountCents).toBe(6500);
+    });
+
+    it("floors both at zero", () => {
+      const result = calculateDualRefundAmounts(1000, 10, policyRules);
+      // Card: 50% of 1000 = 500, minus 2000 = -1500 → 0
+      // Credit: 75% of 1000 = 750, minus 1000 = -250 → 0
+      expect(result.cardRefundAmountCents).toBe(0);
+      expect(result.creditRefundAmountCents).toBe(0);
+    });
+  });
+});

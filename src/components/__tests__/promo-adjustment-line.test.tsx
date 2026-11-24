@@ -1,0 +1,72 @@
+// @vitest-environment jsdom
+
+import "@testing-library/jest-dom/vitest";
+import { render, screen } from "@/lib/__tests__/support/club-time-render";
+import { describe, expect, it, vi } from "vitest";
+import { PromoCodeInput } from "@/components/promo-code-input";
+import { PromoCodeCard } from "@/components/edit-booking/promo-code-card";
+
+/**
+ * The promo adjustment line on the two promo components renders through the
+ * one `formatSignedCents` (#3264). Neither component had a test pinning that
+ * string before the local copies were deleted, so these are the equivalence
+ * evidence for those two former call sites.
+ */
+describe("promo adjustment line", () => {
+  it("PromoCodeInput shows the applied promo's signed adjustment", () => {
+    render(
+      <PromoCodeInput
+        checkIn="2026-08-01"
+        checkOut="2026-08-03"
+        guests={[{ ageTier: "ADULT", isMember: true }]}
+        onPromoApplied={vi.fn()}
+        appliedPromo={{
+          code: "SAVE",
+          description: null,
+          type: "PERCENT",
+          discountCents: 14000,
+          promoAdjustmentCents: -14000,
+          totalPriceCents: 20000,
+          finalPriceCents: 6000,
+        }}
+      />,
+    );
+    expect(screen.getByText("(-$140.00)")).toBeInTheDocument();
+  });
+
+  it("PromoCodeCard shows the kept promo's signed adjustment", async () => {
+    // #3492: the card waits for the guest-code lookup's switch before it
+    // offers any promo control; answer it "off" (the one-code card).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ multiPromoCodes: false, guests: [] }), { status: 200 })),
+    );
+    render(
+      <PromoCodeCard
+        bookingId="booking-1"
+        appliedPromoList={null}
+        onPromoListChange={vi.fn()}
+        onKeepPromoList={vi.fn()}
+        promo={{ code: "SAVE", type: "PERCENT", description: null }}
+        promoAdjustmentCents={-6000}
+        promoAction={{ type: "keep" }}
+        availablePromoCodes={[]}
+        appliedNewPromo={null}
+        prefillPromoCode={undefined}
+        guestStays={{ checkIn: "2026-08-01", checkOut: "2026-08-03", existing: null, added: [] }}
+        remainingGuests={[]}
+        addedGuests={[]}
+        quote={null}
+        forMemberId={undefined}
+        lodgeId={null}
+        editRerates={{}}
+        onRemovePromo={vi.fn()}
+        onKeepPromo={vi.fn()}
+        onPrefillCode={vi.fn()}
+        onPromoApplied={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("(-$60.00)")).toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+});

@@ -1,0 +1,1605 @@
+/**
+ * Booking-invoice create / update against Xero.
+ *
+ * Owns `createXeroInvoiceForBooking` and `updateXeroBookingInvoiceForBooking`;
+ * re-exports `buildInvoiceLineItems` from `xero-booking-invoice-lines.ts`. The create path also records the
+ * matching Xero payment when the Stripe charge succeeded with a
+ * non-zero amount.
+ */
+
+import { bookingHasExternalSettlement, externalSettlementSkipReason } from "@/lib/booking-external-settlement";
+import { storedShortBookingId } from "@/lib/booking-reference";
+import {
+  Invoice,
+  Invoices,
+  LineItem,
+  Payment as XeroPayment,
+} from "xero-node";
+import { PaymentSource, PaymentTransactionKind } from "@prisma/client";
+import { prisma } from "./prisma";
+import { bookingOwner } from "@/lib/booking-owner";
+import logger from "@/lib/logger";
+import { paidByOrganiserInternetBanking } from "@/lib/group-organiser-paid";
+import { ORGANISER_COMBINED_INVOICE_PLACE_MESSAGE, ORGANISER_COMBINED_INVOICE_PLACE_REFUSAL } from "@/lib/organiser-billing";
+import { getStayNights } from "./pricing";
+import { buildXeroInvoiceUrl } from "@/lib/xero-links";
+import {
+  recordWithheldBookingEmail,
+  resolveBookingEmailGate,
+  XERO_BOOKING_INVOICE_EMAIL_TEMPLATE,
+} from "@/lib/booking-email-suppression";
+import {
+  buildXeroIdempotencyKey,
+  completeXeroSyncOperation,
+  failXeroSyncOperation,
+  sanitizeForJson,
+  startXeroSyncOperation,
+  upsertXeroObjectLink,
+} from "@/lib/xero-sync";
+import { callXeroApi, getAuthenticatedXeroClient } from "./xero-api-client";
+import {
+  resolveXeroInvoiceEmailPolicy,
+  sendXeroInvoiceEmail,
+} from "@/lib/xero-invoice-email";
+import {
+  readXeroInvoiceEmailInstruction,
+  xeroInvoiceEmailIsWithheldAtCreation,
+} from "@/lib/xero-invoice-email-instruction";
+import {
+  getAccountMapping,
+  getHutFeeItemCodeMap,
+  getHutFeeSeasonType,
+  getResolvedAccountMapping,
+} from "./xero-mappings";
+import { buildInvoiceLineItems } from "@/lib/xero-booking-invoice-lines";
+import { buildPrimaryInvoiceLines } from "@/lib/xero-primary-invoice-lines";
+import {
+  isPromoAdjustmentLineDescription,
+  promoAdjustmentLineRecord,
+} from "@/lib/xero-promo-adjustment-lines";
+import {
+  retryXeroWriteWithContactRepair,
+  type FindOrCreateXeroContactOptions,
+} from "./xero-contacts";
+import {
+  findOrCreateXeroContactForInvoicedParty,
+  invoicedPartyContactRepair,
+} from "@/lib/organisation-xero-contacts";
+import { formatDateOnly } from "@/lib/date-only";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import { resolveXeroTaxRendering } from "@/lib/xero-tax-anchors";
+import { xeroDocumentDateForClubToday } from "@/lib/xero-provider-dates";
+import { requireContainedXeroContactForInvoiceOperation } from "@/lib/xero-contact-containment-proof";
+import {
+  getBookingInvoiceDueDate,
+  getBookingInvoiceIssueDate,
+} from "./xero-invoice-helpers";
+import { providerAmountToCents } from "@/lib/money-provider-amount";
+import { buildXeroBookingInvoiceCorrelationKey } from "@/lib/xero-booking-invoice-key";
+import type { XeroInvoiceEmailFailureCause } from "@/lib/xero-booking-invoice-outcome";
+import {
+  bookingMoneyBuildUpFromProjection,
+  d3CompatibleBookingMoneyBuildUpCents,
+  selectLoadedBookingMoneyBuildUp,
+} from "@/lib/booking-money-build-up";
+import { reconcileBookingMoney } from "@/lib/booking-money-reconciliation";
+import { asRecord, storedInvoiceRequestLines } from "@/lib/xero-json";
+import { bookingWorthCents, isCapturedPaymentStatus, recordedChangeFeeCents } from "@/lib/booking-payment-state";
+import { CHANGE_FEE_LINE_DESCRIPTION, invoiceLineItemsTotalCents } from "@/lib/xero-modification-line-items";
+import {
+  cardSettleAllocatesAppliedCredit,
+  cardSettleAppliedCreditCents,
+  existingPrimaryInvoiceStripePayment,
+  persistPrimaryInvoiceLink,
+  primaryInvoiceBilledFee,
+  primaryInvoiceStripeCashCents,
+  primaryInvoiceStripePaymentReference,
+  queuePrimaryInvoiceWorthGap,
+  recheckPrimaryInvoiceWorthGap,
+  unrecordedPrimaryInvoiceCash,
+} from "@/lib/xero-primary-invoice-fee-gap";
+import { PRIMARY_INVOICE_NOTHING_LEFT_DUE_REASON } from "@/lib/xero-primary-invoice-fee-at-link";
+import { readBookingForPrimaryInvoice } from "@/lib/xero-primary-invoice-read";
+import { planPrimaryInvoiceManifest, recordPrimaryInvoiceManifest, recordPrimaryInvoiceUpdateManifest } from "@/lib/member-money/doors";
+import { readXeroTaxOverridePause, recordXeroTaxOverrideMismatch } from "@/lib/xero-tax-override-safeguard";
+import { primaryInvoicePaymentKey, readStoredPrimaryInvoicePayment, recordPrimaryInvoicePaymentReceipt, recordStoredPrimaryInvoicePaymentReceipt } from "@/lib/capture-receipt-senders";
+import type { XeroOperationClaim } from "@/lib/xero-operation-outcome-guard";
+
+export interface CreateXeroBookingInvoiceOptions
+  extends FindOrCreateXeroContactOptions {
+  syncOperation?: XeroOperationClaim;
+}
+
+export interface UpdateXeroBookingInvoiceOptions
+  extends FindOrCreateXeroContactOptions {
+  syncOperation?: XeroOperationClaim;
+}
+
+// ---------------------------------------------------------------------------
+// Line-item construction
+// ---------------------------------------------------------------------------
+
+/** Lives in `xero-booking-invoice-lines.ts`; re-exported for existing importers. */
+export { buildInvoiceLineItems };
+
+/**
+ * #1641 — after a CARD booking's invoice is raised with its effective Stripe
+ * payment, allocate the member's applied account credit against the invoice so it
+ * reaches PAID via (effective cash + credit-note allocation) rather than being left
+ * with the applied slice outstanding. Reuses the #1620 allocate-existing engine.
+ *
+ * Card-gated for three reasons: (1) Internet-Banking invoices allocate via their own
+ * fire-after outbox op (#1620) — running it here would double-drive them; (2) a card
+ * invoice follows capture, or a $0 credit-only settle (#3836); (3) a full-price capture
+ * carries `creditAppliedCents = 0` and must NOT allocate — its invoice is settled in
+ * full by real cash, and the settle gave its applied credit back locally (#3864; a
+ * pre-#3864 double-pay by an operator's LOCAL restore), not by a Xero note (which
+ * cannot refund cash already sent). Dynamic import avoids a load-order cycle (mirrors
+ * xero-operation-retry's engine import).
+ *
+ * THROWS on allocation failure so the caller fails the invoice sync op and the retry
+ * re-drives the idempotent engine — the invoice is never re-created (the
+ * `xeroInvoiceId` short-circuit at the top of createXeroInvoiceForBooking), and the
+ * credit-note allocation is idempotent per join-row — rather than silently leaving
+ * the applied credit unallocated (the exact defect this closes).
+ */
+async function settleCardAppliedCreditAllocation(
+  payment: {
+    source: PaymentSource;
+    status: string;
+    amountCents: number;
+    refundedAmountCents: number;
+    creditAppliedCents: number;
+  },
+  bookingId: string,
+  createdByMemberId?: string
+): Promise<void> {
+  // Proceed ONLY for a card cash capture that recorded a credit-reduced mirror
+  // (`cardSettleAllocatesAppliedCredit`, the one gate — the primary payment's
+  // cap reads it too, through `cardSettleAppliedCreditCents`), or a $0
+  // credit-only card settle (#3836), which that gate also admits. It skips a
+  // missing mirror (legacy full-price captures, no-credit bookings):
+  // allocating against a full-price-paid invoice would over-allocate.
+  // #1765 — capture evidence is "captured status + positive net cash", not
+  // `status === "SUCCEEDED"`: a repay-after-refund payment aggregates to
+  // PARTIALLY_REFUNDED at invoice time even though its repay capture settles
+  // the invoice, and skipping here would strand the applied slice outstanding.
+  // A fully-refunded-out payment (net 0) still must not allocate; a credit-only one does (#3836).
+  if (!cardSettleAllocatesAppliedCredit(payment)) return;
+  const { allocateAppliedCreditForBooking } = await import(
+    "@/lib/xero-applied-credit-allocation"
+  );
+  await allocateAppliedCreditForBooking(bookingId, {
+    ...(createdByMemberId ? { createdByMemberId } : {}),
+  });
+}
+
+/**
+ * Stage 4 evidence must reach an already-claimed operation before this handler
+ * can authenticate or otherwise invoke a provider-capable dependency. Later
+ * invoice-payload writes carry the same field when they rebuild the request.
+ *
+ * THE KEY IS A PARAMETER BECAUSE THE TWO CALLERS RECORD TWO DIFFERENT FACTS,
+ * and neither may be written over the other.
+ *
+ * `moneyReconciliation` is the state of the booking's money at the moment this
+ * operation RAISED its invoice. `moneyReconciliationOnReplay` is the state a
+ * later run found when it met an invoice that already existed. An operator
+ * retry of an operation that minted months ago takes the second path — and it
+ * runs immediately before `settleCardAppliedCreditAllocation`, which makes a
+ * provider round trip and throws by design when allocation fails. Writing
+ * today's verdict under the raise-time key would therefore leave the record
+ * asserting the booking's money was unreconciled when the invoice was raised,
+ * which it was not, and the throw would then abandon the run with that claim
+ * standing. Collapsing them the other way — declining to write at all on
+ * replay — loses the replay's own evidence instead. So both are kept, under
+ * their own keys, and each caller names the one it is entitled to write.
+ */
+async function enrichClaimedOperationMoneyReconciliation(
+  syncOperationId: string,
+  moneyReconciliation: ReturnType<typeof reconcileBookingMoney>,
+  key: "moneyReconciliation" | "moneyReconciliationOnReplay",
+): Promise<void> {
+  const operation = await prisma.xeroSyncOperation.findUnique({
+    where: { id: syncOperationId },
+    select: { requestPayload: true },
+  });
+  const requestPayload = asRecord(operation?.requestPayload) ?? {};
+  await prisma.xeroSyncOperation.update({
+    where: { id: syncOperationId },
+    data: {
+      requestPayload: sanitizeForJson({
+        ...requestPayload,
+        [key]: moneyReconciliation,
+      }),
+    },
+  });
+}
+
+/**
+ * The lines the claimed operation sent, from its stored request (#4525), or
+ * null where it stored none. A read failure is null too: the manifest waits.
+ */
+async function readStoredPrimaryInvoiceLines(
+  syncOperationId: string,
+): Promise<{ storedLines: LineItem[] | null; storedLineAmountTypes: string | null }> {
+  try {
+    const operation = await prisma.xeroSyncOperation.findUnique({
+      where: { id: syncOperationId },
+      select: { requestPayload: true },
+    });
+    return storedInvoiceRequestLines(operation?.requestPayload);
+  } catch (error) {
+    logger.error({ err: error, syncOperationId }, "Could not read the stored primary invoice lines");
+    return { storedLines: null, storedLineAmountTypes: null };
+  }
+}
+
+/**
+ * #5208: the lines every earlier attempt under a primary invoice's idempotency
+ * key stored, read before this attempt stores its own. An operation that failed
+ * after its request reached Xero leaves its key to the next, and Xero answers a
+ * replay with the invoice the first request raised. A read failure is "unknown":
+ * one entry no request matches, so the reply is not compared.
+ */
+async function readEarlierPrimaryInvoiceRequests(idempotencyKey: string): Promise<LineItem[][]> {
+  try {
+    const operations = await prisma.xeroSyncOperation.findMany({
+      where: { idempotencyKey },
+      select: { requestPayload: true },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+    });
+    return operations.flatMap(({ requestPayload }) => {
+      const { storedLines } = storedInvoiceRequestLines(requestPayload);
+      return storedLines ? [storedLines] : [];
+    });
+  } catch (error) {
+    logger.error({ err: error, idempotencyKey }, "Could not read the earlier primary invoice requests");
+    return [[]];
+  }
+}
+
+export async function createXeroInvoiceForBooking(
+  bookingId: string,
+  options?: CreateXeroBookingInvoiceOptions
+): Promise<string | null> {
+  // #3980 review M1: one snapshot, so the worth built from and the lines agree.
+  const { booking, markedModificationIdsAtBuild, capturesAtBuild } = await readBookingForPrimaryInvoice(bookingId);
+
+  if (!booking) throw new Error(`Booking not found: ${bookingId}`);
+  if (!booking.payment) throw new Error(`No payment record for booking: ${bookingId}`);
+
+  // Skip if invoice already created
+  if (booking.payment.xeroInvoiceId) {
+    const moneyReconciliation = reconcileBookingMoney(booking);
+    if (options?.syncOperation) {
+      // Replay, not a raise: this operation's invoice already exists, so what
+      // is recorded is today's state under its own key. Whatever raise-time
+      // verdict the payload already carries is left exactly as it was.
+      await enrichClaimedOperationMoneyReconciliation(
+        options.syncOperation.id,
+        moneyReconciliation,
+        "moneyReconciliationOnReplay",
+      );
+    }
+    await upsertXeroObjectLink({
+      localModel: "Payment",
+      localId: booking.payment.id,
+      xeroObjectType: "INVOICE",
+      xeroObjectId: booking.payment.xeroInvoiceId,
+      xeroObjectNumber: booking.payment.xeroInvoiceNumber ?? null,
+      xeroObjectUrl: buildXeroInvoiceUrl(booking.payment.xeroInvoiceId),
+      role: "PRIMARY_INVOICE",
+    });
+    // #4525 (Ledger M13): a run that linked the invoice but recorded no manifest
+    // records it here from the lines its operation stored. Nothing is rebuilt.
+    if (options?.syncOperation) {
+      await recordPrimaryInvoiceManifest(
+        { kind: "REPLAY", bookingId, ...(await readStoredPrimaryInvoiceLines(options.syncOperation.id)) },
+        booking.payment.xeroInvoiceId,
+      );
+    }
+    const storedPayment = options?.syncOperation ? await readStoredPrimaryInvoicePayment(options.syncOperation.id) : null; // #4525 (M13): that run's Stripe payment, preserved through completion for later receipt retries
+    // #4525 review: its capture receipt now, before anything below can throw and have a failure write replace the stored payment.
+    await recordStoredPrimaryInvoicePaymentReceipt(storedPayment, booking.payment, bookingId, booking.payment.xeroInvoiceId);
+    // #3955 review X4 (round 3), #3980: a prior run that persisted the link but
+    // died before or inside its gap check re-runs it here, from what the invoice
+    // billed and the booking's worth as recorded with the link. Idempotent.
+    await recheckPrimaryInvoiceWorthGap({
+      bookingId,
+      xeroInvoiceId: booking.payment.xeroInvoiceId,
+      createdByMemberId: options?.createdByMemberId,
+    });
+    // Retry-safe: a prior run that raised the invoice but failed before/at the
+    // applied-credit allocation re-drives the idempotent engine here (#1641).
+    await settleCardAppliedCreditAllocation(
+      booking.payment,
+      bookingId,
+      options?.createdByMemberId
+    );
+    // #2262 H3 — a CLAIMED operation (the operator retry claims FAILED/PARTIAL
+    // -> RUNNING before calling in; the outbox claims PENDING -> RUNNING) must
+    // not be stranded RUNNING when the invoice already exists: close it
+    // SUCCEEDED against the existing invoice so the ops panel reads true.
+    if (options?.syncOperation) {
+      await completeXeroSyncOperation(options.syncOperation, {
+        status: "SUCCEEDED",
+        responsePayload: storedPayment === undefined ? undefined : {
+          payment: storedPayment,
+          skipped: true,
+          reason: "Invoice already exists for this payment; link re-asserted.",
+        },
+        xeroObjectType: "INVOICE",
+        xeroObjectId: booking.payment.xeroInvoiceId,
+        xeroObjectNumber: booking.payment.xeroInvoiceNumber ?? null,
+        xeroObjectUrl: buildXeroInvoiceUrl(booking.payment.xeroInvoiceId),
+      });
+    }
+    return booking.payment.xeroInvoiceId;
+  }
+
+  // B5 (#2262) HIGH #2, level 3 — the residual-race backstop.
+  //
+  // The choke point (enqueueXeroBookingInvoiceOperation) refuses to queue a
+  // mint for a manually settled booking, and mark-paid refuses under lock(1)
+  // while a CREATE-INVOICE operation is PENDING/RUNNING. Neither closes the
+  // hairline window where an operation is enqueued microseconds BEFORE the
+  // settle commits: that operation is still PENDING and the cron will run it
+  // minutes later. This re-check, at execution time against a fresh read, is
+  // what makes "a manual mark-paid can never race a mint" literally true.
+  //
+  // Abandon LOUDLY (#1765 loud-skip pattern): no invoice is created, no email
+  // is sent, the ids are logged at warn, and the sync operation is closed with
+  // a NON-SUCCEEDED terminal status carrying a populated reason, so it is
+  // visible to an operator and never silently replayed.
+  if (bookingHasExternalSettlement(booking)) {
+    const skipReason = externalSettlementSkipReason(booking.payment);
+    logger.warn(
+      {
+        bookingId,
+        paymentId: booking.payment.id,
+        manuallyMarkedPaidAt: booking.payment.manuallyMarkedPaidAt,
+        syncOperationId: options?.syncOperation?.id ?? null,
+      },
+      skipReason
+    );
+    if (options?.syncOperation) {
+      await completeXeroSyncOperation(options.syncOperation, {
+        status: "CANCELLED",
+        responsePayload: { skipped: true, reason: skipReason },
+      });
+    }
+    return null;
+  }
+
+  // #4299 B1 (`INV-PAY-148`), the handler half of the enqueue choke point's
+  // fence: a row that reaches here for a place the group organiser paid by
+  // internet banking (an earlier row, a retry, a future enqueuer) closes
+  // without raising - and emailing the joiner - an invoice for the whole
+  // place, which the organiser's combined invoice already bills. Loud, as above.
+  if (paidByOrganiserInternetBanking(booking)) {
+    logger.warn({ bookingId, paymentId: booking.payment.id, syncOperationId: options?.syncOperation?.id ?? null }, ORGANISER_COMBINED_INVOICE_PLACE_MESSAGE);
+    if (options?.syncOperation) {
+      await completeXeroSyncOperation(options.syncOperation, {
+        status: "CANCELLED",
+        responsePayload: { skipped: true, refusal: ORGANISER_COMBINED_INVOICE_PLACE_REFUSAL, reason: ORGANISER_COMBINED_INVOICE_PLACE_MESSAGE },
+      });
+    }
+    return null;
+  }
+
+  /*
+    #2929 — THE CREATION-TIME DELIVERY INSTRUCTION, read from the operation that
+    asked for this invoice.
+
+    Read HERE, before the first provider round-trip, and deliberately not from a
+    parameter. The officer who chose "create without emailing" did so in a
+    request that ended long before this ran: the create enqueued an operation and
+    returned, a worker picked it up, and an operator retry may be picking it up
+    now, hours later. A flag passed down the call chain is gone by then, and a
+    retry that cannot tell a deliberate withhold from a lost flag sends the
+    member the very email the officer chose to withhold.
+
+    Read from `options.syncOperation` — the row a dispatcher CLAIMED — rather
+    than from the operation this function may mint for itself a few lines below.
+    A self-minted operation has no enqueuer and therefore no instruction, so
+    reading it back would be asking a row what we just wrote into it.
+
+    HOW THIS FAILS, stated exactly, because the neighbouring switch gate below
+    fails the OTHER WAY and the two must not be confused:
+
+      - the read THROWING is the only fail-closed case, and it is deliberately
+        not wrapped in a try/catch: the whole invoice creation fails before any
+        invoice exists and before any email could be sent;
+      - an UNRECOGNISED stored value, and a `syncOperationId` naming a row that
+        is not there, both resolve to `null` and therefore SEND. That is
+        fail-OPEN, and it is the right direction HERE and only here. A withhold
+        nobody asked for is not safe: the member owes this money and the invoice
+        is how they learn it, so a typo in some future enqueuer must never
+        silently stop invoices reaching members. The switch below is the
+        opposite because its unknown answer is "we could not tell whether an
+        administrator promised this member silence", and breaking that promise
+        is the unrecoverable direction there.
+
+    So `null` here means "no instruction was recorded", which is what every row
+    written before #2929 honestly is, and it is treated identically to SEND.
+  */
+  const queuedInvoiceEmailInstruction = options?.syncOperation?.id
+    ? readXeroInvoiceEmailInstruction(
+        (
+          await prisma.xeroSyncOperation.findUnique({
+            where: { id: options.syncOperation.id },
+            select: { invoiceEmailDelivery: true },
+          })
+        )?.invoiceEmailDelivery,
+      )
+    : null;
+  // #3277: verify the single aggregate promo line from the stored build-up
+  // before authentication or any provider call. A mismatch remains today's
+  // headline under D3 and its classified fallback is persisted on the uniquely
+  // anchored sync operation below.
+  const recordedMoneyBuildUp = bookingMoneyBuildUpFromProjection(booking, {
+    purpose: "XERO_PROMO_LINE",
+  });
+  const promoMoneyBuildUpSelection = selectLoadedBookingMoneyBuildUp(
+    recordedMoneyBuildUp,
+    {
+      derivedCents: booking.promoAdjustmentCents,
+      mismatchClassification: "STORED_SIDE_DEFECT",
+    },
+  );
+  const xeroPromoAdjustmentCents = d3CompatibleBookingMoneyBuildUpCents(
+    promoMoneyBuildUpSelection,
+  );
+  const moneyReconciliation = reconcileBookingMoney(booking);
+
+  if (options?.syncOperation) {
+    // The raise path: no invoice exists yet, so this IS the raise-time verdict
+    // and it is persisted before the first provider round trip below.
+    await enrichClaimedOperationMoneyReconciliation(
+      options.syncOperation.id,
+      moneyReconciliation,
+      "moneyReconciliation",
+    );
+  }
+
+  const { xero, tenantId } = await getAuthenticatedXeroClient();
+
+  // Ensure the invoiced party has a Xero contact.
+  // #3367: where this booking is linked to an Organisation — a school — the
+  // ORGANISATION is the invoiced party and its own organisation-shaped Xero
+  // customer is used. Where it is not, this is byte-for-byte today's behaviour:
+  // the booking's member. The invoice payload below carries only a contact
+  // reference and no name, so this one line is the whole of "the organisation
+  // becomes the invoiced party" for the invoice builder.
+  // #3036 review P1-12: this client was built two lines up, so hand it to the
+  // containment verification rather than making it authenticate a second time.
+  const contactId = await findOrCreateXeroContactForInvoicedParty(booking, {
+    ...options,
+    xero,
+    tenantId,
+  });
+
+  // Resolve account codes, item codes, and season type
+  const [hutFeeMapping, stripeBankCode, hutFeeItemCodeMap, taxRendering] = await Promise.all([
+    getResolvedAccountMapping("hutFeesIncome"),
+    getAccountMapping("stripeBankAccount"),
+    getHutFeeItemCodeMap(),
+    // #4632: the treatment in force when the booking was made, for every line.
+    resolveXeroTaxRendering({ kind: "booking", bookingId }),
+  ]);
+  const bankCode = stripeBankCode ?? "606";
+
+  // Calculate nights using the same logic as the pricing engine
+  const checkIn = new Date(booking.checkIn);
+  const checkOut = new Date(booking.checkOut);
+  const nights = getStayNights(checkIn, checkOut).length;
+
+  // Season type for item-code mapping, from the booking's own lodge (#2913).
+  const bookingSeasonType = await getHutFeeSeasonType(checkIn, booking.lodgeId);
+
+  // Build line items with per-guest item codes
+  const invoiceGuests = booking.guests.map((g) => ({
+    firstName: g.firstName,
+    lastName: g.lastName,
+    ageTier: g.ageTier,
+    isMember: g.isMember,
+    rateMembershipTypeId: g.rateMembershipTypeId,
+    priceCents: g.priceCents,
+    nights: (g.nights ?? []).map((n) => ({ stayDate: n.stayDate, priceCents: n.priceCents })),
+  }));
+  // #4525 review: the lines are composed in ONE place, `buildPrimaryInvoiceLines`,
+  // which the manifest planner below calls too (`INV-SSOT`). Guest lines with
+  // per-guest item codes (#1930, E4); then the signed promo adjustment lines,
+  // one per code (#3828, `INV-MONEY-040`), a several-code split that cannot be
+  // trusted falling back to the aggregate line recorded on the operation below;
+  // then the change-fee line.
+  // #3750 (owner, 7 Oct 2026, "Add fee to amount owed"; #3955 review X2): the
+  // change fee recorded on the payment is billed in full — the ONE figure
+  // the pay steps collect too (`recordedChangeFeeCents`), so the invoice equals
+  // what the member is charged. No other document can have carried it yet;
+  // the reasoning is on the helper.
+  const primaryLineInput = {
+    guests: invoiceGuests,
+    checkIn,
+    checkOut,
+    nights,
+    hutFeeMapping,
+    hutFeeItemCodeMap,
+    seasonType: bookingSeasonType,
+    promo: {
+      aggregateCents: xeroPromoAdjustmentCents,
+      redemptions: booking.promoRedemptions,
+      adjustmentRows: booking.nightAdjustments,
+      firstGuest: booking.guests[0] ?? null,
+    },
+    changeFeeCents: recordedChangeFeeCents(booking.payment),
+    // #4632: the treatment in force when the booking was made, on every line.
+    taxRendering,
+  };
+  const primaryLines = buildPrimaryInvoiceLines(primaryLineInput);
+  const promoLineRecord = promoAdjustmentLineRecord(primaryLines.promoLinePlan);
+  // #4525 (M13): planned against the journal, kept for the manifest. #5208: a COVERED plan's lines are sent, with the
+  // journal's GST on each line unless paused (read outside any transaction, `INV-LOCK-004`); otherwise the builders'.
+  const manifestPlan = await planPrimaryInvoiceManifest({ bookingId, ...primaryLineInput, taxOverrides: await readXeroTaxOverridePause() });
+  const lineItems = manifestPlan?.outcome === "COVERED" ? manifestPlan.lines : primaryLines.lines;
+  // #3980: the worth this read gives and what its lines bill, stored with the link.
+  const builtFrom = {
+    worthCents: bookingWorthCents({ finalPriceCents: booking.finalPriceCents, changeFeeCents: booking.payment.changeFeeCents }),
+    lineTotalCents: invoiceLineItemsTotalCents(lineItems),
+    markedModificationIdsAtBuild,
+    capturesAtBuild, // #3953: the captures its cash figure counts, oldest first
+  };
+
+  // Read once, outside the closure: `buildInvoice` runs for the recorded
+  // request payload and again on every contact-repair attempt, and both must
+  // carry the same date (CT-5, #2869).
+  const clubZone = await readClubTimeZoneOutsideRequest();
+
+  const buildInvoice = (resolvedContactId: string): Invoice => ({
+    type: Invoice.TypeEnum.ACCREC,
+    contact: { contactID: resolvedContactId },
+    lineItems,
+    date: getBookingInvoiceIssueDate(booking),
+    dueDate: getBookingInvoiceDueDate(booking, clubZone),
+    reference: `Booking ${storedShortBookingId(bookingId)}`,
+    status: Invoice.StatusEnum.AUTHORISED,
+    lineAmountTypes: taxRendering.lineAmountTypes,
+  });
+
+  // The booking's stable handle, minted in one place so the outbox row this
+  // operation continues, the key Xero is given, and #3001's warning on the
+  // booking itself can never be looking for three different strings.
+  const invoiceIdempotencyKey =
+    buildXeroBookingInvoiceCorrelationKey(bookingId);
+  let operationClaim = options?.syncOperation ?? null;
+  let operationId = operationClaim?.id ?? null;
+  const requestPayload = {
+    invoices: [buildInvoice(contactId)],
+    moneyBuildUp: promoMoneyBuildUpSelection.historyMetadata,
+    moneyReconciliation,
+    ...(promoLineRecord ? { promoLines: promoLineRecord } : {}),
+  };
+
+  // #5208: what earlier attempts under this key sent; Xero may answer this one with that attempt's invoice.
+  const earlierSentLines = await readEarlierPrimaryInvoiceRequests(invoiceIdempotencyKey);
+  if (operationId) {
+    await prisma.xeroSyncOperation.update({
+      where: { id: operationId },
+      data: {
+        requestPayload: sanitizeForJson(requestPayload),
+      },
+    });
+  } else {
+    const operation = await startXeroSyncOperation({
+      direction: "OUTBOUND",
+      entityType: "INVOICE",
+      operationType: "CREATE",
+      localModel: "Payment",
+      localId: booking.payment.id,
+      idempotencyKey: invoiceIdempotencyKey,
+      correlationKey: invoiceIdempotencyKey,
+      requestPayload,
+      createdByMemberId: options?.createdByMemberId ?? null,
+    });
+    operationId = operation.id;
+    operationClaim = operation;
+  }
+
+  // #2262 H3 — provenance RE-ASSERTED after the operation exists, from a fresh
+  // read. The top-of-function check reads a snapshot taken before the contact
+  // and account-mapping round-trips; a manual mark-paid can commit in those
+  // seconds (its settle-time fence only refuses while an op is PENDING/RUNNING/
+  // WAITING_PAYMENT, and this run's op may not have existed when the settle's
+  // fence read ran). Re-checking here — strictly after the op above is visible
+  // to that fence — closes the interleaving: whichever of the two commits
+  // second now sees the other. Abandon per the #1765 loud-skip pattern: no
+  // invoice, no email, ids at warn, operation closed CANCELLED with the reason.
+  const freshProvenance = await prisma.payment.findUnique({
+    where: { id: booking.payment.id },
+    select: { manuallyMarkedPaidAt: true },
+  });
+  if (freshProvenance?.manuallyMarkedPaidAt) {
+    const lateSkipReason =
+      "Booking was manually marked paid (cash / off-Xero) while this invoice mint was preparing — no Xero invoice is expected, so none was created and nothing was emailed (#2262).";
+    logger.warn(
+      {
+        bookingId,
+        paymentId: booking.payment.id,
+        manuallyMarkedPaidAt: freshProvenance.manuallyMarkedPaidAt,
+        syncOperationId: operationId,
+      },
+      lateSkipReason
+    );
+    await completeXeroSyncOperation(operationClaim!, {
+      status: "CANCELLED",
+      responsePayload: { skipped: true, reason: lateSkipReason },
+    });
+    return null;
+  }
+
+  // #4525 review: outside the try, so a run that fails after Xero took the
+  // payment records its capture receipt in the catch (`paymentReceipt`, set once
+  // the link is stored) and also writes the payment on its FAILED row. The
+  // outbox's own failure write replaces that row with the error alone, so the
+  // catch's record, not the row, is what a queued run relies on.
+  let paymentResponseBody: XeroPayment | null = null;
+  let paymentReceipt: Parameters<typeof recordPrimaryInvoicePaymentReceipt>[0] | null = null;
+  try {
+    const response = await retryXeroWriteWithContactRepair({
+      memberId: bookingOwner(booking).memberId,
+      currentContactId: contactId,
+      // #3367 / `INV-INT-019`: THE REPAIR ENTITY MUST MATCH THE INVOICED PARTY.
+      //
+      // `currentContactId` above is now the ORGANISATION's contact where this
+      // booking is a school's. The default repair resolves through
+      // `findOrCreateXeroContact(booking.memberId)`, which searches Xero by
+      // EMAIL first — and a school's recorded address is routinely a teacher's
+      // own, which this module's own comment calls routine. So on a stale
+      // contact reference the default would find that teacher's personal Xero
+      // contact, link it, and re-send the SCHOOL's invoice against a person:
+      // the #2912 prohibition, through the back door.
+      //
+      // Repairing the invoiced party instead is the fix. Disabling repair for
+      // schools would have been smaller and wrong — a stale reference is
+      // exactly the situation a repair exists for.
+      repairContactLink: invoicedPartyContactRepair(booking),
+      workflow: "createXeroInvoiceForBooking",
+      operationId: operationId!,
+      repairExistingLink: options?.repairExistingLink,
+      createdByMemberId: options?.createdByMemberId,
+      buildRequestPayload: (resolvedContactId) => ({
+        invoices: [buildInvoice(resolvedContactId)],
+        // Contact repair rewrites the stored operation request. Preserve the
+        // Stage 3 source verdict and Stage 4 reconciliation state with the
+        // rebuilt invoice instead of erasing evidence on the only retry that
+        // changes this payload.
+        moneyBuildUp: promoMoneyBuildUpSelection.historyMetadata,
+        moneyReconciliation,
+        ...(promoLineRecord ? { promoLines: promoLineRecord } : {}),
+      }),
+      run: ({ contactId: resolvedContactId }) =>
+        callXeroApi(
+          () =>
+            xero.accountingApi.createInvoices(
+              tenantId,
+              { invoices: [buildInvoice(resolvedContactId)] },
+              undefined,
+              undefined,
+              invoiceIdempotencyKey
+            ),
+          {
+            operation: "createInvoices",
+            resourceType: "INVOICE",
+            workflow: "createXeroInvoiceForBooking",
+            context: `createInvoices(booking ${bookingId})`,
+          }
+        ),
+    });
+
+    const createdInvoice = response.body.invoices?.[0];
+    if (!createdInvoice?.invoiceID) {
+      throw new Error("Failed to create Xero invoice");
+    }
+    // #5208: Xero must keep the GST sent on each line; a difference pauses the overrides. Never throws.
+    await recordXeroTaxOverrideMismatch({ xeroSyncOperationId: operationId!, bookingId, providerInvoiceId: createdInvoice.invoiceID,
+      invoiceNumber: createdInvoice.invoiceNumber ?? null, documentKind: "CREATE", sent: lineItems, returned: createdInvoice.lineItems ?? [], earlierSent: earlierSentLines });
+
+    // Record payment against the invoice in Xero when real funds moved.
+    // Xero already marks zero-total invoices as PAID and rejects $0 payments.
+    // #1765 — settlement evidence comes from the captured-transaction ledger,
+    // mirrored by reconcilePaymentAggregates as `amountCents = gross captured`
+    // and `refundedAmountCents = refunded`, NEVER from the aggregate status
+    // alone: a repay-after-refund payment sits in PARTIALLY_REFUNDED at
+    // invoice time (prod case: gross 28500 / refunded 19500) even though its
+    // repay capture fully settles the invoice. The recorded amount is the NET
+    // capture (gross − refunded): cash handed back to the member is not
+    // settlement, and the refunded slice reconciles against its own credit
+    // note, never against this invoice. Capped at the invoice's amount due —
+    // Xero hard-rejects an overpayment (e.g. a legacy full-price capture on a
+    // since-repriced booking).
+    let paymentWriteError: unknown = null;
+    const paymentSource = booking.payment.source ?? PaymentSource.STRIPE;
+    const paymentCaptured = isCapturedPaymentStatus(booking.payment.status);
+    const netCapturedCents = Math.max(
+      0,
+      booking.payment.amountCents - (booking.payment.refundedAmountCents ?? 0)
+    );
+    // THE ONE BEHAVIOUR DELTA of #2685's conversion, stated for the record:
+    // `providerAmountToCents` also requires the amount due to be FINITE. Only
+    // `NaN` and `±Infinity` differ, which Xero's JSON cannot produce; for those
+    // the cap falls to `netCapturedCents`, as an absent `amountDue` always has.
+    // #3955 round 4 (finding 3): capped so the applied credit the settle below
+    // allocates still fits; cash it leaves over is a change-fee gap's. Round 5
+    // (finding 2): that credit is the allocation engine's own figure.
+    const invoicePaymentCents = primaryInvoiceStripeCashCents({
+      netCapturedCents,
+      amountDueCents: providerAmountToCents(createdInvoice.amountDue),
+      appliedCreditCents: await cardSettleAppliedCreditCents(bookingId, booking.payment),
+    });
+    const stripePaymentReference = primaryInvoiceStripePaymentReference(
+      booking.payment.stripePaymentIntentId ?? null,
+    );
+    const stripeCashToRecord =
+      paymentSource === PaymentSource.STRIPE && paymentCaptured && netCapturedCents > 0;
+    // #3955 round 5 (finding 4): a lost response retried under the same key
+    // gets back the ORIGINAL invoice; where it shows this payment already
+    // taken, the cap can reach zero. That payment is looked up and its link
+    // recorded, rather than the cash being skipped as nothing took it.
+    const existingStripePayment =
+      stripeCashToRecord && invoicePaymentCents === 0
+        ? existingPrimaryInvoiceStripePayment(createdInvoice, stripePaymentReference)
+        : null;
+    if (existingStripePayment) {
+      paymentResponseBody = existingStripePayment;
+      logger.info(
+        { bookingId, invoiceId: createdInvoice.invoiceID, paymentId: existingStripePayment.paymentID },
+        "The Xero invoice already carries this booking's Stripe payment from an earlier run; its link is recorded rather than a second payment",
+      );
+    }
+    const shouldRecordStripeInvoicePayment = stripeCashToRecord && invoicePaymentCents > 0;
+    // #3955 round 6 (F1): the cash the returned invoice already holds. Where the
+    // cap is zero and the reference lookup missed, it is an earlier payment the
+    // lookup could not match - a floor for the stored figure, and the reason
+    // the skip below gives, rather than "nothing is left due".
+    const earlierInvoicePaymentCents = stripeCashToRecord
+      ? Math.max(0, providerAmountToCents(createdInvoice.amountPaid) ?? 0)
+      : 0;
+    const earlierPaymentUnmatched =
+      stripeCashToRecord &&
+      invoicePaymentCents === 0 &&
+      !existingStripePayment &&
+      earlierInvoicePaymentCents > 0;
+    const paymentSkipped =
+      paymentCaptured && !shouldRecordStripeInvoicePayment && !existingStripePayment;
+    const paymentSkipReason = !paymentSkipped
+      ? null
+      : paymentSource === PaymentSource.INTERNET_BANKING
+        ? "Internet Banking invoice payments are reconciled from Xero instead of recorded as Stripe bank payments."
+        : earlierPaymentUnmatched
+          ? "An earlier payment is present on the invoice but not matched by reference; no further cash is recorded against it."
+        : netCapturedCents > 0
+          ? PRIMARY_INVOICE_NOTHING_LEFT_DUE_REASON
+          : (booking.payment.refundedAmountCents ?? 0) > 0
+            ? "Captured Stripe cash was fully refunded; no net cash remains to record against the invoice."
+            : "Zero-total invoice does not require Xero payment recording.";
+
+    if (shouldRecordStripeInvoicePayment) {
+      const payment: XeroPayment = {
+        invoice: { invoiceID: createdInvoice.invoiceID },
+        account: { code: bankCode },
+        amount: invoicePaymentCents / 100,
+        // Bank-reconciliation input, so the club's calendar day rather than the
+        // UTC one (INV-DATE-019, #2834). The invoice's own `date`/`dueDate`
+        // above are derived from `checkIn` and `createdAt` and were settled on
+        // #2697; this payment was the remaining instant in this file.
+        date: xeroDocumentDateForClubToday(await readClubTimeZoneOutsideRequest()),
+        reference: stripePaymentReference,
+      };
+      const paymentIdempotencyKey = primaryInvoicePaymentKey(booking.payment.id);
+      try {
+        const paymentResponse = await callXeroApi(
+          () =>
+            xero.accountingApi.createPayment(
+              tenantId,
+              payment,
+              paymentIdempotencyKey
+            ),
+          {
+            operation: "createPayment",
+            resourceType: "PAYMENT",
+            workflow: "createXeroInvoiceForBooking",
+            context: `createPayment(booking ${bookingId})`,
+          }
+        );
+        // `createPayment` answers with a Payments envelope; the payment is
+        // its first entry, as every other caller reads it (#3955 round 5).
+        paymentResponseBody = paymentResponse.body.payments?.[0] ?? null;
+      } catch (error) {
+        paymentWriteError = error;
+        logger.warn(
+          { err: error, bookingId, invoiceId: createdInvoice.invoiceID },
+          "Created Xero invoice but failed to record the corresponding Xero payment"
+        );
+      }
+    } else if (paymentSkipped) {
+      // #1765 — every skip of a captured payment's Xero write is loud and
+      // carries a populated reason; the silent status-gated skip is the exact
+      // defect that hid the repay-settled invoice's missing payment.
+      logger.warn(
+        {
+          bookingId,
+          invoiceId: createdInvoice.invoiceID,
+          paymentSource,
+          paymentStatus: booking.payment.status,
+          netCapturedCents,
+        },
+        paymentSkipReason ??
+          "Skipped recording a Xero payment for a captured Stripe payment without a matched reason"
+      );
+    }
+
+    /*
+      ONE subject for this pseudo-template, shared by every reason it can be
+      withheld (#2929).
+
+      The withheld-emails banner groups by TEMPLATE NAME and renders a single
+      representative subject for the group — the most recent row's. Two withhold
+      sites spelling the subject out separately therefore makes one kind of
+      withheld email show two different subjects depending on which row happens
+      to be newest, which reads to an officer as two different messages. There
+      is no registry entry to hold this (we never render or transmit it), so the
+      one home is here, above both sites.
+    */
+    const withheldInvoiceEmailSubject = `Xero invoice ${
+      createdInvoice.invoiceNumber ?? createdInvoice.invoiceID ?? "(unnumbered)"
+    } for your Internet Banking booking payment`;
+
+    let invoiceEmailResponseBody: unknown = null;
+    let invoiceEmailError: unknown = null;
+    /*
+      #3001 — WHICH of the three faults stopped the email, recorded beside the
+      error rather than inferred from it. The error VALUE is not redacted and is
+      never read back out of this payload, so a surface that wants to tell an
+      officer what to do about an unsent invoice has nothing to go on unless the
+      cause is its own key. The three want three different actions, and one of
+      them — an unreadable "No emails" switch — must NOT be answered with "send
+      it from Xero yourself", because the switch may be on.
+    */
+    let invoiceEmailFailureCause: XeroInvoiceEmailFailureCause | null = null;
+    const shouldEmailInvoice =
+      booking.payment.source === PaymentSource.INTERNET_BANKING;
+
+    // #2258 (owner decision D10): the per-booking "No emails" switch withholds
+    // EVERYTHING for the booking, including the invoice email XERO sends on our
+    // behalf. Only the EMAILING is skipped — the invoice itself is already
+    // raised in Xero and is untouched, so an admin can still send it from Xero.
+    // (Clearing the switch and re-driving this workflow does NOT resend it: the
+    // emailInvoice call carries a per-invoice idempotency key, so a re-drive is
+    // a no-op. Xero is the place to resend from.) The switch is re-read here
+    // rather than taken from the booking snapshot loaded at the top of this
+    // function, because invoice creation involves several provider round-trips
+    // and an admin can flip the switch in between.
+    //
+    // The gate's own two answers are kept STRICTLY apart, because conflating
+    // them is money-adjacent (#1705): a deliberate `withhold` is a terminal,
+    // intended outcome, while `unknown` means the switch could not be READ. Both
+    // fail closed and send nothing, but an `unknown` is a FAULT — it must not be
+    // filed as "the admin asked for silence" (that would put a false line in the
+    // booking's withheld list for a booking whose switch is OFF, #2259) and it
+    // must not let the sync operation report SUCCEEDED. It therefore populates
+    // invoiceEmailError, exactly as a failed emailInvoice call would, so the
+    // operation completes PARTIAL and stays VISIBLE to an operator.
+    //
+    // Visible, not automatically recoverable: re-driving this workflow will not
+    // resend, because the function short-circuits at the top on
+    // payment.xeroInvoiceId (persisted later in this same run) and never
+    // reaches the email block, and the emailInvoice idempotency key would
+    // no-op anyway. The truthful remediation is to send the invoice from Xero
+    // by hand. The operations panel's payment repair must NOT be used on an
+    // email-only PARTIAL — it records a payment against an unpaid
+    // Internet Banking invoice — and is refused for exactly that case
+    // (partialInvoiceOperationHasPaymentFault in xero-operation-retry.ts).
+    const invoiceEmailGate = shouldEmailInvoice
+      ? await resolveBookingEmailGate(
+          { bookingId },
+          XERO_BOOKING_INVOICE_EMAIL_TEMPLATE,
+        )
+      : null;
+    const invoiceEmailWithheld = invoiceEmailGate?.decision === "withhold";
+    const invoiceEmailGateUnreadable = invoiceEmailGate?.decision === "unknown";
+
+    if (invoiceEmailWithheld) {
+      await recordWithheldBookingEmail({
+        bookingId,
+        templateName: XERO_BOOKING_INVOICE_EMAIL_TEMPLATE,
+        subject: withheldInvoiceEmailSubject,
+        to: bookingOwner(booking).member.email,
+        detail:
+          'Withheld: this booking has the "No emails" switch turned on. The invoice exists in Xero but was not emailed.',
+      });
+      logger.warn(
+        { bookingId, invoiceId: createdInvoice.invoiceID },
+        'Skipped the Xero invoice email for a booking with "No emails" turned on',
+      );
+    }
+
+    /*
+      #2929 — THE ADMINISTRATOR'S CREATION-TIME CHOICE, and it is a THIRD reason
+      an invoice email does not go out. Kept strictly apart from its two
+      neighbours, because an operator reading a booking has to be able to tell
+      them apart:
+
+        - the per-booking "No emails" SWITCH above is persistent and withholds
+          everything about the booking for as long as it is on (#2258);
+        - THIS is one creation's decision, spent the moment this invoice is
+          raised. It changes nothing else: `Booking.noEmails` is untouched, the
+          Xero contact keeps its address, and every later reminder, change and
+          cancellation email is decided by the ordinary rules;
+        - the ENVIRONMENT-SAFETY suppression below is not the club's decision at
+          all, is not recorded as one, and writes no withheld row (#3035).
+
+      ONE WITHHOLD REASON PER EVENT (`INV-CONFIG-004`): this is asked only when
+      the switch neither withheld nor failed to read, so a silenced booking
+      records the switch's withhold and this one stays silent rather than
+      claiming the same non-send twice.
+
+      Like the switch, it withholds the EMAILING only. The invoice is already
+      raised in Xero and stays AUTHORISED, so an officer can still send it from
+      Xero by hand — which is the only way it ever goes out, because a re-drive
+      short-circuits on `payment.xeroInvoiceId` and the per-invoice idempotency
+      key would no-op anyway.
+    */
+    const invoiceEmailWithheldByCreationChoice =
+      shouldEmailInvoice &&
+      !invoiceEmailWithheld &&
+      !invoiceEmailGateUnreadable &&
+      xeroInvoiceEmailIsWithheldAtCreation(queuedInvoiceEmailInstruction);
+
+    if (invoiceEmailWithheldByCreationChoice) {
+      await recordWithheldBookingEmail({
+        bookingId,
+        templateName: XERO_BOOKING_INVOICE_EMAIL_TEMPLATE,
+        subject: withheldInvoiceEmailSubject,
+        to: bookingOwner(booking).member.email,
+        detail:
+          "Withheld: the administrator who created this booking chose not to email the member. The invoice exists in Xero but was not emailed.",
+      });
+      logger.warn(
+        { bookingId, invoiceId: createdInvoice.invoiceID },
+        "Skipped the Xero invoice email because the booking was created with \"do not email the member\"",
+      );
+    }
+
+    if (invoiceEmailGateUnreadable) {
+      // NOT a withhold: no SKIPPED_NO_EMAILS row is written, because the switch
+      // may well be off and the member is simply owed their invoice email.
+      invoiceEmailError = new Error(
+        `Could not read the "No emails" switch for booking ${bookingId}; the Xero invoice email was not sent`,
+      );
+      invoiceEmailFailureCause = "NO_EMAILS_UNREADABLE";
+      logger.error(
+        { bookingId, invoiceId: createdInvoice.invoiceID },
+        "Did not email the Xero invoice because the booking's \"No emails\" switch could not be read; the sync operation is marked PARTIAL so the unsent invoice email stays visible",
+      );
+    }
+
+    /*
+      Environment-safety boundary (#3035, ENV-SAFETY 2; epic #2986).
+      INV-CONFIG-004. Asking Xero to email the invoice is a send to the member's
+      real address, so it is gated like a message this application sends itself.
+
+      Resolved AFTER the "No emails" gate above, so the club's own decision is
+      still recorded as the club's own decision on a copy, and the environment is
+      only consulted when something would otherwise be transmitted. What a
+      non-allow answer means for the sync operation is decided once, in
+      `resolveXeroInvoiceEmailPolicy` (`xero-invoice-email.ts`), which returns the
+      `logMessage`, the `suppressedForNonProduction` flag and the `error` — or
+      absence of one — that decide whether this operation reports SUCCEEDED or
+      PARTIAL. (An earlier draft of this comment named a
+      `classifyXeroInvoiceEmailWithheld` helper that never existed.)
+
+      NOT AUTOMATICALLY RECOVERABLE, exactly like the unreadable-switch case
+      above: re-driving this workflow short-circuits on `payment.xeroInvoiceId`
+      and never reaches the email block, so the truthful remediation for an
+      unconfirmed role is to declare the role and send that one invoice from Xero
+      by hand.
+    */
+    const invoiceEmailPolicy =
+      shouldEmailInvoice &&
+      !invoiceEmailWithheld &&
+      !invoiceEmailGateUnreadable &&
+      !invoiceEmailWithheldByCreationChoice
+        ? await resolveXeroInvoiceEmailPolicy()
+        : null;
+    const invoiceEmailWithheldForEnvironment =
+      invoiceEmailPolicy?.kind === "withhold" &&
+      invoiceEmailPolicy.suppressedForNonProduction;
+    if (invoiceEmailPolicy?.kind === "withhold") {
+      const context = { bookingId, invoiceId: createdInvoice.invoiceID };
+      if (invoiceEmailPolicy.error) {
+        invoiceEmailError = invoiceEmailPolicy.error;
+        invoiceEmailFailureCause = "ROLE_UNCONFIRMED";
+        logger.error(context, invoiceEmailPolicy.logMessage);
+      } else {
+        logger.info(context, invoiceEmailPolicy.logMessage);
+      }
+    }
+
+    if (invoiceEmailPolicy?.kind === "allow") {
+      const invoiceEmailIdempotencyKey = buildXeroIdempotencyKey(
+        "booking",
+        bookingId,
+        "invoice-email",
+        createdInvoice.invoiceID,
+        "v1"
+      );
+
+      try {
+        const emailResponse = await sendXeroInvoiceEmail({
+          clearance: invoiceEmailPolicy.clearance,
+          xero,
+          tenantId,
+          invoiceId: createdInvoice.invoiceID!,
+          idempotencyKey: invoiceEmailIdempotencyKey,
+          workflow: "createXeroInvoiceForBooking",
+          context: `emailInvoice(booking ${bookingId})`,
+        });
+        invoiceEmailResponseBody = emailResponse.body;
+      } catch (error) {
+        invoiceEmailError = error;
+        invoiceEmailFailureCause = "PROVIDER";
+        logger.warn(
+          { err: error, bookingId, invoiceId: createdInvoice.invoiceID },
+          "Created Xero invoice but failed to email it to the contact"
+        );
+      }
+    }
+
+    // The Stripe cash recorded against this invoice, computed ONCE (#3955
+    // round 5, finding 4): the payment Xero holds where there is one, else the
+    // figure it was sized at, floored (round 6, F1) at the cash the invoice
+    // already held. A PARTIAL repair records the attempted figure instead (#4010).
+    const primaryInvoiceCashCents = Math.max(
+      providerAmountToCents(paymentResponseBody?.amount) ??
+        (shouldRecordStripeInvoicePayment ? invoicePaymentCents : 0),
+      earlierInvoicePaymentCents,
+    );
+
+    // Store the Xero invoice ID and number on the payment record, and — in the
+    // same transaction — what the invoice billed, the change fee the payment
+    // held at that instant, the booking's worth then and the cash above (#3955
+    // review X4, round 4 finding 1; #3980). The gap check and its retry read
+    // only those figures.
+    const feeAtLink = await persistPrimaryInvoiceLink({
+      operationId: operationId!,
+      paymentId: booking.payment.id,
+      xeroInvoiceNumber: createdInvoice.invoiceNumber ?? null,
+      billed: primaryInvoiceBilledFee(createdInvoice.invoiceID, createdInvoice.lineItems ?? lineItems),
+      built: builtFrom,
+      primaryInvoiceCashCents,
+      primaryInvoiceAttemptedCashCents: shouldRecordStripeInvoicePayment ? invoicePaymentCents : 0,
+    });
+    // #4525 (M13): the Stripe payment's capture receipt, recordable once the link names its capture. One input, so
+    // the end of this run and its catch record it under the same key (an earlier run's payment found on the invoice too).
+    paymentReceipt = { bookingId, payment: booking.payment, invoiceId: createdInvoice.invoiceID, sent: paymentResponseBody,
+      sentCents: shouldRecordStripeInvoicePayment ? invoicePaymentCents : null, reference: stripePaymentReference, bankCode: existingStripePayment ? null : bankCode };
+    // #4525 (Ledger M13): the manifest, in its own transaction after the link. Never throws.
+    // A replayed create returns the ORIGINAL invoice, so the plan is held to the lines it bills.
+    await recordPrimaryInvoiceManifest(
+      { kind: "BUILT", bookingId, plan: manifestPlan, billedLines: createdInvoice.lineItems ?? lineItems },
+      createdInvoice.invoiceID,
+    );
+    await prisma.paymentTransaction.updateMany({
+      where: {
+        paymentId: booking.payment.id,
+        source: PaymentSource.INTERNET_BANKING,
+        kind: PaymentTransactionKind.PRIMARY,
+      },
+      data: {
+        xeroInvoiceId: createdInvoice.invoiceID,
+        xeroInvoiceNumber: createdInvoice.invoiceNumber ?? null,
+      },
+    });
+
+    // #3955 review X4, #3980: an invoice built before the booking last changed
+    // (an edit committed while this create was in flight, or a lost response
+    // replayed under the same idempotency key, which returns the ORIGINAL
+    // invoice) bills other than the booking was worth at the link. A shortfall
+    // goes on a supplementary invoice; an overcharge, or a shortfall no edit
+    // anchors, becomes a Xero Operations task for the treasurer.
+    // #3980 review C3: a second save of this invoice keeps the first's figures.
+    // Review round 2 F6: with no figures stored for it, this run's own are measured.
+    const worthGap = feeAtLink
+      ? await queuePrimaryInvoiceWorthGap({
+          bookingId,
+          atLink: feeAtLink,
+          figuresOperationId: operationId!,
+          createdByMemberId: options?.createdByMemberId,
+        })
+      : await recheckPrimaryInvoiceWorthGap({
+          bookingId,
+          xeroInvoiceId: createdInvoice.invoiceID,
+          createdByMemberId: options?.createdByMemberId,
+          unstoredSave: { built: builtFrom, billedTotalCents: invoiceLineItemsTotalCents(createdInvoice.lineItems ?? lineItems) },
+        });
+
+    // #3955 round 5 (finding 3): captured cash the cap left off, untaken, is never silent.
+    const primaryInvoiceCashShortfall = unrecordedPrimaryInvoiceCash({
+      netCapturedCents,
+      primaryInvoiceCashCents,
+      gapInvoiceCashCents: worthGap.cashTakenCents,
+    });
+    if (primaryInvoiceCashShortfall) {
+      logger.warn(
+        { bookingId, invoiceId: createdInvoice.invoiceID, ...primaryInvoiceCashShortfall },
+        "Recorded less Stripe cash against the Xero invoice than was captured, and no change-fee gap invoice takes the remainder",
+      );
+    }
+
+    // #1641 — allocate the member's applied credit against this just-raised card
+    // invoice so it settles to PAID (effective cash + credit note) and is never left
+    // with the applied slice outstanding. xeroInvoiceId is already persisted above,
+    // so a throw here fails the op and the retry short-circuits on it (no duplicate
+    // invoice). No-op for IB / no-credit / legacy full-price captures.
+    await settleCardAppliedCreditAllocation(
+      booking.payment,
+      bookingId,
+      options?.createdByMemberId
+    );
+
+    await completeXeroSyncOperation(operationClaim!, {
+      status: paymentWriteError || invoiceEmailError ? "PARTIAL" : "SUCCEEDED",
+      responsePayload: {
+        invoice: response.body,
+        payment: paymentResponseBody,
+        paymentError: paymentWriteError,
+        paymentSkipped,
+        paymentSkipReason: paymentSkipped ? paymentSkipReason : null,
+        // #3955 round 5 (finding 3): the captured cash no document records, or null.
+        primaryInvoiceCashShortfall,
+        invoiceEmail: invoiceEmailResponseBody,
+        invoiceEmailError,
+        // #3001: which of the three faults it was. Read back through
+        // `readXeroInvoiceOperationOutcome`, the one home for this payload.
+        invoiceEmailFailureCause,
+        invoiceEmailSkipped:
+          !shouldEmailInvoice ||
+          invoiceEmailWithheld ||
+          invoiceEmailWithheldByCreationChoice ||
+          invoiceEmailGateUnreadable ||
+          invoiceEmailPolicy?.kind === "withhold",
+        // #2258: a DELIBERATE withhold only. An unreadable switch is a fault and
+        // is reported through invoiceEmailError above (status PARTIAL), never
+        // here — the two must stay distinguishable to an operator.
+        invoiceEmailWithheldByNoEmails: invoiceEmailWithheld,
+        // #2929: the administrator's creation-time "do not email the member"
+        // choice, which is the club's own decision like the switch above but
+        // spent on this one invoice creation. Reported as its own key so an
+        // operator is never told the persistent switch is on when it is not.
+        invoiceEmailWithheldByCreationChoice,
+        // #3035: the environment-safety suppression, which is a THIRD reason and
+        // must not be read as either of the two above. A confirmed copy did not
+        // email the invoice; nothing failed and nobody asked for silence.
+        invoiceEmailWithheldForEnvironment,
+      },
+      xeroObjectType: "INVOICE",
+      xeroObjectId: createdInvoice.invoiceID,
+      xeroObjectNumber: createdInvoice.invoiceNumber ?? null,
+      xeroObjectUrl: buildXeroInvoiceUrl(createdInvoice.invoiceID),
+      extraLinks: [
+        {
+          localModel: "Payment",
+          localId: booking.payment.id,
+          xeroObjectType: "INVOICE",
+          xeroObjectId: createdInvoice.invoiceID,
+          xeroObjectNumber: createdInvoice.invoiceNumber ?? null,
+          xeroObjectUrl: buildXeroInvoiceUrl(createdInvoice.invoiceID),
+          role: "PRIMARY_INVOICE",
+        },
+        ...(paymentResponseBody?.paymentID
+          ? [
+              {
+                localModel: "Payment",
+                localId: booking.payment.id,
+                xeroObjectType: "PAYMENT",
+                xeroObjectId: paymentResponseBody.paymentID,
+                xeroObjectNumber: paymentResponseBody.invoiceNumber ?? null,
+                role: "INVOICE_PAYMENT",
+                metadata: {
+                  invoiceId: createdInvoice.invoiceID,
+                  amount: paymentResponseBody.amount ?? booking.payment.amountCents / 100,
+                },
+              },
+            ]
+          : []),
+      ],
+    });
+    await recordPrimaryInvoicePaymentReceipt(paymentReceipt); // its capture receipt, once the operation is closed
+
+    return createdInvoice.invoiceID;
+  } catch (error) {
+    // #4525 (M13): a run failing after the link records the receipt now, outside any transaction, as the end of
+    // the run would have: the replay that follows a queued run cannot read the payment back. Never throws.
+    if (paymentReceipt) await recordPrimaryInvoicePaymentReceipt(paymentReceipt);
+    await failXeroSyncOperation(operationClaim!, error, paymentResponseBody?.paymentID ? { error, payment: paymentResponseBody } : undefined);
+    throw error;
+  }
+}
+
+
+function copyMutableLineItemFields(lineItem: LineItem): LineItem {
+  const next: LineItem = {};
+
+  if (lineItem.lineItemID) next.lineItemID = lineItem.lineItemID;
+  if (lineItem.description) next.description = lineItem.description;
+  if (typeof lineItem.quantity === "number") next.quantity = lineItem.quantity;
+  if (typeof lineItem.unitAmount === "number") next.unitAmount = lineItem.unitAmount;
+  if (lineItem.itemCode) next.itemCode = lineItem.itemCode;
+  if (lineItem.accountCode) next.accountCode = lineItem.accountCode;
+  if (lineItem.taxType) next.taxType = lineItem.taxType;
+  if (typeof lineItem.taxAmount === "number") next.taxAmount = lineItem.taxAmount;
+  if (typeof lineItem.lineAmount === "number") next.lineAmount = lineItem.lineAmount;
+  if (lineItem.tracking) next.tracking = lineItem.tracking;
+  if (typeof lineItem.discountRate === "number") next.discountRate = lineItem.discountRate;
+  if (typeof lineItem.discountAmount === "number") next.discountAmount = lineItem.discountAmount;
+
+  return next;
+}
+
+function mergeBookingInvoiceLineItemDescriptions(
+  existingLineItems: LineItem[],
+  desiredGuestLineItems: LineItem[],
+  checkIn: Date,
+  checkOut: Date,
+  nights: number
+): LineItem[] {
+  const stayNarration = `${nights} night${nights !== 1 ? "s" : ""} - ${formatDateOnly(checkIn)} - ${formatDateOnly(checkOut)}`;
+  let guestLineIndex = 0;
+
+  return existingLineItems.map((existingLineItem) => {
+    const nextLineItem = copyMutableLineItemFields(existingLineItem);
+    const description = existingLineItem.description ?? "";
+
+    const normalizedDescription = description.trim().toLowerCase();
+    if (
+      normalizedDescription === "discount" ||
+      normalizedDescription.startsWith("discount -") ||
+      isPromoAdjustmentLineDescription(description) ||
+      // #3955 review X3: the change-fee line is not a guest's; relabelling it
+      // would put a guest's name on the fee and shift every guest after it.
+      description === CHANGE_FEE_LINE_DESCRIPTION
+    ) {
+      return nextLineItem;
+    }
+
+    const desiredLineItem = desiredGuestLineItems[guestLineIndex];
+    guestLineIndex += 1;
+
+    if (desiredLineItem?.description) {
+      nextLineItem.description = desiredLineItem.description;
+      return nextLineItem;
+    }
+
+    const dateSuffixPattern = / - \d+ nights? - \d{4}-\d{2}-\d{2} - \d{4}-\d{2}-\d{2}$/;
+    if (description && dateSuffixPattern.test(description)) {
+      nextLineItem.description = description.replace(dateSuffixPattern, ` - ${stayNarration}`);
+    }
+
+    return nextLineItem;
+  });
+}
+
+function readXeroAmount(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function getPrimaryInvoiceUpdateSkipReason(invoice: Invoice): string | null {
+  const amountPaid = readXeroAmount(invoice.amountPaid);
+  const amountCredited = readXeroAmount(invoice.amountCredited);
+  const status = String(invoice.status ?? "").toUpperCase();
+
+  if (amountPaid > 0 || status === "PAID" || invoice.fullyPaidOnDate) {
+    return "Skipped primary Xero invoice update because the invoice has payment applied.";
+  }
+
+  if (amountCredited > 0) {
+    return "Skipped primary Xero invoice update because the invoice has credit applied.";
+  }
+
+  if (status === "VOIDED" || status === "DELETED") {
+    return `Skipped primary Xero invoice update because the invoice status is ${status}.`;
+  }
+
+  return null;
+}
+
+
+export async function updateXeroBookingInvoiceForBooking(
+  bookingId: string,
+  options?: UpdateXeroBookingInvoiceOptions
+): Promise<string | null> {
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    include: {
+      guests: { include: { nights: true } }, // per-night rows (issue #713)
+      payment: true,
+    },
+  });
+
+  if (!booking) throw new Error(`Booking not found: ${bookingId}`);
+  if (!booking.payment) throw new Error(`No payment record for booking: ${bookingId}`);
+
+  const invoiceId = booking.payment.xeroInvoiceId;
+  if (!invoiceId) {
+    if (options?.syncOperation) {
+      await completeXeroSyncOperation(options.syncOperation, {
+        responsePayload: {
+          skipped: true,
+          reason: "No original Xero invoice exists for this booking.",
+        },
+      });
+    }
+    return null;
+  }
+
+  const { xero, tenantId } = await getAuthenticatedXeroClient();
+  const [hutFeeMapping, hutFeeItemCodeMap, taxRendering] = await Promise.all([
+    getResolvedAccountMapping("hutFeesIncome"),
+    getHutFeeItemCodeMap(),
+    resolveXeroTaxRendering({ kind: "booking", bookingId }),
+  ]);
+  const incomeCode = hutFeeMapping.code ?? "200";
+  const checkIn = new Date(booking.checkIn);
+  const checkOut = new Date(booking.checkOut);
+  const nights = getStayNights(checkIn, checkOut).length;
+
+  const bookingSeasonType = await getHutFeeSeasonType(checkIn, booking.lodgeId);
+
+  const desiredGuestLineItems = buildInvoiceLineItems(
+    booking.guests.map((g) => ({
+      firstName: g.firstName,
+      lastName: g.lastName,
+      ageTier: g.ageTier,
+      isMember: g.isMember,
+      rateMembershipTypeId: g.rateMembershipTypeId,
+      priceCents: g.priceCents,
+      nights: (g.nights ?? []).map((n) => ({ stayDate: n.stayDate, priceCents: n.priceCents })),
+    })),
+    checkIn,
+    checkOut,
+    nights,
+    incomeCode,
+    hutFeeMapping.itemCode,
+    hutFeeMapping.codeExplicitlyConfigured,
+    hutFeeItemCodeMap,
+    bookingSeasonType,
+    taxRendering,
+  );
+
+  const invoiceUpdateIdempotencyKey = buildXeroIdempotencyKey(
+    "booking",
+    bookingId,
+    "invoice-update",
+    invoiceId,
+    formatDateOnly(checkIn),
+    formatDateOnly(checkOut),
+    "v1"
+  );
+
+  let operationClaim = options?.syncOperation ?? null;
+  let operationId = operationClaim?.id ?? null;
+  if (!operationId) {
+    const operation = await startXeroSyncOperation({
+      direction: "OUTBOUND",
+      entityType: "INVOICE",
+      operationType: "UPDATE",
+      localModel: "Payment",
+      localId: booking.payment.id,
+      idempotencyKey: invoiceUpdateIdempotencyKey,
+      correlationKey: invoiceUpdateIdempotencyKey,
+      requestPayload: {
+        bookingId,
+        invoiceId,
+      },
+      createdByMemberId: options?.createdByMemberId ?? null,
+    });
+    operationId = operation.id;
+    operationClaim = operation;
+  }
+
+  try {
+    const currentInvoiceResponse = await callXeroApi(
+      () => xero.accountingApi.getInvoice(tenantId, invoiceId),
+      {
+        operation: "getInvoice",
+        resourceType: "INVOICE",
+        workflow: "updateXeroBookingInvoiceForBooking",
+        context: `getInvoice(booking ${bookingId})`,
+      }
+    );
+    const currentInvoice = currentInvoiceResponse.body.invoices?.[0];
+    if (!currentInvoice) {
+      throw new Error(`Xero invoice not found: ${invoiceId}`);
+    }
+    if (!currentInvoice.contact) {
+      throw new Error(`Xero invoice ${invoiceId} is missing its contact.`);
+    }
+
+    /*
+      INV-CONFIG-005 (#3036): this path does NOT go through
+      `findOrCreateXeroContact`, and re-pricing an invoice can RAISE its amount
+      due. On a copy restored from the club's live database the invoice was
+      raised on the live site, so nothing here had ever looked at what its
+      contact holds — and Xero emails invoice reminders for an outstanding
+      AUTHORISED invoice from its own servers, to whatever address that contact
+      holds.
+
+      IT RUNS HERE, below the invoice read, because the contact this update
+      re-sends is `currentInvoice.contact` — not the member's link, which can be a
+      different contact after a merge or an admin re-link. The first version of
+      this check ran at the top of the function against the member's link and
+      therefore proved containment of a contact this update never touches.
+    */
+    await requireContainedXeroContactForInvoiceOperation({
+      resolveXeroContactId: async () => currentInvoice.contact?.contactID,
+      memberId: bookingOwner(booking).memberId,
+      workflow: "updateXeroBookingInvoiceForBooking",
+      xero,
+      tenantId,
+    });
+
+    const skipReason = getPrimaryInvoiceUpdateSkipReason(currentInvoice);
+    if (skipReason) {
+      await completeXeroSyncOperation(operationClaim!, {
+        responsePayload: {
+          skipped: true,
+          reason: skipReason,
+          previousInvoice: currentInvoiceResponse.body,
+          bookingId,
+          invoiceId,
+        },
+        xeroObjectType: "INVOICE",
+        xeroObjectId: invoiceId,
+        xeroObjectNumber: currentInvoice.invoiceNumber ?? null,
+        xeroObjectUrl: buildXeroInvoiceUrl(invoiceId),
+        extraLinks: [
+          {
+            localModel: "Payment",
+            localId: booking.payment.id,
+            xeroObjectType: "INVOICE",
+            xeroObjectId: invoiceId,
+            xeroObjectNumber: currentInvoice.invoiceNumber ?? null,
+            xeroObjectUrl: buildXeroInvoiceUrl(invoiceId),
+            role: "PRIMARY_INVOICE",
+          },
+        ],
+      });
+
+      return invoiceId;
+    }
+
+    const currentLineItems = currentInvoice.lineItems ?? [];
+    if (currentLineItems.length === 0) {
+      throw new Error(`Xero invoice ${invoiceId} has no line items to update safely.`);
+    }
+
+    const updatedInvoice: Invoice = {
+      type: currentInvoice.type ?? Invoice.TypeEnum.ACCREC,
+      contact: currentInvoice.contact,
+      lineItems: mergeBookingInvoiceLineItemDescriptions(
+        currentLineItems,
+        desiredGuestLineItems,
+        checkIn,
+        checkOut,
+        nights
+      ),
+      date: getBookingInvoiceIssueDate(booking),
+      // Preserve the due date the invoice was ISSUED with, exactly like
+      // `reference`, `invoiceNumber` and `lineAmountTypes` below.
+      //
+      // `createdAt` never changes, so recomputing this was a value-stable no-op
+      // until #2697 corrected the derivation. From that point on, recomputing it
+      // would silently move an already-issued invoice's due date by a day the
+      // next time an unrelated edit synced — and the owner decision on #2697 is
+      // that already-issued invoices are untouched, with no write-back. Only
+      // newly created invoices get the corrected date.
+      dueDate:
+        currentInvoice.dueDate ??
+        getBookingInvoiceDueDate(booking, await readClubTimeZoneOutsideRequest()),
+      reference: currentInvoice.reference ?? `Booking ${storedShortBookingId(bookingId)}`,
+      invoiceNumber: currentInvoice.invoiceNumber,
+      // The basis it was issued under; one Xero did not echo is the booking's own (#4632).
+      lineAmountTypes: currentInvoice.lineAmountTypes ?? taxRendering.lineAmountTypes,
+    };
+    const requestPayload: Invoices = { invoices: [updatedInvoice] };
+
+    await prisma.xeroSyncOperation.update({
+      where: { id: operationId },
+      data: {
+        requestPayload: sanitizeForJson({
+          ...requestPayload,
+          bookingId,
+          invoiceId,
+        }),
+      },
+    });
+
+    const response = await callXeroApi(
+      () =>
+        xero.accountingApi.updateInvoice(
+          tenantId,
+          invoiceId,
+          requestPayload,
+          undefined,
+          invoiceUpdateIdempotencyKey
+        ),
+      {
+        operation: "updateInvoice",
+        resourceType: "INVOICE",
+        workflow: "updateXeroBookingInvoiceForBooking",
+        context: `updateInvoice(booking ${bookingId})`,
+      }
+    );
+
+    const updated = response.body.invoices?.[0];
+    await completeXeroSyncOperation(operationClaim!, {
+      responsePayload: {
+        previousInvoice: currentInvoiceResponse.body,
+        invoice: response.body,
+      },
+      xeroObjectType: "INVOICE",
+      xeroObjectId: updated?.invoiceID ?? invoiceId,
+      xeroObjectNumber: updated?.invoiceNumber ?? currentInvoice.invoiceNumber ?? null,
+      xeroObjectUrl: buildXeroInvoiceUrl(updated?.invoiceID ?? invoiceId),
+      extraLinks: [
+        {
+          localModel: "Payment",
+          localId: booking.payment.id,
+          xeroObjectType: "INVOICE",
+          xeroObjectId: updated?.invoiceID ?? invoiceId,
+          xeroObjectNumber: updated?.invoiceNumber ?? currentInvoice.invoiceNumber ?? null,
+          xeroObjectUrl: buildXeroInvoiceUrl(updated?.invoiceID ?? invoiceId),
+          role: "PRIMARY_INVOICE",
+        },
+      ],
+    });
+    // #4525 (ALP-436): what the update sent, beside the primary manifest. Never throws.
+    await recordPrimaryInvoiceUpdateManifest({
+      bookingId,
+      legacyKey: invoiceUpdateIdempotencyKey,
+      providerInvoiceId: invoiceId,
+      lines: updatedInvoice.lineItems ?? [],
+      lineAmountTypes: updatedInvoice.lineAmountTypes!,
+      providerTotal: updated?.total ?? currentInvoice.total,
+    });
+    // #5208: the copied lines carry Xero's own stored tax; it must come back unchanged. Never throws.
+    await recordXeroTaxOverrideMismatch({ xeroSyncOperationId: operationId, bookingId, providerInvoiceId: updated?.invoiceID ?? invoiceId,
+      invoiceNumber: updated?.invoiceNumber ?? currentInvoice.invoiceNumber ?? null, documentKind: "UPDATE", sent: updatedInvoice.lineItems ?? [], returned: updated?.lineItems ?? [] });
+
+    return updated?.invoiceID ?? invoiceId;
+  } catch (error) {
+    await failXeroSyncOperation(operationClaim!, error);
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Credit note on refund
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a Xero credit note when a booking refund is processed.
+ *
+ * @param paymentId - The Payment record ID (not Stripe payment intent ID)
+ * @param refundAmountCents - The refund amount in cents
+ * @returns The Xero credit note ID
+ */

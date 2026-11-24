@@ -1,0 +1,310 @@
+title = "TACBookings Gitleaks config"
+
+# #2686 — this file MUST extend the default rule set.
+#
+# Before #2686 it did not, and that made every gitleaks job in CI vacuous. A
+# gitleaks config without `[extend] useDefault = true` REPLACES the built-in
+# rules rather than adding to them, and this file declared no `[[rules]]` of its
+# own — so the effective rule set was empty and the scan could not fail on
+# anything. Measured on the tree at 66448740c: a file containing an AWS access
+# key id, an AWS secret access key and a `sk_live_` Stripe key scanned clean
+# with this config and reported two findings without it. Never delete the
+# `[extend]` block below; a required check that cannot fail is worse than no
+# check, because it reads as covered.
+
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Allowlists: CONTENT-scoped, and pinned to EXACT LITERALS.
+# ---------------------------------------------------------------------------
+#
+# Two rules, and both were learned the hard way.
+#
+# 1. NEVER path-scoped. A global `[[allowlists]]` entry that carries `paths`
+#    suppresses EVERYTHING under those paths in gitleaks 8.28.0, whatever else
+#    the entry says, and `matchCondition = "AND"` does not change that — it is
+#    silently ignored at this level. Measured: an entry with
+#    `paths = ['(^|/)__tests__/']` AND `regexes = ['<uuid shape>']` suppressed a
+#    plain AWS access key sitting in a `__tests__/` file. The pre-#2686 version
+#    of this file had exactly that shape (`paths = ['^\.env\.example$']` plus a
+#    `sk_test_placeholder` regex), so it allowlisted the whole of `.env.example`
+#    — every rule, every value.
+#
+# 2. NEVER a SHAPE. A global allowlist applies to EVERY rule, not to the one its
+#    description happens to name, so a shape class silences rules nobody thought
+#    about. The first draft of this file allowlisted the UUID shape "because no
+#    credential this application holds is UUID-shaped" — measured, that entry
+#    dropped `heroku_api_key = <uuid>` (rule `heroku-api-key`) and
+#    `CRON_SECRET=<uuid>` on the floor, and the premise was false in-repo
+#    anyway: `adult-member-hosting-coverage-queue.ts` and
+#    `adult-member-hosting-coverage-incidents.ts` both mint `randomUUID()` claim
+#    tokens that are used as BEARER values. The same draft allowlisted
+#    `^(?:pk|sk)_test_[A-Za-z0-9_]+$`, which silenced every Stripe test-mode key
+#    that will ever exist in this repository — and a `sk_test_` key is a real
+#    test-mode credential, not a placeholder.
+#
+#    So every entry below names the one literal value it forgives, anchored
+#    `^…$`. It can hide that value and nothing else. Adding a new fixture that
+#    trips the scanner means adding a line here, in the diff that adds the
+#    fixture, which is the review point we want.
+#
+# Why literals here rather than fingerprints in `.gitleaksignore`: see that
+# file's header. Short version — the history scan diffs merge commits against
+# their first parent (#2686), so the same line is re-reported at every merge
+# that carried it forward, and a `commit:file:rule:line` fingerprint would need
+# re-pinning after every merge. A literal is pinned to the value, so it holds.
+#
+# Writing the literal down here is safe for exactly one reason: each value is
+# forgiven by its own entry, so the copy in this file is not itself a new
+# finding. That reason does NOT extend to anything real — never paste a value
+# here that you would not publish, because this file is public.
+
+[[allowlists]]
+description = "The repeating-hex placeholder used for AUTH_SECRET/NEXTAUTH_SECRET/XERO_ENCRYPTION_KEY in the example env files, in CI env blocks, and in the Xero encryption tests. 64 characters of `0123456789abcdef` repeated four times — a value no generator would ever produce. 16 findings across history."
+regexes = ['''^(?:0123456789abcdef){4}$''']
+
+[[allowlists]]
+description = "The fabricated temporary AUTH_SECRET used only by the #4164 teardown failure fixtures. This readable label replaces no real credential and encrypts or signs nothing; the tests only verify that their saved environment value is restored. Forgive this exact literal, including its existing historical commit, without exempting any path or credential shape."
+regexes = ['''^race-4164-temporary-secret$''']
+
+[[allowlists]]
+description = "The two fabricated role passwords PR #4479's first commits wrote into `database-roles.test.ts` to check the provisioning SQL's password quoting. They are readable labels that were never a credential for any database, and the test now builds its passwords at runtime (`\"m\".repeat(20)`), so the tree no longer carries them. Forgive these exact literals in their historical commits only, without exempting any path or password shape."
+regexes = ['''^migrator-secret-0123456789$''', '''^retention-secret-0123456789$''']
+
+[[allowlists]]
+description = "The fabricated audit-archive password one PR #4479 commit wrote into `backup.test.ts` for the restore-validation guard's archive-name refusal. It is a readable label for a host that does not exist and was never a credential; the test now spells it with the `fixture` stopword, so the tree no longer carries it. Forgive this exact literal in its historical commit only, without exempting any path or password shape."
+regexes = ['''^archive-pw$''']
+
+[[allowlists]]
+description = "The fabricated push secret PR #4582's first commit wrote into `servernz-connection-race.realdb.test.ts` as the doubled central server's answer to a push registration in the standing-connection control (#4470). It is a readable label padded to the schema's 32-character minimum, issued by no server and never a credential; the test now builds its secrets at runtime (`\"s\".repeat(40)`), so the tree no longer carries it. Forgive this exact literal in its historical commits only, without exempting any path or secret shape."
+regexes = ['''^race-4470-standing-secret-padded-to-32-chars$''']
+
+[[allowlists]]
+description = "The fabricated image storage key `race-4590-orphan.webp` that one PR #4591 commit wrote into `club-post-mirror-concurrency.realdb.test.ts` for the orphan-sweep race case. It names a test file on a throwaway mount and was never a credential; `generic-api-key` read it because it sits after `key`. The test now builds the name at runtime, so the tree no longer carries it. Forgive this exact literal in its historical commit only, without exempting any path or shape."
+regexes = ['''^race-4590-orphan\.webp$''']
+
+[[allowlists]]
+description = "The three Stripe TEST-mode placeholders this repository writes down, as exact literals: the diagnostics knowledge-bundle fixtures, the Playwright environment's publishable placeholder, and the booking-payment wrapper's fixture key. Any OTHER Stripe test key still fails the gate — `sk_test_` is a real test-mode credential and only these three named strings are forgiven. Live keys (`sk_live_`, `pk_live_`, `rk_live_`) are never allowlisted by shape. 51 findings across history."
+regexes = [
+  '''^sk_test_placeholder$''',
+  '''^pk_test_e2e_placeholder$''',
+  '''^sk_test_51SecretKeyMaterial$''',
+]
+
+[[allowlists]]
+description = "The two canonical fake `live` Stripe keys the redaction/diagnostics suites assert on: they exist to prove the redactor masks a live-looking key, so the scanner must not stop them being written down. 32 findings across history."
+regexes = ['''^sk_live_ABCDEF1234567890$''', '''^sk-live-abcdef123456$''']
+
+[[allowlists]]
+description = "The fake Stripe PaymentIntent client secret the redaction suites assert gets masked, in `redact-sensitive-json.test.ts` and `xero-inbound-reconciliation.test.ts`. The string has to be written down for the test to prove the redactor removes it."
+regexes = ['''^pi_123_secret_liveSecret$''']
+
+[[allowlists]]
+description = "The two UUID fixtures `member-credit.test.ts` and `admin-member-credit-routes.test.ts` use as idempotency keys, as exact literals. NOT the UUID shape: this application does mint UUID bearer tokens (the adult-member-hosting coverage claim tokens), so forgiving the shape would forgive a real one."
+regexes = [
+  '''^9a13b0af-7ffc-451b-a50b-81f6fb8630f4$''',
+  '''^26822a78-5929-4471-889f-b49f7c88914d$''',
+]
+
+[[allowlists]]
+description = "The readable idempotency-key label the #4285 race test gives its fabricated unplanned card-refund recovery row in `completed-redelivery.realdb.test.ts`. A test's own label for a row it created: it authorises nothing and names no credential. This exact literal is forgiven, including its existing historical commit, without exempting any path or shape."
+regexes = ['''^race-4285-unplanned-refund$''']
+
+[[allowlists]]
+description = "A readable snake_case fixture id used as the idempotency key in the pending-charge confirmation tests. Not a UUID and not a credential — it is a test's own label for a row it created."
+regexes = ['''^pending_charge_b1$''']
+
+[[allowlists]]
+description = "A fabricated idempotency key from ANOTHER subsystem (the late-cancel refund path), used in `saved-card-charge-attempt.test.ts` as the \"a key that is not ours\" case: the test proves a `payment_intent.succeeded` carrying somebody else's key adopts nothing. Readable snake_case, no credential, and it names no real intent or booking — the same class as `pending_charge_b1` above (#3267)."
+regexes = ['''^late_cancel_refund_bk_1_pi_x$''']
+
+[[allowlists]]
+description = "An original-shape saved-card attempt key (no `_v2` suffix), once written out in `stripe-app-intent-metadata.test.ts` in a commit of #4681 that history keeps; the file now builds it with `mintedSavedCardChargeKey`. A test's own label for a fabricated row: readable snake_case, no credential, and it names no real intent or booking. The same class as `pending_charge_b1` above (#4646)."
+regexes = ['''^pending_charge_bk_1_txn_1$''']
+
+[[allowlists]]
+description = "A saved-card attempt key the #4993 stranded-claim test in `cron-confirm-pending.test.ts` expects the ordinary pass to replay (commit 203a75cb5 in PR #5129's history first carries it). It is the test's own label for a fabricated booking `b1` and attempt row `txn_stranded`, in the `_v2` key shape: readable snake_case, no credential, and it names no real intent or booking. `generic-api-key` fires on the `idempotencyKey` identifier, not the value. The same class as `pending_charge_b1` above. Only this exact literal is forgiven."
+regexes = ['''^pending_charge_b1_txn_stranded_v2$''']
+
+[[allowlists]]
+description = "A readable fixture idempotency key from the booking ledger's real-PostgreSQL proof (#3595), in a commit this pull request cannot rewrite: `generic-api-key` matched it because the field is called `postingKey`. Not a credential — a test's own label for a line it posted and deleted. The file now uses plain words below the rule's length floor; this literal is forgiven only because history keeps it. Same class as `pending_charge_b1` above."
+regexes = ['''^k-3595-contrast$''']
+
+[[allowlists]]
+description = "A readable fixture posting key from the booking ledger's real-PostgreSQL proof for #3582 (`booking-ledger-modification.realdb.test.ts`), in a commit this pull request cannot rewrite (b2ce84e2b): `generic-api-key` matched it because the field is called `postingKey`. Not a credential — a test's own label for the second reversal it posts, so that only the unique `reversesLineId` can refuse it. Same class, and same cause, as `k-3595-contrast` above."
+regexes = ['''^race-3582-second-reversal$''']
+
+[[allowlists]]
+description = "Prose, not credentials. `generic-api-key` matches the entropy of a sentence listing what the diagnostics tool returns — an auth outcome, then row, byte and timing counts — written as a slash-separated list. Same sentence in `diagnostics/tools/types.ts`, in the ADR that introduced it, and in the knowledge-bundle doc."
+regexes = ['''^row/byte/timing$''', '''^row/count/byte/timing$''']
+
+[[allowlists]]
+description = "Two settings lines from `.env.example`'s Mirotalk block. The JWT key line above them has an EMPTY value, and the rule matched across the line break onto the neighbouring expiry and presenter settings. Neither string is a secret; both are the setting name and its default, which is why they can be written here."
+regexes = ['''^MIRO_JWT_EXP=1h$''', '''^MIRO_MEETING_PRESENTER=true$''']
+
+[[allowlists]]
+description = "The signed test JWT built by the mirotalk-token suite so it can assert the token is verified and rejected on tamper. Signed with the suite's own throwaway key, over a payload that decodes to fixture data, and expired since 2023."
+regexes = ['''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJkYXRhIjoiVTJGc2RHVmtYMThBQVFJREJBVUdCOHdmSWF4NHJTaWc3N2txVkVYL210eEZTR05uUytzaHdOOVNsb283b2l4TFpZMm9xMlgvYitJSjAyaFJnNU1lTGJvT1Mvekg4QmtpU1BQT05CYk9OTG89IiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDB9\.Tpa8rwDsiXuKPVud59TmKAkW_jTuSlIUYiW-d7w06aQ$''']
+
+[[allowlists]]
+description = "The synthetic high-entropy example key the mirotalk-token suite uses (in `describeMirotalkJwtKeyWeakness` and the 'stays silent for a properly generated key' test) to prove a strong MIRO_JWT_KEY draws NO weak-key warning. A hand-built 34-character string — two-letter/one-digit groups whose digits are a permutation of 0-9 — chosen only to clear the 32-char, distinct-character strength check in `mirotalk-token.ts`. It signs nothing real: MIRO_JWT_KEY is a self-hosted deployment's own signing secret, kept only in that deployment's env, and `.env.example` ships it EMPTY. Only this exact literal is forgiven; any other high-entropy value still fails the gate."
+regexes = ['''^Zx7Qb2Lm9Rt4Vy6Kd8Np1Sw3Hj5Cf0Gu2$''']
+
+[[allowlists]]
+description = "A fixture database password in the measurement harness's own self-test, whose value is a hyphenated English phrase naming the UTF-16 test material it exists to exercise. It is a password to nothing."
+regexes = ['''^utf16-secret-material$''']
+
+[[allowlists]]
+description = "The md5 digests of PostgreSQL catalog definitions (`pg_get_constraintdef`, `pg_get_triggerdef`, `pg_get_indexdef`) of the member-money journal's constraints, triggers and unique indexes, which PR #4542 (#4513) briefly pinned in commit f9ab43ffb before replacing them, in the same PR, with the definitions' text. They are hashes of a public schema, not credentials: `generic-api-key` matched them only because the constraint and index names they sit under end in `_key`, `_pkey` or `_fkey`. The commit cannot be rewritten, so these exact literals are forgiven, one per distinct digest; any other 32-character hex value still fails the gate. NOT a shape, NOT path-scoped. 36 findings in that one commit, 28 distinct values."
+regexes = [
+  '''^008453491c8f0659e2607b7ef96edc58$''',
+  '''^0b0fe5d4caf0d28c69e98c6578cac37e$''',
+  '''^0e9befc60df7395f80ef18a99c7ca76f$''',
+  '''^208928121c2bcc91ddb7348d1e991c56$''',
+  '''^210c0567cb5318b9c3932cb5d8f13487$''',
+  '''^22ca9b18286287bd39952de4e64adda9$''',
+  '''^3955457f2077c3695b9e1bc0041ca930$''',
+  '''^3da4fb0017a954e360673d23702fc68c$''',
+  '''^45dc2a9511cea1ddeb209174614349d0$''',
+  '''^4c6419b3704337bbfe50f018842a9ad3$''',
+  '''^58b90166240d879161bae4ecfc821e53$''',
+  '''^5a1ebf4eb481c4469e0889d0fd0a386c$''',
+  '''^6388303ebdc4088f5a9a96f30bfaf07b$''',
+  '''^832f8b9ac7b3d637a6da5e4748c7b4ba$''',
+  '''^84a0ecc7411e7c2394eca4da49fb5bc6$''',
+  '''^946f417847528057c4518a2bcefb550c$''',
+  '''^983f00bcf3d8ee57ca31c5e73722239d$''',
+  '''^9bb262f2bfc231b3ae0955160857de09$''',
+  '''^a9c314c363277462f4bda2e8d6942109$''',
+  '''^acb7ce548312f8513628901ff3975b78$''',
+  '''^bd44dc7e36067341bd462d50939fee60$''',
+  '''^bfb14062993af86e2a6ac423c2fc5477$''',
+  '''^db609f1acc60a72b499d2f45e7278684$''',
+  '''^e0bc0470c9bdaafe0129dfb1996dff11$''',
+  '''^e382fee27cdb0c1ac55177728f59450a$''',
+  '''^e3cf1837238c3d0a0da94776b7786f79$''',
+  '''^ee98e76dac1f82613e6230a8d285d3e4$''',
+  '''^ff3b906cc7029defd0c5a26af6ef8872$''',
+]
+
+[[allowlists]]
+description = "The synthetic 64-hex action token the #2827 attribute-oracle tests share, written in source as four hand-typed 16-hex fragments joined with `+` — a shape no credential generator emits, so it is plainly a source constant. The suites (`family-invite-login-link`, `group-join-verify-pay-token-not-rendered`, `family-invite-return-address`, `family-invite-return-cookie-proxy`) assert this token NEVER appears in a rendered HTML attribute and use a short prefix of it as an `^=` CSS oracle probe, so it has to LOOK like a real action token — high entropy, no repeating run — for the absence to prove anything. `issueActionToken` mints these from randomness and persists only their hash; this fixed constant authorises nothing in any deployment. `generic-api-key` matches only the first 16-hex fragment, forgiven here as an exact literal and nothing else."
+regexes = ['''^e7c1b93a5d0f4826$''']
+
+[[allowlists]]
+description = "The pinned SHA-256 of one fixture proposal snapshot in the #3252 migration-verification file (`prisma/migration-verification/20260930010000_relocale_proof_exception_request_identities.ts`), a digest of public test data that authorises nothing. The CAUSE was the identifier, not the value: `generic-api-key` fires on any identifier containing `api`/`key`/`token`/`secret`/`auth`/`access`, and the constant was first named `ESCAPING_HASH` - measured with the pinned v8.28.0 image, the same 64-hex value behind `ESCAPED_PARTY_HASH` scans clean, which is what the constant is now called. The literal is still forgiven because commit fe2f4a072 in the PR's history carries the old line, the history scan re-reports it at every merge that carries it forward, and this file's header rules out fingerprints for exactly that reason. Only this exact literal is forgiven. If a future fixture trips this rule, rename the identifier first; add a value here only when the tripping line is already in history."
+regexes = ['''^bbbd2b447299d6f849655b881b1c8978b9904a229223e00ae25c6964f5c062cb$''']
+
+[[allowlists]]
+description = "The `idempotencyKey` of the fixture `MembershipSubscriptionCharge` the #3971 real-PostgreSQL proof seeds (`src/lib/__tests__/xero-subscription-invoice-retry.realdb.test.ts`). It is a unique-column value for a throwaway row in the disposable race database and authorises nothing. `generic-api-key` fires on the `idempotencyKey` identifier, not the value. The literal is forgiven because commit 6664bf772 in the PR's history carries the line, and this file's header rules out fingerprints. Only this exact literal is forgiven."
+regexes = ['''^race-3971-charge-key$''']
+
+[[allowlists]]
+description = "The `idempotencyKey` of the fixture `MembershipSubscriptionCharge` the #4098 real-PostgreSQL proof seeds (`src/lib/__tests__/membership-subscription-charge-close.realdb.test.ts`). It is a unique-column value for a throwaway row in the disposable race database and authorises nothing. `generic-api-key` fires on the `idempotencyKey` identifier, not the value. The literal is forgiven because commit e98867fe6 in the PR's history carries the line, and this file's header rules out fingerprints. Only this exact literal is forgiven."
+regexes = ['''^race-4098-charge-key$''']
+
+[[allowlists]]
+description = "The `idempotencyKey` of a fixture `PaymentRecoveryOperation` the #4131 real-PostgreSQL proof seeded (`src/lib/__tests__/late-capture-own-charge-refund.realdb.test.ts`, a sibling cancel row). It is a unique-column value for a throwaway row in the disposable race database and authorises nothing. `generic-api-key` fires on the `idempotencyKey` identifier, not the value. The line was later removed, but commit af92f13ee in the PR's history carries it, and this file's header rules out fingerprints. Only this exact literal is forgiven."
+regexes = ['''^race-4131-cancel-sibling$''']
+
+[[allowlists]]
+description = "The `idempotencyKey` of a fixture row that the #4110 real-PostgreSQL proof seeds (`src/lib/__tests__/membership-family-rebill.realdb.test.ts`), for a second live family charge in the disposable race database. It is a unique-column value for a throwaway row and authorises nothing. `generic-api-key` fires on the `idempotencyKey` identifier, not on the value. Only this exact literal is forgiven."
+regexes = ['''^race-4110-second-live-key$''']
+
+[[allowlists]]
+description = "Two fabricated values from PR #4765's (#4456) commits that history keeps. `race-4456-rotated-secret-0123456789abcdefghij` was the rotated AUTH_SECRET in `data-encryption-key-ring.realdb.test.ts` (commit cb7a3a280): a readable label that signs and decrypts nothing outside a throwaway race database; the test now builds its secrets at run time. `c9d614901e6bb357d95bdef8c2b3bd0a` is the GCM tag of the golden legacy credential vector in `data-encryption-legacy-golden.test.ts` (commit 614c225bb): a tag over a fixture plaintext under a fixture secret, which must stay literal for the vector to prove anything; `generic-api-key` read it because it followed the `authTag` field, and the file now names it `GOLDEN_GCM_TAG`. Only these exact literals are forgiven, NOT a path or a shape."
+regexes = [
+  '''^race-4456-rotated-secret-0123456789abcdefghij$''',
+  '''^c9d614901e6bb357d95bdef8c2b3bd0a$''',
+]
+
+[[allowlists]]
+description = "The idempotency key of the fixture organiser-child `PaymentRecoveryOperation` in the #4851 group card-refund settle unit test (`src/lib/__tests__/card-refund-group-settle.test.ts`), commit 532b2b573 in PR #4901's history. It is a readable label - the `organiser_child_refund_` prefix the writer mints with, then `cancel_settle_child-1` - for a mocked row that never reaches a database, and it authorises nothing. `generic-api-key` fired on the `CHILD_KEY` identifier, not the value. The test now builds the key from `ORGANISER_CHILD_REFUND_KEY_PREFIX` at run time under the name `CHILD_ROW`, so the tree no longer carries it; the literal is forgiven only because history keeps it, and this file's header rules out fingerprints. Only this exact literal is forgiven."
+regexes = ['''^organiser_child_refund_cancel_settle_child-1$''']
+
+[[allowlists]]
+description = "The fabricated AUTH_SECRET stand-in that PR #5286's (ALP-653) commit 5210631d1 wrote into `src/lib/__tests__/mcp-principal.test.ts`, returned by a mocked `getAuthSecret` so the unit test can sign a fixture session. It is a readable label that signs nothing outside that mocked test and was never a credential for any deployment. `generic-api-key` fired on the `TEST_SECRET` identifier. The test now builds its secret at run time (`\"s\".repeat(40)`), so the tree no longer carries it; the literal is forgiven only because history keeps it, and this file's header rules out fingerprints. Only this exact literal is forgiven."
+regexes = ['''^test-secret-for-alp-653-principal$''']
+
+[[allowlists]]
+description = "The readable outbox label `race-4324-other-ask` that commit 2437ce376 in PR #5301's history (#5220) wrote as the `correlationKey` and `idempotencyKey` of a fabricated second supplementary-invoice row in `kept-change-capture-record.realdb.test.ts`, the another-invoice-queued refusal case. A test's own label for a throwaway row in the disposable race database: it authorises nothing and names no credential. `generic-api-key` fired on the `...Key` identifiers, not the value. The test now names it through the `OTHER_ASK_LABEL` constant, so the tree no longer carries the flagged lines; the literal is forgiven only because history keeps it, and this file's header rules out fingerprints. Only this exact literal is forgiven."
+regexes = ['''^race-4324-other-ask$''']
+
+# ---------------------------------------------------------------------------
+# Repository-owned rules
+# ---------------------------------------------------------------------------
+
+# #2686. gitleaks' default rule set has no rule for a database/broker connection
+# string, so `postgresql://user:<password>@host/db` and `redis://default:<pw>@…`
+# were both undetected — measured on v8.28.0 with the default rules and no
+# allowlists. On a PUBLIC repository holding a club's member and payment data
+# that is the most damaging plausible leak available, because the URL carries
+# the host as well as the credential.
+#
+# Precision, and why the thresholds are where they are. This repository writes
+# hundreds of connection strings in docs, Compose files, CI env blocks and test
+# harnesses — 28 distinct passwords in the working tree alone — and every one of
+# them is a local development or fixture value. Three filters keep those out:
+#
+#   * the password must be at least 8 characters. Every dev value in the tree
+#     is shorter (`pw`, `codex`, `s3cr3t`, `apppass`, `tacdev`, `rotated`);
+#     nothing this application would ever hold for real is, since its own
+#     generated secrets are 32+ hex characters;
+#   * `entropy` requires the password to look random rather than typed, which
+#     is what separates a generated credential from a chosen one;
+#   * a placeholder or an interpolation is excluded by construction — the
+#     password character class refuses `$`, `{`, `}`, `<`, `>` and backtick, so
+#     `${DB_PASSWORD}` and `<your-password>` cannot match at all — and the
+#     stopwords below drop the spelled-out ones.
+#
+# The cost is stated rather than hidden: a real credential shorter than 8
+# characters, or one a human chose and typed, is not caught by this rule. It is
+# still caught by review, and by the provider-specific default rules for every
+# credential shape that has a recognisable prefix.
+#
+# `scripts/ci/gitleaks-selftest.sh` proves this rule both fires and stays quiet,
+# on generated samples, as a step of the required `Secret scan (gitleaks)` job.
+[[rules]]
+id = "acb-connection-string-password"
+description = "Database or message-broker connection string carrying an inline password"
+regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver|clickhouse|cockroachdb)://[a-z0-9._%+\-]{1,64}:([^\s/@"'`<>${}\[\]()]{8,128})@'''
+secretGroup = 1
+entropy = 3.0
+keywords = [
+  "postgres",
+  "postgresql",
+  "mysql",
+  "mariadb",
+  "mongodb",
+  "redis",
+  "rediss",
+  "amqp",
+  "amqps",
+  "mssql",
+  "sqlserver",
+  "clickhouse",
+  "cockroachdb",
+]
+
+  # Rule-SCOPED, unlike the global entries above: a `[[rules.allowlists]]` block
+  # can only ever affect this rule, so a spelled-out placeholder forgiven here
+  # is still a finding for every other rule. (`targetRules` on a global
+  # allowlist is NOT an equivalent — in 8.28.0 it silently voids the allowlist
+  # entirely, so it is never used in this file.)
+  [[rules.allowlists]]
+  description = "Spelled-out development and placeholder passwords. `stopwords` are case-insensitive SUBSTRING matches, so `staging-password-change-me`, `example-password` and `placeholder-pw` are all covered by the words they contain."
+  stopwords = [
+    "postgres",
+    "password",
+    "passwd",
+    "placeholder",
+    "example",
+    "changeme",
+    "change-me",
+    "change_me",
+    "redacted",
+    "fixture",
+    "dummy",
+    "localhost",
+  ]

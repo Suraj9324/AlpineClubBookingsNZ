@@ -1,0 +1,579 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Trash2, X } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { FieldHint, useFieldHint } from "@/components/ui/field-hint";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { AgeTierBadge } from "@/components/admin/family-groups/age-tier-badge";
+import { MemberAgeChip } from "@/components/admin/family-groups/member-age-display";
+import { FamilyGroupLoginHolderSection } from "@/components/admin/family-groups/login-holder-section";
+import { FamilyGroupRequestReviewSection } from "@/components/admin/family-groups/request-review-section";
+import {
+  AdminViewOnlySectionBanner,
+  ViewOnlyActionButton,
+} from "@/components/admin/view-only-action";
+import { ADMIN_VIEW_ONLY_ACTION_REASON } from "@/hooks/use-admin-area-edit-access";
+import {
+  buildSharedEmailClusters,
+  getMemberName,
+  normalizeFamilyEmail,
+  type FamilyGroupDetail,
+  type FamilyGroupMemberRow,
+  type FamilyGroupRequest,
+  type MemberIdentityOption,
+  type SharedEmailCluster,
+} from "@/lib/admin-family-group-ui-helpers";
+import { useDebouncedMemberSearch } from "@/hooks/use-debounced-member-search";
+import { useScrollToFeedback } from "@/hooks/use-scroll-to-feedback";
+import { resolveEffectiveEmail } from "@/lib/member-email";
+
+export interface FamilyGroupEditorProps {
+  groupId: string;
+  onClose: () => void;
+  onChanged?: () => void;
+  // Tri-state (#2065): `undefined` while the session resolves (neutral disabled).
+  canEdit: boolean | undefined;
+  /**
+   * Whether this editor renders its OWN view-only banner (#2160). Default
+   * `true`, which is what the dialog mount on `/admin/members/[id]` needs: a
+   * dialog is a separate accessibility container, so no ancestor banner can
+   * reach it and the editor must state the reason itself.
+   *
+   * `/admin/family-groups` renders this editor inline BELOW its own page
+   * banner, which is unconditional and covers the same membership scope, so it
+   * passes `false` — otherwise a view-only membership admin who opens a group
+   * meets the same sentence twice, in two `role="status"` regions. Gating never
+   * changes; this only says WHO states the reason.
+   */
+  renderViewOnlyBanner?: boolean;
+}
+
+export function FamilyGroupEditor({
+  groupId,
+  onClose,
+  onChanged,
+  canEdit,
+  renderViewOnlyBanner = true,
+}: FamilyGroupEditorProps) {
+  const [group, setGroup] = useState<FamilyGroupDetail | null>(null);
+  const [requests, setRequests] = useState<FamilyGroupRequest[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [formName, setFormName] = useState("");
+  // #2257 — the example lives UNDER the field, not inside it as grey pseudo-content.
+  const groupNameHint = useFieldHint();
+  // #2568: the pending member set keeps each member's age label, so the pills an
+  // admin is about to save (or remove) name a specific person unambiguously.
+  const [selectedMembers, setSelectedMembers] = useState<MemberIdentityOption[]>([]);
+  const [memberSearch, setMemberSearch] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
+  const [loginHolderSelections, setLoginHolderSelections] = useState<Record<string, string>>({});
+  const [loginHolderSavingEmail, setLoginHolderSavingEmail] = useState<string | null>(null);
+  const [loginHolderErrors, setLoginHolderErrors] = useState<Record<string, string>>({});
+  const [loginHolderMessages, setLoginHolderMessages] = useState<Record<string, string>>({});
+  const [setupInviteSendingId, setSetupInviteSendingId] = useState<string | null>(null);
+  const [setupInviteMessages, setSetupInviteMessages] = useState<Record<string, string>>({});
+  const editorRef = useRef<HTMLDivElement>(null);
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  const { scrollToError, scrollToTop } = useScrollToFeedback();
+
+  const sharedEmailClusters = useMemo(
+    () => buildSharedEmailClusters(group?.members ?? []),
+    [group?.members]
+  );
+
+  // #2568: the family-group lookup rather than the members admin search — every
+  // row carries the calculated age needed to link the right person, and no date
+  // of birth. Its own filters cover active/non-archived and the ten-row cap, so
+  // no `active`/`pageSize` parameters are sent (`type=primary` was never a
+  // parameter the members endpoint parsed, so nothing is lost by dropping it).
+  const { results: rawSearchResults, searching } =
+    useDebouncedMemberSearch<MemberIdentityOption>({
+      query: memberSearch,
+      endpoint: "/api/admin/family-groups/member-search",
+    });
+  const searchResults = useMemo(() => {
+    const selectedIds = new Set(selectedMembers.map((member) => member.id));
+    return rawSearchResults
+      .filter((member) => !selectedIds.has(member.id))
+      .map((member) => ({
+        id: member.id,
+        firstName: member.firstName,
+        lastName: member.lastName,
+        email: member.email,
+        ageLabel: member.ageLabel,
+      }));
+  }, [rawSearchResults, selectedMembers]);
+
+  const refreshEditor = useCallback(async () => {
+    setLoading(true);
+    setError("");
+
+    try {
+      const [groupRes, requestsRes] = await Promise.all([
+        fetch(`/api/admin/family-groups/${groupId}`),
+        fetch("/api/admin/family-groups/requests"),
+      ]);
+
+      const groupData = await groupRes.json().catch(() => ({}));
+      if (!groupRes.ok) {
+        throw new Error(groupData.error || "Failed to load family group");
+      }
+
+      const rawMembers = (groupData.members ?? []) as FamilyGroupMemberRow[];
+      const members = await Promise.all(
+        rawMembers.map(async (member) => ({
+          ...member,
+          effectiveEmail: normalizeFamilyEmail(resolveEffectiveEmail(member)),
+        }))
+      );
+
+      const nextGroup = { ...groupData, members } as FamilyGroupDetail;
+      setGroup(nextGroup);
+      setFormName(nextGroup.name || "");
+      setSelectedMembers(
+        members.map((member) => ({
+          id: member.id,
+          firstName: member.firstName,
+          lastName: member.lastName,
+          email: member.email,
+          ageLabel: member.ageLabel,
+        }))
+      );
+
+      const clusters = buildSharedEmailClusters(members);
+      setLoginHolderSelections((current) => {
+        const nextSelections: Record<string, string> = {};
+        for (const cluster of clusters) {
+          nextSelections[cluster.email] =
+            current[cluster.email] ||
+            cluster.members.find((member) => member.canLogin)?.id ||
+            "";
+        }
+        return nextSelections;
+      });
+
+      if (requestsRes.ok) {
+        const requestData = await requestsRes.json();
+        const groupRequests = ((requestData.requests ?? []) as FamilyGroupRequest[])
+          .filter((request) => request.familyGroup.id === groupId);
+        setRequests(groupRequests);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load family group");
+    } finally {
+      setLoading(false);
+    }
+  }, [groupId]);
+
+  useEffect(() => {
+    refreshEditor();
+  }, [refreshEditor]);
+
+  useEffect(() => {
+    if (error) scrollToError(errorRef);
+  }, [error, scrollToError]);
+
+  function addMember(member: MemberIdentityOption) {
+    // Defence-in-depth: a view-only (or still-resolving) admin must not mutate
+    // the pending member set even if a control slips past the disabled gate.
+    if (!canEdit) return;
+    setSelectedMembers((current) => [...current, member]);
+    setMemberSearch("");
+  }
+
+  function removeMember(id: string) {
+    if (!canEdit) return;
+    setSelectedMembers((current) => current.filter((member) => member.id !== id));
+  }
+
+  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!canEdit) return;
+    setError("");
+    setStatusMessage("");
+
+    if (selectedMembers.length < 1) {
+      setError("At least one member is required");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const res = await fetch(`/api/admin/family-groups/${groupId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: formName.trim(),
+          memberIds: selectedMembers.map((member) => member.id),
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || "Failed to save family group");
+        return;
+      }
+
+      scrollToTop(editorRef);
+      onChanged?.();
+      onClose();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!canEdit) return;
+    if (!confirm("Delete this family group? Members will be unlinked.")) return;
+
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/admin/family-groups/${groupId}`, { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.error || "Failed to delete family group");
+        return;
+      }
+
+      onChanged?.();
+      onClose();
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  async function sendPasswordSetupInvite(member: FamilyGroupMemberRow) {
+    if (!canEdit) return;
+    setSetupInviteSendingId(member.id);
+    setSetupInviteMessages((current) => {
+      const next = { ...current };
+      delete next[member.id];
+      return next;
+    });
+
+    try {
+      const res = await fetch("/api/admin/members/send-setup-invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memberIds: [member.id] }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || data.sent !== 1) {
+        setSetupInviteMessages((current) => ({
+          ...current,
+          [member.id]: data.error || "Password setup email could not be sent.",
+        }));
+        return;
+      }
+
+      setSetupInviteMessages((current) => ({
+        ...current,
+        [member.id]: "Password setup email sent.",
+      }));
+    } finally {
+      setSetupInviteSendingId((current) => (current === member.id ? null : current));
+    }
+  }
+
+  async function saveLoginHolder(cluster: SharedEmailCluster) {
+    if (!canEdit) return;
+    const newHolderId = loginHolderSelections[cluster.email];
+    if (!newHolderId) {
+      setLoginHolderErrors((current) => ({
+        ...current,
+        [cluster.email]: "Choose an adult member before saving.",
+      }));
+      return;
+    }
+
+    setLoginHolderSavingEmail(cluster.email);
+    setLoginHolderErrors((current) => {
+      const next = { ...current };
+      delete next[cluster.email];
+      return next;
+    });
+    setLoginHolderMessages((current) => {
+      const next = { ...current };
+      delete next[cluster.email];
+      return next;
+    });
+
+    try {
+      const res = await fetch(`/api/admin/family-groups/${groupId}/login-holder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: cluster.email, newHolderId }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        setLoginHolderErrors((current) => ({
+          ...current,
+          [cluster.email]: data.error || "Failed to save login holder.",
+        }));
+        return;
+      }
+
+      setLoginHolderMessages((current) => ({
+        ...current,
+        [cluster.email]: "Login holder updated.",
+      }));
+      await refreshEditor();
+      onChanged?.();
+    } finally {
+      setLoginHolderSavingEmail((current) => (current === cluster.email ? null : current));
+    }
+  }
+
+  /*
+    #2160: the view-only explanation lives here, once, at the top of the section —
+    announced on arrival and ahead of the controls it explains — instead of on
+    each disabled button below. The `role="status"` wrapper is permanently
+    mounted so the live region is registered in the accessibility tree before its
+    content appears; a region injected already-populated is silently dropped by
+    some screen-reader/browser pairings. It is rendered in EVERY return branch,
+    including the loading one, and sits OUTSIDE the card's `space-y-*` stack so
+    the empty wrapper an edit-capable admin gets costs no layout.
+
+    `renderViewOnlyBanner={false}` suppresses it for the one parent that already
+    covers this editor with its own banner (`/admin/family-groups`, which renders
+    the editor inline under a page banner). The dialog mount keeps the default:
+    a dialog is its own accessibility container, so the ancestor banner does not
+    reach it and this is the only explanation the admin gets there.
+  */
+  const viewOnlyBanner = renderViewOnlyBanner ? (
+    <AdminViewOnlySectionBanner canEdit={canEdit} className="mb-6">
+      Your admin role can view this family group but cannot change it.
+    </AdminViewOnlySectionBanner>
+  ) : null;
+
+  if (loading) {
+    return (
+      <div>
+        {viewOnlyBanner}
+        <Card>
+          <CardContent className="p-6 text-sm text-muted-foreground">Loading family group...</CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (!group) {
+    return (
+      <div>
+        {viewOnlyBanner}
+        <Card>
+          <CardContent className="space-y-3 p-6">
+            <p className="text-sm text-danger-11">{error || "Family group not found"}</p>
+            <Button type="button" variant="outline" onClick={onClose}>
+              Close
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {viewOnlyBanner}
+    <Card ref={editorRef}>
+      <CardHeader>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle className="text-lg">Edit Family Group</CardTitle>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Rename the group, manage linked members, review pending requests, or swap a shared-email login holder.
+            </p>
+          </div>
+          <ViewOnlyActionButton
+            canEdit={canEdit}
+            describeReason={false}
+            type="button"
+            variant="outline"
+            size="sm"
+            className="text-danger-11 hover:bg-danger-3 hover:text-danger-11"
+            onClick={handleDelete}
+            disabled={deleting}
+          >
+            <Trash2 className="h-4 w-4" />
+            {deleting ? "Deleting..." : "Delete"}
+          </ViewOnlyActionButton>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        {error && (
+          <p
+            ref={errorRef}
+            role="alert"
+            tabIndex={-1}
+            className="scroll-mt-20 text-sm text-danger-11 focus:outline-none"
+          >
+            {error}
+          </p>
+        )}
+        {statusMessage && <p className="text-sm text-success-11">{statusMessage}</p>}
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <Label htmlFor={`family-group-name-${groupId}`}>Group Name</Label>
+            <Input
+              id={`family-group-name-${groupId}`}
+              value={formName}
+              onChange={(event) => setFormName(event.target.value)}
+              required
+              disabled={canEdit !== true}
+              {...groupNameHint.fieldProps}
+            />
+            <FieldHint {...groupNameHint.hintProps}>
+              Example: Smith Family
+            </FieldHint>
+          </div>
+
+          <div>
+            <Label>Members</Label>
+            {selectedMembers.length > 0 && (
+              <div className="mb-2 mt-2 flex flex-wrap gap-2">
+                {selectedMembers.map((member) => {
+                  const memberInfo = group.members.find((groupMember) => groupMember.id === member.id);
+                  return (
+                    <Badge
+                      key={member.id}
+                      variant="secondary"
+                      // #2568: `flex-wrap` and `max-w-full` so a long name plus
+                      // an age tier plus an age stays inside the pill on a phone
+                      // instead of overflowing the row.
+                      className="flex max-w-full flex-wrap items-center gap-1 px-2 py-1"
+                    >
+                      <span className="break-words">{getMemberName(member)}</span>
+                      {memberInfo?.ageTier && <AgeTierBadge tier={memberInfo.ageTier} />}
+                      {/* Identity-sensitive: this pill's X removes this member
+                          from the group (#2568). */}
+                      <MemberAgeChip ageLabel={member.ageLabel ?? memberInfo?.ageLabel} />
+                      <button
+                        type="button"
+                        onClick={() => removeMember(member.id)}
+                        disabled={canEdit !== true}
+                        title={canEdit === false ? ADMIN_VIEW_ONLY_ACTION_REASON : undefined}
+                        className="ml-1 hover:text-danger-11 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-current"
+                        aria-label={`Remove ${getMemberName(member)}`}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </Badge>
+                  );
+                })}
+              </div>
+            )}
+            <div className="relative">
+              <Input
+                value={memberSearch}
+                onChange={(event) => setMemberSearch(event.target.value)}
+                placeholder="Search members by name or email..."
+                disabled={canEdit !== true}
+              />
+              {searching && (
+                <div className="absolute right-3 top-2.5 text-xs text-muted-foreground">
+                  Searching...
+                </div>
+              )}
+              {searchResults.length > 0 && (
+                <div className="absolute z-10 mt-1 max-h-48 w-full overflow-y-auto rounded-md border bg-card shadow-lg">
+                  {searchResults.map((member) => (
+                    <button
+                      key={member.id}
+                      type="button"
+                      onClick={() => addMember(member)}
+                      disabled={canEdit !== true}
+                      className="w-full px-3 py-2 text-left text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {/* #2568: linking an existing member is identity-sensitive,
+                          so the age is on the row being clicked. */}
+                      <span className="flex flex-wrap items-center gap-2">
+                        <span className="break-words font-medium">{getMemberName(member)}</span>
+                        <MemberAgeChip ageLabel={member.ageLabel} />
+                      </span>
+                      <span className="block break-words text-muted-foreground">
+                        {member.email}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Add adults, youth, or children to this family group
+            </p>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <ViewOnlyActionButton
+              canEdit={canEdit}
+              describeReason={false}
+              type="submit"
+              disabled={submitting || selectedMembers.length < 1}
+            >
+              {submitting ? "Saving..." : "Update Group"}
+            </ViewOnlyActionButton>
+            <Button type="button" variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+          </div>
+        </form>
+
+        <FamilyGroupLoginHolderSection
+          canEdit={canEdit}
+          clusters={sharedEmailClusters}
+          selections={loginHolderSelections}
+          savingEmail={loginHolderSavingEmail}
+          errors={loginHolderErrors}
+          messages={loginHolderMessages}
+          setupInviteSendingId={setupInviteSendingId}
+          setupInviteMessages={setupInviteMessages}
+          onSelectLoginHolder={(email, memberId) =>
+            setLoginHolderSelections((current) => ({
+              ...current,
+              [email]: memberId,
+            }))
+          }
+          onSaveLoginHolder={saveLoginHolder}
+          onSendPasswordSetupInvite={sendPasswordSetupInvite}
+        />
+
+        <section className="space-y-3 rounded-lg border border-border p-4">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">Pending family changes</h3>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Review requests that target this family group.
+            </p>
+          </div>
+          {requests.length === 0 ? (
+            <p className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">
+              No pending requests for this group.
+            </p>
+          ) : (
+            <FamilyGroupRequestReviewSection
+              requests={requests}
+              onReviewed={async () => {
+                await refreshEditor();
+                onChanged?.();
+              }}
+              idPrefix="editor-"
+              createMemberNoun="adult"
+              canEdit={canEdit}
+            />
+          )}
+        </section>
+      </CardContent>
+    </Card>
+    </div>
+  );
+}

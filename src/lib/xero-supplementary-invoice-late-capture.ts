@@ -1,0 +1,601 @@
+/**
+ * WHAT A CAPTURED ADDITIONAL PAYMENT DOES TO ITS XERO SUPPLEMENTARY INVOICE
+ * (#3641, `INV-PAY-104`), split from `xero-operation-outbox.ts`, which owns the
+ * queue, the release write and the per-anchor lock this module reuses. The
+ * waiting-invoice reaper (`xero-waiting-invoice-reaper.ts`) sits above it.
+ */
+import type { PaymentStatus, Prisma } from "@prisma/client";
+import logger from "@/lib/logger";
+import { prisma } from "@/lib/prisma";
+import { SUPERSEDED_INTENT_OPERATION_TYPES } from "@/lib/superseded-intent-ownership";
+import { isLateCaptureRefundedBookingStatus } from "@/lib/additional-payment-chase";
+import {
+  decideLateCapture,
+  type LateCaptureRefundState,
+} from "@/lib/late-capture-kept-xero-rules";
+import { sendAdminXeroSyncErrorAlert } from "@/lib/email";
+import { supplementaryInvoiceBilledCents } from "@/lib/xero-operation-outbox-payload";
+import {
+  billedByOthers,
+  CAPTURED_NOT_ISSUED_ERROR_CODE,
+  captureRefusalFor,
+  ISSUE_REFUSAL_TEXT,
+  STALE_WAITING_PAYMENT_ERROR_CODE,
+  type CapturedTransaction,
+  type IssueRefusal,
+} from "@/lib/xero-supplementary-invoice-capture-rules";
+import {
+  SUPPLEMENTARY_INVOICE_CREATE_WHERE,
+  stillWaitingOnIntentWhere,
+  supplementaryInvoicesNamingIntentWhere,
+} from "@/lib/xero-supplementary-invoice-statuses";
+import { alertTakenBackInvoicesPaidAgain, returnMovedInvoicesToCapturedIntent } from "@/lib/superseded-ask-invoice-return";
+import {
+  attachPaymentIntentToWaitingSupplementaryInvoiceOperations,
+  hasReleasedXeroSupplementaryInvoiceOperationsForPaymentIntent,
+  releaseWaitingSupplementaryInvoiceOperations,
+} from "@/lib/xero-operation-outbox";
+import { lockSupplementaryInvoiceAnchor } from "@/lib/xero-supplementary-invoice-enqueue";
+import { enqueueAdditionalCaptureReceiptOperation } from "@/lib/additional-capture-receipt-enqueue";
+import {
+  reviveRetiredSupplementaryInvoice,
+  type RetiredInvoiceRevival,
+} from "@/lib/xero-supplementary-invoice-revive";
+
+/**
+ * What a captured additional payment did to its Xero supplementary invoice.
+ * Every outcome is named, so "released nothing" is never silent.
+ */
+export type CapturedAdditionalPaymentXeroOutcome =
+  /** A waiting invoice was released now. */
+  | "released"
+  /** An invoice the reaper had retired was re-queued now, from that same row. */
+  | "requeued"
+  /** An earlier call, or another invoice for the same request, already covers it. */
+  | "already-released"
+  /** No supplementary invoice was ever parked on this intent (no issued primary invoice, or Xero not in use). */
+  | "none-queued"
+  /**
+   * #3953 (`INV-PAY-139`): none was parked, and the booking's primary invoice
+   * exists, so the capture's own receipt was queued by this call
+   * (`enqueueAdditionalCaptureReceiptOperation`). Counted in `released`, so
+   * every caller kicks the outbox for it; a replay finds it queued and
+   * answers `already-released`.
+   */
+  | "receipt-queued"
+  /** Issuing the invoice was not safe, so an officer was told instead, by this call. */
+  | "alerted"
+  /** An earlier capture of this intent already told an officer; nothing new. */
+  | "already-alerted"
+  /**
+   * The capture is one that is REFUNDED rather than kept
+   * (`lateCaptureRefundState`: an approved treasurer task, or with no task a
+   * CANCELLED booking or a superseded intent), so no invoice is released or
+   * re-queued for it; a waiting one is left for the reaper to retire. The
+   * refund path's Xero correction counts on that.
+   */
+  | "left-retired"
+  /**
+   * #3635: a treasurer is still deciding whether to refund or keep it (an OPEN
+   * #3639 approval task). Nothing is touched: a waiting invoice stays waiting
+   * and a retired one stays retired, until the decision releases or retires it.
+   */
+  | "awaiting-decision";
+
+/**
+ * WHAT HAPPENS TO THIS CAPTURE'S MONEY: refunded, awaiting a treasurer, or
+ * kept? (#3641 review round, delta D1; three-valued since #3635.) This loads
+ * the facts and asks the one decision, `decideLateCapture`
+ * (`late-capture-kept-xero-rules.ts`), which the dismissal, the kept-capture
+ * worker and the repair tool ask too (`INV-SSOT`).
+ *
+ * A DISMISSED task is kept even when the capture has since been refunded in
+ * the Stripe dashboard: the receipt is recorded gross and the refund is
+ * answered by its own refund credit note (orchestrator decision 29 Sep 2026).
+ * The superseded-intent read is taken only where it can change the answer.
+ */
+
+export async function lateCaptureRefundState(params: {
+  paymentIntentId: string;
+  bookingStatus: string | null | undefined;
+}): Promise<LateCaptureRefundState> {
+  const task = await prisma.manualRefundTask.findUnique({
+    where: { lateCaptureApprovalIntentId: params.paymentIntentId },
+    select: { status: true },
+  });
+  const superseded =
+    !task && !isLateCaptureRefundedBookingStatus(params.bookingStatus)
+      ? (await prisma.paymentRecoveryOperation.findFirst({
+          where: {
+            paymentIntentId: params.paymentIntentId,
+            type: { in: [...SUPERSEDED_INTENT_OPERATION_TYPES] },
+          },
+          select: { id: true },
+        })) !== null
+      : false;
+  return decideLateCapture({
+    taskStatus: task?.status ?? null,
+    bookingStatus: params.bookingStatus,
+    superseded,
+    capture: null,
+  }).state;
+}
+
+/**
+ * Which retired row answers a capture, when a change has several on one intent
+ * (#3641 review round, N1): the one billing the MOST. An ask on one change only
+ * ever grows (the restate never lowers, `restatePendingSupplementaryInvoiceAmount`),
+ * so the largest is the current ask whatever order the rows were written in; a
+ * stale, smaller settlement replayed after a larger row was retired is newer
+ * but not current. Ties go to the newest.
+ */
+function byCurrentAsk(
+  a: { requestPayload: Prisma.JsonValue | null; createdAt: Date },
+  b: { requestPayload: Prisma.JsonValue | null; createdAt: Date },
+): number {
+  const billed = (row: { requestPayload: Prisma.JsonValue | null }) =>
+    supplementaryInvoiceBilledCents(row.requestPayload) ?? -1;
+  return (
+    billed(b) - billed(a) || b.createdAt.getTime() - a.createdAt.getTime()
+  );
+}
+
+/**
+ * Which retired rows a capture may still revive. `STALE_WAITING_PAYMENT_COVERED`
+ * is absent: that stamp is terminal. One list for the release and the keep
+ * (`INV-SSOT`); the keep passes its anchor, the release passes none.
+ */
+const RETIRED_INVOICE_CANDIDATE_CODES = [
+  STALE_WAITING_PAYMENT_ERROR_CODE,
+  CAPTURED_NOT_ISSUED_ERROR_CODE,
+] as const;
+
+const retiredInvoiceCandidateSelect = {
+  id: true,
+  localModel: true,
+  localId: true,
+  lastErrorCode: true,
+  requestPayload: true,
+  createdAt: true,
+} as const;
+
+function retiredInvoiceCandidateWhere(paymentIntentId: string, anchorId: string | null) {
+  return {
+    ...SUPPLEMENTARY_INVOICE_CREATE_WHERE,
+    status: "CANCELLED" as const,
+    // Every supplementary enqueue writes both; the lock needs the anchor.
+    localModel: { not: null },
+    localId: anchorId ?? { not: null },
+    lastErrorCode: { in: [...RETIRED_INVOICE_CANDIDATE_CODES] },
+    requestPayload: { path: ["paymentIntentId"], equals: paymentIntentId },
+  };
+}
+
+type RetiredInvoiceCandidate = {
+  id: string;
+  localModel: string | null;
+  localId: string | null;
+  lastErrorCode: string | null;
+  requestPayload: Prisma.JsonValue;
+  createdAt: Date;
+};
+
+/**
+ * The largest ask on one anchor, after `byCurrentAsk`. A captured refusal at
+ * the top has already been alerted. Older stale siblings are the ones a
+ * revival stamps covered.
+ */
+function pickRetiredInvoiceToRevive<T extends { id: string; lastErrorCode: string | null }>(
+  sorted: readonly T[],
+):
+  | { kind: "none" }
+  | { kind: "already-alerted" }
+  | { kind: "revive"; newest: T; supersededIds: string[] } {
+  const [newest, ...older] = sorted;
+  if (!newest) return { kind: "none" };
+  if (newest.lastErrorCode === CAPTURED_NOT_ISSUED_ERROR_CODE) return { kind: "already-alerted" };
+  return {
+    kind: "revive",
+    newest,
+    supersededIds: older
+      .filter((row) => row.lastErrorCode === STALE_WAITING_PAYMENT_ERROR_CODE)
+      .map((row) => row.id),
+  };
+}
+
+/** The officer alert for a retired row a capture refused to revive: one shape for the release and the keep (`INV-SSOT`). */
+function retiredRefusalAlert(
+  operation: Pick<RetiredInvoiceCandidate, "id" | "localModel" | "localId">,
+  paymentIntentId: string,
+  reason: IssueRefusal,
+): InvoiceNotIssuedAlert {
+  return {
+    operationId: operation.id,
+    localModel: operation.localModel,
+    localId: operation.localId,
+    paymentIntentId,
+    reason,
+    wasRetired: true,
+  };
+}
+
+async function loadRetiredInvoiceCandidates(
+  db: Prisma.TransactionClient | typeof prisma,
+  paymentIntentId: string,
+  anchorId: string | null,
+): Promise<RetiredInvoiceCandidate[]> {
+  const rows = await db.xeroSyncOperation.findMany({
+    where: retiredInvoiceCandidateWhere(paymentIntentId, anchorId),
+    select: retiredInvoiceCandidateSelect,
+  });
+  return rows.sort(byCurrentAsk);
+}
+
+/**
+ * THE LATE-SUCCESS RELEASE (#3641, `INV-PAY-104`). Every caller that has seen
+ * an additional PaymentIntent captured calls this: the Stripe webhook's two
+ * arms, the confirm route's two arms, and the reaper when it finds a waiting
+ * invoice whose payment already arrived.
+ *
+ * 1. A WAITING invoice on the intent is released, unless the capture does not
+ *    cover it (`captureRefusalFor`), in which case it is cancelled unsent and an
+ *    officer is told, once.
+ * 2. An invoice the reaper RETIRED (`STALE_WAITING_PAYMENT`) is re-queued from
+ *    THAT ROW, never a new one: its payload, correlation key and idempotency key
+ *    are the ones it was always going to be sent with, so no second key can
+ *    reach Xero. Only ONE retired row per booking change is decided, the one
+ *    billing the most (`byCurrentAsk`: a raised ask queues a second row on the
+ *    same intent, and reviving a smaller one would under-invoice); the others
+ *    are stamped covered.
+ *
+ * EXACTLY ONCE, and why. The re-queue runs under the per-anchor
+ * supplementary-invoice lock (`lockSupplementaryInvoiceAnchor`), the lock
+ * `enqueueXeroSupplementaryInvoiceOperation` decides "does this change already
+ * have an invoice going out?" under, and every write is an `updateMany` guarded
+ * on the retired status AND code. The two callers racing, or a replay, serialise:
+ * one wins the write, every later caller matches nothing.
+ *
+ * WHERE IT ALERTS INSTEAD: the capture does not cover the invoice, or the change
+ * already has an active supplementary-invoice link, or another outstanding
+ * invoice for a different ask. An invoice for this SAME request already on its
+ * way or sent is not a reason to alert: that one covers the capture, and the
+ * retired row is stamped covered so the second caller does not alert either.
+ *
+ * WHERE IT DOES NEITHER: a refunded capture (`lateCaptureRefundState`: an
+ * approved treasurer task, or with no task a CANCELLED booking or a superseded
+ * intent). Nothing is released or revived, waiting or retired, because the
+ * refund path's Xero correction assumes the invoice was never sent
+ * (`left-retired`). Nor while a treasurer is still deciding
+ * (`awaiting-decision`). A kept capture - including one on a CANCELLED booking
+ * whose treasurer task was dismissed (#3635) - is released, re-queued or
+ * alerted like any booking; the dismissal calls this itself.
+ */
+export async function releaseXeroSupplementaryInvoiceForCapturedPaymentIntent(
+  paymentIntentId: string,
+): Promise<{
+  released: number;
+  queueOperationIds: string[];
+  outcome: CapturedAdditionalPaymentXeroOutcome;
+}> {
+  const captured = await prisma.paymentTransaction.findFirst({
+    where: { source: "STRIPE", stripePaymentIntentId: paymentIntentId },
+    select: {
+      status: true,
+      amountCents: true,
+      payment: { select: { bookingId: true, booking: { select: { status: true } } } },
+    },
+  });
+  const transaction: CapturedTransaction = captured
+    ? { status: captured.status, amountCents: captured.amountCents }
+    : null;
+
+  // Only a capture the club KEEPS is invoiced. A refunded one releases and
+  // revives nothing: a waiting invoice is left for the reaper to retire, a
+  // retired one stays retired. One awaiting a treasurer's decision is left
+  // exactly as it is.
+  const refundState = await lateCaptureRefundState({
+    paymentIntentId,
+    bookingStatus: captured?.payment?.booking?.status,
+  });
+  if (refundState === "refunded") {
+    logger.warn(
+      { paymentIntentId },
+      "Captured additional payment is one that is refunded; its Xero supplementary invoice is left unsent",
+    );
+    return { released: 0, queueOperationIds: [], outcome: "left-retired" };
+  }
+  if (refundState === "awaiting-decision") {
+    logger.info(
+      { paymentIntentId },
+      "Captured additional payment is awaiting a treasurer's refund decision; its Xero supplementary invoice is left as it is",
+    );
+    return { released: 0, queueOperationIds: [], outcome: "awaiting-decision" };
+  }
+
+  // #3403 review (M1): a capture of a superseded ask takes back the invoices first parked on it.
+  await returnMovedInvoicesToCapturedIntent(paymentIntentId);
+  const waiting = await releaseWaitingInvoicesForCapture(
+    paymentIntentId,
+    transaction,
+  );
+  // Review 2 (F3): an invoice taken back from this request by its change's own capture was paid twice.
+  await alertTakenBackInvoicesPaidAgain(paymentIntentId);
+
+  const retiredOperations = await loadRetiredInvoiceCandidates(prisma, paymentIntentId, null);
+
+  const byAnchor = new Map<string, typeof retiredOperations>();
+  for (const operation of retiredOperations) {
+    const anchorId = operation.localId as string;
+    byAnchor.set(anchorId, [...(byAnchor.get(anchorId) ?? []), operation]);
+  }
+
+  const requeuedIds: string[] = [];
+  let alerted = waiting.alerted;
+  let alreadyAlerted = false;
+  for (const [anchorId, operations] of byAnchor) {
+    const picked = pickRetiredInvoiceToRevive(operations);
+    if (picked.kind === "none") continue;
+    if (picked.kind === "already-alerted") {
+      alreadyAlerted = true;
+      continue;
+    }
+    const { newest } = picked;
+    const verdict = await requeueRetiredSupplementaryInvoiceOperation({
+      operation: { ...newest, localModel: newest.localModel as string },
+      anchorId,
+      supersededIds: picked.supersededIds,
+      paymentIntentId,
+      transaction,
+      bookingId: captured?.payment?.bookingId ?? null,
+    });
+    if (verdict.outcome === "requeued") {
+      requeuedIds.push(newest.id);
+    } else if (verdict.outcome === "refused") {
+      alerted = true;
+      await alertInvoiceNotIssuedOnCapture(retiredRefusalAlert(newest, paymentIntentId, verdict.reason));
+    }
+  }
+
+  if (requeuedIds.length > 0) {
+    logger.warn(
+      { paymentIntentId, queueOperationIds: requeuedIds },
+      "Re-queued a Xero supplementary invoice the reaper had retired before its payment was captured",
+    );
+  }
+
+  const released = waiting.released + requeuedIds.length;
+  const queueOperationIds = [
+    ...new Set([...waiting.queueOperationIds, ...requeuedIds]),
+  ];
+  let outcome: CapturedAdditionalPaymentXeroOutcome;
+  if (requeuedIds.length > 0) outcome = "requeued";
+  else if (waiting.released > 0) outcome = "released";
+  else if (alerted) outcome = "alerted";
+  else if (alreadyAlerted) outcome = "already-alerted";
+  else if (retiredOperations.length > 0) outcome = "already-released";
+  else {
+    const alreadyReleased =
+      await hasReleasedXeroSupplementaryInvoiceOperationsForPaymentIntent(
+        paymentIntentId,
+      );
+    if (!alreadyReleased) {
+      logger.info(
+        { paymentIntentId },
+        "Captured additional payment has no Xero supplementary invoice parked on it",
+      );
+      // #3953: nothing waits on this capture, so its own receipt records it
+      // against the invoice that bills it - once, whoever calls first.
+      const receipt = await enqueueAdditionalCaptureReceiptOperation(paymentIntentId);
+      if (receipt.outcome === "queued") {
+        return { released: released + 1, queueOperationIds: [...queueOperationIds, receipt.queueOperationId], outcome: "receipt-queued" };
+      }
+      if (receipt.outcome === "already-queued") {
+        return { released, queueOperationIds, outcome: "already-released" };
+      }
+    }
+    outcome = alreadyReleased ? "already-released" : "none-queued";
+  }
+  return { released, queueOperationIds, outcome };
+}
+
+/**
+ * Step 1: the still-waiting invoices on this intent. Each that the capture
+ * covers is released through the outbox's one release write; each it does not
+ * is cancelled unsent (guarded on WAITING_PAYMENT, which is also the alert's
+ * claim) and an officer is told.
+ */
+async function releaseWaitingInvoicesForCapture(
+  paymentIntentId: string,
+  transaction: CapturedTransaction,
+): Promise<{ released: number; queueOperationIds: string[]; alerted: boolean }> {
+  // #3403 review (M2): every invoice naming the capture, read once; those
+  // already released or sent count first, and each waiting one is issued only
+  // while all of them together fit what was captured.
+  const naming = await prisma.xeroSyncOperation.findMany({
+    where: supplementaryInvoicesNamingIntentWhere(paymentIntentId),
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: { id: true, status: true, localModel: true, localId: true, requestPayload: true },
+  });
+  const waitingOperations = naming.filter((operation) => operation.status === "WAITING_PAYMENT");
+  let billedCents = billedByOthers(naming.filter((operation) => operation.status !== "WAITING_PAYMENT"));
+
+  const issuableIds: string[] = [];
+  let alerted = false;
+  for (const operation of waitingOperations) {
+    const refusal = captureRefusalFor(transaction, operation.requestPayload, billedCents);
+    if (!refusal) {
+      issuableIds.push(operation.id);
+      billedCents += supplementaryInvoiceBilledCents(operation.requestPayload) ?? 0;
+      continue;
+    }
+    // Review 2 (F4): guarded on the intent too, as the release is - one taken
+    // back by a superseded ask's own capture since is not this capture's to refuse.
+    const claimed = await prisma.xeroSyncOperation.updateMany({
+      where: { id: operation.id, ...stillWaitingOnIntentWhere(paymentIntentId) },
+      data: {
+        status: "CANCELLED",
+        completedAt: new Date(),
+        lastErrorCode: CAPTURED_NOT_ISSUED_ERROR_CODE,
+        lastErrorMessage: `The linked payment was captured, and this invoice was not issued: ${ISSUE_REFUSAL_TEXT[refusal]}.`,
+      },
+    });
+    if (claimed.count === 1) {
+      alerted = true;
+      await alertInvoiceNotIssuedOnCapture({
+        operationId: operation.id,
+        localModel: operation.localModel,
+        localId: operation.localId,
+        paymentIntentId,
+        reason: refusal,
+        wasRetired: false,
+      });
+    }
+  }
+
+  const released = await releaseWaitingSupplementaryInvoiceOperations(issuableIds, paymentIntentId);
+  return { ...released, alerted };
+}
+
+async function requeueRetiredSupplementaryInvoiceOperation(args: {
+  operation: {
+    id: string;
+    localModel: string;
+    requestPayload: Prisma.JsonValue | null;
+  };
+  anchorId: string;
+  /** Older retired rows on this change and intent: stamped covered, whatever is decided here. */
+  supersededIds: string[];
+  paymentIntentId: string;
+  transaction: CapturedTransaction;
+  /** The capture's booking, for its receipt check (#3953); null with no capture. */
+  bookingId: string | null;
+}): Promise<RetiredInvoiceRevival> {
+  return prisma.$transaction(async (tx) => {
+    await lockSupplementaryInvoiceAnchor(tx, args.anchorId);
+    return reviveRetiredSupplementaryInvoice(tx, args);
+  });
+}
+
+/**
+ * What the keep's in-transaction revival did (#4382, #5220). `requeued` names
+ * the row now PENDING, so the keep can queue its receipt on the same
+ * transaction; `refused` carries the alert the keep sends after it commits,
+ * the stamp having won its claim here. `none` is no revivable row on the
+ * anchor, or one already stamped captured (alerted before).
+ */
+export type KeptCaptureRevival =
+  | { outcome: "none" }
+  | { outcome: "already" }
+  | { outcome: "requeued"; operationId: string }
+  | { outcome: "refused"; alert: InvoiceNotIssuedAlert };
+
+/**
+ * #4382: a keep revives the retired change invoice on the anchor it already
+ * holds, inside the dismissal's transaction. The same row and the same
+ * guarded writes as the late-success release, the refusal's
+ * `STALE_WAITING_PAYMENT_CAPTURED` stamp included (#5220). A row on any other
+ * anchor is left for the after-commit release. No email here.
+ */
+export async function reviveRetiredChangeInvoiceForKeptCapture(params: {
+  store: Prisma.TransactionClient;
+  paymentIntentId: string;
+  anchorId: string;
+  bookingId: string;
+  transaction: { status: PaymentStatus; amountCents: number };
+}): Promise<KeptCaptureRevival> {
+  const picked = pickRetiredInvoiceToRevive(
+    await loadRetiredInvoiceCandidates(params.store, params.paymentIntentId, params.anchorId),
+  );
+  if (picked.kind !== "revive") return { outcome: "none" };
+  const { newest } = picked;
+  const verdict = await reviveRetiredSupplementaryInvoice(params.store, {
+    operation: { id: newest.id, localModel: newest.localModel as string, requestPayload: newest.requestPayload },
+    anchorId: params.anchorId,
+    supersededIds: picked.supersededIds,
+    paymentIntentId: params.paymentIntentId,
+    transaction: params.transaction,
+    bookingId: params.bookingId,
+  });
+  if (verdict.outcome === "requeued") return { outcome: "requeued", operationId: newest.id };
+  if (verdict.outcome === "already") return verdict;
+  return { outcome: "refused", alert: retiredRefusalAlert(newest, params.paymentIntentId, verdict.reason) };
+}
+
+/**
+ * THE RECOVERY'S ATTACH, which must not strand an invoice (#3641 review round).
+ * A failed mint's recovery points the change's waiting invoice at the intent it
+ * finally minted, the only thing that lets a capture release it. When that
+ * write failed it was logged and forgotten, and the invoice then waited on no
+ * intent until the age backstop retired it while the member paid. Now an
+ * officer is told. A capture that lands BEFORE a successful attach is picked up
+ * by the reaper, which releases a waiting invoice whose payment has arrived.
+ */
+export async function attachRecoveredIntentToWaitingSupplementaryInvoice(params: {
+  bookingModificationId: string;
+  paymentIntentId: string;
+  recoveryOperationId: string;
+}): Promise<void> {
+  try {
+    await attachPaymentIntentToWaitingSupplementaryInvoiceOperations({
+      bookingModificationId: params.bookingModificationId,
+      paymentIntentId: params.paymentIntentId,
+    });
+  } catch (err) {
+    logger.error(
+      { err, ...params },
+      "Failed to attach recovered additional intent to waiting Xero operations",
+    );
+    try {
+      await sendAdminXeroSyncErrorAlert({
+        errorType: "SUPPLEMENTARY_INVOICE_INTENT_NOT_ATTACHED",
+        operation: `Supplementary invoice for booking change ${params.bookingModificationId}`,
+        errorMessage: `A recovered card payment request (${params.paymentIntentId}) could not be linked to this booking change's waiting Xero supplementary invoice, so paying it will not release that invoice. Check the change's Xero invoice once the member pays (payment recovery operation ${params.recoveryOperationId}).`,
+        timestamp: new Date(),
+      });
+    } catch (alertErr) {
+      logger.error(
+        { err: alertErr, ...params },
+        "Failed to send the unattached-supplementary-invoice alert",
+      );
+    }
+  }
+}
+
+/** The officer alert for an invoice a capture did not issue; JSON-safe, so a keep's plan can carry it past its commit. */
+export type InvoiceNotIssuedAlert = {
+  operationId: string;
+  localModel: string | null;
+  localId: string | null;
+  paymentIntentId: string;
+  reason: IssueRefusal;
+  wasRetired: boolean;
+};
+
+/**
+ * Best-effort; never throws. The operation's own stamp is the durable record.
+ * Sent only by the caller whose `STALE_WAITING_PAYMENT_CAPTURED` claim won,
+ * after that claim committed; never inside a transaction.
+ */
+export async function alertInvoiceNotIssuedOnCapture(params: InvoiceNotIssuedAlert): Promise<void> {
+  const when = params.wasRetired
+    ? "after its waiting Xero supplementary invoice had been retired, and the invoice was not re-issued automatically"
+    : "and its waiting Xero supplementary invoice was not issued automatically";
+  const errorMessage = `A card payment (${params.paymentIntentId}) for a booking change was captured ${when} because ${ISSUE_REFUSAL_TEXT[params.reason]}. Stripe holds this money; check Xero has an invoice naming it (${params.localModel ?? "record"} ${params.localId ?? "unknown"}, outbox operation ${params.operationId}).`;
+  logger.error(
+    { ...params },
+    "Captured additional payment met a Xero supplementary invoice that could not be issued",
+  );
+  try {
+    await sendAdminXeroSyncErrorAlert({
+      errorType: "SUPPLEMENTARY_INVOICE_NOT_ISSUED_ON_CAPTURE",
+      operation: `Supplementary invoice for captured payment ${params.paymentIntentId}`,
+      errorMessage,
+      timestamp: new Date(),
+    });
+  } catch (err) {
+    logger.error(
+      { err, operationId: params.operationId },
+      "Failed to send the supplementary-invoice capture alert",
+    );
+  }
+}

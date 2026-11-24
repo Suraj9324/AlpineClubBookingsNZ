@@ -1,0 +1,1015 @@
+# The `admin` audit category, reviewed site by site (#2730)
+
+**What this page is.** A record of every production audit writer that recorded
+`category: "admin"`, read one at a time against the owner's rule that **the
+category follows the business domain the event affected, never who performed
+it**. Twenty-two were wrong and were moved, eighty-seven were read and kept, and
+nine were held for a decision because moving them would publish rows on a
+member-facing surface. This page says why for each, rather than leaving `admin`
+to look like the absence of a decision.
+
+**One of the nine has since been resolved, and the resolution went the other
+way.** #2755 unified the three writers of *an officer editing somebody else's
+member record* on `admin` by moving the two bulk-screen branches IN, rather than
+moving the member-page writer out into a member-visible category. Eight of the
+nine remain held. `admin` therefore read 98 sites after #2755, not 96, and the rule that
+came out of it is `INV-PRIV-012` — which is also where the fifteen lodge-gated
+sites and the `lockers` group (unresolved then, settled by #2777) are now
+recorded, instead of only in the open-question section at the foot of this page.
+
+**And the open question at the foot of this page is closed: they stay (#2765).**
+The test that decided it — *did this site split a subsystem*, not *does it name a
+lodge* — is `INV-PRIV-013`, and the fifteen are pinned per site in
+`LODGE_GATED_ADMIN_CATEGORIES_2765` so the keep no longer depends on the next
+author reading this page. `lockers` went back as its own filed decision, **#2777**,
+not as a sentence here, and was decided on 11 August 2026: the four stay `admin`.
+#2765 records why in terms that can be re-measured rather than re-argued.
+
+**What this page is not.** It is a record of where the platform FILES new rows. It
+changed no row already in the database, which left bed-allocation history split by
+date — a separate reviewed decision, taken in
+[#2751](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/2751), whose
+one-off exact-action migration has since moved the stored rows as well.
+See [Rows already written](#rows-already-written-moved-too-by-2751).
+
+**Why it exists.** `AuditLog.category` is a permission decision, not a label.
+It decides which AI Diagnostics correlation entry can return the row — and
+therefore which admin areas an operator must hold — and whether the member the
+row concerns sees it on their own activity list. [#2581](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/2581)
+gave every writer a category; PR #2676 classified the 82 that had none and
+**explicitly did not read the 118 that already said `admin`**, which is the
+platform's catch-all. #2581's own readiness note said those classifications
+"cannot be assumed correct". This is the pass that checked.
+
+For the taxonomy itself, and which permission each category sits behind, see
+[the support tool pack](tool-pack-support.md) and
+[`src/lib/audit-categories.ts`](../../src/lib/audit-categories.ts). For the
+operator's view of the same table, see [the audit log guide](../guides/audit-log.md).
+
+## The two readerships every verdict below is measured against
+
+| | Who can correlate it in AI Diagnostics | Can the member it concerns see it? |
+| --- | --- | --- |
+| `admin` | `support:view` alone | **No** |
+| `lodge` | `support:view` **+ `lodge:view`** | **No** |
+| `family`, `account`, `privacy`, `communication` | `support:view` **+ `membership:view`** | **Yes** |
+| `security` | `support:view` alone | **Yes** |
+| `booking` | `support:view` **+ `bookings:view`** | Yes |
+| `payment`, `xero` | `support:view` **+ `finance:view`** | payment yes, xero no |
+
+Two consequences run through everything below.
+
+1. **Moving out of `admin` into any non-member category is a narrowing.** A
+   support-only operator loses evidence they can correlate today. They can still
+   read the row in **Admin → Audit Log**, which needs `support` and nothing else,
+   so nothing becomes unreadable — but the AI Diagnostics channel closes.
+2. **Moving out of `admin` into a member-visible category is a widening**, and it
+   is the direction this pass would not take on its own. Every writer in this
+   population passes the acting administrator's own member id as `memberId`, and
+   `buildMemberVisibleAuditLogWhere` matches on it, so *any* such move at minimum
+   publishes the row on the acting administrator's own activity page — and where
+   `subjectMemberId` names a different member, it publishes to that member too.
+   The member projection withholds metadata, request id, IP and drill-downs, but
+   it returns `action`, `summary` and — whenever `details` is not a JSON object —
+   `details` **verbatim**.
+
+Retention is the third axis and it is quiet. `classifyAuditRetention` reads the
+category, so a reclassification can silently change how long a row is kept.
+Every verdict below states whether it does.
+
+## Moved: 22 sites, `admin` → `lodge`
+
+Both a **narrowing** on the AI Diagnostics axis and **retention-neutral**:
+`classifyAuditRetention` returns `critical` (7 years) for all 22 under both the
+old and the new category, measured rather than assumed. Neither category is
+member-visible, so **no row reached a member who could not read it before**.
+
+### Bed allocation — 21 sites
+
+| File | Sites |
+| --- | ---: |
+| `src/app/api/admin/bed-allocation/allocations/bulk/route.ts` | 2 |
+| `src/app/api/admin/bed-allocation/allocations/route.ts` | 2 |
+| `src/app/api/admin/bed-allocation/auto-allocate/route.ts` | 1 |
+| `src/app/api/admin/bed-allocation/beds/[id]/route.ts` | 2 |
+| `src/app/api/admin/bed-allocation/beds/route.ts` | 1 |
+| `src/app/api/admin/bed-allocation/rooms/[id]/route.ts` | 2 |
+| `src/app/api/admin/bed-allocation/rooms/bulk/route.ts` | 1 |
+| `src/app/api/admin/bed-allocation/rooms/import-from-config/route.ts` | 1 |
+| `src/app/api/admin/bed-allocation/rooms/route.ts` | 1 |
+| `src/app/api/admin/bed-allocation/settings/route.ts` | 1 |
+| `src/lib/bed-allocation-approval.ts` | 1 |
+| `src/lib/bed-allocation-manual-writes.ts` | 2 |
+| `src/lib/bed-allocation-range-audit.ts` | 2 |
+| `src/lib/bed-allocation-removal.ts` | 2 |
+
+**Why.** This was the clearest violation in the repository, and it was written
+down: the automatic path in `bed-allocation-lifecycle.ts` carried a comment
+arguing that because "there is no acting member … this is a 'lodge' system event
+rather than an 'admin' action". That is classification by initiator, and the
+three admin-initiated writers of the **same action name** took it at its word.
+`BED_ALLOCATION_PARTNER_PROMOTED` and `BED_ALLOCATION_PARTNERS_PROMOTED` were
+each written into two different permission gates, with the same `entityType`,
+the same `targetId` shape and near-identical summaries.
+
+**What went wrong for a real person.** A Lodge Manager holding Support + Lodge
+asked AI Diagnostics to correlate bed-allocation promotions for a night. The
+Lodge entry read only `lodge`, so it returned the automatic promotions, omitted
+every manual, bulk and range one, and reported that nothing else matched — an
+answer that reads as a bounded absence rather than a partial one. A support-only
+operator got the mirror image. Bed allocation is now wholly `lodge`: 28 sites,
+one gate.
+
+**Who loses.** A support-only operator, and a Booking Officer holding
+`support` + `bookings` but not `lodge` — worth naming, because the routes that
+*write* these rows are gated on `bookings:edit`, not `lodge:edit`. They keep full
+access through Admin → Audit Log. The comment that caused the split has been
+replaced with one that states the affected-domain reason instead.
+
+### `LODGE_DISPLAY_CONFIG_UPDATED` — 1 site
+
+`src/app/api/admin/display/lodge-config/route.ts`. The last writer under
+`/api/admin/display/**` still saying `admin` while its ten siblings said
+`lodge`. Nine of the ten siblings were among #2676's 82, so that sweep is what
+turned a uniformly `admin` subsystem into a split one. An operator with Support +
+Lodge could see every layout, template and device change for a misbehaving kiosk
+but not the config change that caused it.
+
+**The rule this was moved on, stated because other writers pass the same
+surface tests and were NOT moved.** It is not "does it name a Lodge" and not "is
+the route gated `lodge:edit`": `LODGE_CREATED`, `LODGE_UPDATED`,
+`LODGE_SETTINGS_UPDATED` and `LODGE_INSTRUCTION_UPDATED` all carry
+`entityType: "Lodge"` or sit on a `lodge:edit` route, and all of them stay
+`admin`. The test is **whether the site split a subsystem** — whether some other
+writer of the same objects already answered to a different gate, so that no
+operator could get a complete answer. That was true here (ten `lodge` siblings,
+one `admin`) and true of bed allocation (two action names written into two
+gates). It is not true of the `LODGE_*` records-and-settings group, which is
+uniform at `admin`: moving it is a readership change of its own size rather than
+the closing of a split, and it is recorded as the open question below. The rule
+is repeated in a comment at the writer so the next author does not have to find
+this page.
+
+## Rows already written: moved too, by #2751
+
+**The 22 edits changed where the platform files a NEW row, and nothing more.**
+`buildAuditCategoryWhere` (`src/lib/audit-query.ts`) ORs its legacy action-name
+guess in only for rows whose `category` is NULL, so a bed-allocation row written
+before that release carried a hard `"admin"`, matched neither
+`{category: "lodge"}` nor the legacy `LODGE_`/`lodge` clause, and was returned
+under the Admin filter alone. Bed-allocation evidence was therefore split by
+**date** rather than by initiator: in Admin → Audit Log, filtering by Lodge got
+rows from the release forwards and filtering by Admin got the older ones, with
+neither answering a question that spanned the date; in AI Diagnostics the Lodge
+entry returned the newer half and the System entry the older half.
+
+**[#2751](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/2751) closed
+that, and this is the shape of the fix.** One migration,
+`prisma/migrations/20260810020000_backfill_bed_allocation_audit_category`, rewrites
+`category` from `admin` to `lodge` on rows matched by an EXACT literal list of the
+18 distinct action names these 22 sites write — never a prefix, which could not be
+reviewed against the census and would sweep up whatever is added next. `category`
+is the only column in the `SET` clause, so the date, the actor, the subject, the
+summary, the stored details, `retentionClass` and `expiresAt` are all untouched;
+the counts before and after are recorded as one `AUDIT_CATEGORY_BACKFILLED` row in
+the club's own history; and the statement is idempotent, so it can be run again
+after cutover for the rows the draining old colour wrote during the upgrade window.
+
+Two things the backfill did **not** change, and both were checked in the code
+rather than assumed:
+
+- **Retention.** `pruneExpiredAuditLogs` and `archiveEligibleAuditLogs` select on
+  the stored `retentionClass`, `expiresAt`, `severity`, `createdAt` and
+  `archivedAt` columns and never read `category` at all — and
+  `classifyAuditRetention` returns `critical` for every one of these actions under
+  both values anyway, so no row's expiry moved in either direction and none was
+  brought forward for deletion.
+- **What a member sees.** Neither `admin` nor `lodge` is in
+  `MEMBER_VISIBLE_AUDIT_CATEGORIES`, so no row crossed onto a member's own
+  activity list, in either direction.
+
+What the backfill **did** change is who can correlate the older rows in AI
+Diagnostics, and it is the same narrowing this page's 22 moves applied to the new
+ones: a Support-only operator, and a Booking Officer holding Support and Bookings
+but not Lodge, lose them from the System entry and do not gain them in the Lodge
+entry. Everyone with Support access still reads every one of those rows in full in
+Admin → Audit Log, which is why this is a projection change rather than a loss of
+evidence. Both correlation entries' `scope` and `description` are inverted to
+match, and the pack test that used to pin the split now pins its absence.
+
+The generalised rule this produced is **`INV-OPS-012`**: a pull request that
+reclassifies an audit category either ships the backfill for the rows already
+written or files it as an issue — never neither, and never as prose — and a
+backfill that would cross the member-visible boundary in either direction needs
+its own owner decision rather than following the rule automatically. It carries
+the honest limit too, that only the pinned population can be checked
+mechanically.
+
+## Kept: 87 sites
+
+Each group states the affected domain that makes `admin` right, and — where the
+alternative reading is real — what taking it would have cost.
+
+### Platform, club and section configuration — 20 sites
+
+AI assistant and AI Diagnostics settings; club contact and club identity; module
+toggles; member-field settings; notification delivery policies; admin
+notification preferences; public-content settings; email message settings and
+both email-template override writers; membership cancellation, lockout and
+nomination settings; member-guest settings; internet-banking payment settings;
+both booking-message override writers; `booking_request.settings_updated`.
+
+**Kept because the affected domain *is* administration.** These change the club's
+own configuration, not a booking, a member or a payment. This is what `admin`
+means when it is not being used as a catch-all, and a taxonomy with no home for
+"an administrator changed a platform setting" would need to invent one.
+
+Three of these have a live alternative reading and were kept deliberately:
+
+- **`INTERNET_BANKING_PAYMENT_SETTINGS_UPDATED`** could read as `payment`. It
+  configures how money is taken, but takes none; `payment` is reserved for
+  movements of money, which is what makes the Finance entry's answers about a
+  charge trustworthy. The existing model-facing description already names this
+  trap to operators.
+- **The two booking-message writers and `booking_request.settings_updated`**
+  could read as `booking`, and the booking-policy writers #2676 classified *did*
+  go to `booking`. The distinction kept here is that a booking policy is a rule
+  the booking engine evaluates, whereas message wording and request-form settings
+  are presentation and workflow configuration. **This is the weakest keep on the
+  page** and a reasonable reviewer could move all three; it is recorded as a
+  judgement rather than a certainty.
+- **The two email-template writers** could read as `communication`. They were
+  kept because `communication` is member-visible and these writers pass the
+  acting administrator's `memberId`, so moving them would publish template edits
+  on that administrator's own activity page for no operator benefit.
+
+### Access-role definitions — 3 sites
+
+`src/app/api/admin/access-roles/**`. The affected object is the club's admin
+permission model itself. `security` is the alternative and is retention-identical
+(`sensitive_access`, 24 months, because the action contains the word "access")
+and readable by the same `support:view` — but `security` **is** member-visible,
+so the move would publish role-definition edits on the editing administrator's
+activity page and buy nothing.
+
+### Committee roles and assignments — 6 sites
+
+`src/app/api/admin/committee/**`. Club governance structure. `account` was
+considered for the assignment writers, since an assignment names a member; it was
+rejected because the affected record is the committee, and `account` is
+member-visible.
+
+### Configuration import and export — 3 sites
+
+`config-transfer/apply`, `config-transfer/export`, `src/lib/config-transfer/apply.ts`.
+Whole-platform configuration movement. Unambiguously administration.
+
+### Site content and presentation — 15 sites
+
+Page content (4), site banners (3), site content, site style and logo (2), image
+library (2), notices (3). The affected domain is the club's published content.
+`communication` was considered for notices and rejected: the notice *record* is
+content, and the notice *email* already writes `notice.emailSent` under
+`communication` from `src/lib/notices-email.ts` — two events, correctly two
+categories.
+
+### Lodge-gated operational configuration — 15 sites
+
+Chores (3), lockers (4), lodge instructions (2), lodge settings (1), the `LODGE_*`
+lodge records themselves — `LODGE_CREATED` and the `LODGE_UPDATED` /
+`LODGE_ACTIVATED` / `LODGE_DEACTIVATED` writer (2) — and work parties (3).
+
+**Kept in this pass, but this is the group most likely to move next, and it is
+recorded as an open question rather than a settled keep.** Every one of these
+routes except lockers is gated on `lodge:*`, their affected objects are lodge
+artefacts, and at least one has a sibling split of exactly the shape this pass
+fixed elsewhere: `lodge.chore.completed` is written `lodge` from
+`src/app/api/lodge/roster/[date]/route.ts`, while `CHORE_TEMPLATE_UPDATED` — the
+change that alters the roster somebody is completing — is `admin`.
+
+They were not moved here because no decision on #2730 covers them: the issue
+named four defects and gave each a direction to tick, and moving fifteen more
+sites out of the support-only gate is a readership change of its own size. It
+would be a narrowing, member-invisible in both directions, and retention-neutral
+(`critical` either way, and `locker.*` and `workparty.*` contain no access-event
+word). The lockers writers are the odd ones out: their routes are gated
+`membership:*` and a locker is allocated to a named member, so `lodge` is not
+obviously their answer either.
+
+**Both halves of that were decided on #2765 (11 August 2026), and the group is now
+pinned per site.** The fifteen stay `admin` under the rule they were always
+measured against — *did this site split a subsystem* — which is written down as
+`INV-PRIV-013` and enforced by `LODGE_GATED_ADMIN_CATEGORIES_2765`
+(`scripts/audit/audit-writer-census-manifest.ts`), measured from the tree, so a
+third pass that disagrees fails CI instead of landing the change and finding the
+argument afterwards. **`lockers` was decided for `membership`, the move was
+refused on measurement — the intended destination turned out to be
+member-visible, reaching the acting officer's own activity page — and the
+question went back as its own filed decision, #2777, which the owner settled on
+11 August 2026: the four stay `admin`.** The measurement, the declined
+extend-the-taxonomy alternative and the accepted cost are recorded once, in
+`INV-PRIV-013`, with the full option set on #2777 itself.
+
+**Why `LODGE_DISPLAY_CONFIG_UPDATED` moved and `LODGE_UPDATED` did not**, since
+both name a Lodge on a `lodge:edit` route: the display writer was closing a
+**split** — ten siblings in the same subsystem already said `lodge` — whereas
+this group is uniform at `admin`, so moving it would not remove a
+two-gates-for-one-thing defect but open a new readership question. That is the
+rule the whole pass ran on, and it is repeated in a comment at the display
+writer.
+
+**The cost while they stay here is a silent absence, and it is closed.** Before
+this pass the Lodge correlation entry's `scope` named chores, lockers, work
+parties and lodge settings as `admin` but not lodge instructions and not the
+`LODGE_*` records — so "when was this lodge deactivated" returned nothing from
+the Lodge entry with no warning that the answer was in another tool. Both
+entries' `scope` and the Lodge entry's `description` now name the whole set.
+
+### Induction templates — 4 sites
+
+`src/app/api/admin/induction-templates/**`. The sibling reading is real —
+induction *records* are `lodge` (`induction.ts`, `induction-baseline.ts`), and
+both the support pack and the audit-log guide already warn operators that
+induction is filed under `lodge` even though the screen sits under Membership.
+Kept because the template is the club's induction *policy* document rather than
+any lodge's operations, and because the routes are gated `membership:*`, so a
+move to `lodge` would put the evidence behind a permission the people who create
+it do not need. Grouped with the lodge-gated question above for whoever takes the
+next pass.
+
+### Calendar events — 4 sites
+
+`src/app/api/calendar/events/**`. Club calendar administration, gated to calendar
+managers. `calendar.event.join` mints a MiroTalk **host** credential, which makes
+`security` arguable; it was kept because `security` is member-visible and the row
+would then appear on the minting manager's own activity page.
+
+### Membership types — 6 sites
+
+Create, update, delete, reorder and merge. These are the club's membership
+*product definitions* — price bands and eligibility rules — not any member's
+membership. `account` would be wrong for that reason and member-visible besides.
+
+### Member merge — 2 sites
+
+`MEMBER_MERGED` and `MEMBER_MERGE_REFUSED` in `src/lib/member-merge.ts`. Kept,
+and this one is pinned elsewhere: `INV-LIFE-083` records the refusal row as
+`category admin, outcome blocked`, so moving it is a documented-invariant change
+rather than a reclassification. The support pack's model-facing description also
+names "member merges are recorded under admin" to stop an operator reading an
+empty membership-entry result as absence.
+
+### Member import and lodge access — 2 sites
+
+- `member.imported` (`admin/members/import`): a bulk administrative import.
+- `MEMBER_LODGE_ACCESS_UPDATED` (`admin/members/[id]/lodge-access`): **kept, with
+  a retention reason.** The action contains the word "access", so
+  `classifyAuditRetention` returns `sensitive_access` — 24 months — *because* the
+  category is `admin`. Under `lodge` or `account` the same row becomes `critical`
+  and is kept for **seven years**. Moving it is therefore a data-lifecycle change
+  as well as a permission change, and needs to be decided as one.
+
+(The third writer on this surface — the dynamic one in
+`admin-member-detail-service.ts` — was moved out of this section on review. It is
+**held for an owner decision** below.)
+
+### Seasonal membership assignments — 4 sites
+
+`src/lib/seasonal-membership-assignments.ts`. Bulk administrative assignment of
+season membership tiers.
+
+**Kept because the affected record is the club's seasonal roll-forward, not any
+one member's account** — three of the four writers act on a whole season at once
+and the fourth records one assignment inside that same mechanism. `account` is
+the live alternative and is not dismissed lightly: `saveSeasonalMembershipAssignment`
+carries `subjectMemberId`, so under `account` the row would appear on that
+member's own activity page. That makes the move a **widening**, which is why it
+is not taken here — but the domain argument above is the reason it is filed as
+`admin`, not the fact that the support pack's model-facing description already
+names it that way. (It does, and that description would need updating with any
+move.) Grouped with the held decisions below for whoever takes the next pass.
+
+### Xero member-import membership types — 1 site
+
+`src/lib/xero-member-import.ts`. The affected object is the membership-type
+catalogue the import creates, not the Xero link — `xero` would file a
+membership-configuration change behind Finance.
+
+### Analytics integration — 2 sites
+
+`ANALYTICS_SETTINGS_UPDATED` and `ANALYTICS_CONSENT_REVISION_BUMPED`. `privacy`
+is a genuine alternative — consent is the privacy domain (`INV-PRIV`) — but
+`privacy` is member-visible and these rows carry no member subject, so the move
+would publish a settings change on the acting administrator's activity page and
+narrow the operator gate at the same time. Kept, and flagged as re-decidable.
+
+## Held for an owner decision: 9 sites, of which 8 are still held
+
+Two of #2730's own findings, plus one the sweep turned up, that this pass **did
+not** apply. Every destination is member-visible, so each move publishes rows on
+a member-facing surface. A widening is not a refactor and is not this lane's to
+take.
+
+**One of the three has since been resolved, and not by widening.** The
+member-record writer below (`admin.member.*`, 1 site) was closed in #2755 by
+moving the OTHER TWO writers of the same act — both branches of
+`bulk-update/route.ts` — **into** `admin`, rather than by moving this one out.
+The split is gone and nothing crossed onto a member-facing surface. Its section
+below is kept and updated in place rather than deleted, because the comparison it
+sets out is the reasoning, and the **eight** remaining held sites — the six
+`member_lifecycle` sites and the two family-suggestion sites below — are still
+held on exactly the grounds it states. `INV-PRIV-012` is the rule that came out of
+it.
+
+### `member_lifecycle.delete_*` and `archive_*` — 6 sites
+
+`src/lib/member-lifecycle-actions.ts`. All six pass
+`subjectMemberId: <the member being deleted or archived>`, so filing them under
+`privacy` (or `account` for the archive trio) publishes them **to that member**,
+not merely to the acting administrator. The row's `details` is `cleanedReason` —
+free text an administrator wrote to justify the request — and the member
+projection returns `details` verbatim whenever it is not a JSON object. The
+acting administrator is rendered as "Club admin" only if their role is `ADMIN`;
+any officer holding the permission through an access role is **named in full**.
+
+The case for moving is strong and unchanged: the member-initiated equivalents
+(`member.deletion_requested` / `_rejected` / `_approved`) are already `privacy`,
+so the same act answers to two gates depending on who started it, and
+`audit-query.ts` files `member_lifecycle.delete*` under `privacy` on the read
+side in two places. It is also retention-neutral. But it is a widening, and it
+wants the owner's explicit answer to a plain question: **should a member be able
+to see, on their own activity page, that their deletion was requested, who
+requested it, and the reason they gave?**
+
+### `FAMILY_SUGGESTION_HIDDEN` and `FAMILY_SUGGESTIONS_RESET` — 2 sites
+
+`admin/family-suggestions/hide` and `.../reset`. Checked at the writers as #2730
+asked: `targetId` is a suggestion signature rather than a member id and
+`subjectMemberId` is unset, so **no third-party member** is published to. But
+both pass `memberId: guard.session.user.id`, which the member-timeline filter
+matches, so moving them to `family` publishes each row on the **acting
+officer's** own activity page. The names in the row travel in `metadata`, which
+the member projection withholds. It is the smallest widening on this page and
+still a widening.
+
+### `admin.member.updated` / `.deactivated` / `.reactivated` — 1 site — RESOLVED in #2755
+
+`src/lib/admin-member-detail-service.ts`. **Not one of #2730's four findings —
+the sweep turned it up, and it was the weakest `admin` left in the tree.** It was
+filed by the SCREEN the officer used, which is initiator reasoning wearing a
+different hat:
+
+| The same business act | Where #2730 left it | Where #2755 files it |
+| --- | --- | --- |
+| Deactivate one member from the member page | `admin` — this site | `admin` |
+| Deactivate the same members from the bulk screen (`member.bulk-deactivate`) | `account` | `admin` |
+| Change one member's access roles from the member page | `admin` — this site, as `admin.member.updated` | `admin` |
+| Change the same roles from the bulk screen (`member.bulk-set-role`) | `security` | `admin` |
+| The member edits the same profile fields themselves (`/api/profile`) | `account` | `account` — unchanged |
+
+The comparison was inside the platform, not imported: `bulk-update/route.ts` set
+out the rule in its own comment — the account itself is `account`, what a member
+is permitted to do is `security` — and named picking by who acted as "the exact
+thing the owner rule forbids". The consequence for a member was visible: they saw
+a bulk deactivation on their own activity list and saw **nothing** when an
+officer deactivated them from the member page.
+
+**#2755 closed it by moving the bulk screen's two branches to `admin`, not by
+moving this site out.** The rule is that category follows the business domain
+affected, and editing, activating, deactivating or re-roling somebody's member
+record is one domain: the administration of that record, however many screens
+reach it. Both alternatives were member-visible and all three rows reach the
+subject member's own timeline, so unifying on either would have published an
+officer's edits **to the member the record is about** — and audit rows are
+append-only, so that is not quietly reversible. (Only the detail writer passes
+`subjectMemberId`; the two bulk writers pass none and reach the member through
+`buildMemberAuditLogWhere`'s null-subject `targetId` leg. "Has no subject" is not
+a reason to think a move is invisible.) Whether a member should see a given event
+is meant to become an explicit per-event declaration at the writing site, denied
+by default, rather than a consequence of which label a classification sweep
+reached for — #2695 decided that on 9 Aug 2026 and it is **not built yet**, so in
+the meantime the category is the only lever and these two events are simply
+invisible to the member.
+
+**The rule that came out of this is scoped to those six actions, not to "an
+officer acted".** Other officer-driven writers file member-visible categories on
+purpose and stay that way: the member-photo pair (#2581's own worked example,
+`account` on the on-behalf branch deliberately — and the photo editor renders on
+this very screen in `mode="admin"`) and the officer-driven cancellation writers.
+`INV-PRIV-012` names them, and
+`OFFICER_DRIVEN_MEMBER_VISIBLE_WRITERS_2755` pins them from the tree, so citing
+the unification to sweep them into `admin` fails CI with the withdrawal named.
+
+**The last row of the table did not move, deliberately.** `/api/profile` is the
+member editing their own record: actor IS subject, no on-behalf path, so it is
+self-service rather than administration. Filing it `admin` would hide a member's
+own action from their own timeline. #2755's issue body listed it among the split
+sites and gave an anchor (`api/admin/members/[id]/profile/route.ts`) that does not
+exist in the tree; the `security` site it meant is the bulk screen's set-role
+branch.
+
+**What the resolution costs, since it is a narrowing in two directions.** The
+subject member stops seeing a bulk deactivation or bulk role change of their own
+account (they already saw nothing when an officer used the member page, so the
+result is uniform invisibility rather than visibility decided by screen), and the
+two bulk rows move from `support` + `membership` to `support` alone — the gate
+this site has always answered to. Retention is untouched: all six action names
+classify `critical` under the old and new values alike. And as with bed
+allocation it moved the WRITERS, not the stored rows, so bulk member-record
+evidence recorded before the release is still `account`/`security`, still in the
+membership correlation entry and still on the member's own timeline. Both
+correlation entries' prose says so. The backfill question is **#2763**, filed
+separately from #2751 rather than folded into it: #2751's bed-allocation rows move
+between two member-invisible categories, so no member's view changes either way,
+while rewriting these rows would **withdraw** entries a member can see about their
+own account today. That is a different decision, and it is the recommendation on
+#2763 to leave them alone.
+
+Pinned in `MEMBER_RECORD_ADMIN_CATEGORIES_2755` (per site),
+`MEMBER_RECORD_ADMIN_ACTIONS_2755` (by action name, with one level of same-file
+`const` indirection resolved and a corpus gate over every file that names one of
+the six literals) and `MEMBER_RECORD_ADMIN_SURFACES_2755` (every member-visible
+writer on the officer member-record surfaces must be a reviewed exception). So a
+fourth screen for the same act fails CI if it reuses one of the six action names
+however it assembles the string, or if it invents a new name on those surfaces and
+files a member-visible category. What is still a review question rather than a
+mechanical one is a new name for the same act written somewhere else entirely.
+Rule: `INV-PRIV-012`.
+
+## The open question this pass did not have a decision for
+
+The **fifteen lodge-gated operational sites** in the keeps above (chores, lockers,
+lodge instructions, lodge settings, the `LODGE_*` records, work parties) are
+recorded as an open question rather than a settled keep, and the reasoning is in
+that section. Moving them would be a **narrowing** — member-invisible in both
+directions and retention-neutral — which is a materially easier question than the
+three widenings above, but it is still fifteen more sites out of the support-only
+gate and no ticked option on #2730 covers it.
+
+While they stay `admin`, the model-facing prose has to say so or an empty lodge
+correlation reads as absence: the Lodge entry's `scope` and `description` both
+name chores, lockers, work parties, lodge instructions, lodge settings **and the
+lodge records themselves** as `admin`, and the System entry's `scope` names the
+same set. That was a real gap — "when was this lodge deactivated" returned
+nothing from the Lodge entry with no warning — and it is fixed whichever way the
+decision goes.
+
+**#2765 closed this open question, and the answer was "they stay".** The rule that
+decided it is now `INV-PRIV-013` and the fifteen are pinned per site in
+`LODGE_GATED_ADMIN_CATEGORIES_2765`, so the keep is enforced rather than argued
+each time. `lockers` was the one subgroup that needed its own decision, for a
+measured reason rather than a stylistic one; it was carried as a filed decision
+(**#2777**) rather than as an open question on a page, and decided on 11 August
+2026: the four stay `admin` — see the section above. Read the two paragraphs
+below as the history of how it got there.
+
+**#2755 promoted both halves of that from a page note to an invariant, and left
+them at `admin`.** `INV-PRIV-012` records the fifteen as a deliberate keep with
+the rule they were measured against — *did this site split a subsystem*, not *does
+it name a lodge* and not *is the route gated `lodge:edit`* — and records that
+`lockers` (4 of the fifteen) was, at that point, **unresolved rather than settled**, because its
+routes are gated `membership:*` and a locker is allocated to a named member, so
+`lodge` is not obviously its answer either. The point of moving it into the
+invariant is that a decision recorded only in a page attached to a closed issue is
+a decision the next author will not find; the fifteen were nearly re-swept twice
+already. The census distribution alone cannot protect them — it counts `admin`
+without saying which sites are in it — so if a later pass moves any of them, that
+is a readership change to argue for and the invariant is where the argument has to
+land.
+
+## How to check this page is still true
+
+`pnpm run audit:census` prints the live distribution and every site's category.
+`scripts/audit/audit-write-sites.ts` records each production write site's
+category and sink, one line per site, and
+`src/lib/__tests__/audit-writer-census.test.ts` fails CI when any site is added,
+removed or reclassified without its line changing with it. A pull request that
+adds a writer regenerates that file with `pnpm run audit:census --write`.
+
+This page publishes no current count, and no longer records each new writer
+(#5211). A pasted count went stale with every new writer, and each pull request
+that added one edited the same lines here, so any two of them conflicted. The
+paragraphs below are the record up to #5211, kept because each says why its
+writer files where it does; the figures in them are the ones measured at the
+time.
+
+`admin` was 96 when this page was written for #2730 (87 kept + 9 held) and was 98
+after #2755 moved the two `bulk-update/route.ts` branches in, against `account`
+20 → 19 and `security` 19 → 18. #2755 moved categories and added no writer;
+#2760 then added the late-capture auto-refund record writer (`payment` 34 → 35),
+taking the total from 428 to 429. Since then #2749 added the three Other Lodges
+admin CRUD writers (`admin` 98 → 101, 429 → 432) and #2773/#2774 added the two
+late-capture writers this page's own subject depends on (`payment` 35 → 37,
+432 → 434). Since then #2822 added the email-inheritance effective-source change
+event (`family` 34 → 35, 434 → 435). Since then four separate changes landed on top of 435 and they
+are DISJOINT, so the merged figure is the sum of all of them rather than either
+branch's own total. The Alpine Central Server integration (PR #21) added four:
+the manual Other Clubs upload and download plus the shared sync-failure row
+(`lodge` 52 → 55) and the connection-settings save (`admin` 101 → 102), taking
+435 → 439. The #2949 review added the refused-base-URL-change record
+(`security` 18 → 19, 439 → 440). Local database backups added three
+(`security` 19 → 22, 440 → 443): a restore over the live database records
+started, completed AND failed, because the row written before the attempt is the
+only one guaranteed to survive a restore that dies part-way — which is exactly
+the incident someone would need to reconstruct. And #2780 added the ten
+maintenance-report writers (`lodge` 55 → 65, 443 → 453). Since then CT-1
+(#2989) added the club-timezone change record (`admin` 102 → 103, 453 → 454) —
+one writer, because the timezone change is a single audited event and a
+re-save of the unchanged zone deliberately records nothing at all. Since then
+ENV-SAFETY 1 (#3034) added the environment-safety override record
+(`admin` 103 → 104, 454 → 455) - again one writer, and again a no-op
+records nothing, because that route's dirty gate counts an absent settings row
+as "override off". That is the figure above, and it was taken from
+`npm run audit:census` on the merged tree rather than by adding one branch's
+delta to the other's total. The category values sum to 454 rather than 455
+because one site forwards its category rather than naming one.
+maintenance-report writers (`lodge` 55 → 65, 443 → 453). And the Communication
+Portal (epic #2992) added the six club message board moderation writers
+(`communication` 14 → 20, 453 → 459). The federation work then added the
+board image upload writer (`communication` 20 → 21, 459 → 460). The upstream
+merge then brought the club-time and environment-safety writers with it
+(`admin` 102 → 104, 460 → 462). Since then #3170 added the uncollected
+review-share record (`payment` 37 → 38, 462 → 463): a settled share that could
+not be added to a booking change's ask is money the club is owed and nobody can
+find, and it was a log line rather than a record until then. ONE write site
+serves both asks — the card request already paid, and the Xero supplementary
+invoice already sent — because they are the same fact about the same edit; a
+`leg` of `payment-request` or `xero-invoice` in the metadata and in the prose is
+what tells an officer which one to go and fix.
+
+Since then #3191 added the stored-night-price record
+(`payment` 38 → 39, 463 → 464 on its own branch; both this and the note below
+landed together, so the MERGED tree measures `payment` 40 and 465): settling a
+review may also record what the
+booking's unpriced nights sold for, which rewrites what a stay is stored as
+having been worth and is therefore a money-affecting act in its own right. It is
+a SECOND entry beside the completion's rather than metadata on it, because it can
+also happen on a DISMISSAL, whose entry says in as many words that nothing moved.
+#3498 changed that entry's METADATA shape, and not additively: one closure can
+now repair several strands, so the four per-strand figures moved from flat keys
+into a `repairedStrands` array with one object each, still `null` rather than
+empty where nothing was recorded. Rows written before it keep the flat keys and
+nothing rewrites them - the one home for that statement is `INV-MOD-036` in
+`docs/invariants/booking-modifications.md`.
+That is the figure above, and it was taken from `npm run audit:census` on the
+merged tree rather than by adding one branch's delta to the other's total. The
+category values sum to 463 rather than 464 because one site forwards its category
+rather than naming one.
+what tells an officer which one to go and fix. Since then #3193 added that
+record's counterpart (`payment` 39 → 40, 464 → 465 measured on the merged
+tree, not by adding one branch's delta to the other's total): the owner decided on
+31 Aug 2026 that the difference is BILLED, on a second separate invoice, rather
+than collected by hand, so `booking.editFinancialReview.chargeShareReinvoiced`
+records that it is on its way and the `chargeShareUncollected` row now fires only
+when that second invoice could not be raised. Two write sites rather than one
+here, unlike the two asks above, because the two carry opposite instructions: one
+says chase this money, the other says nothing needs chasing and explains the
+second document the member is about to receive. That
+is the figure above, and it was taken from `npm run audit:census` on the merged
+tree rather than by adding one branch's delta to the other's total. The category
+values sum to 463 rather than 464 because one site forwards its category rather
+than naming one.
+
+Since then #3354 added one (`admin` 104 -> 105, 470 -> 471, MEASURED by running
+the census suite on that branch rather than added to the literal):
+`AI_SPEND_CURRENCY_RATE_UPDATED`, the record that an administrator changed the
+rate both AI spend caps are compared through. `admin` for the same reason as the
+two AI settings writers beside it: installation configuration, readable with
+`support:view` alone, carrying a ratio and an administrator id and no member data.
+
+Since then #3340 added two (`payment` 42 -> 44, 468 -> 470, MEASURED with
+`npm run audit:census` on that branch rather than added to the literal): the
+permanent record that a payment taken against a superseded charge was refunded,
+and the `critical` escalation for when the member notice that should accompany it
+could not be assembled. Until #3340 that refund left no record at all - the
+payment provider's own receipt was the entire notice, a member wrote in asking
+what had happened, and that query is the only reason the money leak underneath it
+was found. `payment` for the same audience reason as every row beside it: money
+left the club with nobody deciding it should, and the person who answers for that
+is the one who reconciles the club's money.
+
+#3371 then added one more (`payment` 44 -> 45, 471 -> 472, MEASURED with
+`npm run audit:census` on that branch rather than added to the literal): the
+record that a booking change's payment request absorbed another change's unpaid
+extra, because raising the new request cancels the old one. Once that earlier row
+is cancelled, what it was owed for is not derivable from anything, so the figure
+lives on the ledger row and the story lives here. It is `info`/`success` rather
+than `important`/`failure`, deliberately - nothing is owed outside the system and
+nobody has to act - but an officer opening the earlier change finds its request
+gone with no explanation on it, and a member sees one larger figure where they
+expected two. `payment` for the same audience reason as the review-charge rows
+beside it.
+
+#3528 then added one more (`payment` 46 -> 47, 484 -> 485, MEASURED with
+`npm run audit:census` on that branch rather than added to the literal):
+`booking.additionalPayment.withdrawn`, the record that a finance officer withdrew
+an unpaid payment request a completed financial review had raised. `payment` for
+the same audience reason as the request it reverses, and `important` rather than
+`info` because it is the only place the withdrawal shows: the review task stays
+COMPLETED and the booking's columns read as if no request had existed, so the
+row carries who withdrew it, how much, the card request and its provider status
+after the cancel, the review task it came from, and what was retired.
+
+#3563 then added one more (`admin` 107 -> 108, 485 -> 486, MEASURED with
+`npm run audit:census` on that branch rather than added to the literal):
+`CLUB_FORMAT_UPDATED`, the record that a Full Admin changed the installation's
+currency or locale. `admin` for exactly the reason `CLUB_TIME_ZONE_UPDATED` and
+`CLUB_IDENTITY_SETTINGS_UPDATED` are - it is installation configuration, read
+by the same administrators who can already see those - so it widens nobody's
+readership. The row carries the actor and the before/after pair and nothing
+else: no request echo and no settings blob.
+
+#3531 3b then added one more (`payment` 47 -> 48, 486 -> 487, RE-MEASURED with
+`npm run audit:census` on the tree composed with #3563, not incremented):
+`booking-payment.stored-night-price.rate-derived`,
+the record that the operator-run backfill re-derived a booking's evenly-split
+night prices from the rate table, every guest total unchanged. `payment` beside
+the officer night-price repair it mirrors, and `important` because it is the
+only place the per-night rewrite shows; it carries every strand's before and
+after vectors.
+
+#3029 then added one more (`booking` 104 -> 105, 487 -> 488, RE-MEASURED with
+`npm run audit:census`): `booking.guest_dietary.updated` / `.cleared`, the record
+that a booking officer changed or cleared one guest's dietary/allergy note for a
+stay. `booking` because that note is booking data read by booking officers; the
+row carries the guest id and a changed flag and never the note itself
+(`INV-PRIV-022`).
+
+#3566 then added one more (`admin` 108 -> 109, 488 -> 489, RE-MEASURED with
+`npm run audit:census` on the tree merged with #3029 rather than added to the
+literal):
+`AI_SPEND_CURRENCY_RATE_CLEARED`, the record that changing the club's currency
+cleared the stored AI spend conversion rate, which records no currency of its
+own and would otherwise go on pricing the new currency at the old one's rate.
+`admin` for the reason `AI_SPEND_CURRENCY_RATE_UPDATED` is: installation
+configuration, readable with `support:view` alone, carrying two currency codes,
+a ratio and an administrator id and no member data.
+
+#3639 then added one more (`payment` 48 -> 49, 489 -> 490, RE-MEASURED with
+`npm run audit:census`): `booking.payment.late_notice_acknowledged`, the record
+that a Stripe success notice on a cancelled booking was answered WITHOUT a
+refund because the cancellation had already settled the money, or it was
+already refunded. `payment` beside the late-capture records it sits with.
+The club setting for genuine late captures (owner decision 26 Sep 2026) then
+added two (`payment` 49 -> 51, 490 -> 492, RE-MEASURED):
+`booking.payment.late_capture_refund_held`, a late capture held for a
+treasurer, and the `booking.payment.refunded_after_cancellation` a treasurer's
+approval writes when its refund goes out. The review round added one more
+(`payment` 51 -> 52, 492 -> 493, RE-MEASURED):
+`booking-defaults.late_capture_refund_approval.changed`, who switched the
+club between automatic refunds and treasurer approval. #3462 then added one
+(`xero` 37 -> 38, 493 -> 494, RE-MEASURED): `xero.operation.marked_failed`,
+the per-row Mark failed on a stale RUNNING Xero operation. #3454 then added one
+(`security` 24 -> 25, 494 -> 495, RE-MEASURED): the two-factor enrolment and
+erasure-clear record in `two-factor-audit.ts`.
+#3792 then added one
+(`xero` 38 -> 39, 495 -> 496, RE-MEASURED):
+`xero.allocation.restored-booking-change-refused`, a Xero allocation change the
+inbound credit-note sync refused to post to a cancelled booking whose applied
+credit was already restored. #3653 (epic #3503) then added one, disjoint from
+#3792's, so the composed figure is both (`booking` 105 -> 106, 496 -> 497,
+RE-MEASURED on the merged tree): the organiser child refund recovery record,
+`booking.payment.refund_recovered`. Epic #3813 then added two, disjoint from
+both (RE-MEASURED on the tree #3829 composed): #3827's
+`booking.modify.promo_reprice`, a guest's acceptance re-pricing the booking's
+promo codes (`booking` 106 -> 107, 497 -> 498), and #3492's
+`promo_code.guest_lookup`, a booker looking up their guests' promo codes for
+the chips (`privacy` 20 -> 21, 498 -> 499). #3372 then added
+`booking-payment.card-refund.paid-another-way`, the treasurer closing a card
+refund Stripe gave up on (`payment` 52 -> 53, 499 -> 500), and
+`booking-payment.card-refund.paid-twice-resolved`, the treasurer marking a
+refund paid back twice as sorted out with the member (`payment` 53 -> 54; 499 ->
+500 on the tree composed with triyder/AlpineClubBookingsNZ#52's removals below and #3750's change-request
+approval, MEASURED). #3819 added one, disjoint from all of these: the
+per-lodge "Who can be hut leader for school bookings" save,
+`LODGE_SETTINGS_UPDATED` beside its lodge-settings sibling (`admin` 109 -> 110,
+RE-MEASURED).
+
+triyder/AlpineClubBookingsNZ#52 then REMOVED two (`admin` 109 -> 107, 497 -> 495 on the tree composed
+with all of the above; MEASURED with
+`npm run audit:census` on that branch rather than subtracted from the literal):
+`OTHER_LODGE_CREATED` and `OTHER_LODGE_DELETED` went with the create and delete
+handlers of the other-lodges registry, because a site now changes only the lodge
+the central server says it owns and never adds to or removes from the shared
+list. `OTHER_LODGE_UPDATED` stays, still `admin` under INV-PRIV-013's rule, so
+the lodge-gated keep shrinks from nineteen pinned sites to seventeen without
+anyone's readership changing.
+
+triyder/AlpineClubBookingsNZ#62 then added one (`admin` 107 -> 108, 497 -> 498, MEASURED with
+`pnpm run audit:census`): `LODGE_CENTRAL_LINK_UPDATED`, the record that an
+administrator linked a local lodge to its lodge on the Alpine Central Server.
+`admin` under INV-PRIV-013's rule, like every writer in the lodge-records
+subsystem, so the lodge-gated keep grows from seventeen pinned sites to
+eighteen; the row names two central lodge ids and the administrator, no member.
+
+triyder/AlpineClubBookingsNZ#58 then added one more (`admin` 108 -> 109, 498 -> 499, MEASURED with
+`pnpm run audit:census`): `OTHER_LODGE_HIDDEN`, the record that an
+administrator hid an Other lodges row the Alpine Central Server does not list.
+`admin` under INV-PRIV-013's rule, beside the registry's update, so the
+lodge-gated keep grows from eighteen pinned sites to nineteen; the row names
+the lodge by id and name only, no member.
+
+triyder/AlpineClubBookingsNZ#58 also added the download's own record of the lodges it hid because the
+central server deleted them (`alpine_server.other_lodges.hidden`, `lodge`
+66 -> 67, 499 -> 500, MEASURED): lodge names and a count of unlinked club
+lodges, no member. A library writer, so it joins no keep.
+
+triyder/AlpineClubBookingsNZ#77 added the record that this club's own Other lodge was refilled from its
+Fees page (`OTHER_LODGE_RATES_FROM_FEES`, `lodge` 67 -> 68, 500 -> 501,
+MEASURED): the lodge, the trigger and the fields that changed, no member. A
+library writer, so it joins no keep.
+`main` then added #3750's executed approval of a change request on a finished
+stay (`booking` 107 -> 108, `booking-change-request.approve` with
+`executed: true`). The sync of `main` into epic #3789 composed #3819's addition
+with triyder/AlpineClubBookingsNZ#52's two removals and #3750's addition, all disjoint: `admin` 108,
+`booking` 108, 499 row-producing sites, and the lodge-gated keep eighteen
+(RE-MEASURED with `pnpm run audit:census` on the composed tree, never added
+together). The later sync of `main` 0ff7e6d46 into the epic (#3821) composed
+#3372's two `payment` additions with that tree, also disjoint: `admin` 108,
+`payment` 54, 501 row-producing sites (RE-MEASURED the same way). The hand sync of `main`
+f3b6c008b (epic #3789) brought the same two `payment` additions in again from
+the other side and measured the same figures on the merged tree.
+
+#3498 then added one more (`payment` 45 -> 46, 483 -> 484, MEASURED with
+`npm run audit:census` on that branch rather than added to the literal):
+`booking-payment.manual-refund-task.reopen`, the record that an officer put a
+DISMISSED money task back on the finance queue. `payment` for the same audience
+reason as the closure it reverses, and it carries what that closure looked like —
+who dismissed it, when, and the note they wrote — because the status claim beside
+it clears all three off the row, so this entry is the only place they survive.
+
+#4098 then added one more (`payment` 54 -> 55, 501 -> 502, MEASURED with
+`pnpm run audit:census`): `membership-subscription-billing.close-already-paid`,
+an officer closing a subscription charge whose members had already paid, filed
+`payment` beside the other subscription-billing actions the same people read.
+
+#4104 then added one more (`payment` 55 -> 56, 502 -> 503, MEASURED with
+`pnpm run audit:census`): `booking-payment.card-refund.failed-later-not-resent`,
+a card refund Stripe failed later that the app did not make for the booking,
+filed `payment` beside the paid-another-way close the same people read.
+
+#4149 left the totals where they were (`payment` 56, 503, MEASURED with
+`pnpm run audit:census`) by moving two writers and adding one: the two
+late-capture handlers' `booking.payment.refunded_after_cancellation` writers
+became one shared writer (`reportAutomaticLateCaptureRefund`), and the
+lost-record recovery adds `booking.payment.auto_refund_record_recovered`, also
+`payment`, read by the same people who reconcile the refund.
+
+#4170, folded into the same change, then added one (`payment` 56 -> 57, 503 ->
+504, MEASURED with `pnpm run audit:census`):
+`booking.payment.late_capture_refunded_outside_app`, a late capture the
+late-capture handler marked as its own but refunded some other way, named for
+the same people instead of being noted in Xero.
+
+#4219 then added one more (`xero` 39 -> 40, 507 -> 508, MEASURED with
+`pnpm run audit:census`): `xero.credit_note.spent_outside_app_converged`, the credit-ledger
+convergence's own row, filed `xero` beside the other Xero rows.
+
+#4338 then added one more (`xero` 40 -> 41, 508 -> 509, MEASURED with
+`pnpm run audit:census`): `xero.credit_note.spent_outside_app_attempt_closed`,
+the same convergence closing a concurrent attempt's failed allocation, filed
+`xero` beside it.
+#4253 then added five (`payment` 60 -> 64, `xero` 41 -> 42, 509 -> 514, MEASURED with
+`pnpm run audit:census`): a released-credit card request raised, one closed without
+asking and two closed because Xero shows its invoice paid (one at ask time, one by the
+sweep), filed `payment`, and the recording of its card payment in Xero, filed `xero`.
+
+#4253 release 2 then added one (`payment` 64 -> 65, 516 -> 517, MEASURED with
+`pnpm run audit:census`): `payment.credit_release_ask.backlog_batch_taken`, the row each
+batch of the switchable backlog run writes, filed `payment` beside the request's own rows.
+Its fix round added one more (`payment` 65 -> 66, 517 -> 518, MEASURED with
+`pnpm run audit:census`): `payment.credit_release_ask.left_to_officers`, the note that a
+request was left to the officers, filed `payment` with the rest.
+
+#4270 then added two (`xero` 42 -> 44, 514 -> 516, MEASURED with
+`pnpm run audit:census`): `xero.credit_note.outside_spend_mirrored` and
+`xero.credit_note.outside_spend_restored`, the inbound credit-note mirror's rows, filed
+`xero` beside the converge's.
+
+#4686 then added one (`xero` 50 -> 51, 532 -> 533, MEASURED with
+`pnpm run audit:census`): `xero.operation.late_partial_not_recorded`, the row a Xero
+operation's part-success writes when its attempt stalled, lost its claim (Reset stale
+running, then a Retry, a withdrawal or another attempt) and came back having made a Xero
+object the app did not record over the queued or closed row, so the object has a durable
+trace. Filed `xero` beside the other Xero rows; nobody's readership changes.
+
+The one-step central-server connection (triyder/AlpineClubBookingsNZ#97) then added
+one (`admin` 111 -> 112, 533 -> 534, MEASURED with `pnpm run audit:census`):
+`LODGE_CENTRAL_LINK_UPDATED` from the setup page's Link your lodges dialog
+(`/api/admin/alpine-server/lodge-links`), the Central lodge card's twin and filed
+`admin` like it; the readership of that event does not change.
+
+#4516 (Ledger M4c) then added two (`payment` 67 -> 69, 534 -> 536, MEASURED with
+`pnpm run audit:census`): `booking-payment.card-refund.reservation-refused`, the row a card
+refund writes when the journal refused to reserve its slice and Stripe was not asked, and
+`booking-payment.card-refund.reservation-released-by-operator`, an owner's release of a
+reservation nothing could answer. Both filed `payment` beside the other card refund rows;
+nobody's readership changes.
+
+#4915 then added two (`privacy` 23 -> 25, 543 -> 545, MEASURED with
+`pnpm run audit:census`): `member.data_exported`, a member downloading their own
+data, and `member.subject_access_exported`, a Full Admin's subject access report on
+one person. Both are `privacy`, so they need `membership:view` to read, and the
+report's row reaches the subject's own timeline on purpose: the subject sees that a
+copy of their record was released.
+
+#4680 then added one (`xero` 49 -> 50, 531 -> 532, MEASURED with
+`pnpm run audit:census`): `xero.organiser_adjustment_note.run_stood_down`, the row an
+organiser adjustment run writes when, after recording its credit note, it finds before a
+money-moving Xero call that a stale reset took its claim, and stops without allocating or
+paying out, so the stand-down has a durable trace. Filed `xero` beside the other Xero
+rows; nobody's readership changes.
+
+#4655 then added one (`xero` 48 -> 49, 530 -> 531, MEASURED with
+`pnpm run audit:census`): `xero.organiser_adjustment_note.late_note_not_recorded`, the
+row an organiser adjustment's credit-note create writes when Xero answers after its job
+was reset and the job may no longer take the note (resolved by hand, run again or
+closed), so the late note it did not record has a durable trace. Filed `xero` beside the
+other Xero rows; nobody's readership changes.
+
+#4426 then added one (`xero` 47 -> 48, 529 -> 530, MEASURED with
+`pnpm run audit:census`): `xero.refund_credit_note.late_note_not_recorded`, the row a
+refund credit-note create writes when Xero answers after its job was resolved by hand
+recording a note, so the late note it did not record has a durable trace. Filed `xero`
+beside the other Xero rows; nobody's readership changes.
+
+#4154 then added one more (`payment` 57 -> 58, 504 -> 505, MEASURED with
+`pnpm run audit:census`): `booking-payment.capacity-race.refunded-total-corrected`,
+a capacity race's card charge corrected to its refund rows before its hand-back
+(the owner's guarded recalculation), filed `payment` beside the close it enables.
+
+#4162 then added two (`payment` 58 -> 60, 505 -> 507, MEASURED with
+`pnpm run audit:census`): `booking-payment.bank-refund.void-undone`, the nightly
+undo of a voided bank-transfer refund note, and `.void-answered`, a person's
+answer to one the undo could not match - both the payment's figures, filed
+`payment` for the people who reconcile it.
+
+#2942 then added one more (`admin` 106 -> 107, 482 -> 483 on the MERGED tree —
+the MAD epic's own children carried the total from 472 to 482 without a
+paragraph each here, and the header block above is the measured figure; MEASURED
+with `npm run audit:census` on the merged tree rather than added to either
+branch's total):
+`LODGE_MEMBER_ROSTER_SETTINGS_UPDATED`, the record of how much of a name the
+member lodge roster shows for one lodge, before and after. `admin` rather than
+`lodge`, and the pull the other way is worth stating: the setting is the twin of
+the lobby display's name-granularity dial, whose writer files `lodge`. That
+writer sits in the DISPLAY subsystem, which #2730 unified; this one sits under
+`/api/admin/lodges/`, where every writer files `admin`. Following the sibling
+would have opened a split inside the lodge-records group rather than closing
+one.
+
+Since then #3220 added the refused stranded-intent record (`payment` 41 -> 42,
+467 -> 468 - taken from `npm run audit:census` on the merged tree, not from this
+branch's own pre-merge delta): when a booking change's card request could not be
+set up and the background retries have run out, the system now withdraws the
+card request that was left standing, so the member cannot pay an ask the club
+has already invoiced in Xero. This row is written only when that withdrawal is
+REFUSED - the card provider will not cancel an intent it is already processing -
+because a withdrawal that worked needs no officer, and one that did not leaves a
+live card request against an unpaid invoice for the same money. `important`
+rather than `critical`: nothing is mis-stated yet and the remedy is a
+reconciliation by hand, which is the same severity the sibling
+`chargeShareUncollected` record carries.
+
+Merging `main` into the epic on 13 Sep 2026 brought BOTH rounds into one tree: #3340's two
+payment rows and #2698's two, so 470 -> 472, `booking` 102 -> 103 and `lodge` 65 -> 66.
+RE-MEASURED with `npm run audit:census` on the merged tree — each side had independently
+measured 470 from different rows, and the numeric lines merged silently without conflicting.
+
+Since then #2698 added two writers carrying four actions, taking 468 -> 470 as
+measured by `npm run audit:census`. One is a SHARED writer for the hut-leader
+assignment create, update and delete (`lodge` 65 -> 66), which recorded nothing
+at all before: an officer could hold a bed for a custodian, move it or hand it
+back, and the only trace was the row itself. It is `lodge` because a hut-leader
+assignment IS the lodge roster, and everyone who can write one already holds
+lodge access, so nobody gains a read. The second is
+`booking.wholeLodgeHold.custodianAmended` (`booking` 102 -> 103): the officer's
+explicit acceptance that holding a bed narrows an existing whole-lodge hold's
+sole occupancy. It is `booking` rather than `lodge` because what narrowed is a
+BOOKING's sole occupancy, matching `booking.exclusiveHold.set` beside it, and
+because whole-lodge hold coverage is derived rather than stored that row IS the
+amendment rather than a note about one. It carries booking ids, dates and
+nights only — no party data. `booking` IS member-visible, so that row also
+appears on the acting officer's own activity list; what makes it safe there,
+and why the roster rows are not member-visible at all, is set out in the
+manifest beside the two counts.
+
+The 22 moves are pinned **per site**, not only by that
+distribution: `REVIEWED_ADMIN_CATEGORIES_2730` in
+`scripts/audit/audit-writer-census-manifest.ts` records each one, and the census
+contract test measures the tree against it. A distribution cannot see a swap —
+send one of these back to `admin` and one `admin` site into `lodge` and every
+count is identical while both rows change who may read them — so the per-site pin
+is what makes a reversal a named diff. The same test asserts that none of the 22
+lands in a member-visible category, which is the property that made the move a
+narrowing rather than a decision for the owner.
+
+The sentences that tell the model where bed-allocation history lives are pinned in
+`src/lib/diagnostics/tools/packs/__tests__/support-correlation.test.ts` ("tells the
+model that bed allocation is WHOLLY lodge now, older rows included"). They were
+pinned in the opposite direction while the date split was real, and #2751 inverted
+them in the same change that closed it — a reclassification that shipped no
+backfill would put the overclaim straight back. The backfill's own action list is
+pinned against `REVIEWED_ADMIN_CATEGORIES_2730` by
+`src/lib/__tests__/bed-allocation-audit-category-backfill.test.ts`, so a 23rd
+bed-allocation writer added here cannot re-open the split silently (`INV-OPS-012`).

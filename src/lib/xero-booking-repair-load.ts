@@ -1,0 +1,687 @@
+// Scope-where construction and audit-data loading (bookings, links, operations)
+// for the booking-vs-Xero repair tool. Extracted verbatim from
+// xero-booking-repair.ts (#1208 item 2).
+import {
+  ManualRefundTaskKind,
+  ManualRefundTaskStatus,
+  PaymentRecoveryOperationStatus,
+  PaymentRecoveryOperationType,
+  Prisma,
+} from "@prisma/client";
+import {
+  bookingRepairSelect,
+  xeroObjectLinkSelect,
+  xeroOperationSelect,
+  type BookingCancellationRefundRecoveryRecord,
+  type BookingClassificationContext,
+  type BookingXeroRepairScope,
+  type XeroObjectLinkRecord,
+  type XeroOperationRecord,
+} from "./xero-booking-repair-types";
+import { buildBookingCancellationRefundIdempotencyKey } from "./payment-recovery-keys";
+import { loadFailedLaterOwedCents } from "./xero-booking-repair-failed-later";
+import { readPaidBackRefundRequests } from "@/lib/xero-inbound/refund-request-paid-back";
+import { groupOpenIntentRecoveriesByBooking, intentRecoveryKeyMaps } from "./xero-booking-repair-intent-recoveries";
+import { unallocatedAppliedCreditCentsByBooking } from "@/lib/xero-applied-credit-ledger-state";
+import { findCreditNotesSpentOutsideApp } from "@/lib/xero-credit-note-spent-outside-flag";
+import {
+  editReviewChargeShareTaskSelect,
+  editReviewChargeShareTaskWhere,
+  sumEditReviewChargeSharesByAnchor,
+  type EditReviewChargeShareRow,
+} from "@/lib/edit-financial-review-charge-shape";
+import logger from "@/lib/logger";
+import { loadAdditionalCaptureReceiptEvidence, loadKeptChangeCaptureEvidence } from "./xero-booking-repair-additional-capture";
+import type { RepairDependencies } from "./xero-booking-repair-deps";
+import { makeLocalKey, parseRepairScopeDay } from "./xero-booking-repair-utils";
+import {
+  addDaysDateOnly,
+  formatDateOnly,
+  isDateOnlyString,
+  parseDateOnly,
+} from "@/lib/date-only";
+import {
+  requireCalendarDate,
+  startOfClubDay,
+  type ClubTimeZone,
+} from "@/lib/club-time";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import { isPartPaymentReviewTask, NOT_NON_CANCELLATION_HAND_BACK_WHERE } from "@/lib/manual-refund-task-settlement-rules";
+import { refundPaymentLinkWhere } from "@/lib/xero-refund-note-settlement";
+import { refundNoteSetsForPayments } from "@/lib/xero-refund-note-status";
+
+/** A settled edit-review charge share, carrying the booking it was raised on. */
+type EditReviewChargeShareRecord = EditReviewChargeShareRow & {
+  bookingId: string;
+};
+
+/**
+ * An edit-review charge whose additional PaymentIntent has NOT been minted yet
+ * and is still owed by the recovery replay (#3187 fix round).
+ *
+ * Only PENDING and PROCESSING count as open. A FAILED row is terminal - nothing
+ * will replay it - and the #1491 cancellation arm already treats FAILED that
+ * way, so a terminal row must not hold the repair tool off forever. SUCCEEDED
+ * means the intent exists, and the request row it minted answers the question
+ * on its own.
+ *
+ * WHAT "NOT FOREVER" COSTS, stated rather than implied (#3187 fix round). Once
+ * the row is FAILED this tool stops deferring and will queue the invoice
+ * UNPAID, and completing it closes the anchor: there is no `WAITING_PAYMENT`
+ * row left, so `releaseXeroSupplementaryInvoiceOperationsForPaymentIntent` has
+ * nothing to act on ever again. If a LATER share is then settled on the same
+ * edit and its mint succeeds, a live PaymentIntent exists against an invoice
+ * that was raised unpaid and has already been sent - the member can pay the
+ * card while Xero reads unpaid permanently and the Stripe clearing account
+ * stays short.
+ *
+ * That is accepted, not solved, and it is accepted because the alternative is
+ * deferring the repair of every failed mint forever - permanent silence on
+ * money that is genuinely owed. It is also VISIBLE rather than silent since
+ * #3181: the later share's own dispatch finds the existing anchor, the enqueue
+ * returns `short` rather than queueing a second invoice, and
+ * `recordShortEditReviewChargeInvoice` writes the durable audit row an officer
+ * can find. Visible is not fixed; an operator who applies this arm on a booking
+ * whose retry has failed is taking on a receivable to collect and record by
+ * hand, which `docs/MAINTENANCE.md` says in the operator's own words.
+ */
+const OPEN_PAYMENT_RECOVERY_STATUSES = [
+  PaymentRecoveryOperationStatus.PENDING,
+  PaymentRecoveryOperationStatus.PROCESSING,
+] as const;
+
+type EditReviewChargeIntentRecoveryRecord = {
+  bookingId: string;
+  idempotencyKey: string;
+};
+
+/**
+ * The club calendar day after `day`, as `yyyy-MM-dd`.
+ *
+ * The result is re-validated because the last representable day does not have
+ * one: `9999-12-31` — which the day validator accepts, since it is a real date
+ * — steps to the expanded-year form `"+010000-01"`, and that reaches Prisma as
+ * a nonsense bound and fails there with an error naming neither the flag nor
+ * the day. Refusing it here fails just as closed, one layer earlier, and says
+ * which day it was.
+ */
+function nextDateOnly(day: string): string {
+  const next = formatDateOnly(addDaysDateOnly(parseDateOnly(day), 1));
+  if (!isDateOnlyString(next)) {
+    throw new Error(
+      `The repair scope's end day ${JSON.stringify(day)} has no representable next day, so its exclusive upper bound cannot be built.`
+    );
+  }
+  return next;
+}
+
+/**
+ * The `[from, to]` scope window, as the four different comparisons it really is
+ * (#2868, INV-DATE-013).
+ *
+ * The operator names two club calendar days and the sweep matches a booking
+ * whose check-in, creation, last update, or any modification falls inside them.
+ * Those four columns are not the same kind of thing, so one bound value cannot
+ * be right for all of them:
+ *
+ * - `Booking.checkIn` is `DateTime @db.Date` in `prisma/schema.prisma` — a
+ *   lodge night, a calendar day with no time in it. `@prisma/adapter-pg`
+ *   narrows whatever `Date` is bound against such a column to its UTC calendar
+ *   date and throws the time away, so this arm takes the date-only value
+ *   `parseDateOnly` produces (UTC midnight, which reads as the same calendar
+ *   day everywhere).
+ * - `Booking.createdAt`, `Booking.updatedAt` and `BookingModification.createdAt`
+ *   are bare `DateTime` in `prisma/schema.prisma` — real instants, kept whole
+ *   by the adapter. These arms take the instant the club day STARTS at,
+ *   `startOfDateOnlyForTimeZone`.
+ *
+ * The two differ by the club's UTC offset — twelve hours in NZST — and each is
+ * wrong in the other's place. Handing the instants a date-only value would put
+ * their boundary at club MIDDAY (the hazard #2838 recorded when it kept
+ * `startOfDateOnlyForTimeZone` for `draftExpiresAt`); handing `checkIn` a
+ * club-midnight instant is the defect this fixes, because club midnight is the
+ * previous UTC day and therefore the previous DATE, all day, every day.
+ *
+ * The upper bound is exclusive in both cases and is built from the day AFTER
+ * `to`, which is what makes `to` itself an included day. Either end may be
+ * omitted, giving a half-open sweep; a day that is PRESENT but not a real
+ * calendar day is refused rather than dropped, because "not supplied" and
+ * "supplied wrongly" must not mean the same thing on a tool that can `--apply`.
+ *
+ * CT-5 (#2869) changed one thing and nothing else: the club day the instant
+ * arms start at is now the PERSISTED club timezone rather than `APP_TIME_ZONE`,
+ * which was `process.env.TZ`. The operator naming two days means the club's
+ * days, so which container the repair happens to run in must not move the
+ * window (`INV-CONFIG-002`). The `checkIn` arm still takes the date-only value
+ * and takes no zone at all, for exactly the reason above.
+ */
+function buildScopeWhere(
+  scope: BookingXeroRepairScope,
+  clubTimeZone: ClubTimeZone,
+): Prisma.BookingWhereInput {
+  const and: Prisma.BookingWhereInput[] = [];
+
+  if (scope.bookingId) {
+    and.push({ id: scope.bookingId });
+  }
+
+  // Validate before the emptiness test, not with it. Reading these through
+  // truthiness — as this did — silently treats `""` as "no lower bound" and
+  // widens the sweep to all of history.
+  const fromDay =
+    scope.from === undefined ? undefined : parseRepairScopeDay(scope.from, "The repair scope's start day");
+  const toDay =
+    scope.to === undefined ? undefined : parseRepairScopeDay(scope.to, "The repair scope's end day");
+
+  if (fromDay || toDay) {
+    const dayAfterTo = toDay ? nextDateOnly(toDay) : undefined;
+
+    const checkInRange = {
+      ...(fromDay ? { gte: parseDateOnly(fromDay) } : {}),
+      ...(dayAfterTo ? { lt: parseDateOnly(dayAfterTo) } : {}),
+    };
+    const instantRange = {
+      ...(fromDay
+        ? { gte: startOfClubDay(requireCalendarDate(fromDay), clubTimeZone) }
+        : {}),
+      ...(dayAfterTo
+        ? { lt: startOfClubDay(requireCalendarDate(dayAfterTo), clubTimeZone) }
+        : {}),
+    };
+
+    and.push({
+      OR: [
+        { createdAt: instantRange },
+        { updatedAt: instantRange },
+        { checkIn: checkInRange },
+        {
+          modifications: {
+            some: {
+              createdAt: instantRange,
+            },
+          },
+        },
+      ],
+    });
+  }
+
+  if (scope.all || and.length === 0) {
+    return and.length > 0 ? { AND: and } : {};
+  }
+
+  return { AND: and };
+}
+
+export async function loadAuditData(
+  scope: BookingXeroRepairScope,
+  deps: RepairDependencies
+) {
+  const bookings = await deps.prisma.booking.findMany({
+    where: buildScopeWhere(scope, await readClubTimeZoneOutsideRequest()),
+    select: bookingRepairSelect,
+    orderBy: [
+      { createdAt: "asc" },
+      { id: "asc" },
+    ],
+  });
+
+  const paymentIds = bookings
+    .map((booking) => booking.payment?.id)
+    .filter((value): value is string => Boolean(value));
+  const bookingIds = bookings.map((booking) => booking.id);
+  const modificationIds = bookings.flatMap((booking) =>
+    booking.modifications.map((modification) => modification.id)
+  );
+
+  const linkScopes: Prisma.XeroObjectLinkWhereInput[] = [];
+  if (paymentIds.length > 0) {
+    linkScopes.push({ localModel: "Payment", localId: { in: paymentIds } });
+  }
+  if (bookingIds.length > 0) {
+    linkScopes.push({ localModel: "Booking", localId: { in: bookingIds } });
+  }
+  if (modificationIds.length > 0) {
+    linkScopes.push({
+      localModel: "BookingModification",
+      localId: { in: modificationIds },
+    });
+  }
+
+  const operationScopes: Prisma.XeroSyncOperationWhereInput[] = [];
+  if (paymentIds.length > 0) {
+    operationScopes.push({ localModel: "Payment", localId: { in: paymentIds } });
+  }
+  if (bookingIds.length > 0) {
+    operationScopes.push({ localModel: "Booking", localId: { in: bookingIds } });
+  }
+  if (modificationIds.length > 0) {
+    operationScopes.push({
+      localModel: "BookingModification",
+      localId: { in: modificationIds },
+    });
+  }
+
+  // #3187 / #3954: the exact recovery keys each loaded edit would have written.
+  const intentRecoveryKeys = intentRecoveryKeyMaps(modificationIds);
+
+  const [
+    links,
+    operations,
+    cancellationRefundRecoveryOperations,
+    editReviewChargeShares,
+    editReviewChargeIntentRecoveries,
+    lateCaptureApprovalTasks,
+    handBackTasks,
+    partPaymentReviewTasks,
+    appliedCreditAllocations,
+  ] = await Promise.all([
+    linkScopes.length > 0
+      ? deps.prisma.xeroObjectLink.findMany({
+          where: {
+            active: true,
+            OR: linkScopes,
+          },
+          select: xeroObjectLinkSelect,
+          orderBy: [
+            { updatedAt: "desc" },
+            { createdAt: "desc" },
+          ],
+        })
+      : Promise.resolve([] as XeroObjectLinkRecord[]),
+    operationScopes.length > 0
+      ? deps.prisma.xeroSyncOperation.findMany({
+          where: {
+            OR: operationScopes,
+          },
+          select: xeroOperationSelect,
+          orderBy: [
+            { updatedAt: "desc" },
+            { createdAt: "desc" },
+          ],
+        })
+      : Promise.resolve([] as XeroOperationRecord[]),
+    // #1491: booking-cancel card refunds freeze their decision as a recovery
+    // operation keyed booking_cancel_refund_recovery_<bookingId> — matched by
+    // exact key so booking-modification refund recoveries never alias in.
+    bookingIds.length > 0
+      ? deps.prisma.paymentRecoveryOperation.findMany({
+          where: {
+            idempotencyKey: {
+              in: bookingIds.map((bookingId) =>
+                buildBookingCancellationRefundIdempotencyKey(bookingId)
+              ),
+            },
+          },
+          select: {
+            id: true,
+            bookingId: true,
+            status: true,
+            amountCents: true,
+            createdAt: true,
+          },
+        })
+      : Promise.resolve([] as BookingCancellationRefundRecoveryRecord[]),
+    // #3187: the money a parked booking edit actually owes. It is on the review
+    // TASKS, never on the `BookingModification` row the edit wrote - parking
+    // exists so the structural change can commit while the money stays
+    // unresolved, so that row's `priceDiffCents` is 0 and stays 0. Scoped to the
+    // bookings this sweep loaded, and selected through the charge feature's own
+    // criteria (`editReviewChargeShareTaskWhere`) so the repair tool and the
+    // settlement it audits cannot disagree about which rows count as owed.
+    bookingIds.length > 0
+      ? deps.prisma.manualRefundTask.findMany({
+          where: {
+            bookingId: { in: bookingIds },
+            ...editReviewChargeShareTaskWhere,
+          },
+          select: { bookingId: true, ...editReviewChargeShareTaskSelect },
+        })
+      : Promise.resolve([] as EditReviewChargeShareRecord[]),
+    // #3187 fix round: an edit whose additional PaymentIntent mint FAILED at the
+    // provider. `edit-financial-review-charge-sync.ts` writes this row and returns
+    // `not-raised`, and the live settlement then queues no supplementary invoice
+    // at all - "deferred, not short". The repair tool has to be able to tell
+    // that state from the internet-banking route, which looks identical from the
+    // ledger (no request row) and needs the opposite answer.
+    intentRecoveryKeys.review.size > 0
+      ? deps.prisma.paymentRecoveryOperation.findMany({
+          where: {
+            type: PaymentRecoveryOperationType.CREATE_ADDITIONAL_PAYMENT_INTENT,
+            status: { in: [...OPEN_PAYMENT_RECOVERY_STATUSES] },
+            idempotencyKey: {
+              in: [...intentRecoveryKeys.review.keys(), ...intentRecoveryKeys.ordinary.keys()],
+            },
+          },
+          select: { bookingId: true, idempotencyKey: true },
+        })
+      : Promise.resolve([] as EditReviewChargeIntentRecoveryRecord[]),
+    // #3639 review F3: approval tasks own their captures, any status.
+    bookingIds.length > 0
+      ? deps.prisma.manualRefundTask.findMany({
+          where: {
+            bookingId: { in: bookingIds },
+            lateCaptureApprovalIntentId: { not: null },
+          },
+          // #3635: the status says which were KEPT; the id anchors their
+          // invoice; the raise time is the capture day the receipt is dated.
+          select: {
+            id: true,
+            bookingId: true,
+            lateCaptureApprovalIntentId: true,
+            status: true,
+            createdAt: true,
+          },
+        })
+      : Promise.resolve(
+          [] as {
+            id: string;
+            bookingId: string;
+            lateCaptureApprovalIntentId: string | null;
+            status: string;
+            createdAt: Date;
+          }[],
+        ),
+    // #3643 F2: the organisation late-cash arm's hand-back, any status - it is
+    // the evidence that cash arrived after a retired clearing note.
+    bookingIds.length > 0
+      ? deps.prisma.manualRefundTask.findMany({
+          where: {
+            bookingId: { in: bookingIds },
+            kind: ManualRefundTaskKind.CANCELLED_BOOKING_HAND_BACK,
+            // A part-payment review is not cash that arrived (below).
+            partPaymentReviewPaymentId: null,
+            // #3827 (`INV-PAY-117`): nor is an edit's refund hand-back.
+            ...NOT_NON_CANCELLATION_HAND_BACK_WHERE,
+          },
+          select: { bookingId: true, paymentId: true },
+        })
+      : Promise.resolve([] as { bookingId: string; paymentId: string | null }[]),
+    // #3643 (owner decision 28 Sep 2026): the hand-back task a DECISION 2
+    // cancel raised, and whether a treasurer has closed it.
+    bookingIds.length > 0
+      ? deps.prisma.manualRefundTask.findMany({
+          where: {
+            bookingId: { in: bookingIds },
+            partPaymentReviewPaymentId: { not: null },
+          },
+          select: { bookingId: true, partPaymentReviewPaymentId: true, status: true },
+        })
+      : Promise.resolve(
+          [] as {
+            bookingId: string;
+            partPaymentReviewPaymentId: string | null;
+            status: ManualRefundTaskStatus;
+          }[],
+        ),
+    // #3535: INV-PAY-017's allocation term, per booking, for the
+    // cancelled-open-invoice arm's clearing-note size. The release and the
+    // cancel path first run `repairLegacyAppliedCreditNoteAllocationsForBooking`,
+    // a write this read-only loader does not make; on a legacy booking whose
+    // stamp-era allocations have no slices yet the sum can read low and size
+    // the note above the release's. That fails safe: the builder's live
+    // AmountDue read refuses an oversize note (a shortfall, reported for a
+    // person, never auto-retried).
+    bookingIds.length > 0
+      ? deps.prisma.memberCreditNoteAllocation.groupBy({
+          by: ["appliedToBookingId"],
+          where: { appliedToBookingId: { in: bookingIds } },
+          _sum: { amountCents: true },
+        })
+      : Promise.resolve(
+          [] as Array<{ appliedToBookingId: string; _sum: { amountCents: number | null } }>
+        ),
+  ]);
+  const failedLaterOwedByPaymentId = await loadFailedLaterOwedCents(deps, paymentIds);
+  // #4215 (`INV-PAY-118`): the one reader the inbound recount uses too.
+  const paidBackRefundRequests = await readPaidBackRefundRequests(paymentIds, deps.prisma);
+  const unallocatedAppliedCreditByBookingId = await unallocatedAppliedCreditCentsByBooking(bookingIds, deps.prisma);
+  // #4220: the reading kept at ingest, judged now; database reads only, no Xero call.
+  const creditNotesSpentOutside = await findCreditNotesSpentOutsideApp(deps.prisma, { bookingIds });
+  const allocatedAppliedCreditByBookingId = new Map(
+    appliedCreditAllocations.map((row) => [
+      row.appliedToBookingId,
+      row._sum.amountCents ?? 0,
+    ])
+  );
+
+  // #3548 round 3: the unsettled-refund-note finding's links, active or not.
+  const refundPaymentLinks: XeroObjectLinkRecord[] =
+    paymentIds.length > 0
+      ? await deps.prisma.xeroObjectLink.findMany({
+          where: refundPaymentLinkWhere(paymentIds),
+          select: xeroObjectLinkSelect,
+        })
+      : [];
+
+  // #4091: refund notes Xero voided, active or not (`paymentLinks` holds active links only).
+  // #4231: one read gives the voided notes and the payments ever refund-noted.
+  const { cancelled: cancelledRefundNoteIds, notedPaymentIds: refundNotedPaymentIds } = await refundNoteSetsForPayments(paymentIds, deps.prisma);
+  const linksByLocalKey = new Map<string, XeroObjectLinkRecord[]>();
+  for (const link of links) {
+    const key = makeLocalKey(link.localModel, link.localId);
+    const list = linksByLocalKey.get(key) ?? [];
+    list.push(link);
+    linksByLocalKey.set(key, list);
+  }
+
+  const cancellationRecoveryByBookingId = new Map<
+    string,
+    BookingCancellationRefundRecoveryRecord[]
+  >();
+  for (const operation of cancellationRefundRecoveryOperations) {
+    if (!operation.bookingId) {
+      continue;
+    }
+    const list = cancellationRecoveryByBookingId.get(operation.bookingId) ?? [];
+    list.push(operation);
+    cancellationRecoveryByBookingId.set(operation.bookingId, list);
+  }
+
+  /**
+   * Per BOOKING, then per anchor. Grouping by booking first is not decoration:
+   * the anchor is read out of a stored JSON context, and a context naming a
+   * modification that belongs to a DIFFERENT booking must not contribute to that
+   * booking's expected invoice. Summing globally would let one unreadable or
+   * mis-written row move another booking's money.
+   */
+  const editReviewChargeSharesByBookingId = new Map<
+    string,
+    EditReviewChargeShareRecord[]
+  >();
+  for (const share of editReviewChargeShares) {
+    const list = editReviewChargeSharesByBookingId.get(share.bookingId) ?? [];
+    list.push(share);
+    editReviewChargeSharesByBookingId.set(share.bookingId, list);
+  }
+
+  const openIntentRecoveries = groupOpenIntentRecoveriesByBooking(editReviewChargeIntentRecoveries, intentRecoveryKeys);
+
+  const approvalIntentIdsByBookingId = new Map<string, Set<string>>();
+  const lateCaptureTasksByBookingId = new Map<string, Map<string, { id: string; status: string }>>();
+  const keptApprovalsByBookingId = new Map<string, Map<string, { id: string; createdAt: Date }>>();
+  for (const task of lateCaptureApprovalTasks) {
+    if (!task.lateCaptureApprovalIntentId) continue;
+    const ids = approvalIntentIdsByBookingId.get(task.bookingId) ?? new Set<string>();
+    ids.add(task.lateCaptureApprovalIntentId);
+    approvalIntentIdsByBookingId.set(task.bookingId, ids);
+    const tasks =
+      lateCaptureTasksByBookingId.get(task.bookingId) ?? new Map<string, { id: string; status: string }>();
+    tasks.set(task.lateCaptureApprovalIntentId, { id: task.id, status: task.status });
+    lateCaptureTasksByBookingId.set(task.bookingId, tasks);
+    if (task.status === "DISMISSED") {
+      const kept =
+        keptApprovalsByBookingId.get(task.bookingId) ??
+        new Map<string, { id: string; createdAt: Date }>();
+      kept.set(task.lateCaptureApprovalIntentId, { id: task.id, createdAt: task.createdAt });
+      keptApprovalsByBookingId.set(task.bookingId, kept);
+    }
+  }
+  // #3635: a kept booking payment's invoice anchors on its task, which no
+  // scope above reaches, so its rows are read by the approval task ids - every
+  // one, whatever its status (round-3 N1/R5).
+  const approvalTaskIds = [...lateCaptureTasksByBookingId.values()].flatMap((tasks) =>
+    [...tasks.values()].map((task) => task.id),
+  );
+  const keptTaskOperations =
+    approvalTaskIds.length > 0
+      ? ((await deps.prisma.xeroSyncOperation.findMany({
+          where: { localModel: "ManualRefundTask", localId: { in: approvalTaskIds } },
+          select: xeroOperationSelect,
+          orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+        })) as XeroOperationRecord[]).filter(
+          (operation) =>
+            operation.localModel === "ManualRefundTask" &&
+            operation.localId !== null &&
+            approvalTaskIds.includes(operation.localId),
+        )
+      : [];
+
+  // #3635 (composed review): the refund cents a note may still answer, read
+  // through the one gap reader (`readRefundCreditNoteGap`: note-eligible cash
+  // less coverage, resolved notes included), so the missing-refund-note arm
+  // never asks for a late capture's refund no note may answer. #3880 round 3:
+  // every source, so a bank payment's per-refund notes - never its canonical
+  // note - still count as cover and a fully covered booking asks for nothing.
+  const refundNoteUncoveredCentsByPaymentId = new Map<string, number>();
+  for (const booking of bookings) {
+    const payment = booking.payment;
+    if (booking.status !== "CANCELLED" || !payment) continue;
+    if (payment.refundedAmountCents <= 0) continue;
+    try {
+      const gap = await deps.readRefundCreditNoteGap({
+        id: payment.id,
+        bookingId: booking.id,
+        refundedAmountCents: payment.refundedAmountCents,
+      });
+      // #3924 round 8: a CARD note's ask, so a close's own bank cash is left out.
+      refundNoteUncoveredCentsByPaymentId.set(payment.id, gap.uncoveredCents - gap.paidAnotherWayUncoveredCents);
+    } catch (err) {
+      logger.warn({ err, paymentId: payment.id }, "Could not read a payment's refund-note gap; sizing from the refunded total");
+    }
+  }
+
+  const handBackPaymentIdsByBookingId = new Map<string, Set<string>>();
+  for (const task of handBackTasks) {
+    if (!task.paymentId) continue;
+    const ids = handBackPaymentIdsByBookingId.get(task.bookingId) ?? new Set<string>();
+    ids.add(task.paymentId);
+    handBackPaymentIdsByBookingId.set(task.bookingId, ids);
+  }
+
+  // #3643: split by status. A CLOSED review quiets the booking's finding; an
+  // OPEN one is still the durable local proof the cancel had that money was
+  // recorded against the invoice (task-queue review F2), so the classifier
+  // never offers a full clearing note over it.
+  const closedPartPaymentReviewIdsByBookingId = new Map<string, Set<string>>();
+  const openPartPaymentReviewIdsByBookingId = new Map<string, Set<string>>();
+  for (const task of partPaymentReviewTasks) {
+    if (!isPartPaymentReviewTask(task)) continue;
+    const byBooking =
+      task.status === ManualRefundTaskStatus.OPEN
+        ? openPartPaymentReviewIdsByBookingId
+        : closedPartPaymentReviewIdsByBookingId;
+    const ids = byBooking.get(task.bookingId) ?? new Set<string>();
+    ids.add(task.partPaymentReviewPaymentId);
+    byBooking.set(task.bookingId, ids);
+  }
+
+  const operationsByLocalKey = new Map<string, XeroOperationRecord[]>();
+  for (const operation of operations) {
+    if (!operation.localModel || !operation.localId) {
+      continue;
+    }
+    const key = makeLocalKey(operation.localModel, operation.localId);
+    const list = operationsByLocalKey.get(key) ?? [];
+    list.push(operation);
+    operationsByLocalKey.set(key, list);
+  }
+
+  // #3953: the change captures each booking's Xero records hold, or do not.
+  const additionalCaptureReceipts = await loadAdditionalCaptureReceiptEvidence(deps.prisma, bookings);
+  // #4324: the kept change captures on cancelled, invoiced bookings.
+  const keptChangeCaptures = await loadKeptChangeCaptureEvidence(deps.prisma, bookings, keptApprovalsByBookingId);
+
+  return bookings.map<BookingClassificationContext>((booking) => ({
+    booking,
+    additionalCaptureReceipts: additionalCaptureReceipts.get(booking.id),
+    keptChangeCaptures: keptChangeCaptures.get(booking.id),
+    paymentLinks: booking.payment
+      ? linksByLocalKey.get(makeLocalKey("Payment", booking.payment.id)) ?? []
+      : [],
+    cancelledRefundNoteIds,
+    paymentRefundPaymentLinks: booking.payment
+      ? refundPaymentLinks.filter((link) => link.localModel === "Payment" && link.localId === booking.payment!.id)
+      : [],
+    bookingLinks: linksByLocalKey.get(makeLocalKey("Booking", booking.id)) ?? [],
+    modificationLinksById: new Map(
+      booking.modifications.map((modification) => [
+        modification.id,
+        linksByLocalKey.get(makeLocalKey("BookingModification", modification.id)) ?? [],
+      ])
+    ),
+    paymentOperations: booking.payment
+      ? operationsByLocalKey.get(makeLocalKey("Payment", booking.payment.id)) ?? []
+      : [],
+    bookingOperations: operationsByLocalKey.get(makeLocalKey("Booking", booking.id)) ?? [],
+    modificationOperationsById: new Map(
+      booking.modifications.map((modification) => [
+        modification.id,
+        operationsByLocalKey.get(makeLocalKey("BookingModification", modification.id)) ?? [],
+      ])
+    ),
+    cancellationRefundRecoveryOperations:
+      cancellationRecoveryByBookingId.get(booking.id) ?? [],
+    lateCaptureApprovalIntentIds:
+      approvalIntentIdsByBookingId.get(booking.id) ?? new Set<string>(),
+    failedLaterOwedCentsByTransactionId:
+      (booking.payment ? failedLaterOwedByPaymentId.get(booking.payment.id) : undefined) ?? new Map<string, number>(),
+    keptLateCaptures: new Map(
+      [...(keptApprovalsByBookingId.get(booking.id) ?? new Map<string, { id: string; createdAt: Date }>())].map(
+        ([paymentIntentId, task]) => [
+          paymentIntentId,
+          {
+            taskId: task.id,
+            raisedAt: task.createdAt,
+            operations: keptTaskOperations.filter((operation) => operation.localId === task.id),
+          },
+        ],
+      ),
+    ),
+    lateCaptureTasks: new Map(
+      [...(lateCaptureTasksByBookingId.get(booking.id) ?? new Map<string, { id: string; status: string }>())].map(
+        ([paymentIntentId, task]) => [
+          paymentIntentId,
+          {
+            taskId: task.id,
+            status: task.status,
+            operations: keptTaskOperations.filter((operation) => operation.localId === task.id),
+          },
+        ],
+      ),
+    ),
+    cancelledBookingHandBackPaymentIds:
+      handBackPaymentIdsByBookingId.get(booking.id) ?? new Set<string>(),
+    paidBackRefundRequests: paidBackRefundRequests.filter((request) => request.paymentId === booking.payment?.id),
+    everRefundNoteLinked: booking.payment ? refundNotedPaymentIds.has(booking.payment.id) : false,
+    refundNoteUncoveredCents: booking.payment
+      ? refundNoteUncoveredCentsByPaymentId.get(booking.payment.id) ?? null
+      : null,
+    closedPartPaymentReviewPaymentIds:
+      closedPartPaymentReviewIdsByBookingId.get(booking.id) ?? new Set<string>(),
+    openPartPaymentReviewPaymentIds:
+      openPartPaymentReviewIdsByBookingId.get(booking.id) ?? new Set<string>(),
+    editReviewChargeCentsByModificationId: sumEditReviewChargeSharesByAnchor(
+      editReviewChargeSharesByBookingId.get(booking.id) ?? []
+    ),
+    xeroAllocatedAppliedCreditCents:
+      allocatedAppliedCreditByBookingId.get(booking.id) ?? 0,
+    unallocatedAppliedCreditCents: unallocatedAppliedCreditByBookingId.get(booking.id) ?? 0,
+    creditNotesSpentOutsideApp: creditNotesSpentOutside.filter(
+      (note) => note.bookingIds.includes(booking.id) || note.resolvedAllocations.some((entry) => entry.bookingId === booking.id),
+    ),
+    openEditReviewChargeIntentRecoveryModificationIds:
+      openIntentRecoveries.review.get(booking.id) ?? new Set<string>(),
+    openAdditionalIntentRecoveryModificationIds:
+      openIntentRecoveries.ordinary.get(booking.id) ?? new Set<string>(),
+  }));
+}

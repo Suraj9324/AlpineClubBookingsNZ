@@ -1,0 +1,276 @@
+import { beforeEach, describe, expect, it, vi } from "vitest"
+import { bookingGuestDietarySeeding } from "@/lib/member-dietary-booking-writes";
+
+const mocks = vi.hoisted(() => ({
+  transaction: vi.fn(),
+  seasonFindMany: vi.fn(),
+  bookingCreate: vi.fn(),
+  bookingFindMany: vi.fn(),
+  bookingUpdate: vi.fn(),
+  memberFindUnique: vi.fn(),
+  acquireLodgeCapacityLock: vi.fn(),
+  sendWaitlistConfirmationEmail: vi.fn(),
+  sendAdminNewBookingAlert: vi.fn(),
+  order: [] as string[],
+}))
+
+const tx = {
+  booking: {
+    create: (...args: unknown[]) => mocks.bookingCreate(...args),
+    findMany: (...args: unknown[]) => mocks.bookingFindMany(...args),
+    update: (...args: unknown[]) => mocks.bookingUpdate(...args),
+    findUnique: vi.fn(),
+  },
+  adultMemberHostingPolicy: { findMany: vi.fn().mockResolvedValue([]) },
+  // #3276: the night adjustment build-up writer reads and rewrites these.
+  bookingGuestNightAdjustment: {
+    deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    createMany: vi.fn().mockResolvedValue({ count: 0 }),
+    findMany: vi.fn().mockResolvedValue([]),
+  },
+  bookingGuestNight: {
+    findMany: vi.fn().mockResolvedValue([]),
+    updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+  },
+  promoRedemption: { findUnique: vi.fn().mockResolvedValue(null), findMany: vi.fn().mockResolvedValue([]), findFirst: vi.fn().mockResolvedValue(null) },
+}
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    $transaction: (callback: (client: typeof tx) => Promise<unknown>) =>
+      mocks.transaction(callback),
+    season: { findMany: (...args: unknown[]) => mocks.seasonFindMany(...args) },
+    member: { findUnique: (...args: unknown[]) => mocks.memberFindUnique(...args) },
+  },
+}))
+
+vi.mock("@/lib/lodges", () => ({
+  resolveOptionalActiveLodgeId: vi.fn().mockResolvedValue("lodge-b"),
+  lodgeNullTolerantScope: (lodgeId: string) => ({ lodgeId }),
+}))
+
+vi.mock("@/lib/lodge-access", () => ({
+  assertMemberMayBookLodge: vi.fn().mockResolvedValue(undefined),
+  LodgeBookingEligibilityError: class extends Error {},
+}))
+
+vi.mock("@/lib/capacity", () => ({
+  acquireLodgeCapacityLock: async (_tx: unknown, lodgeId: string) => {
+    mocks.order.push(`lock:${lodgeId}`)
+    await mocks.acquireLodgeCapacityLock(_tx, lodgeId)
+  },
+  checkCapacityForGuestRanges: vi.fn(),
+}))
+
+vi.mock("@/lib/booking-member-night-conflicts", () => ({
+  assertNoBookingMemberNightConflicts: vi.fn().mockResolvedValue(undefined),
+  BookingMemberNightConflictError: class extends Error {},
+  DUPLICATE_STAY_BOOKING_STATUSES: [],
+}))
+
+vi.mock("@/lib/membership-type-policy", () => ({
+  priceBookingGuestsWithMembershipTypePolicy: vi.fn().mockResolvedValue({
+    totalPriceCents: 10_000,
+    guests: [
+      {
+        priceCents: 10_000,
+        perNightCents: [5_000, 5_000],
+        nightDates: [new Date("2026-08-10"), new Date("2026-08-11")],
+      },
+    ],
+  }),
+  assertMembershipTypeBookingAllowed: vi.fn(),
+  MembershipTypeBookingPolicyError: class extends Error {},
+}))
+
+vi.mock("@/lib/booking-create-promo", () => ({
+  // #3827: the plural resolution; no codes, so no promotion.
+  promoCodeRequestsOf: vi.fn().mockReturnValue([]),
+  resolveEffectivePromoSources: vi.fn().mockResolvedValue([]),
+  resolvePromotionsInTransaction: vi.fn().mockResolvedValue({
+    discountCents: 0,
+    promoAdjustmentCents: 0,
+    promoAdjustmentTargets: [],
+    redemptions: [],
+  }),
+  getPromoTargetBookingGuestIds: vi.fn().mockReturnValue([]),
+  remapPromoIndexesToSubset: vi.fn().mockReturnValue([]),
+}))
+
+// #3827 (C1): the code-row locks and the redemptions, in the order they ran.
+vi.mock("@/lib/promo", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/promo")),
+  lockPromoCodeRowsForUpdate: async (_tx: unknown, ids: string[]) => {
+    mocks.order.push(`rows:${[...ids].sort().join(",")}`)
+  },
+  redeemPromoCode: async (_tx: unknown, promoCodeId: string) => {
+    mocks.order.push(`redeem:${promoCodeId}`)
+  },
+}))
+
+vi.mock("@/lib/adult-member-hosting-review", () => ({
+  recordAdultMemberHostingReviewForNewBooking: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock("@/lib/audit", () => ({ logAudit: vi.fn() }))
+vi.mock("@/lib/booking-events", () => ({
+  recordBookingEvent: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock("@/lib/email", () => ({
+  sendWaitlistConfirmationEmail: (...args: unknown[]) =>
+    mocks.sendWaitlistConfirmationEmail(...args),
+  sendAdminNewBookingAlert: (...args: unknown[]) =>
+    mocks.sendAdminNewBookingAlert(...args),
+  sendBookingConfirmedEmail: vi.fn(),
+  sendBookingPendingEmail: vi.fn(),
+}))
+vi.mock("@/lib/logger", () => ({
+  default: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}))
+
+import {
+  createWaitlistedBooking,
+  type WaitlistedBookingInput,
+} from "@/lib/booking-create"
+import { resolvePromotionsInTransaction } from "@/lib/booking-create-promo"
+
+describe("createWaitlistedBooking per-lodge position", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.order.length = 0
+    mocks.transaction.mockImplementation(
+      async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
+    )
+    mocks.seasonFindMany.mockResolvedValue([])
+    mocks.acquireLodgeCapacityLock.mockResolvedValue(undefined)
+    mocks.memberFindUnique.mockResolvedValue({
+      id: "member-b",
+      email: "member-b@example.test",
+      firstName: "Bea",
+      lastName: "Member",
+    })
+    const created = {
+      id: "booking-b",
+      memberId: "member-b",
+      lodgeId: "lodge-b",
+      checkIn: new Date("2026-08-10"),
+      checkOut: new Date("2026-08-12"),
+      createdAt: new Date("2026-07-10"),
+      status: "WAITLISTED",
+      finalPriceCents: 10_000,
+      requiresAdminReview: false,
+      adminReviewReason: null,
+      memberReviewJustification: null,
+      guests: [{ id: "guest-b" }],
+    }
+    mocks.bookingCreate.mockResolvedValue(created)
+    // #5402: the live queue read. One older overlapping Lodge A entry that
+    // named no alternate, and no Lodge B entries. A reader that counted every
+    // lodge would report position 2.
+    mocks.bookingFindMany.mockImplementation(async () => {
+      mocks.order.push("queue")
+      return [
+        {
+          id: "booking-a",
+          lodgeId: "lodge-a",
+          checkIn: new Date("2026-08-10"),
+          checkOut: new Date("2026-08-12"),
+          createdAt: new Date("2026-07-01"),
+          waitlistAlternateLodges: [],
+        },
+      ]
+    })
+    mocks.sendWaitlistConfirmationEmail.mockResolvedValue(undefined)
+    mocks.sendAdminNewBookingAlert.mockResolvedValue(undefined)
+  })
+
+  it("does not let Lodge A's queue make the first Lodge B entry position 2", async () => {
+    const result = await createWaitlistedBooking({
+      effectiveMemberId: "member-b",
+      isOnBehalf: false,
+      sessionUserId: "member-b",
+      checkIn: new Date("2026-08-10"),
+      checkOut: new Date("2026-08-12"),
+      lodgeId: "lodge-b",
+      guestDietarySeeding: bookingGuestDietarySeeding(false),
+      guests: [
+        {
+          firstName: "Bea",
+          lastName: "Member",
+          ageTier: "ADULT",
+          isMember: true,
+          memberId: "member-b",
+        },
+      ],
+    } as WaitlistedBookingInput)
+
+    expect(result.position).toBe(1)
+    expect(mocks.bookingFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: expect.arrayContaining([{ lodgeId: { in: ["lodge-b"] } }]),
+        }),
+      }),
+    )
+    // Read under the lodge key, and never stored (#5402): no path writes a
+    // position another path then has to keep in step.
+    expect(mocks.order).toEqual(["lock:lodge-b", "queue"])
+    expect(mocks.bookingUpdate).not.toHaveBeenCalled()
+    expect(mocks.bookingCreate.mock.calls[0]![0].data).not.toHaveProperty(
+      "waitlistPosition",
+    )
+    expect(mocks.sendWaitlistConfirmationEmail).toHaveBeenCalledWith(
+      { bookingId: "booking-b", recipientMemberId: "member-b" },
+      "member-b@example.test",
+      "Bea",
+      expect.any(Date),
+      expect.any(Date),
+      1,
+      1,
+      "lodge-b",
+    )
+  })
+
+  it("locks every code row in one sorted call after the lodge key, before any redemption (#3827)", async () => {
+    // Two codes, the booker's order putting the later id first: each
+    // redemption's counter write row-locks its code, so without the sorted
+    // lock two such creates in opposite orders would deadlock.
+    const redemption = (promoCodeId: string, applicationOrder: number) => ({
+      promoCodeId,
+      applicationOrder,
+      discountCents: 1_000,
+      priceAdjustmentCents: -1_000,
+      freeNightsUsed: 0,
+      eligibleGuestCount: 1,
+      allocations: [],
+      selectedGuestIndexes: undefined,
+    })
+    vi.mocked(resolvePromotionsInTransaction).mockResolvedValueOnce({
+      discountCents: 2_000,
+      promoAdjustmentCents: -2_000,
+      promoAdjustmentTargets: [],
+      redemptions: [redemption("zz-promo", 0), redemption("aa-promo", 1)],
+    })
+
+    await createWaitlistedBooking({
+      effectiveMemberId: "member-b",
+      isOnBehalf: false,
+      sessionUserId: "member-b",
+      checkIn: new Date("2026-08-10"),
+      checkOut: new Date("2026-08-12"),
+      lodgeId: "lodge-b",
+      guestDietarySeeding: bookingGuestDietarySeeding(false),
+      guests: [
+        { firstName: "Bea", lastName: "Member", ageTier: "ADULT", isMember: true, memberId: "member-b" },
+      ],
+    } as WaitlistedBookingInput)
+
+    expect(mocks.order.slice(0, 4)).toEqual([
+      "lock:lodge-b",
+      "rows:aa-promo,zz-promo",
+      // The redemptions keep the booker's order; only the locks are sorted.
+      "redeem:zz-promo",
+      "redeem:aa-promo",
+    ])
+  })
+})

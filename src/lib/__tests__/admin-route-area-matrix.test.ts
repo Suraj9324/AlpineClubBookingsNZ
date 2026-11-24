@@ -1,0 +1,913 @@
+import { describe, expect, it } from "vitest";
+import {
+  getAdminRouteRequirement,
+  type AdminPermissionArea,
+} from "@/lib/admin-permissions";
+import { ADMIN_ROUTE_AREA_ANCHOR_ENTRIES } from "@/lib/__tests__/helpers/admin-route-area-anchors";
+import { ADMIN_PAGES, ADMIN_RETIRED_PAGES } from "@/lib/admin-hubs";
+import {
+  adminApiRouteFiles,
+  toRawPathname,
+  toResolverPathname,
+} from "@/lib/__tests__/helpers/admin-route-enumeration";
+
+// ---------------------------------------------------------------------------
+// Admin route -> area matrix pin (issue #1548).
+//
+// The sibling admin-route-map-drift.test.ts guards ONE failure mode: a new
+// /api/admin route that silently lands on the `overview` catch-all. It cannot
+// catch a route that is MIS-mapped onto an existing, wrong prefix (a new
+// finance action added under /api/admin/members/[id]/... inherits `membership`
+// and passes there).
+//
+// This test closes that gap by pinning the COMPLETE route -> area assignment.
+// It walks every /api/admin/**/route.ts, resolves each through the REAL
+// getAdminRouteRequirement(), and asserts the full map equals a frozen snapshot
+// (EXPECTED_ROUTE_AREAS). Any prefix edit, new route, or reshuffle that changes
+// an area shows up as a precise diff, so remapping the effective access of every
+// deployed custom role cannot happen unnoticed.
+//
+// The snapshot is CURRENT truth, derived from the resolver over the working
+// tree — not aspirational. When it fails, do NOT blindly repaste: confirm the
+// new/changed route's area is the one you intend (a wrong prefix silently
+// widens or narrows access), then update EXPECTED_ROUTE_AREAS to match.
+// ---------------------------------------------------------------------------
+
+/**
+ * The walk and both pathname builders are SHARED (#2975) — see
+ * `helpers/admin-route-enumeration.ts` for why three identical walks with two
+ * different dynamic-segment placeholders was a latent hazard rather than a
+ * harmless difference. The snapshot below is still this file's own statement;
+ * only the list of routes it is made about is shared.
+ */
+
+type DiscoveredRoute = { rawPath: string; resolverPath: string };
+
+const routes: DiscoveredRoute[] = adminApiRouteFiles
+  .map((file) => ({
+    rawPath: toRawPathname(file),
+    resolverPath: toResolverPathname(file),
+  }))
+  .sort((a, b) => a.rawPath.localeCompare(b.rawPath));
+
+// route (raw path, with [param]) -> resolved admin permission area, via the
+// real resolver with a GET (area is method-independent; only level varies).
+const actualAreaByRoute: Record<string, AdminPermissionArea | "__unresolved__"> =
+  {};
+for (const { rawPath, resolverPath } of routes) {
+  const requirement = getAdminRouteRequirement(resolverPath, "GET");
+  actualAreaByRoute[rawPath] = requirement?.area ?? "__unresolved__";
+}
+
+// Routes that intentionally resolve to the `overview` catch-all. Every other
+// overview landing is an unmapped route and a real finding.
+//   - pending-counts: the cross-area badge aggregate.
+//   - menu-role: the sidebar preference (C14 #4811). The catch-all is not the
+//     gate; the handler admits any admin and answers 404 while hubs are off.
+const OVERVIEW_ALLOWLIST = [
+  "/api/admin/pending-counts",
+  "/api/admin/menu-role",
+] as const;
+
+// Frozen snapshot of the COMPLETE /api/admin route -> area assignment, derived
+// from getAdminRouteRequirement() over the working tree. See the
+// header comment: a mismatch is a real change to effective role access — verify
+// intent before repasting. Several groupings are deliberate and adjudicated as
+// intended (issue #1548), NOT bugs to "fix" by remapping:
+//   - /api/admin/modules + /api/admin/booking-messages -> support (system
+//     configuration, alongside email settings/templates and access-roles).
+//   - /api/admin/committee* -> membership (committee roles/contacts are member
+//     records).
+//   - /api/admin/members/[id]/lodge-access -> membership (a member attribute
+//     written from member admin, governed by membership:edit).
+//   - /api/admin/pending-counts -> overview (the cross-area badge aggregate).
+//   - /api/admin/menu-role -> overview (the sidebar preference; the handler's
+//     any-admin check is the gate, not this catch-all).
+//   - member-prefix finance carve-outs (credits, xero-link/push/unlink) ->
+//     finance via SPECIAL_ROUTE_AREA_PATTERNS, not membership.
+const EXPECTED_ROUTE_AREAS: Record<string, AdminPermissionArea> = {
+  "/api/admin/access-roles": "support",
+  "/api/admin/access-roles/[id]": "support",
+  "/api/admin/age-tier-settings": "bookings",
+  // Alpine Central Server (ServerNZ) integration lives on the Integrations hub
+  // (finance), matching the "/api/admin/alpine-server" prefix in admin-permissions.
+  "/api/admin/alpine-server/lodge-links": "finance",
+  "/api/admin/alpine-server/other-lodges/download": "finance",
+  "/api/admin/alpine-server/other-lodges/upload": "finance",
+  "/api/admin/alpine-server/settings": "finance",
+  "/api/admin/alpine-server/version": "finance",
+  "/api/admin/ai-assistant/settings": "support",
+  "/api/admin/ai-assistant/usage": "support",
+  // AI Diagnostics (AID-2, #2371): a separate admin-only paid capability. Its
+  // budget-settings and readiness routes sit in "support" alongside the sibling
+  // ai-assistant config routes above.
+  //
+  // The `ask` route (AID-7, #2378) inherits "support" from the same prefix, but
+  // the handler OVERRIDES the inference by owner decision Q6 and ADR-002 §1: it
+  // passes `requireAdmin({ permission: "any-admin" })`, the guard's own "holds at
+  // least one of the seven areas" rule, and every tool re-checks its own area at
+  // invocation. It used to pass `{ area: "overview", level: "view" }` on the
+  // grounds that every admin grid carries `overview`; #2984 abolished that
+  // premise. Its own route test pins the call shape and
+  // `admin-route-authorization-proof.test.ts` pins the divergence from this row.
+  // This row records what the RESOLVER would say, so that if someone removes the
+  // explicit override, the gate that silently springs into place (`support:view`,
+  // narrowing access against Q6) is at least the one adjudicated here.
+  "/api/admin/ai-diagnostics/ask": "support",
+  "/api/admin/ai-diagnostics/readiness": "support",
+  "/api/admin/ai-diagnostics/settings": "support",
+  // The NZD -> club-currency rate for AI spend (#3354): one setting shared by
+  // both AI modules, at its own prefix, same support view/edit levels.
+  "/api/admin/ai-spend-currency": "support",
+  "/api/admin/audit-log": "support",
+  "/api/admin/backups/config": "support",
+  // The `support` AREA, with a Full-Admin gate inside the handler — the same
+  // shape the destination fields on the config route carry. Restoring over the
+  // live database is not a support:edit action; the area only decides who can
+  // reach the route at all.
+  "/api/admin/backups/restore": "support",
+  "/api/admin/backups/run": "support",
+  "/api/admin/backups/status": "support",
+  // #4409: the Backups setup wizard's resume cursor, under its own area.
+  "/api/admin/backups/wizard-progress": "support",
+  "/api/admin/bed-allocation": "bookings",
+  "/api/admin/bed-allocation/allocations": "bookings",
+  "/api/admin/bed-allocation/allocations/bulk": "bookings",
+  // #2595's reviewed-move preview. `bookings` like every other allocation
+  // route: it reads the board's own rows and returns an authoritative preview,
+  // and the apply half stays on the plural `allocations` route above.
+  "/api/admin/bed-allocation/allocations/move": "bookings",
+  "/api/admin/bed-allocation/allocations/range": "bookings",
+  "/api/admin/bed-allocation/allocations/removal": "bookings",
+  "/api/admin/bed-allocation/approve": "bookings",
+  "/api/admin/bed-allocation/auto-allocate": "bookings",
+  "/api/admin/bed-allocation/beds": "bookings",
+  "/api/admin/bed-allocation/beds/[id]": "bookings",
+  "/api/admin/bed-allocation/rooms": "bookings",
+  "/api/admin/bed-allocation/rooms/[id]": "bookings",
+  "/api/admin/bed-allocation/rooms/bulk": "bookings",
+  "/api/admin/bed-allocation/rooms/import-from-config": "bookings",
+  "/api/admin/bed-allocation/settings": "bookings",
+  "/api/admin/booking-change-requests": "bookings",
+  "/api/admin/booking-change-requests/[id]": "bookings",
+  "/api/admin/booking-change-requests/[id]/quote": "bookings",
+  // Unified officer exception-request queue (#2524): same class of officer
+  // surface as booking-change-requests above, so it shares the bookings area.
+  "/api/admin/booking-exception-requests": "bookings",
+  // #2526: the officer's decision endpoint for one exception request. Same
+  // bookings area — `view` reads it, `edit` approves or refuses it, and the
+  // approval additionally reauthorizes against FRESH database roles inside its
+  // own transaction (a session token can be older than a revoked role).
+  "/api/admin/booking-exception-requests/[id]": "bookings",
+  "/api/admin/booking-messages": "support",
+  "/api/admin/booking-messages/preview": "support",
+  "/api/admin/booking-messages/reset": "support",
+  // #2364: booking-policy configuration gates on the bookings area, like every
+  // other route in this folder — view to read it, edit to change it.
+  "/api/admin/booking-policies/adult-member-hosting": "bookings",
+  "/api/admin/booking-policies/cancellation": "bookings",
+  "/api/admin/booking-policies/group-discount": "bookings",
+  "/api/admin/booking-policies/minimum-stay": "bookings",
+  "/api/admin/booking-policies/minimum-stay/[id]": "bookings",
+  "/api/admin/booking-policies/periods": "bookings",
+  "/api/admin/booking-policies/periods/[id]": "bookings",
+  "/api/admin/booking-requests": "bookings",
+  "/api/admin/booking-requests/[id]/approve": "bookings",
+  "/api/admin/booking-requests/[id]/contacts": "bookings",
+  "/api/admin/booking-requests/[id]/correct": "bookings",
+  "/api/admin/booking-requests/[id]/decline": "bookings",
+  "/api/admin/booking-requests/[id]/hold": "bookings",
+  // #2263: admin-only availability + conflict preview for a whole-lodge
+  // request. Read-only and advisory, but it exposes per-night occupancy and the
+  // identities of overlapping bookings, so it belongs to the same "bookings"
+  // area as the approve/decline actions it informs — never a wider one.
+  "/api/admin/booking-requests/[id]/hold-conflicts": "bookings",
+  "/api/admin/booking-requests/[id]/link-conflicts": "bookings",
+  "/api/admin/booking-requests/[id]/price": "bookings",
+  "/api/admin/booking-requests/[id]/quote": "bookings",
+  "/api/admin/booking-requests/[id]/release-hold": "bookings",
+  "/api/admin/booking-requests/[id]/resend-attendee-confirmation": "bookings",
+  "/api/admin/booking-requests/[id]/resolve-pending-adults": "bookings",
+  "/api/admin/booking-requests/[id]/school-record": "bookings",
+  "/api/admin/booking-requests/[id]/send-quote": "bookings",
+  // #4969: the four queue counts that badge the Booking Requests page tabs.
+  // Bookings view, like the lists it counts, rather than the overview-area
+  // sidebar aggregate, so a bookings-only role still gets its badges.
+  "/api/admin/booking-requests/pending-counts": "bookings",
+  "/api/admin/booking-requests/settings": "bookings",
+  "/api/admin/booking-reviews": "bookings",
+  "/api/admin/bookings": "bookings",
+  "/api/admin/bookings/[id]/additional-payment-reminder": "bookings",
+  "/api/admin/bookings/[id]/additional-payment/withdraw": "bookings",
+  "/api/admin/bookings/[id]/capacity-hold": "bookings",
+  "/api/admin/bookings/[id]/confirm-pending-guests": "bookings",
+  "/api/admin/bookings/[id]/copy": "bookings",
+  "/api/admin/bookings/[id]/eligible-family": "bookings",
+  "/api/admin/bookings/[id]/exclusive-hold": "bookings",
+  "/api/admin/bookings/[id]/fresh-email-copy": "bookings",
+  "/api/admin/bookings/[id]/force-confirm": "bookings",
+  // #3029: one guest's dietary/allergy note for this stay, bookings:edit.
+  "/api/admin/bookings/[id]/guest-dietary": "bookings",
+  // B5 (#2262): a bookings-prefixed path deliberately resolved to finance by
+  // SPECIAL_ROUTE_AREA_PATTERNS — recording or reversing a cash settlement is a
+  // money action, gated finance:edit.
+  "/api/admin/bookings/[id]/mark-paid": "finance",
+  // MG4 (#2309): the officer's member-guest picker, scoped to one booking. It
+  // sits in `bookings` because that is what it is FOR — adding a guest to this
+  // booking — and its own handler additionally requires `membership:view`
+  // before it will search by NAME (owner decision D-20, rider (a)), so the
+  // area recorded here is the floor, not the whole gate.
+  "/api/admin/bookings/[id]/member-guest-candidates": "bookings",
+  "/api/admin/bookings/[id]/no-emails": "bookings",
+  "/api/admin/bookings/[id]/requested-room": "bookings",
+  // #2649: the stranded zero-dollar waitlist confirm repair. It moves booking
+  // status, so path inference gives it bookings:edit, and the route declares
+  // that permission explicitly rather than relying on inference.
+  "/api/admin/bookings/[id]/return-to-waitlist": "bookings",
+  "/api/admin/bookings/[id]/work-party": "bookings",
+  "/api/admin/bookings/[id]/review": "bookings",
+  "/api/admin/bookings/eligible-family": "bookings",
+  "/api/admin/bookings/non-member-contact": "bookings",
+  "/api/admin/bookings/search": "bookings",
+  "/api/admin/chores": "lodge",
+  "/api/admin/chores/[id]": "lodge",
+  "/api/admin/club-contact": "content",
+  // #3563 (programme #3205): the club currency and locale maintenance API.
+  // `support` for route-map resolution only; each verb passes its own explicit
+  // gate (#3596) — the read `requireAdmin({ permission: "any-admin" })`, WIDER
+  // than this area, and the write `requireAdmin({ permission: false })`, Full
+  // Admin like club-time-zone below. Both divergences are pinned in
+  // `admin-route-authorization-proof.test.ts`.
+  "/api/admin/club-format": "support",
+  "/api/admin/club-identity": "content",
+  // #4632: the club's GST / tax treatment schedule. `finance`, beside the Xero
+  // routes whose documents render from it: the read is `finance:view`, but the
+  // writes pass `requireAdmin({ permission: false })`, Full Admin, stricter
+  // than `finance:edit`; both divergences are pinned in
+  // `admin-route-authorization-proof.test.ts`.
+  "/api/admin/club-tax": "finance",
+  // CT-1 (#2989): the club-timezone maintenance API. `support` is the area — it
+  // is installation configuration, alongside /api/admin/modules and
+  // /api/admin/config-transfer — but the AREA is not the gate here. Both verbs
+  // pass `requireAdmin({ permission: false })`, i.e. Full Admin only, the same
+  // shape /api/admin/backups/restore carries. This row records what the RESOLVER
+  // would say, so if that explicit override is ever removed the gate that
+  // silently springs into place (`support:view` on the read, `support:edit` on
+  // the write — both a WIDENING against #2989's decision) is at least the one
+  // adjudicated here.
+  "/api/admin/club-time-zone": "support",
+  // #2998: club message board moderation. `membership`, beside the notices
+  // routes -- and what each of these handlers already enforces for itself
+  // via requireAdmin({ area: "membership" }).
+  "/api/admin/club-posts": "membership",
+  "/api/admin/club-posts/[id]": "membership",
+  "/api/admin/club-posts/cleanup": "membership",
+  "/api/admin/club-posts/settings": "membership",
+  "/api/admin/committee/assignments": "membership",
+  "/api/admin/committee/assignments/[id]": "membership",
+  "/api/admin/config-transfer/apply": "support",
+  "/api/admin/config-transfer/export": "support",
+  "/api/admin/config-transfer/plan": "support",
+  "/api/admin/config-transfer/reseal": "support",
+  "/api/admin/committee/roles": "membership",
+  "/api/admin/committee/roles/[id]": "membership",
+  "/api/admin/communications/history": "membership",
+  "/api/admin/communications/send": "membership",
+  "/api/admin/notices": "membership",
+  "/api/admin/notices/[id]": "membership",
+  "/api/admin/notices/[id]/reads": "membership",
+  "/api/admin/credit-approvals": "finance",
+  "/api/admin/opening-credits": "finance",
+  "/api/admin/opening-credits/[id]/reverse": "finance",
+  "/api/admin/opening-credits/confirm": "finance",
+  "/api/admin/opening-credits/preview": "finance",
+  "/api/admin/deletion-requests": "membership",
+  "/api/admin/deletion-requests/[id]": "membership",
+  "/api/admin/display/built-ins/restore": "lodge",
+  "/api/admin/display/devices": "lodge",
+  "/api/admin/display/devices/[id]": "lodge",
+  "/api/admin/display/devices/[id]/pairing": "lodge",
+  "/api/admin/display/devices/[id]/revoke": "lodge",
+  "/api/admin/display/layouts": "lodge",
+  "/api/admin/display/layouts/[id]": "lodge",
+  "/api/admin/display/lodge-config": "lodge",
+  "/api/admin/display/preview": "lodge",
+  "/api/admin/display/preview-grant": "lodge",
+  "/api/admin/display/reference/conditions": "lodge",
+  "/api/admin/display/templates": "lodge",
+  "/api/admin/display/templates/[id]": "lodge",
+  "/api/admin/email-failures/[id]/reissue-token": "support",
+  "/api/admin/email-failures/[id]/retry": "support",
+  "/api/admin/email-failures/[id]/review": "support",
+  "/api/admin/email-settings": "support",
+  "/api/admin/email-suppressions": "support",
+  "/api/admin/email-suppressions/[id]/clear": "support",
+  "/api/admin/email-templates": "support",
+  "/api/admin/email-templates/preview": "support",
+  "/api/admin/email-templates/reset": "support",
+  // Environment safety (ENV-SAFETY 1 #3034). `support` for route-map
+  // resolution only; BOTH verbs enforce Full Admin in the route itself with
+  // `requireAdmin({ permission: false })`, exactly like club-time-zone above.
+  "/api/admin/environment-safety": "support",
+  "/api/admin/family-groups": "membership",
+  "/api/admin/family-groups/[id]": "membership",
+  "/api/admin/family-groups/[id]/login-holder": "membership",
+  // #2568: identity-confirmation member lookup for the family-group workflows.
+  "/api/admin/family-groups/member-search": "membership",
+  "/api/admin/family-groups/partner-invites": "membership",
+  "/api/admin/family-groups/requests": "membership",
+  "/api/admin/family-suggestions": "membership",
+  "/api/admin/family-suggestions/hide": "membership",
+  "/api/admin/family-suggestions/reset": "membership",
+  "/api/admin/fee-configuration": "finance",
+  "/api/admin/food-orders/settings": "lodge",
+  "/api/admin/health": "support",
+  "/api/admin/hut-leaders": "lodge",
+  "/api/admin/hut-leaders/[id]": "lodge",
+  "/api/admin/hut-leaders/[id]/pin": "lodge",
+  // #2286: the custodian bed picker's per-bed availability feed.
+  "/api/admin/hut-leaders/available-beds": "lodge",
+  "/api/admin/hut-leaders/eligible-members": "lodge",
+  "/api/admin/hut-leaders/unassigned-dates": "lodge",
+  "/api/admin/image-library": "content",
+  "/api/admin/image-library/[id]": "content",
+  "/api/admin/image-manager/directories": "content",
+  "/api/admin/image-manager/images": "content",
+  "/api/admin/image-manager/upload": "content",
+  "/api/admin/induction-templates": "membership",
+  "/api/admin/induction-templates/[id]": "membership",
+  "/api/admin/inductions": "membership",
+  "/api/admin/inductions/[id]": "membership",
+  // #2573: Google Analytics configuration. `finance`, deliberately and like every
+  // other route on this prefix — Xero, Stripe and Google sign-in setup all live in
+  // that area, and the owner's decision made analytics a peer of them on the same
+  // Integrations hub. Read needs finance:view, write finance:edit.
+  "/api/admin/integrations/analytics": "finance",
+  "/api/admin/integrations/analytics/reconsent": "finance",
+  "/api/admin/integrations/credentials": "finance",
+  "/api/admin/integrations/google/status": "finance",
+  "/api/admin/integrations/google/verify/start": "finance",
+  // #2940: the club-editable MiroTalk settings and the three encrypted
+  // secrets. Finance, like every other Integrations-hub endpoint — reading
+  // the status is finance-area, and every WRITE additionally requires Full
+  // Admin, which this matrix does not model and each route enforces itself.
+  "/api/admin/integrations/mirotalk": "finance",
+  "/api/admin/integrations/mirotalk/credentials": "finance",
+  "/api/admin/integrations/stripe/status": "finance",
+  "/api/admin/integrations/wizard-progress": "finance",
+  "/api/admin/internet-banking-settings": "finance",
+  "/api/admin/issue-reports": "support",
+  "/api/admin/issue-reports/[id]": "support",
+  "/api/admin/lockers": "membership",
+  "/api/admin/lockers/[id]": "membership",
+  "/api/admin/lockers/bulk": "membership",
+  "/api/admin/lodge": "lodge",
+  "/api/admin/lodge-instructions": "lodge",
+  "/api/admin/lodge-settings": "lodge",
+  "/api/admin/lodge-settings/school-hut-leaders": "lodge",
+  "/api/admin/lodges": "lodge",
+  "/api/admin/lodges/[id]": "lodge",
+  // The member lodge roster's per-lodge name-detail dial (#2942). It sits under
+  // the existing "/api/admin/lodges" prefix on purpose, so the gate it enforces
+  // (`lodge:view` / `lodge:edit`) is the one this map already infers and no new
+  // prefix is invented for one setting.
+  "/api/admin/lodges/[id]/roster-settings": "lodge",
+  "/api/admin/lodges/[id]/central-lodge": "lodge",
+  "/api/admin/maintenance-reports": "lodge",
+  "/api/admin/maintenance-reports/[id]": "lodge",
+  "/api/admin/maintenance-reports/questions": "lodge",
+  "/api/admin/maintenance-reports/settings": "lodge",
+  "/api/admin/maintenance-reports/tokens": "lodge",
+  "/api/admin/organisations/[id]/contact": "bookings",
+  "/api/admin/organisations/[id]/contact/retry": "bookings",
+  "/api/admin/other-lodges": "lodge",
+  "/api/admin/other-lodges/[id]": "lodge",
+  "/api/admin/other-lodges/[id]/hide": "lodge",
+  "/api/admin/mcp/grants": "support",
+  "/api/admin/mcp/grants/[id]": "support",
+  "/api/admin/mcp/settings": "support",
+  "/api/admin/member-applications": "membership",
+  "/api/admin/member-applications/[id]": "membership",
+  "/api/admin/member-applications/[id]/approval-preview": "membership",
+  "/api/admin/member-applications/[id]/nominations/refresh": "membership",
+  "/api/admin/member-applications/[id]/nominators/[slot]/replace": "membership",
+  "/api/admin/member-fields": "membership",
+  // Deliberately BOOKINGS, not membership, despite the /api/admin/member* name
+  // (epic #2305, MG2 #2307): it is booking policy — ask-first vs notify-only and
+  // how long a pending member guest holds the bed — so it belongs with
+  // booking-requests/settings, and it is bookings editors who administer it.
+  "/api/admin/member-guest-settings": "bookings",
+  "/api/admin/member-lifecycle-action-requests": "membership",
+  "/api/admin/member-lifecycle-action-requests/[requestId]": "membership",
+  "/api/admin/members": "membership",
+  "/api/admin/members/[id]": "membership",
+  "/api/admin/members/[id]/audit-log": "membership",
+  "/api/admin/members/[id]/credits": "finance",
+  "/api/admin/members/[id]/credits/[requestId]": "finance",
+  "/api/admin/members/[id]/dependent-email-source": "membership",
+  "/api/admin/members/[id]/dependents/[dependentId]": "membership",
+  "/api/admin/members/[id]/dependents/link": "membership",
+  // #2253: read-only derived family tree; intentionally membership like the
+  // member detail page it renders inside.
+  "/api/admin/members/[id]/family-tree": "membership",
+  "/api/admin/members/[id]/joining-fee/preview": "membership",
+  "/api/admin/members/[id]/lifecycle/archive": "membership",
+  "/api/admin/members/[id]/lifecycle/delete": "membership",
+  "/api/admin/members/[id]/lodge-access": "membership",
+  "/api/admin/members/[id]/membership-cancellation": "membership",
+  "/api/admin/members/[id]/merge": "membership",
+  "/api/admin/members/[id]/merge/preview": "membership",
+  "/api/admin/members/[id]/partner-link": "membership",
+  "/api/admin/members/[id]/seasonal-membership": "membership",
+  "/api/admin/members/[id]/seasonal-membership/preview": "membership",
+  "/api/admin/members/[id]/xero-link": "finance",
+  "/api/admin/members/[id]/xero-push": "finance",
+  "/api/admin/members/[id]/xero-unlink": "finance",
+  "/api/admin/members/bulk-membership-type": "membership",
+  "/api/admin/members/bulk-membership-type/preview": "membership",
+  "/api/admin/members/bulk-subscription-category": "membership",
+  "/api/admin/members/bulk-subscription-category/preview": "membership",
+  "/api/admin/members/bulk-update": "membership",
+  "/api/admin/members/export": "membership",
+  "/api/admin/members/import": "membership",
+  "/api/admin/members/send-password-reset": "membership",
+  "/api/admin/members/send-setup-invite": "membership",
+  "/api/admin/members/subject-access": "membership",
+  "/api/admin/members/subject-access/guests": "membership",
+  "/api/admin/membership-cancellation-requests": "membership",
+  "/api/admin/membership-cancellation-requests/[requestId]/participants/[participantId]":
+    "membership",
+  "/api/admin/membership-cancellation-requests/[requestId]/participants/[participantId]/resend-confirmation":
+    "membership",
+  "/api/admin/membership-cancellation-settings": "membership",
+  "/api/admin/membership-lockout-settings": "membership",
+  "/api/admin/membership-lockout-settings/liability-impact": "membership",
+  "/api/admin/membership-nomination-settings": "membership",
+  "/api/admin/membership-types": "membership",
+  "/api/admin/membership-types/[id]": "membership",
+  "/api/admin/membership-types/[id]/merge": "membership",
+  "/api/admin/membership-types/reorder": "membership",
+  "/api/admin/membership-types/roll-forward": "membership",
+  // The role-menu cookie (C14 #4811). The path has no area of its own, so it
+  // lands on the overview catch-all; the handler's `any-admin` is the gate.
+  "/api/admin/menu-role": "overview",
+  "/api/admin/modules": "support",
+  "/api/admin/mountain-conditions": "content",
+  "/api/admin/notification-delivery-policies": "support",
+  "/api/admin/notifications": "support",
+  "/api/admin/occupancy": "bookings",
+  "/api/admin/page-content": "content",
+  "/api/admin/public-content-settings": "content",
+  "/api/admin/payments": "finance",
+  "/api/admin/payments/[id]/generate-invoice": "finance",
+  "/api/admin/payments/bank-refund-voids/[id]/answered": "finance",
+  "/api/admin/payments/bank-refund-voids/[id]/pick": "finance",
+  // B5 (#2262): the open hand-back queue and the endpoint that closes a task.
+  // The /api/admin/payments prefix already resolves to finance, so no
+  // SPECIAL_ROUTE_AREA_PATTERNS entry is needed for this one.
+  "/api/admin/payments/card-refunds/[id]/paid-another-way": "finance",
+  // #3372 (owner, 9 Oct 2026): a paid-twice row marked Resolved, gated as the close is.
+  "/api/admin/payments/card-refunds/[id]/paid-twice-resolved": "finance",
+  // #4368 (owner, 25 Oct 2026): a dead card refund's no-money close and its re-arm, gated as the close is.
+  "/api/admin/payments/card-refunds/[id]/nothing-left-owed": "finance",
+  "/api/admin/payments/card-refunds/[id]/try-card-again": "finance",
+  "/api/admin/payments/manual-refund-tasks": "finance",
+  "/api/admin/payments/manual-refund-tasks/[id]": "finance",
+  // #3498 (owner decision D2): putting a dismissed money task back on the queue
+  // is gated exactly as closing one is - undoing a money decision is not a
+  // lesser act than taking it.
+  "/api/admin/payments/manual-refund-tasks/[id]/reopen": "finance",
+  "/api/admin/payments/manual-refund-tasks/[id]/reduce-by-lost-dispute": "finance",
+  "/api/admin/pending-counts": "overview",
+  "/api/admin/privacy-hosting": "content",
+  "/api/admin/privacy-retention": "support",
+  "/api/admin/promo-codes": "bookings",
+  "/api/admin/promo-codes/[id]": "bookings",
+  "/api/admin/promo-codes/[id]/redemptions": "bookings",
+  "/api/admin/refund-requests": "finance",
+  "/api/admin/refund-requests/[id]": "finance",
+  "/api/admin/reports": "finance",
+  "/api/admin/roster/[date]": "lodge",
+  "/api/admin/roster/status": "lodge",
+  "/api/admin/runtime-status": "support",
+  "/api/admin/seasons": "bookings",
+  "/api/admin/seasons/[id]": "bookings",
+  // Login & Security config (#2033/#2103): support-area system config, pinned
+  // alongside /api/admin/modules. Each route names support:edit explicitly
+  // rather than relying on path inference, which depends on the middleware-set
+  // request-path header (absent header ⇒ full-ADMIN fallback, silently
+  // excluding support-area admins). See admin-permissions.ts.
+  "/api/admin/security/magic-link": "support",
+  "/api/admin/security/officer-two-factor": "support",
+  "/api/admin/security/password-policy": "support",
+  "/api/admin/security/two-factor-reset/[memberId]": "support",
+  "/api/admin/setup": "support",
+  "/api/admin/setup/finance-report-mappings": "finance",
+  "/api/admin/setup/finance-report-mappings/backfill": "finance",
+  "/api/admin/setup/progress": "support",
+  "/api/admin/setup/provider-test": "support",
+  "/api/admin/site-banners": "content",
+  "/api/admin/site-banners/[id]": "content",
+  "/api/admin/site-content": "content",
+  "/api/admin/site-images": "content",
+  "/api/admin/site-style": "content",
+  "/api/admin/site-style/logo": "content",
+  "/api/admin/stuck-states": "support",
+  "/api/admin/subscriptions": "finance",
+  "/api/admin/subscriptions/[id]/manual-payment": "finance",
+  "/api/admin/subscription-billing": "finance",
+  "/api/admin/subscription-categories": "membership",
+  "/api/admin/subscription-categories/[id]": "membership",
+  "/api/admin/waitlist": "bookings",
+  "/api/admin/work-parties": "lodge",
+  "/api/admin/work-parties/[id]": "lodge",
+  "/api/admin/work-parties/[id]/calendar": "lodge",
+  "/api/admin/xero/account-mappings": "finance",
+  "/api/admin/xero/callback": "finance",
+  // #5204: the overpayment and prepayment queue (GET, finance:view) and its
+  // Xero refresh (POST, finance:edit).
+  "/api/admin/xero/cash-credits": "finance",
+  "/api/admin/xero/chart-of-accounts": "finance",
+  "/api/admin/xero/connect": "finance",
+  "/api/admin/xero/contact-group-mismatches": "finance",
+  "/api/admin/xero/contact-groups": "finance",
+  "/api/admin/xero/contact-link-mismatches": "finance",
+  "/api/admin/xero/disconnect": "finance",
+  "/api/admin/xero/duplicate-contacts": "finance",
+  // #3058: the erased-member Xero contact review. A GET and nothing else —
+  // the erasure performs no Xero mutation, so there is no write to gate.
+  "/api/admin/xero/erased-member-contacts": "finance",
+  "/api/admin/xero/force-sync": "finance",
+  "/api/admin/xero/health": "finance",
+  "/api/admin/xero/import-member-contact": "finance",
+  "/api/admin/xero/import-members": "finance",
+  "/api/admin/xero/inbound-events": "finance",
+  "/api/admin/xero/inbound-events/[id]/replay": "finance",
+  "/api/admin/xero/item-code-mappings": "finance",
+  "/api/admin/xero/items": "finance",
+  "/api/admin/xero/link-maintenance": "finance",
+  // E8 (#1934): member-grouping mode/rules/dry-run/bulk-resync — finance, like
+  // every other /api/admin/xero surface (the route guard itself narrows the
+  // POST to finance:view with per-action finance:edit checks).
+  "/api/admin/xero/member-grouping": "finance",
+  // #2939: the missing-contact census (GET, finance:view) and the bounded
+  // seeding run (POST, finance:edit). Both are finance.
+  "/api/admin/xero/missing-contacts": "finance",
+  "/api/admin/xero/missing-invoices": "finance",
+  "/api/admin/xero/operations": "finance",
+  "/api/admin/xero/operations/[id]/mark-failed": "finance",
+  "/api/admin/xero/operations/[id]/mark-non-replayable": "finance",
+  "/api/admin/xero/operations/[id]/requeue": "finance",
+  "/api/admin/xero/operations/[id]/resolve": "finance",
+  "/api/admin/xero/operations/[id]/retry": "finance",
+  "/api/admin/xero/operations/reset-stale-running": "finance",
+  "/api/admin/xero/operations/retry-all": "finance",
+  "/api/admin/xero/organisation": "finance",
+  "/api/admin/xero/records/[localModel]/[localId]": "finance",
+  "/api/admin/xero/search-contacts": "finance",
+  "/api/admin/xero/status": "finance",
+  "/api/admin/xero/sync-contacts": "finance",
+  "/api/admin/xero/sync-memberships": "finance",
+  "/api/admin/xero/sync-now": "finance",
+  "/api/admin/xero/tax-categories": "finance",
+  // #5208: the GST-override pause; finance:view reads it, finance:edit clears it.
+  "/api/admin/xero/tax-override-pause": "finance",
+  "/api/admin/xero/tax-override-pause/clear": "finance",
+  "/api/admin/xero/usage": "finance",
+  "/api/admin/xero/webhook-health": "finance",
+  // #2081: webhook intent-to-receive verify status / amber-badge source. Read is
+  // any-admin (status visibility); the webhook-key WRITE stays Full-Admin-only
+  // via the C1 credentials API. Lives under the finance area like its siblings.
+  "/api/admin/xero/webhook/verify-status": "finance",
+};
+
+describe("admin route -> area matrix pin (#1548)", () => {
+  it("finds the /api/admin routes to enumerate", () => {
+    // Sanity floor so a broken walk can never make the pin vacuously pass.
+    expect(routes.length).toBeGreaterThan(150);
+  });
+
+  it("resolves every /api/admin route to a non-null requirement", () => {
+    const unresolved = Object.entries(actualAreaByRoute)
+      .filter(([, area]) => area === "__unresolved__")
+      .map(([rawPath]) => rawPath);
+    expect(unresolved).toEqual([]);
+  });
+
+  it("never lands a route on the overview catch-all outside the allowlist", () => {
+    const violations = Object.entries(actualAreaByRoute)
+      .filter(
+        ([rawPath, area]) =>
+          area === "overview" &&
+          !(OVERVIEW_ALLOWLIST as readonly string[]).includes(rawPath),
+      )
+      .map(([rawPath]) => rawPath);
+
+    // overview is the resolver's catch-all: a new route landing here is almost
+    // always a forgotten ROUTE_AREA_PREFIXES entry, not an intended overview
+    // route. Add the mapping (or, consciously, extend OVERVIEW_ALLOWLIST).
+    expect(violations).toEqual([]);
+  });
+
+  it("pins the complete route -> area assignment to the frozen snapshot", () => {
+    // A mismatch is a real change to the effective access of every deployed
+    // custom role. Verify the changed route's area is intended, then update
+    // EXPECTED_ROUTE_AREAS.
+    expect(actualAreaByRoute).toEqual(EXPECTED_ROUTE_AREAS);
+  });
+
+  it("agrees with the reviewed anchors the authorization proof drives (#2975)", () => {
+    // The anchor table and this snapshot are the same reviewed fact stated twice:
+    // "this route belongs to this area". They are separate because they are used
+    // differently — the anchors are driven through the REAL guards, this snapshot
+    // is resolved through the map alone — but two statements of one fact can
+    // disagree, and a disagreement here would mean one of them was updated and
+    // the other was not. The table itself lives in
+    // `helpers/admin-route-area-anchors.ts`; this is the seam that keeps them one.
+    const apiAnchors = ADMIN_ROUTE_AREA_ANCHOR_ENTRIES.filter(({ pathname }) =>
+      pathname.startsWith("/api/admin"),
+    );
+    expect(apiAnchors.length).toBeGreaterThan(10);
+    const disagreements = apiAnchors.flatMap(({ area, pathname }) => {
+      const snapshot = EXPECTED_ROUTE_AREAS[pathname];
+      if (snapshot === undefined) {
+        return [`${pathname}: anchored to "${area}" but absent from the snapshot`];
+      }
+      return snapshot === area
+        ? []
+        : [`${pathname}: anchored to "${area}", snapshot says "${snapshot}"`];
+    });
+    expect(disagreements).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The same pin for the admin PAGES (#4799).
+//
+// Since C2 of epic #4468 the page half of the route map is generated from the
+// hub registry (`src/lib/admin-hubs/`) rather than written by hand, so the
+// registry entry IS the prefix edit. This snapshot is the reviewed statement
+// that the generation must reproduce: every page's area, keyed by its OLD path
+// (dynamic segments as `[param]`), as `getAdminRouteRequirement` resolved it on
+// `main` before C2. A page's hub path must resolve to the same row.
+//
+// A new page needs a row here as well as a registry entry. A changed row is a
+// change to who can open that screen: confirm it is intended before repasting.
+// ---------------------------------------------------------------------------
+const EXPECTED_PAGE_AREAS: Record<string, AdminPermissionArea> = {
+  "/admin/access-roles": "support",
+  "/admin/age-tier-settings": "bookings",
+  "/admin/ai-assistant": "support",
+  "/admin/ai-connections": "support",
+  "/admin/ai-diagnostics": "overview",
+  "/admin/alpine-server/setup": "finance",
+  "/admin/appearance": "content",
+  "/admin/appearance/identity": "content",
+  "/admin/audit-log": "support",
+  "/admin/background-jobs": "support",
+  "/admin/backups": "support",
+  "/admin/backups/setup": "support",
+  "/admin/bed-allocation": "bookings",
+  "/admin/book": "bookings",
+  "/admin/booking-approvals": "bookings",
+  "/admin/booking-change-requests": "bookings",
+  "/admin/booking-messages": "support",
+  "/admin/booking-policies": "bookings",
+  "/admin/booking-policies/adult-member-hosting": "bookings",
+  "/admin/booking-policies/cancellation": "bookings",
+  "/admin/booking-policies/group-discount": "bookings",
+  "/admin/booking-policies/minimum-stay": "bookings",
+  "/admin/booking-policies/periods": "bookings",
+  "/admin/booking-policies/public-requests": "bookings",
+  "/admin/booking-requests": "bookings",
+  "/admin/bookings": "bookings",
+  "/admin/bookings-setup": "bookings",
+  "/admin/calendar": "lodge",
+  "/admin/chores": "lodge",
+  "/admin/club-format": "support",
+  "/admin/club-time": "support",
+  "/admin/committee": "membership",
+  "/admin/communications": "membership",
+  "/admin/config-transfer": "support",
+  "/admin/dashboard": "overview",
+  "/admin/deletion-requests": "membership",
+  "/admin/display": "lodge",
+  "/admin/display/builder": "lodge",
+  "/admin/display/devices": "lodge",
+  "/admin/display/layouts": "lodge",
+  "/admin/display/preview": "lodge",
+  "/admin/display/reference": "lodge",
+  "/admin/display/settings": "lodge",
+  "/admin/display/setup": "lodge",
+  "/admin/display/templates": "lodge",
+  "/admin/email-deliverability": "support",
+  "/admin/email-messages": "support",
+  "/admin/environment": "support",
+  "/admin/family-groups": "membership",
+  "/admin/fee-configuration": "finance",
+  "/admin/fees": "bookings",
+  "/admin/food-orders": "lodge",
+  "/admin/google/setup": "finance",
+  "/admin/health": "support",
+  "/admin/hut-leaders": "lodge",
+  "/admin/image-manager": "content",
+  "/admin/induction": "membership",
+  "/admin/induction/[id]/print": "membership",
+  "/admin/induction/settings": "membership",
+  "/admin/integrations": "finance",
+  "/admin/internet-banking": "finance",
+  "/admin/issue-reports": "support",
+  "/admin/lockers": "membership",
+  "/admin/lodge": "lodge",
+  "/admin/lodge-instructions": "lodge",
+  "/admin/lodges": "lodge",
+  "/admin/lodges/[id]": "lodge",
+  "/admin/lodges/[id]/central-lodge": "lodge",
+  "/admin/lodges/[id]/display": "lodge",
+  "/admin/lodges/[id]/roster": "lodge",
+  "/admin/lodges/[id]/setup": "lodge",
+  "/admin/maintenance-reports": "lodge",
+  "/admin/member-applications": "membership",
+  "/admin/member-fields": "membership",
+  "/admin/members": "membership",
+  "/admin/members/[id]": "membership",
+  "/admin/members/[id]/merge": "membership",
+  "/admin/membership-cancellations": "membership",
+  "/admin/membership-setup": "membership",
+  "/admin/membership-types": "membership",
+  "/admin/message-board": "membership",
+  "/admin/modules": "support",
+  "/admin/mountain-conditions": "content",
+  "/admin/notices": "membership",
+  "/admin/notices/[id]": "membership",
+  "/admin/notices/new": "membership",
+  "/admin/notification-recipients": "support",
+  "/admin/notification-rules": "support",
+  "/admin/notifications": "support",
+  "/admin/page-content": "content",
+  "/admin/payments": "finance",
+  "/admin/privacy-retention": "support",
+  "/admin/promo-codes": "bookings",
+  "/admin/refund-requests": "finance",
+  "/admin/reports": "finance",
+  "/admin/rooms-beds": "lodge",
+  "/admin/roster": "lodge",
+  "/admin/roster/[date]/print": "lodge",
+  "/admin/seasons": "bookings",
+  "/admin/security": "support",
+  "/admin/setup": "support",
+  "/admin/setup/finance": "finance",
+  "/admin/setup/foundations": "support",
+  "/admin/site-banners": "content",
+  "/admin/site-content": "content",
+  "/admin/site-style": "content",
+  "/admin/stripe/setup": "finance",
+  "/admin/stuck-states": "support",
+  "/admin/subscription-categories": "membership",
+  "/admin/subscription-lockout": "membership",
+  "/admin/subscriptions": "finance",
+  "/admin/testing/route-error": "overview",
+  "/admin/video-meetings/setup": "finance",
+  "/admin/waitlist": "bookings",
+  "/admin/work-parties": "lodge",
+  "/admin/xero": "finance",
+  "/admin/xero/member-grouping": "finance",
+  "/admin/xero/records/[localModel]/[localId]": "finance",
+  "/admin/xero/setup": "finance",
+  "/admin/xero/unallocated-payments": "finance",
+};
+
+/**
+ * The five pages S1 (#4796) retired by merging them into another, with the
+ * area each was pinned to above until then. Their rows left the table with
+ * their files; this keeps what they admitted on, so each merge is checked
+ * against it.
+ */
+const RETIRED_PAGE_AREAS: Record<string, AdminPermissionArea> = {
+  "/admin/family-suggestions": "membership",
+  "/admin/membership-cancellation": "membership",
+  "/admin/setup/booking-rules": "bookings",
+  "/admin/setup/cancellation": "support",
+  "/admin/setup/integrations": "support",
+};
+
+/**
+ * The one merge whose destination is on a different area, reviewed: the
+ * Cancellation setup page was a `support` page of links to two `membership`
+ * pages and Email Messages; its content is now a `membership` tab. An admin
+ * who reaches it now needs `membership`, as every link on it already did, so
+ * nobody is admitted who was not.
+ */
+const RETIRED_AREA_CHANGES: Record<string, AdminPermissionArea> = {
+  "/admin/setup/cancellation": "membership",
+};
+
+/** A concrete URL for a registry path: every `[name]` filled with `x123`. */
+function concretePagePath(registryPath: string): string {
+  return registryPath.replace(/\[[^\]/]+\]/g, "x123");
+}
+
+describe("admin page -> area pin (#4799)", () => {
+  it("has exactly one row per registered page", () => {
+    expect(ADMIN_PAGES.length).toBeGreaterThan(100);
+    expect(ADMIN_PAGES.map((page) => page.oldPath).sort()).toEqual(
+      Object.keys(EXPECTED_PAGE_AREAS).sort(),
+    );
+  });
+
+  it("resolves every page's old path to its pinned area", () => {
+    const drift = ADMIN_PAGES.flatMap((page) => {
+      const area = getAdminRouteRequirement(concretePagePath(page.oldPath), "GET")?.area;
+      return area === EXPECTED_PAGE_AREAS[page.oldPath]
+        ? []
+        : [`${page.oldPath}: ${area}, pinned ${EXPECTED_PAGE_AREAS[page.oldPath]}`];
+    });
+    expect(drift).toEqual([]);
+  });
+
+  it("resolves every page's hub path to the same pinned area", () => {
+    const drift = ADMIN_PAGES.flatMap((page) => {
+      const area = getAdminRouteRequirement(concretePagePath(page.hubPath), "GET")?.area;
+      return area === EXPECTED_PAGE_AREAS[page.oldPath]
+        ? []
+        : [`${page.hubPath} (hub twin of ${page.oldPath}): ${area}, pinned ${EXPECTED_PAGE_AREAS[page.oldPath]}`];
+    });
+    expect(drift).toEqual([]);
+  });
+
+  it("agrees with the reviewed page anchors", () => {
+    const pageAnchors = ADMIN_ROUTE_AREA_ANCHOR_ENTRIES.filter(({ pathname }) =>
+      pathname.startsWith("/admin"),
+    );
+    expect(pageAnchors.length).toBeGreaterThan(10);
+    const disagreements = pageAnchors.flatMap(({ area, pathname }) =>
+      EXPECTED_PAGE_AREAS[pathname] === area
+        ? []
+        : [`${pathname}: anchored to "${area}", snapshot says "${EXPECTED_PAGE_AREAS[pathname]}"`],
+    );
+    expect(disagreements).toEqual([]);
+  });
+});
+
+describe("retired admin pages (S1 #4796)", () => {
+  it("records the former area of exactly the retired pages", () => {
+    expect(ADMIN_RETIRED_PAGES.map((page) => page.oldPath).sort()).toEqual(
+      Object.keys(RETIRED_PAGE_AREAS).sort(),
+    );
+  });
+
+  it("merges each into a page of its own area, bar the one reviewed change", () => {
+    const drift = ADMIN_RETIRED_PAGES.flatMap((retired) => {
+      const target = ADMIN_PAGES.find((page) => page.id === retired.mergedInto);
+      const destination = target ? EXPECTED_PAGE_AREAS[target.oldPath] : undefined;
+      const expected =
+        RETIRED_AREA_CHANGES[retired.oldPath] ?? RETIRED_PAGE_AREAS[retired.oldPath];
+      return destination === expected
+        ? []
+        : [`${retired.oldPath} -> ${retired.mergedInto}: ${destination}, expected ${expected}`];
+    });
+    expect(drift).toEqual([]);
+  });
+});
+
+describe("admin route level derivation (#1548)", () => {
+  const sample = "/api/admin/members/x123";
+
+  it("maps GET/HEAD/OPTIONS to view and mutating methods to edit", () => {
+    expect(getAdminRouteRequirement(sample, "GET")?.level).toBe("view");
+    expect(getAdminRouteRequirement(sample, "HEAD")?.level).toBe("view");
+    expect(getAdminRouteRequirement(sample, "OPTIONS")?.level).toBe("view");
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      expect(getAdminRouteRequirement(sample, method)?.level).toBe("edit");
+    }
+  });
+
+  it("forces edit on GET for the xero connect/callback OAuth handlers", () => {
+    for (const route of [
+      "/api/admin/xero/connect",
+      "/api/admin/xero/callback",
+    ]) {
+      expect(getAdminRouteRequirement(route, "GET")?.level).toBe("edit");
+    }
+  });
+});
+
+describe("admin member-prefix special-area carve-outs (#1548)", () => {
+  it("routes member credits and xero-link/push/unlink to finance, not membership", () => {
+    const financeCarveOuts = [
+      "/api/admin/members/x123/credits",
+      "/api/admin/members/x123/credits/y456",
+      "/api/admin/members/x123/xero-link",
+      "/api/admin/members/x123/xero-push",
+      "/api/admin/members/x123/xero-unlink",
+    ];
+    for (const route of financeCarveOuts) {
+      expect(getAdminRouteRequirement(route, "GET")?.area).toBe("finance");
+    }
+
+    // The carve-out is specific: the member record itself stays membership.
+    expect(
+      getAdminRouteRequirement("/api/admin/members/x123", "GET")?.area,
+    ).toBe("membership");
+  });
+});

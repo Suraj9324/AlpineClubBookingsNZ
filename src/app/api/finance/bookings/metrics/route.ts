@@ -1,0 +1,164 @@
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { dateOnlyStringSchema } from "@/lib/date-only-schema";
+import { requireFinanceViewerApiAccess } from "@/lib/finance-api-auth";
+import {
+  getFinanceBookingMetrics,
+  getFinanceBookingMetricsWindowDayCount,
+  MAX_FINANCE_BOOKING_METRICS_WINDOW_DAYS,
+} from "@/lib/finance-booking-metrics";
+import logger from "@/lib/logger";
+
+function validateWindowSpan(
+  input: {
+    from?: string;
+    to?: string;
+  },
+  path: "realized" | "forward",
+  context: z.RefinementCtx
+) {
+  if (!input.from || !input.to) {
+    return;
+  }
+
+  // A non-day is already refused on its own field by `dateOnlyStringSchema`;
+  // measuring the span too would add a second, vaguer error for one mistake.
+  if (
+    !dateOnlyStringSchema.safeParse(input.from).success ||
+    !dateOnlyStringSchema.safeParse(input.to).success
+  ) {
+    return;
+  }
+
+  try {
+    const dayCount = getFinanceBookingMetricsWindowDayCount(
+      input.from,
+      input.to
+    );
+    if (dayCount > MAX_FINANCE_BOOKING_METRICS_WINDOW_DAYS) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [path],
+        message: `${path} window cannot exceed ${MAX_FINANCE_BOOKING_METRICS_WINDOW_DAYS} days`,
+      });
+    }
+  } catch (error) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [path],
+      message: error instanceof Error ? error.message : "Invalid date window",
+    });
+  }
+}
+
+// Every date is a real calendar day, not just its shape: a bare regex let
+// `realizedCutoff=2026-02-30` through to the metrics loader, which threw on it
+// and answered 500 (#5075).
+const financeBookingMetricsQuerySchema = z
+  .object({
+    realizedFrom: dateOnlyStringSchema.optional(),
+    realizedTo: dateOnlyStringSchema.optional(),
+    realizedCutoff: dateOnlyStringSchema.optional(),
+    forwardFrom: dateOnlyStringSchema.optional(),
+    forwardTo: dateOnlyStringSchema.optional(),
+    forwardAsOf: dateOnlyStringSchema.optional(),
+  })
+  .superRefine((value, context) => {
+    if (Boolean(value.realizedFrom) !== Boolean(value.realizedTo)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["realized"],
+        message: "realizedFrom and realizedTo must be provided together",
+      });
+    }
+
+    if (Boolean(value.forwardFrom) !== Boolean(value.forwardTo)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["forward"],
+        message: "forwardFrom and forwardTo must be provided together",
+      });
+    }
+
+    if (!value.realizedFrom && !value.forwardFrom) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["query"],
+        message:
+          "Provide realizedFrom/realizedTo, forwardFrom/forwardTo, or both",
+      });
+    }
+
+    validateWindowSpan(
+      { from: value.realizedFrom, to: value.realizedTo },
+      "realized",
+      context
+    );
+    validateWindowSpan(
+      { from: value.forwardFrom, to: value.forwardTo },
+      "forward",
+      context
+    );
+  });
+
+export async function GET(request: NextRequest) {
+  const authResult = await requireFinanceViewerApiAccess();
+
+  if (!authResult.ok) {
+    return authResult.response;
+  }
+
+  const { searchParams } = new URL(request.url);
+  const parsed = financeBookingMetricsQuerySchema.safeParse({
+    realizedFrom: searchParams.get("realizedFrom") ?? undefined,
+    realizedTo: searchParams.get("realizedTo") ?? undefined,
+    realizedCutoff: searchParams.get("realizedCutoff") ?? undefined,
+    forwardFrom: searchParams.get("forwardFrom") ?? undefined,
+    forwardTo: searchParams.get("forwardTo") ?? undefined,
+    forwardAsOf: searchParams.get("forwardAsOf") ?? undefined,
+  });
+
+  if (!parsed.success) {
+    return NextResponse.json(
+      {
+        error:
+          "Invalid finance booking metrics query. Use paired realizedFrom/realizedTo and/or forwardFrom/forwardTo dates in YYYY-MM-DD format.",
+        details: parsed.error.flatten(),
+      },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const metrics = await getFinanceBookingMetrics({
+      // #3372: one request, one window set - so it carries the owed figures.
+      includeRefundsAndCreditsOwed: true,
+      ...(parsed.data.realizedFrom && parsed.data.realizedTo
+        ? {
+            realized: {
+              from: parsed.data.realizedFrom,
+              to: parsed.data.realizedTo,
+              cutoffDate: parsed.data.realizedCutoff,
+            },
+          }
+        : {}),
+      ...(parsed.data.forwardFrom && parsed.data.forwardTo
+        ? {
+            forward: {
+              from: parsed.data.forwardFrom,
+              to: parsed.data.forwardTo,
+              asOfDate: parsed.data.forwardAsOf,
+            },
+          }
+        : {}),
+    });
+
+    return NextResponse.json(metrics);
+  } catch (error) {
+    logger.error({ err: error }, "Failed to load finance booking metrics");
+    return NextResponse.json(
+      { error: "Failed to load finance booking metrics" },
+      { status: 500 }
+    );
+  }
+}

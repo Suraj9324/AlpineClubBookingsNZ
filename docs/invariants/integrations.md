@@ -1,0 +1,1012 @@
+# Integrations
+
+Audience: Developer, Agent.
+
+Prefix defined in this file: **`INV-INT`** — webhooks and cron idempotency,
+provider callback verification, what may appear in logs and webhook records, and
+Xero member contact-group grouping.
+
+Read this file when you are changing a webhook, a cron job, a provider callback,
+what is logged about an integration, or Xero contact-group grouping.
+
+Index: [`docs/DOMAIN_INVARIANTS.md`](../DOMAIN_INVARIANTS.md) — every `INV-*` ID
+with a one-line description of what it covers. ID scheme and allocation rules:
+[`SCHEME.md`](SCHEME.md).
+
+`INV-XERO` is deliberately not a prefix: the `INV-` namespace already carries
+Xero invoice-number test fixtures, so the Xero grouping rules take `INV-INT`
+alongside the rest of Integrations. See §1.2.1 of the scheme.
+
+Every heading below whose whole text is an `INV-*` ID defines that invariant. IDs
+are permanent: never renumbered, never reused. **The text under each ID is a
+verbatim move from the source document and must not be reworded in place** —
+only the ID heading lines were added.
+
+## INV-INT-001
+
+- Webhooks and cron jobs must be idempotent.
+
+## INV-INT-002
+
+- Provider callbacks must verify signatures, state, or expected origin before
+  local mutation.
+
+## INV-INT-003
+
+- External provider calls should not be placed inside long database
+  transactions unless there is a documented reason.
+- A provider call held inside a lock has an explicit client deadline, zero
+  in-lock retries, and a transaction timeout that fits both (#4919).
+
+## INV-INT-004
+
+- Email, Xero, and payment failures that affect business-critical outcomes must
+  be visible and retryable.
+
+## INV-INT-005
+
+- Logs, webhook records, Sentry events, and PR comments must not expose secrets,
+  OAuth codes/states, action tokens, client secrets, or personal data beyond the
+  minimum needed for diagnosis.
+
+## Xero member grouping (E8, #1934)
+
+### INV-INT-006
+
+- A single club-level mode governs member auto-grouping: `NONE`,
+  `MEMBERSHIP_TYPE`, or `MEMBERSHIP_TYPE_AND_AGE` (`XeroGroupingSettings`
+  singleton). Grouping rules live in one table, `XeroContactGroupRule`
+  (`MANAGED` = the group the sync adds; `ACCEPTED` = tolerated, never removed).
+
+### INV-INT-007
+
+- The system NEVER deletes a Xero contact group. It only adds/removes a
+  contact's *membership* of groups in the "managed universe" = groupIds
+  referenced by ACTIVE rules that are applicable under the current mode.
+  Xero groups not referenced by any active rule are never touched.
+
+### INV-INT-008
+
+- `NONE` mode is a total no-op — the per-member sync short-circuits before any
+  Xero call, and the cancellation path performs no managed removals.
+
+### INV-INT-009
+
+- A rule targets a **set** of age tiers (`ageTiers`, #2093): the EMPTY set is
+  the "all age tiers" wildcard (the migrated null "Any age"); a non-empty set
+  matches a member whose tier is IN the set. Sets are stored canonical-sorted and
+  a full-tier selection collapses to the empty set, so each shape has exactly one
+  canonical form and the DB partial unique index dedupes reordered sets. In
+  `MEMBERSHIP_TYPE` mode a non-empty tier set makes the rule inert.
+
+### INV-INT-010
+
+- Resolution is pure and mode-driven (`resolveMemberGrouping`): most-specific
+  MANAGED match wins on the ladder `type + tiers` > `type-only` > `tiers-only`;
+  among tiered rules **fewer tiers is more specific**, and an all-tiers (`[]`)
+  rule is the LEAST specific in the tier dimension (a naive ascending
+  tier-count comparator would wrongly invert this). Exact ties break
+  deterministically by `sortOrder` then group id. ACCEPTED is the union
+  of matching accepted rules plus the matched managed group. The effective
+  membership type is resolved by the ONE shared policy helper
+  (`resolveMembershipTypePolicyForMember`) at the CURRENT season year — pricing
+  resolves per stay-night season, grouping resolves at "now"; the two must not
+  be merged.
+
+### INV-INT-011
+
+- Add-suppression: the managed group is added only when the contact is in NONE
+  of (matched MANAGED ∪ matched ACCEPTED), so members parked in an accepted
+  group get no spurious add. A member matching no rule is left untouched (no
+  removals); when such a member sits in managed-universe group(s) they surface
+  as an information-only entry in the dry-run snapshot (never iterated by the
+  bulk re-sync) for deliberate admin cleanup in Xero.
+
+### INV-INT-012
+
+- The cutover migration deactivates every pre-existing `XeroContactGroupRule`
+  row it did not backfill itself, so only tier-only backfill rules are live at
+  deploy; dormant legacy rules require a deliberate admin re-enable via the
+  grouping UI.
+
+### INV-INT-013
+
+- Mode/rule changes NEVER auto-resync the population. Deactivating or deleting a
+  rule shrinks the managed universe, so members already in that group are never
+  removed by the system. Members re-group on their next trigger (age-tier
+  change, current-season membership-type change, cron age-up) or via the
+  explicit admin bulk re-sync.
+
+### INV-INT-014
+
+- The per-member sync keeps Xero calls outside DB transactions, ledgers each
+  operation with an idempotency key (the per-add key carries a per-operation
+  nonce so a legitimate later re-add is never swallowed by Xero's 24h
+  idempotency window), adds before removing, and refreshes the contact cache
+  from the post-write contact. A remove-404 is idempotent success recorded as
+  already-absent — never counted as a removal; an add-404 is a ledgered
+  failure.
+
+### INV-INT-015
+
+- The bulk re-sync is admin-triggered, dry-run-first, cache-pre-filtered to
+  mismatched members, chunked and resumable by member-id cursor, and never
+  advances the CONTACT delta-sync watermark. Members without a Xero contact are
+  reported as skipped, never silently omitted.
+
+### INV-INT-017
+
+- **A Xero contact's `CompanyNumber` (NZBN) field carries the member's date of
+  birth, in `dd/mm/yyyy`, and exactly one module encodes and decodes it**:
+  `src/lib/xero-contact-date-of-birth.ts`. Four divergent copies of that parser
+  had grown before #2859 — two of them local-midnight and wrong — so a new
+  reader or writer imports this module rather than matching the pattern again.
+  The stored value is a date-only `Date` at UTC midnight [INV-DATE-024], so the
+  parse is `parseDateOnly` and the render is `formatDateOnly`, both UTC.
+- **The sync is two-directional and neither direction erases the other.** The
+  app SENDS a date of birth it holds, on contact create and on contact update.
+  The Xero→app direction (`xero-inbound/contact.ts`, `xero-member-import.ts`)
+  only ever FILLS A GAP — it writes a date of birth onto a member who has none —
+  so the pair cannot loop.
+- **Three things the outbound write must never do**, all enforced in
+  `buildXeroContactCompanyNumberPatch`. That field is the NZBN, and an
+  organisation or school account may carry a real business number in it, so
+  every one of these is somebody else's data:
+  1. **Never send `""`.** A member with no date of birth contributes no
+     `companyNumber` key at all. Absence is expressed by omission, never by
+     blanking.
+  2. **Never overwrite a value the DECODER cannot read as a calendar day.** The
+     test is `parseXeroContactDateOfBirth`, not a `dd/mm/yyyy` shape match. The
+     two disagree — `12/34/5678`, `31/02/1990`, `00/00/0000`, `99/99/9999` and
+     the US-ordered `06/15/1985` all match the pattern and are all refused by
+     the decoder — and a value this app would not import is a value it must not
+     overwrite. A shape test here was a live defect (#2867 review).
+  3. **Never write when nothing is known about the field.** "Known" means an
+     observed `XeroContactCache` row for that contact. No row means no
+     observation, and no observation means no write — not "the field must be
+     empty". The app links contacts it did not create: `findOrCreateXeroContact`
+     resolves a member onto a PRE-EXISTING contact by email match and then by
+     exact-name match, writing no cache row, so a contact holding a genuine NZBN
+     presents to an update as "no row". A cache row that exists and holds `null`
+     is the opposite — a positive observation that Xero's field is empty — and
+     is writable. Nothing may manufacture that state: erasure DELETES the cache
+     row rather than nulling the field, precisely so it cannot be read as an
+     observation (`deletion-requests/[id]/route.ts`,
+     `member-lifecycle-actions.ts`).
+- **There is no backfill, and its absence is a decision rather than an
+  oversight.** The outbound write fires only when a contact is created or
+  updated, so members already on file populate the NZBN field the next time
+  something on their record changes; the owner chose that over a bulk push
+  (15 August 2026).
+- Because the outbound payload now carries a date of birth, `companyNumber` is
+  redacted out of anything stored or logged; see [INV-PRIV-011].
+
+## Endpoint modes external consumers still call (#2678)
+
+### INV-INT-016
+
+**`GET /api/bookings/rooms` keeps its no-`lodgeId` mode because CONSUMERS
+OUTSIDE THIS REPOSITORY still call it that way** — not because anything in
+`src/` needs it (#2678 surface 4).
+
+The unscoped signature is the **pre-multi-lodge** one. This repository is a
+template that other clubs fork and run, and their booking wizards and external
+integrations still call the endpoint without a `lodgeId`. Requiring one would
+break them for no internal gain. Since #2677 no page in `src/` uses the mode, so
+from inside this repository it looks like an oversight and a tidy-up will
+propose deleting it. It is not: the reason cannot be re-derived from the code,
+which is why it is written here rather than left in a closed issue.
+
+Four things follow, and all four are load-bearing:
+
+- **Do not make `lodgeId` required, and do not delete the branch.** Changing the
+  mode is a breaking change to a published contract with no internal benefit.
+  The eligibility filtering is what makes retaining it SAFE — a named forbidden
+  lodge answers `403`, an unscoped listing is filtered to the member's eligible
+  lodges — but it is not the reason for retaining it.
+- **No client in `src/` may call it without a `lodgeId`.** Doing so is the
+  #2664 defect (a picker offering another lodge's rooms for a booking whose
+  lodge is already fixed), and internal reuse of the mode is what made that
+  defect possible. Pinned by
+  `src/app/api/bookings/__tests__/rooms-unscoped-mode-has-no-internal-caller.test.ts`.
+- **The unscoped listing EXCLUDES ARCHIVED LODGES** (#2727). It filters on
+  `Room.active`, on the member's booking restrictions, and on the LODGE's own
+  `active` flag, in both eligibility shapes: a default-open member's club-wide
+  listing, and a restricted member whose `BOOKING_RESTRICTION` rows name a lodge
+  that was archived afterwards. This is part of what "retained" means, not a
+  separate nicety — the mode is discovery ("where could I book?"), and a club
+  archives a lodge when it is closed, sold, out of service or seasonally shut,
+  so offering its rooms invites a member to try somewhere the club has
+  deliberately withdrawn. Eligibility and service state are different questions
+  and both must be asked. The named-lodge branch is deliberately NOT filtered
+  this way: naming a lodge is not discovery, and the caller already holds the
+  id. Pinned by
+  `src/app/api/bookings/rooms/__tests__/rooms-route-lodge-scope.test.ts`, which
+  covers both branches because nothing in `src/` walks the unscoped one.
+- **Describing the mode counts as documenting it.** A comment in `src/` that
+  discusses this endpoint and archived lodges must cite `#2727` or
+  `INV-INT-016`. This exists because #2727's own review caught two comments
+  still asserting, in the present tense, that the unscoped mode has no
+  lodge-`active` filter — after the route and three docs copies had been
+  corrected. A stale description of a leak reads as a live one, and no lint,
+  typecheck or index gate looks at prose. Pinned by the third case in
+  `src/app/api/bookings/__tests__/rooms-unscoped-mode-has-no-internal-caller.test.ts`.
+- **This retention covers the DISCOVERY READ, and nothing else** (#2701). It is
+  not a general licence for an omitted `lodgeId`, and specifically it does not
+  extend to `POST /api/bookings`, which now REFUSES a create that names no
+  lodge (`INV-CAP-034`) rather than resolving one. The two are consistent, and
+  the distinction is the same one this entry already draws when it says the
+  named-lodge branch is deliberately not filtered because "naming a lodge is not
+  discovery": an unscoped READ answers a real question — *where could I book?* —
+  whereas an unscoped CREATE answers none, because nobody books "somewhere".
+  Retaining a published read mode for forks costs those forks nothing; filling a
+  blank on a write cost a member a paid booking at a lodge they were never
+  shown. Said here because a reader who arrives holding only this invariant will
+  otherwise read it as blessing both.
+
+History, because the rule reads as obvious once it is written down and was not:
+until #2727 this listing filtered on `Room.active` and booking restrictions but
+not on the lodge's `active` flag, so an unrestricted member's cross-lodge
+listing included archived lodges' rooms
+(`docs/multi-lodge/lodge-scoping-contract.md` recorded it as behaviour rather
+than as a defect). Pinning the mode with a rule while it carried that leak meant
+the rule protected the leak too, which is why #2727 amended this rule rather
+than only patching the route. Removing rows from a published response is a
+visible change for an external consumer, and it was taken as a compatibility
+note rather than a breaking change on the ground that no consumer can
+legitimately depend on being offered an out-of-service lodge.
+
+### INV-INT-018
+
+- **A Xero contact id has at most ONE local home.** Two unique columns can hold
+  one (#3366) — `Member.xeroContactId`, `Organisation.xeroContactId` — with no
+  constraint spanning tables. Both holding it makes a school and a person one
+  customer.
+- **Every writer refuses rather than guesses**, throwing
+  `XeroContactTwoHomesError` naming the holder. `xero-contact-home.ts` holds the
+  check, the lock and the transfer. **Every linker in the tree takes it, with no
+  exception but `INV-INT-020`** — and that is MEASURED, not listed:
+  `xero-contact-linker-census.test.ts` reads the tree from disk, finds every
+  site that writes a non-null `xeroContactId` onto a `Member` or an
+  `Organisation`, and fails when the set is not the declared one. A prose list
+  is a memory of the population rather than the population; this one had already
+  drifted, naming five paths while an entry below named a sixth. Clearing the
+  column is not linking and is excluded: an unlink cannot give a contact a
+  second home.
+- **The refusal is SYMMETRIC**: the member resolve searches Xero by email and a
+  school's contact carries its invented member's address, so a collision needs
+  no race.
+- **Serialised by `hashtext('xero-contact-home:<contactId>')`**, its own
+  keyspace, taken after the writer's entity advisory key and BEFORE any `Member`
+  row lock (`INV-LOCK-002`), because the transfer takes a member row while
+  holding it. No provider call inside.
+- **ONE exception, and only one: `INV-INT-020`** — a school takes the contact
+  its own invented member holds. The refusal above then runs unweakened, so a
+  transfer that declines to fire can only ever produce a refusal.
+- **Bounded.** #3369 removes the invented member, the other home. Pinned by
+  `organisation-reader-contract.test.ts`.
+
+### INV-INT-019
+
+- **A Xero link that cannot be made fails LOUDLY and stays REPLAYABLE.** The
+  sync operation is recorded `FAILED`, never closed as skipped, and keeps its
+  idempotency key so a replay converges on the same contact rather than minting
+  a second. No invoice is ever raised against a customer nobody chose.
+- **An Organisation-linked booking is invoiced as the Organisation or not at
+  all** (owner, 13 Sep 2026, #3367). There is no fallback to the booking's
+  member: the returning school's contact is taken rather than borrowed, so
+  anything left for a fallback to catch is a genuine failure.
+- **A stale contact reference is repaired against the INVOICED party**, not the
+  booking's member: the member repair searches Xero by email, and a school's
+  recorded address is routinely a teacher's own.
+- **The organisation resolve never searches by email**, for the same reason. Its
+  only adoption path is a name Xero itself refused to duplicate, and a contact
+  adopted that way is re-shaped to the organisation form so a school stops
+  reading as a surnameless person.
+- **A correction that is only cosmetic never fails an invoice.** The
+  contact-person refresh and the organisation-shape correction record `FAILED`
+  and retry on the next resolve; neither throws into the invoice, because a
+  contact that already works must not be held hostage to its own shape.
+- **This rule exempts no linker, and a two-homes refusal is a TERMINAL SKIP
+  rather than a retry (#2939).** The two once-exempted paths take the
+  `INV-INT-018` key and refusal. The inbound reconciler then skips that
+  participant; the bulk contact sync reports it under `skippedOther`, out of the
+  cursor's retry list. A retry would be permanently red and burn quota, the
+  remedy being in Xero rather than in the loop. Pinned by
+  `xero-contact-linker-census.test.ts`,
+  `xero-two-homes-refusal-callers.test.ts`,
+  `phase4-contact-sync-and-import.test.ts`.
+
+### INV-INT-020
+
+- **A school's Xero contact changes hands exactly ONCE, and only to its
+  Organisation** (owner, 13 Sep 2026, #3367). The single exception to
+  `INV-INT-018`, which then runs unweakened immediately after it. Nothing moves
+  at Xero: the contact keeps its id, its history and every invoice raised
+  against it.
+- **The holder is a returning school's own invented school member**, minted for
+  an earlier booking. Its link and its `CONTACT` ledger rows are released in the
+  same transaction that claims the id for the organisation, and the hand-over is
+  audited (`xero.contact.moved_to_organisation`, `xero`).
+- **Four legs, all read from the database under the contact-home lock**, never
+  from a caller's argument: this school's history resolves to the member, no
+  other school's positively does, it cannot sign in, it is not one of the
+  school's named contact people. The first two read `Booking.organisationId` AND
+  the `BookingRequest` that minted the member (`convertedMemberId`, with
+  `organisationId` or a `schoolName`), because that column is written only from
+  this release and a returning school's earlier booking carries none.
+- **A proof may never be stricter than the match that produced it.** Names use
+  the folding Xero's own contact-name search uses (`xero-contact-name-match.ts`,
+  one home); stricter refuses the very contact the provider matched, and the
+  school is then never invoiced at all.
+- **Leg 2 refuses only on EVIDENCE**: another organisation id, or a name
+  resolving to a different existing `Organisation`. An unresolvable name is
+  ambiguity, not evidence, and must not out-vote history that positively
+  resolves. Pinned by `organisation-reader-contract.test.ts`.
+
+## Xero account mapping keys (#2717)
+
+### INV-INT-021
+
+- **A new Xero account mapping key ships with three things, always** (owner,
+  10 Aug 2026, #2717): an account filter, a fallback for while unset, a setup
+  prompt saying so. Never a hard failure on upgrade, never a silent default.
+- **Filter on the account's CLASS, not its type** — Xero types four kinds of
+  account as expenses; class is the field meaning "an expense account".
+  `normalizeXeroAccountClass` is the ONE reading of it, shared with the finance
+  reports. A definition may narrow to types within its class.
+- **Structural: that a filter exists, and that the picker obeys it.**
+  `accountClass` is REQUIRED on every definition in
+  `src/lib/xero-account-mapping-keys.ts`, the one registry the picker, API
+  allowlist, resolver and seed derive from; `accountsForMappingKey` is a
+  picker's only filter.
+- **NOT structural: the stored code.** Judging it needs
+  the org's chart, so config transfer and the API are TRUSTED for the value.
+  `mappingWriteViolation` refuses only what the registry sees: unknown key,
+  account code on an item-only key, item code on a key reading none, blank code.
+  The setup screen flags a stored code outside the filter.
+- **The fallback is ONE hop, and verbatim**: while unset,
+  `getResolvedAccountMappingWithFallback` returns the fallback key's resolution
+  unchanged, so an upgrading club posts where it did. A fallback key declares
+  none itself.
+- **"Configured" means the club CHOSE a code** — `isCodeExplicitlyConfigured`,
+  asked of the code being shown, never a server flag that stales mid-edit.
+- **The prompt is in TWO places**, the mapping row and the `xero-mappings` setup
+  step: the mappings section is collapsed by default.
+- **`goodwillWriteOffs` is the first instance**: whole EXPENSE class, falling
+  back to `hutFeeRefunds`, reclassifying nothing. Only a noteless legacy
+  `ADMIN_ADJUSTMENT` mint, or a Goodwill grant while unset, routes to it.
+  Member's own money stays on `hutFeeRefunds` (`INV-PAY-023`). Pinned by
+  `xero-account-mapping-registry.test.ts`,
+  `goodwill-write-off-account.test.ts`.
+
+## Bulk person-contact seeding (#2939)
+
+### INV-INT-022
+
+The read-only census; the run is `INV-INT-023`.
+
+- **The dry run writes nothing** — no `Member` row, operation, outbox entry or
+  audit — and REFUSES while the Xero contact cache has never been refreshed,
+  because every member then looks like "no contact in Xero", the one answer that
+  produces duplicates. It reports that cache's AGE and warns past a week:
+  staleness is what turns "no cached match" into a duplicate.
+- **Schools leave the population.** `Role.SCHOOL`, any member invented as a
+  school's booking contact (both generations of the tie, as `INV-INT-020` reads
+  them, and the request TYPE), anonymised accounts, a dependant who lost an
+  inherited address, other `.invalid` addresses and whoever the shared create
+  gate refuses are all excluded.
+- **Ambiguity is handed back, never guessed, on BOTH matching axes.** A member
+  goes to an operator when the contact on their address is a school's, another
+  member's, one of several, or differently named; when a second unlinked member
+  shares that address; or when Xero already holds an active contact under that
+  member's exact NAME. The name axis is not optional: Xero enforces contact-name
+  uniqueness, so a census reading addresses alone cannot see the collision the
+  provider itself will raise. Pinned by
+  `xero-missing-contact-seeding.test.ts`,
+  `organisation-reader-contract.test.ts`.
+
+### INV-INT-023
+
+The bounded run; its census is `INV-INT-022`.
+
+- **Bulk seeding RESOLVES NOTHING ITSELF.** Every contact comes from calling
+  `findOrCreateXeroContact` once per member, so link-before-create, the
+  member-scoped idempotency key, the `INV-INT-018` and `INV-CONFIG-005` refusals
+  and email containment come from that funnel rather than second copies. It is
+  therefore NOT the bulk path `INV-INT-019` once exempted: holding no
+  transaction across contacts, it takes and releases the contact-home key once
+  per member, as for a single invoice.
+- **The funnel is asked AUTHORITATIVELY, or nothing is done for that member.**
+  `requireAuthoritativeMatch` turns the funnel's two proceed-anyway fallbacks
+  into refusals: a failed Xero search no longer falls through to a create, and a
+  name-uniqueness rejection is no longer recovered by adopting the same-named
+  contact on the NAME alone. Both defaults are right where a blocked invoice is
+  the expensive outcome, and inverted here, where nothing is blocked and a wrong
+  contact is permanent. A refused member is a recorded failure, left unchanged.
+- **A run touches the INTERSECTION** of the reviewed ids with a pushable set
+  recomputed server-side, AND refuses when the plan's digest has moved. The
+  reviewed half excludes anybody eligible only since the review; the recomputed
+  half revalidates every row; the digest covers what neither sees, a member who
+  stays pushable while what would HAPPEN to them changes. The contact returned
+  is compared against the one the plan named. Writes are idempotent by member.
+- **Bounded and non-blocking.** The chunk size is DERIVED from a member's real
+  call cost, which rises when contact grouping is on; a wall-clock budget
+  returns a partial result rather than losing it to a route timeout. A failure
+  is recorded and the chunk continues, the funnel having left that operation
+  `FAILED` and replayable (`INV-INT-019`); a daily limit halts it. Pinned by
+  `xero-missing-contact-seeding.test.ts`, `missing-contacts-panel.test.tsx`.
+
+## Erased-member Xero contact review (#3058)
+
+### INV-INT-024
+
+No erasure path asks Xero to change, archive, blank or delete the member's
+CONTACT; this review is how anybody finds out what an erasure left behind.
+
+- **No Xero contact write, on any erasure path.** Neither erasure source names a
+  provider call or an outbox enqueue; each reaches one Xero-named module, the
+  contact-create fence; and `findOrCreateXeroContact` refuses an anonymised
+  member before any provider call, so a credit note's contact repair cannot mint
+  one either. Erasure never waits on Xero; no provider-cleanup state exists for
+  a replay to create.
+- **Erasure is not free of Xero writes, and the guard names which.** Cancelling
+  the member's paid future bookings enqueues a credit note — the accounting
+  ledger, not the contact. Every directly imported module reaching Xero is
+  declared in the contract test.
+- **A retired contact link is NOT an erasure.** Four other paths retire one, so
+  the erasure is proved POSITIVELY from a durable decision record — never from
+  the anonymisation markers (`INV-LIFE-015`), which a hard delete leaves no row
+  to carry.
+- **A contact anything local still points at was never orphaned.** Ownership
+  goes through `INV-INT-018`'s one accessor, over both columns.
+- **Ids only; `finance:view` to read, `finance:edit` to check.** A row carries a
+  member id, a contact id, the erasure kind and its date. The contact cache is
+  read for `contactId` and `contactStatus` alone; the live check keeps only the
+  status and writes no `XeroContactCache` row.
+- **A row is retired only by observing Xero, and otherwise stays.** The `POST` —
+  `getContacts` over the listed ids, archived included — is the one thing that
+  makes the list shrink; no document may say Contact Sync does. A contact left
+  live in Xero stays listed indefinitely.
+
+Rationale: [`xero/ARCHITECTURE.md`](../xero/ARCHITECTURE.md). Pinned by
+`xero-erased-member-contact-review.test.ts`,
+`xero-erased-member-contact-status-check.test.ts`,
+`member-erasure-no-xero-mutation-contract.test.ts`,
+`erased-member-contacts-panel.test.tsx`.
+
+## Xero operations resolved in Xero (#3635)
+
+### INV-INT-025
+
+An outbound Xero operation an officer marked **resolved in Xero** is done: never
+re-run, never offered for retry, never re-minted beside (owner decision,
+28 Sep 2026) - but still reported.
+
+- **One predicate.** `isResolvedInXero` (`xero-operation-resolution.ts`); a
+  `where` clause spells it on `manuallyResolvedAt`. The mark leaves the row
+  `FAILED`/`PARTIAL`, so status alone reads it live; a late success lands
+  and alerts, except where `INV-INT-029` says.
+- **Retries refuse it.** `getXeroOperationRetryMeta` refuses first; retry and
+  requeue answer 409; the drain cancels that queued row.
+- **Enqueues and the outbox respect it.** A resolved refund note covers its
+  recorded amount, so later refunds still get notes, unless voided or deleted
+  (#4250) or a refund request's (#4265); one sum
+  (`sumRefundCreditNoteCoverageCents`) caps the enqueue, the send and the gap. No booking invoice is
+  queued while the latest create is resolved; only single-booking force-sync
+  overrides it, audited. The outbox cancels, unsent, a copy queued before a
+  sibling was resolved.
+- **Resolve and retry.** The route refuses while the operation is RUNNING, a
+  live copy is queued, or a queued retry is RUNNING or started before the mark
+  and completed after it - checked after the mark is written, then withdrawn.
+  Gaps: clock skew between instances, and a caller of
+  `retryXeroSyncOperation` that bypasses the drain.
+- **Applied-credit operations are retry-only.** The route refuses them, and a
+  pre-release mark on one is void on the retry path.
+- **Done is not absent.** `getBlockingOperation` returns `retryable`, `blocked`
+  or `resolved`; a resolved row never outranks a live one, nor is dropped.
+  `buildRetryAction` takes only `retryable`. The repair tool and booking page
+  report `RESOLVED_IN_XERO_BY_OFFICER` (info, no action) where no document is
+  recorded; the tool also for a note allocated by hand.
+
+Pinned by `xero-operation-retry.test.ts`, `xero-operation-queue.test.ts`,
+`xero-operation-routes.test.ts`, `xero-operations-panel-failed-default.test.tsx`,
+`xero-operation-outbox.test.ts`,
+`xero-booking-repair.test.ts`, `refunds-missing-credit-notes.test.ts`,
+`booking-provider-mismatches.test.ts`.
+
+### INV-INT-028
+
+A payment refund credit-note create resolved by hand names the Xero note the
+officer made, and that note records no other refund: one note, one refund
+(#4421, owner decision 26 Oct 2026).
+
+- **Asked of one population.** `refundNoteResolveShape`
+  (`xero-resolve-refund-note.ts`) asks for the number on a FAILED row naming no
+  note, among the rows `readResolvedRefundCreditNoteCoverage` reads that are
+  their own refund's (`countsTowardRefundNoteCoverage`). A refund request's
+  note (#4391), a row naming its note and every other row resolve as
+  `INV-INT-025` says; a number sent for one is refused. Refused too: a PARTIAL
+  row naming no note, an unreadable amount (Mark non-replayable), and a row a
+  retry or same-key run already raised.
+- **Checked as the hand-made answer is.** `verifyHandMadeRefundNote`
+  (`INV-ADDPAY-042`), before any transaction: approved or paid, a sales credit
+  note for the booking's contact, the row's exact amount.
+- **Recorded once, and tracked.** Under `lock(1)`, then the Payment row: a
+  retry since the read, a superseding run, a live copy, another create row or
+  any link recording the note refuses with a 409 and nothing written; then the
+  status-guarded claim writes the mark and the note, and the answer's own
+  writer (`writeHandMadeRefundNoteLink`) its live link, so a void is caught and
+  the note counted once. Either order of resolve and answer records once. A
+  withdrawn mark retires its link (audited; a failed withdrawal alerts); only
+  that row takes it back. Every refusal is audited.
+- **Legacy.** A row resolved before #4421 names no note.
+- **A create records once (#4426, #4656).** Under the Payment row,
+  `recordCreatedRefundNote` claims its row, then refuses a note another create
+  row records; a note kept out or not recorded in time is audited and
+  alerted, never linked, settled or failed.
+
+Pinned by `xero-resolve-refund-note.test.ts`,
+`resolve-records-refund-note.realdb.test.ts`, `advisory-lock-guard.test.ts`,
+`xero-late-refund-note-after-resolve.realdb.test.ts`,
+`xero-refund-note-record-gaps.realdb.test.ts`.
+
+### INV-INT-035
+
+While Xero holds a payment refund note the app could not record, no other
+refund note on that payment is sized or raised until that note is recorded
+(#4688).
+
+- **The mark is on the row.** A record that loses its wait (`INV-INT-028`,
+  #4656) stamps its own create row `REFUND_NOTE_UNRECORDED`, naming the note
+  in its response payload; row-only and guarded on its claim: RUNNING, or the
+  FAILED row Mark failed left; never a resolved row or one naming a note.
+- **One read fences.** `findUnrecordedRefundNoteOperation`: a stamped,
+  unresolved row naming no note, whatever its status or age, unless a live
+  or voided link on the payment now records its note. Every refund-note create
+  waits on it before sizing, back to PENDING as
+  `REFUND_NOTE_AWAITING_RESOLVE`, which the outbox scan and the retry drain
+  space out (#4692); Retry, Requeue and Retry all refuse the payment's
+  refund-note creates; the nightly self-heal queues none.
+- **Resolving lifts it.** The resolve's claim sets `manuallyResolvedAt`; a
+  withdrawn resolve restores the fence. A PENDING copy the fence holds does
+  not refuse the resolve; once the fence reads lifted, a copy queued before
+  the resolve closes CANCELLED (`INV-INT-025`). A stamped row whose note
+  another row recorded resolves with that note, adding no link.
+  Mark failed and Reset stale running keep the code and the note's message.
+- **Limits.** Until the stamp lands the row holds others back only as a live
+  claim (#3880). A stamp that fails is logged, and the alert says nothing
+  holds later notes back.
+
+Pinned by `xero-refund-note-in-flight.test.ts`,
+`xero-late-refund-note-record.test.ts`, `xero-refund-note-crash-window.test.ts`,
+`xero-operation-outbox.test.ts`, `xero-operation-queue.test.ts`,
+`xero-resolve-refund-note.test.ts`, `xero-operation-routes.test.ts`,
+`cron-credit-reconciliation.test.ts` and, against real PostgreSQL,
+`xero-unrecorded-refund-note-fence.realdb.test.ts`.
+
+## An account-credit note's member credit (#4685)
+
+### INV-INT-036
+
+An account-credit Xero note stamps the one member credit it was raised for, and
+a note is on at most one of a booking's cancellation credits
+(`MemberCredit.xeroCreditNoteId`, which `INV-PAY-023`'s allocation engine reads
+as the lot's note).
+
+- **The row names its credit.** Every enqueue of a payment's account-credit
+  note adds `memberCreditId` to the queued payload: the cancel's credit branch,
+  both inbound Internet Banking mint arms (a replay names the credit it found),
+  and the repair tool's missing-note action when one credit makes up its sum.
+  The executed payload keeps it, so a retry stamps the same credit. One reader,
+  `readAccountCreditNoteCredit`, serves both parses.
+- **The stamp writes that row by id** (`stampCancellationCreditXeroNote`),
+  scoped to its member, booking, type and amount, and only while it names no
+  note. It never overwrites a note, and a note already on one of the booking's
+  cancellation credits stamps nothing more. Inbound reconciles stamp unheld
+  notes through it, by the outbox row's credit (#4705).
+- **Rows queued before the field** name no credit, so the stamp falls back to
+  the old match (member, booking, amount, the three pipeline descriptions), one
+  credit at a time, oldest first - never every equal credit at once.
+- **No lock.** The write moves no balance, status or settlement money, and each
+  is one null-guarded single-row update (`INV-LOCK-001`; no key or order,
+  `INV-LOCK-002`; no new site, `INV-LOCK-003`).
+- **Limits.** A payment gets one account-credit note (the enqueue keys it on
+  the amount; no writer retires its link), so a second equal credit gets none,
+  and no writer mints one today. Two writers stamping one note on two credits
+  at once can both land.
+
+Pinned by `xero-account-credit-note-stamp.test.ts`,
+`xero-operation-outbox-payload.test.ts`, `xero-operation-outbox.test.ts`,
+`xero-operation-retry.test.ts`, `booking-cancel.test.ts`,
+`xero-inbound-reconciliation.test.ts`, `xero-booking-repair.test.ts` and,
+against real PostgreSQL, `xero-account-credit-note-stamp.realdb.test.ts`.
+
+## A manual credit grant's Xero note (#4431)
+
+### INV-INT-037
+
+An approved positive manual grant queues one `ADMIN_GRANT_CREDIT_NOTE` on that
+credit. The worker stamps that row and no other, and a replay does not create a
+second note.
+
+- **Queued with the credit.** Approval writes the `MemberCredit` row and the
+  outbox row in the same transaction. The note's Xero id does not exist yet, so
+  approval does not call Xero. The account is the one the requester chose.
+- **The stamp is that row.** One update, matching the credit's id, type and
+  amount, and only while `xeroCreditNoteId` is null. The same note id is
+  success. A different id fails and is not overwritten. The link role is
+  `ADMIN_GRANT_CREDIT_NOTE`.
+- **A contact repair keeps the queued request (#5221).** The repair's stored
+  payload spreads `buildAdminGrantCreditNotePayload`, the builder approval
+  queues with. The outbox routes the row by that `queueType`, and a Retry
+  requeues in place only a row holding it (`INV-INT-041`).
+- **No new lock.** The stamp moves no balance (`INV-LOCK-001`). It uses no new
+  key or order (`INV-LOCK-002`) and no new site (`INV-LOCK-003`).
+
+Pinned by `xero-admin-grant-credit-note.test.ts`, `member-credit.test.ts`,
+`xero-operation-outbox-payload.test.ts` and
+`xero-admin-grant-credit-note-contact-repair.realdb.test.ts`.
+
+## One outcome per Xero operation row (#4356)
+
+### INV-INT-029
+
+A recorded Xero outcome is never replaced by a worse one, nor lands on another
+attempt's claim. Two callers can share one row (#1354).
+
+- **One guard, in the two writers.** `completeXeroSyncOperation` and
+  `failXeroSyncOperation` guard every outcome with `outcomeWriteGuard`
+  (`xero-operation-outcome-guard.ts`). Only SUCCEEDED lands on SUCCEEDED,
+  only SUCCEEDED or PARTIAL on PARTIAL.
+- **Every outcome carries its claim (#4373):** the row's id and its RUNNING
+  claim's `startedAt`, from its start, outbox, REQUEUE or retry claim, or
+  late-note re-take (`INV-INT-034`). None lands on another claim's RUNNING
+  row.
+- **Any other outcome lands only on its own claim's row (#4673, #4686):**
+  RUNNING or FAILED under its `startedAt` (a PARTIAL, PARTIAL too), never
+  CANCELLED (a withdrawal keeps `startedAt`). One that lost its claim (an
+  in-place Retry) is dropped; the queued run writes its own. A dropped
+  PARTIAL's Xero object is not linked (that run's keyed call records it):
+  audited per delivery, alerted once.
+- **A repair's claim is kept too.** The PARTIAL and FAILED refund-note
+  repairs mark their RUNNING claim; only SUCCEEDED, or that claim's own
+  outcome (`retryClaim`), lands there.
+- **A success lands on any row no claim holds,** even one resolved in Xero
+  (#4374): the mark stays; a recorded object alerts officers once per
+  operation after commit, re-sent by the sweep until out (`INV-INT-042`).
+  Late notes under `INV-INT-028` and `INV-INT-034` keep out: audited and
+  alerted.
+- **A refused write leaves the row:** null; the outbox counts refused
+  failures skipped. A missing row throws, or logs for a guarded caller. A
+  success refused for a later claim records its links, warned.
+- **Claims, resets and marks write directly,** guarded; the outbox and
+  REQUEUE hand-backs to PENDING touch only their own claim.
+
+Pinned by `xero-sync.test.ts`, `xero-outbox-fail-fast.test.ts`,
+`xero-success-after-resolution-alert.test.ts`,
+`xero-late-partial-trace.test.ts` and, against real PostgreSQL,
+`xero-shared-operation-outcome.realdb.test.ts` and
+`xero-late-failure-after-retry.realdb.test.ts`.
+
+### INV-INT-034
+
+An organiser adjustment's credit note that Xero creates after its stalled job
+was reset is recorded on the job or surfaced once, never lost (#4655).
+
+- **It lands where a success may.** `recordCreatedOrganiserNote` writes it
+  before moving money, in status-guarded `updateMany`s, only on a row
+  recording no other note: this run's RUNNING claim; an unresolved FAILED row
+  (a reset), re-taken RUNNING under a fresh claim in one write; or an
+  unresolved PENDING row (a Retry queued it; the queued run continues). A
+  retry never raises a second note.
+- **A re-taken row is this run's (#4672):** its outcomes go under the fresh
+  claim; Resolve and Retry refuse it while RUNNING; a dead process is reset
+  again.
+- **Anywhere else it is kept out.** A row resolved by hand, non-replayable,
+  held by another claim (or a live row with its key), recording another note
+  or closed takes nothing and is not failed. `traceUnrecordedLateNote` warns,
+  writes one `xero` audit row
+  (`xero.organiser_adjustment_note.late_note_not_recorded`) and sends #4374's
+  alert once per note, each step caught.
+- **A resolved row is a stated choice:** unlike a plain-resolved refund-note
+  row (#4426), it takes no late note: that would move money after an officer
+  took over.
+- **Money moves only under the run's claim (#4680, #4701).** Each invoice
+  void, resize, allocation, settlement, refund payment, or completion with
+  nothing allocated or paid reads the row RUNNING under it first
+  (`holdsXeroOperationClaim`); lost, the run calls nothing, writes no outcome;
+  audited, alerted once if resolved.
+- **Limits.** A retry may record the same note via Xero's idempotency key
+  (the alert says compare). A process dying before auditing leaves only
+  the warning. A call in flight as the claim is lost still completes,
+  alerted (#4374).
+
+Pinned by `organiser-extra-note-record.test.ts`,
+`organiser-extra-adjustment.test.ts` and, on real PostgreSQL,
+`organiser-late-note-after-reset.realdb.test.ts` and
+`organiser-run-claim-check.realdb.test.ts`.
+
+## An abandoned inbound reconcile's operation row (#4921 prerequisite)
+
+### INV-INT-038
+
+A later attempt at an inbound Xero webhook reconcile never runs under an
+abandoned attempt's claim, and recovers the row that attempt left RUNNING.
+
+- **Nothing else reaps it.** The outbox and the waiting-invoice reaper read
+  OUTBOUND rows only; the stale reset is an officer's.
+- **Never shared.** `startInboundReconcileOperation`
+  (`xero-inbound/reconcile-operation.ts`) starts with
+  `shareActiveOperation: false`, so the active-correlation-key clash (#1354)
+  is never answered with another attempt's row.
+- **Taken over in place.** An INBOUND `WEBHOOK_RECONCILE` row RUNNING past
+  `STALE_RUNNING_XERO_OPERATION_MINUTES` is re-claimed under a fresh
+  `startedAt` in one `updateMany` guarded on the claim read: of racing
+  takeovers, or a takeover and Mark failed, exactly one wins. A loser reads
+  again: a row Mark failed ended lets it insert its own.
+- **The abandoned claim's late outcome is refused** (`INV-INT-029`) while the
+  new claim runs and after it fails or succeeds; only a late success may
+  still land on a row no claim holds, as for any row.
+- **A live row is left alone.** Any other active row for the key fails the
+  attempt as in flight; the event is retried after its backoff.
+- **Outbound starts are unchanged.** Only this caller opts out of sharing.
+
+Pinned by `xero-inbound-reconcile-operation.test.ts`, `xero-sync.test.ts`
+and, against real PostgreSQL, `xero-inbound-abandoned-operation.realdb.test.ts`.
+
+## A webhook attempt that died mid-flight (#4921)
+
+### INV-INT-039
+
+A provider event whose attempt died after its claim is reprocessed, never lost
+as a duplicate and never applied twice by racing takeovers.
+
+- **One lease.** Stripe and SES/SNS claim a `ProcessedWebhookEvent` row
+  through `webhook-claim-lease.ts`: a COMPLETED claim is a duplicate; a
+  PROCESSING one inside `WEBHOOK_PROCESSING_LEASE_MINUTES` forces a provider
+  retry (SES answers 503); one past it is taken over in one guarded
+  `updateMany`. Completion and release are fenced on the attempt's
+  `processingStartedAt`.
+- **Xero inbound events are taken over automatically.** The stored-event
+  worker first resets events PROCESSING past the same lease to RECEIVED, in
+  one `updateMany` guarded on status and the stale `updatedAt`, and the winner
+  deletes the event's `xero` dedup row in the same transaction: left in place,
+  it would mark the reprocess PROCESSED unapplied. A loser counts it skipped.
+- **Replay shares the helper.** A Replay of a stale PROCESSING event takes it
+  over through the same guard; losing it answers 409. A fresh one is refused.
+- **The operation row** the dead attempt left is recovered by `INV-INT-038`.
+- **Replays are harmless.** Handlers are idempotent; the same SES feedback
+  (message id and event type) is not counted twice toward suppression.
+- **A poison event stops being retaken.** After three dead attempts (the
+  `INV-INT-038` row's `attemptCount`), the worker leaves the event PROCESSING
+  and logs an error each run; only Replay retries it.
+- **Limits.** Xero
+  outcome writes are not fenced, so a live attempt past the lease can overlap
+  its successor. SNS's default HTTP/S policy stops retrying within a minute, so
+  SES takeover needs the longer delivery policy `CONFIGURATION.md` gives. The
+  operation threshold must not exceed the lease.
+
+Pinned by `ses-sns-webhook.test.ts`, `stripe-webhook-events.test.ts`,
+`xero-inbound-stale-event-takeover.test.ts`, `email-suppression-replay.test.ts`
+and, against real PostgreSQL, `xero-inbound-stale-event-takeover.realdb.test.ts`.
+
+## Stored outbox payloads (#3971)
+
+### INV-INT-026
+
+An outbox worker never reads its target from a payload key the persisting
+redactor blanks. `startXeroSyncOperation` stores `requestPayload` through
+`sanitizeForJson`, the same key denylist as the logs (`INV-PRIV-011`), and the
+worker reads the stored row. A redacted key reaches it as `"[REDACTED]"`.
+
+- **Take the id from the row.** A target that is the row's anchor is read from
+  `localId`. The membership subscription invoice's charge is read through
+  `subscriptionInvoiceChargeId`, and its payload carries no id: its `chargeId`
+  matched the Stripe `charge` rule, and every subscription invoice failed.
+- **Never weaken the redactor to fit a payload.** Rename the key or anchor the
+  row instead.
+- **Rows stored before a fix still parse.** A blanked key is ignored, and the
+  row's Retry on Xero Operations re-runs it.
+
+Pinned by `xero-operation-outbox.test.ts`: every queue type's stored payload
+must reach its handler with the same arguments as the payload it was queued
+with. The retry is pinned by `xero-operation-retry.test.ts` and, against a real
+database, `xero-subscription-invoice-retry.realdb.test.ts`.
+
+## Alpine Central Server API version (triyder/AlpineClubBookingsNZ#49)
+
+### INV-INT-027
+
+Syncing with the Alpine Central Server runs only while the server's API
+version is IDENTICAL to the one this site was built for; otherwise every
+server-bound transfer, both ways, is refused locally.
+
+- **One gate, where it cannot be bypassed.** `resolveConnection` in
+  `servernz-api.ts` refuses a server-bound request with
+  `ServerNzVersionMismatchError` before any request is built; every function
+  that reaches the server goes through it, and the only opt-out is the version
+  call itself. Callers that hold a single-flight claim or an attempt counter
+  ask first (`checkServerVersion` / `isServerSyncPaused`), so a pause takes no
+  claim and burns no attempt.
+- **Integer equality, never a float.** `compareServerVersions` in
+  `servernz-api-version.ts` is the one comparison: `major.minor` parsed as two
+  integers, equal only when both are; `1.10` is not `1.1`; a minor-only
+  difference pauses. No version string is read with `Number()` or
+  `parseFloat()` (census in `servernz-api-version.test.ts`).
+- **Nothing stored says "mismatch".** The row holds the server's last ANSWER
+  (`ServerNzSettings.serverVersion`: NULL never asked, `"unknown"` for a 404,
+  else `major.minor`); the mismatch is computed on every read against
+  `SERVERNZ_EXPECTED_SERVER_VERSION`, so upgrading this site is changing that
+  constant and nothing is reset.
+- **A failed check never pauses.** Unreachable or refused keeps the stored
+  answer and reports "could not check"; a NULL answer allows, after one inline
+  check. A 404 IS an answer (the server predates versioning) and pauses.
+- **Shown, and resumes by itself.** The nightly sync checks before its claim,
+  so a matching answer resumes syncing with no manual step; the setup page,
+  the lodges panel and the Daily digest show the two numbers while they
+  differ, and a lodge-only recipient gets only that entry, as its own
+  template (`INV-PRIV` masking).
+
+Pinned by `servernz-api-version.test.ts`, `servernz-api-version-gate.test.ts`,
+`servernz-version-check.test.ts`, `cron-alpine-server-sync.test.ts`,
+`club-post-sharing.test.ts`, `club-post-mirror.test.ts`,
+`admin-daily-digest-server-version.test.ts`.
+
+## Alpine Central Server free-beds answer (triyder/AlpineClubBookingsNZ#62)
+
+### INV-INT-030
+The central server's public lodge search may ask this site how many beds are free at one of its lodges, and the answer is counts only, given only when the club has said yes twice.
+
+- **Two switches, both on.** `GET /api/webhooks/servernz-availability` answers only while the `alpineCentralServer` module is on AND `ServerNzSettings.otherLodgesEnabled` is set; either off is the same 404 as an unknown lodge, so a club that turns the module off (and can no longer reach the setup page) stops answering at once.
+- **Signed before read.** The question is verified with the push secret over a route-specific text (`centralAvailabilitySignedText`) within a five-minute window before its query is parsed, and the posts webhook refuses any body that is not a JSON object before its own check, so a captured request of either route cannot be replayed to the other.
+- **Counts only.** The body is the free beds per night and their minimum, for the active lodge an administrator has explicitly linked to its central id (`Lodge.centralLodgeId`), a one-lodge club included: there is no automatic one-lodge fallback (owner decision, 24 Oct 2026, #4262); never a guest, member or booking, and every refusal is one 404.
+
+Pinned by `webhooks/servernz-availability/__tests__/route.test.ts`, `webhooks/servernz-posts/__tests__/route.test.ts`, `central-lodge-link.test.ts`.
+
+## A payment deleted in Xero (#4531)
+
+### INV-INT-031
+A Xero payment link is retired only when Xero says its payment is DELETED, never because a payload left it out.
+
+- **Absence nominates; Xero decides.** The inbound invoice and credit-note reconcile nominate an active `PAYMENT` link, of a role that document's own reconcile writes, whose payment the payload no longer lists. Only a trusted payload nominates: a `Payments` list whose entries all carry an id, every one not already DELETED a readable amount, and, for an invoice, whose cash `quantifyXeroInvoiceCashCents` finds complete and whose `AmountPaid` equals the listed sum. Retirement needs `GET /Payments/{id}` to report DELETED.
+- **Budgeted and deferrable.** One attempt per payment, at most five per run, none past the usage panel's critical threshold or during Xero's daily limit. A deferred or unanswered candidate stays active and marked, and the inbound cron cycle re-checks marked links at most every six hours, five failed answers at most; the event does not fail.
+- **The retire.** `active = false` and `metadata.status = "DELETED"`, other fields kept, in one write guarded on the link still being active with the metadata it was read with. Never while an operation that reads the link may run again (`rerunnableOperationWhere`, on its record or the same booking): its retry would pay again. A replay writes nothing.
+- **Never re-adopted.** Any inbound write of a payment Xero reports DELETED lands its link inactive. A hand-entered replacement is in the payload and stays active.
+- **Backfill.** `scripts/xero-deleted-payment-link-backfill.ts` is report-only by default; `--apply` retires only payments Xero confirms DELETED, through the same write.
+
+Pinned by `xero-deleted-payment-links.test.ts`, `xero-deleted-payment-link-backfill.test.ts`, `xero-inbound-reconciliation.test.ts`, `xero-inbound-audit-summary.test.ts`, `xero-api-usage.test.ts` and, against a real database, `xero-deleted-payment-links.realdb.test.ts`.
+
+## Stripe payments the app did not create (#4532)
+
+### INV-INT-032
+A succeeded Stripe payment the app did not create is recorded once and alerted once; it never completes silently.
+
+- **Recognised means routed.** `appPaymentIntentRoute` (`stripe-app-intent-metadata.ts`) is the one definition: a non-empty `bookingId` or `type: "group_settlement"`. Both PaymentIntent wire functions in `stripe.ts` require `AppPaymentIntentMetadata`, and a census holds every Stripe money-object creation (PaymentIntent, Checkout session, Payment Link, invoice, subscription, charge) to those two. Key presence is not recognition: a Payment Link's own `type` or `memberId` metadata is still foreign.
+- **One record.** `payment_intent.succeeded` for any other intent writes one `UnrecognisedStripePayment` row: amount in Stripe's smallest unit, currency, created instant, PaymentIntent, charge, Checkout session and Payment Link ids, and the line items (else the intent's description), capped. The unique PaymentIntent id is the claim; a later delivery reads the stored row and asks Stripe nothing. The Checkout read runs before the write, outside any transaction.
+- **One alert.** `admin-unrecognised-stripe-payment`, unmuteable and delivery-locked, to Finance editors, claimed once ever per PaymentIntent. A send nobody received releases its copies, gives its own claim back, twice if need be, and fails the event, as does a claim write that threw (#4679): Stripe redelivers; the email cron replays one recipient's lost copy, or all once it claimed one, keeping the claim (#4669). An unstamped claim is a sibling's for the webhook lease less a margin, then taken over and sent, unless a sent marker shows it went out. No card data or payer identity is sent.
+- **Nothing else.** The event completes; no booking, settlement, ledger or Xero document is touched, and no advisory lock is taken. Coding the money in Xero is the treasurer's, by hand.
+
+Pinned by `stripe-app-intent-metadata.test.ts`, `unrecognised-stripe-payment.test.ts`, `unrecognised-stripe-payment-email-retry.test.ts`, `caller-retried-alert-replay.test.ts`, `stripe-webhook-alerts.test.ts`, `admin-unrecognised-stripe-payment-alert.test.ts` and, against a real database, `unrecognised-stripe-payment.realdb.test.ts`.
+
+## A succeeded app intent no payment row settles (#4624)
+
+### INV-INT-033
+A succeeded PaymentIntent the app created for a booking that matches no PRIMARY payment transaction is recorded once and alerted once; it never completes silently.
+
+- **Where.** `handlePaymentIntentSucceeded` (`stripe-webhook-service.ts`), after the group-settlement, superseded-capture and additional-ask routes and the saved-card attempt adoption: no row names the intent (`APP_INTENT_NO_TRANSACTION`), or the row is not `PRIMARY` (`APP_INTENT_NOT_PRIMARY`). Those routes are the expected cases and never reach it. [`STATE_MACHINES.md`](../STATE_MACHINES.md#a-succeeded-app-intent-no-primary-row-settles-4624) lists every minting flow and whether it can.
+- **One record, one alert.** `recordUnmatchedAppStripePayment` reuses `INV-INT-032`'s `UnrecognisedStripePayment` row (with `reason` and the metadata `bookingId`; no Checkout read) and its once-ever key, so one PaymentIntent has one row and one alert whichever case recorded it first; the stored row's reason picks the mail. The alert is `admin-unmatched-app-stripe-payment`: unmuteable, delivery-locked, to Finance editors. Retried as for `INV-INT-032`: by Stripe's redelivery when nobody received it, by the email retry cron for one recipient's lost copy (#4669).
+- **Nothing else.** The booking, its payment, ledger, capacity and Xero are untouched, and no advisory lock is taken: matching the money to the booking or refunding it is a person's.
+
+Pinned by `unrecognised-stripe-payment.test.ts`, `unrecognised-stripe-payment-email-retry.test.ts`, `caller-retried-alert-replay.test.ts`, `stripe-webhook-alerts.test.ts` ("#4624"), `admin-unrecognised-stripe-payment-alert.test.ts` and, against a real database, `unrecognised-stripe-payment.realdb.test.ts`.
+
+## Invoicing while Xero is off (#4986)
+
+### INV-INT-040
+
+While the effective `xeroIntegration` module is off, no subscription or
+joining-fee invoice work is written. The Xero worker skips every task then, so
+work written would wait and go out unchecked the day Xero comes back.
+
+- **One guard.** `isXeroInvoicingEnabled` (`xero-invoicing-guard.ts`) reads the
+  same effective module state as the Xero cron; an unreadable settings row reads
+  as off. A missing account mapping is not a stand-in.
+- **Refused before anything is frozen.** The Subscriptions screen's annual
+  batch and charge retry, and the Xero Operations retry of a subscription
+  invoice, answer 409 with one plain message.
+  `enqueueMembershipSubscriptionChargeOperation` refuses for any other caller.
+  A switch-off racing a confirm that passed the check leaves its charges
+  committed; the confirm answers 200 and says they wait for Xero.
+- **Approval still succeeds.** It creates no subscription charge and no
+  joining-fee outbox row (the fee is SKIPPED and audited), and warns the
+  officer to bill anything owed outside the app.
+- **Work already waiting is shown, not changed.** The screen counts the
+  season's QUEUED, PROCESSING and INVOICE_CREATED charges and tells the officer
+  to mark paid members first: a paid member's charge not yet invoiced is then
+  held as CONFLICT, not invoiced.
+- **No new lock.** Each check is a read before any write (`INV-LOCK-001`), with
+  no new key or order (`INV-LOCK-002`) and no new site (`INV-LOCK-003`).
+
+Pinned by `xero-invoicing-guard.test.ts`, the subscription-billing `route.test.ts`
+("#4986"), `membership-nomination.test.ts`, `membership-subscription-billing.test.ts`,
+`xero-operation-retry.test.ts`, `xero-subscription-invoices.test.ts` and
+`subscription-billing-panel.test.tsx`.
+
+## A PENDING outbox row holds a request the outbox can send (#5228)
+
+### INV-INT-041
+
+An outbound Xero row with an outbox queue type is PENDING only while its stored
+request is a queued request the outbox can claim and send under that queue
+type. A row the outbox cannot claim is skipped on every pass, and nothing fails
+or alerts.
+
+- **The column claims.** The outbox builds its claim from the immutable
+  `queueType` column and reads the stored request only through
+  `readQueuedOutboxRequestFor`. It never routes on another queue type.
+- **One guarded write.** Every give-back, Retry requeue and kept-capture
+  requeue writes PENDING through `returnOutboxRowToPending`. A still-queued
+  request stays (a handler's checkpoint); over an execution request the
+  dispatch's claimed queued request is laid back, keeping only stored keys
+  that leave its reading unchanged, replacing a claimed value only with an
+  execution record, in one compare-and-set on the stored request; with
+  neither, nothing is written: the row fails or Retry answers 409.
+- **Two more writers, on never-dispatched rows.** WAITING_PAYMENT releases,
+  and the supplementary-invoice revive (CANCELLED to PENDING), which refuses a
+  request not reading as queued for its column.
+- **Stuck rows are not sent from a guess.** The scan leaves out a PENDING row
+  whose request names no queue type (`NAMES_NO_QUEUE_TYPE`), so nothing waits
+  behind it; the run counts it (`unclaimableRequest`) and the cron run warns.
+  The owner's `pnpm run xero:stuck-queued-report --release` fails exactly the
+  rows still as listed (`QUEUED_REQUEST_RELEASED`), keeping request, response,
+  Xero ids and keys. A refund note's Retry bills only what is still
+  uncovered.
+- **No new lock.** Each write is a status- and claim-guarded compare-and-set
+  (`INV-LOCK-001`), with no new key, order (`INV-LOCK-002`) or site
+  (`INV-LOCK-003`).
+
+Pinned by `xero-outbox-fail-fast.test.ts`, `xero-operation-retry.test.ts`,
+`xero-pending-writer-census.test.ts` (every writer), `xero-cron-runner.test.ts`
+and, on PostgreSQL, `xero-cooldown-giveback-queued-request.realdb.test.ts`,
+`xero-pending-request-transitions.realdb.test.ts`,
+`xero-stuck-queued-request.realdb.test.ts`,
+`xero-released-refund-current-cap.realdb.test.ts` and
+`xero-stale-request-recovery.realdb.test.ts`.
+
+## Once-ever admin alerts held with nothing sent (#5255)
+
+### INV-INT-042
+
+A once-ever admin alert whose claim is held with no email behind it is given
+back within 30 minutes, and the sweep never makes it go out twice (owner
+decision, 18 Nov 2026).
+
+- **The mark.** `sendAdminAlertOnceEver` claims with `awaitingSendSince` set.
+  The alert's own admin emails take the claim once (`takeOnceEverClaim`); each
+  writes its `EmailLog` row in one transaction with `confirmAlertCooldownSend`,
+  clearing the mark under the claim's stamp. Claim gone: no row, nothing sent.
+  A send whose emails recorded nothing gives the claim back.
+- **The sweep.** `once-ever-alert-sweep`, first task of the 15-minute payments
+  cycle, deletes a claim still marked after 15 minutes, only while its stamp
+  and mark stand. The row lock orders that delete against the confirm. So
+  #4696's two lost cases (both give-backs fail; the write commits after the
+  give-back) are sent by the caller's next run.
+- **Raised-once callers** use `sendReplayableAdminAlertOnceEver`, which stores
+  the alert as `once-ever-owed:<key>` first. The sweep re-sends it through the
+  same claim while none holds it, settles it once kept, and drops it with an
+  error after 7 days. `admin-alert-once.ts`'s census puts each caller in one
+  group.
+- **No new lock.** No advisory key, tier or order (`INV-LOCK-001`,
+  `INV-LOCK-002`); the `AlertCooldown` row lock serialises, registered in the
+  writer index (`INV-LOCK-003`). The confirm holds no provider call.
+- **Known limits, not owner-accepted:** an alert raised while every database
+  write fails is only logged (#5297); an email row a crash left `QUEUED` is
+  never sent (#5298); if one recipient's row write fails while another's
+  commits, the claim is kept and that recipient gets nothing, with no `FAILED`
+  row to retry.
+
+Pinned by `admin-alert-once-lost-cases.test.ts`, `admin-alert-once.test.ts`,
+`admin-alert-once-sweep.test.ts`, `admin-alert-once-replayable.test.ts`,
+`admin-alert-once-census.test.ts`, `alert-cooldown.test.ts`,
+`attempt-log-once-ever-claim.test.ts` and, against real PostgreSQL,
+`admin-alert-once-sweep.realdb.test.ts`.

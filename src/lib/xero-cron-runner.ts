@@ -1,0 +1,539 @@
+import { withCronRunClaim } from "@/lib/cron-run-claim";
+import { isEffectiveModuleEnabled } from "@/lib/admin-modules";
+import {
+  recordCronJobRunSafe,
+  type CronJobRunStatus,
+  type RecordCronJobRunInput,
+} from "@/lib/cron-job-run";
+import { runRecordedCronTask } from "@/lib/cron-recorded-task";
+import logger from "@/lib/logger";
+import { isXeroDailyMembershipRefreshEnabled } from "@/lib/xero-feature-flags";
+import {
+  backfillHistoricalXeroObjectLinks,
+  cleanupStaleCanonicalXeroObjectLinks,
+  sendXeroReconciliationReport,
+} from "@/lib/xero-hardening";
+import { canonicalLinkCleanupFailureMessage } from "@/lib/xero-hardening-shared";
+import {
+  processStoredXeroInboundEventBatches,
+  runXeroInboundReconciliationCycle,
+  type RunXeroInboundReconciliationCycleResult,
+} from "@/lib/xero-inbound-reconciliation";
+import {
+  bankRefundVoidFollowUpFailureMessage,
+  runBankRefundVoidFollowUp,
+} from "@/lib/bank-refund-void-follow-up";
+import { reconcileXeroCreditSync } from "@/lib/xero-credit-sync-checker";
+import { XERO_CRON_JOB_NAMES, XERO_CRON_TASKS, type XeroCronTask } from "@/lib/xero-cron-jobs";
+import { runCreditNoteMirrorSweep } from "@/lib/xero-credit-note-mirror-sweep";
+import { refreshXeroCashCredits } from "@/lib/xero-cash-credits";
+import { processQueuedXeroOutboxOperations } from "@/lib/xero-operation-outbox";
+import { processQueuedXeroOperationRetries } from "@/lib/xero-operation-queue";
+import { refreshAllMembershipStatuses } from "@/lib/xero-membership-sync";
+import { isXeroConnected } from "@/lib/xero-token-store";
+import { retryCashSettlementAlerts } from "@/lib/xero-inbound/cash-settlement-alert-retry";
+import { clubFormatValues } from "@/lib/club-format-server";
+
+export type XeroCronTaskSelection = XeroCronTask | "all";
+
+export interface XeroCronRunnerPayload {
+  message: string;
+  task: string;
+  connected: boolean;
+  membershipRefresh: unknown | null;
+  queuedOutboxOperations: unknown | null;
+  queuedRetries: unknown | null;
+  inboundReconciliation: unknown | null;
+  linkBackfill: unknown | null;
+  linkCleanup: unknown | null;
+  bankRefundVoidFollowUp: unknown | null;
+  reconciliationReport: unknown | null;
+  creditSyncCheck: unknown | null;
+  creditNoteMirror: unknown | null;
+  cashCreditRefresh: unknown | null;
+}
+
+export interface XeroCronRunnerDependencies {
+  recordCronRun?: (input: RecordCronJobRunInput) => Promise<void> | void;
+  isModuleEnabled?: typeof isEffectiveModuleEnabled;
+  isConnected?: typeof isXeroConnected;
+  isDailyMembershipRefreshEnabled?: typeof isXeroDailyMembershipRefreshEnabled;
+  log?: Pick<typeof logger, "error">;
+  tasks?: Partial<{
+    refreshAllMembershipStatuses: typeof refreshAllMembershipStatuses;
+    processQueuedXeroOutboxOperations: typeof processQueuedXeroOutboxOperations;
+    processQueuedXeroOperationRetries: typeof processQueuedXeroOperationRetries;
+    runXeroInboundReconciliationCycle: typeof runXeroInboundReconciliationCycle;
+    backfillHistoricalXeroObjectLinks: typeof backfillHistoricalXeroObjectLinks;
+    cleanupStaleCanonicalXeroObjectLinks: typeof cleanupStaleCanonicalXeroObjectLinks;
+    runBankRefundVoidFollowUp: typeof runBankRefundVoidFollowUp;
+    sendXeroReconciliationReport: typeof sendXeroReconciliationReport;
+    reconcileXeroCreditSync: typeof reconcileXeroCreditSync;
+    runCreditNoteMirrorSweep: typeof runCreditNoteMirrorSweep;
+    refreshXeroCashCredits: typeof refreshXeroCashCredits;
+  }>;
+  includeLinkCleanupForBackfill?: boolean;
+  assertRunOwned?: () => Promise<void>;
+}
+
+export class XeroCronRunnerError extends Error {
+  payload: XeroCronRunnerPayload;
+  failures: Array<{ task: XeroCronTask; message: string }>;
+
+  constructor(
+    payload: XeroCronRunnerPayload,
+    failures: Array<{ task: XeroCronTask; message: string }>
+  ) {
+    // One failure reports its own message; none or several report the task
+    // list, which is what the length check chose between (#2800).
+    const [soleFailure, ...extraFailures] = failures;
+    super(
+      soleFailure !== undefined && extraFailures.length === 0
+        ? soleFailure.message
+        : `Xero cron failed for ${failures
+            .map((failure) => failure.task)
+            .join(", ")}`
+    );
+    this.name = "XeroCronRunnerError";
+    this.payload = payload;
+    this.failures = failures;
+  }
+}
+
+export function isXeroCronTask(value: string): value is XeroCronTask {
+  return XERO_CRON_TASKS.includes(value as XeroCronTask);
+}
+
+function tasksForSelection(
+  task: XeroCronTaskSelection,
+  options: { includeLinkCleanupForBackfill: boolean }
+): XeroCronTask[] {
+  if (task === "all") return [...XERO_CRON_TASKS];
+  if (task === "backfill" && options.includeLinkCleanupForBackfill) {
+    return ["backfill", "link-cleanup"];
+  }
+  return [task];
+}
+
+// SKIPPED means the task did no work: `skipped: true` from a disabled or
+// unconnected task, a throttled credit-sync pass, or a sweep with nothing to
+// read. The outbox and replay tasks report a numeric `skipped` count of rows
+// passed over after working their batch (a lost claim, a row resolved or not
+// replayable, a note waiting its turn); that run SUCCEEDED (#4375). A pre-call
+// refusal or a failed row still warns: see `withQueueRunWarning`.
+function cronStatusForResult(result: unknown): CronJobRunStatus {
+  return result &&
+    typeof result === "object" &&
+    (result as { skipped?: unknown }).skipped === true
+    ? "SKIPPED"
+    : "SUCCESS";
+}
+
+// #4375: the outbox and replay tasks are SUCCESS once they work their batch,
+// so what an officer must still see rides on the #3663 `warning`: rows Xero
+// refused before any call (outage cooldown, daily limit, environment check;
+// they stay queued), rows that failed (they wait for a retry or an officer) and
+// (#5228) rows the outbox cannot send, which no pass will ever take.
+function withQueueRunWarning<T extends { failed: number; cooldownDeferred?: number; unclaimableRequest?: number }>(
+  result: T
+): T & { warning?: string } {
+  const deferred = result.cooldownDeferred ?? 0;
+  const unclaimable = result.unclaimableRequest ?? 0;
+  const reasons = [
+    deferred > 0
+      ? `Xero refused ${deferred} operation(s) before any call (outage cooldown, daily limit or environment check); they stay queued and run once it clears.`
+      : null,
+    unclaimable > 0
+      ? `${unclaimable} queued operation(s) hold no request the outbox can send and will not run; the owner lists and releases them with pnpm run xero:stuck-queued-report.`
+      : null,
+    result.failed > 0
+      ? `${result.failed} operation(s) failed; see Xero Operations.`
+      : null,
+  ].filter((reason): reason is string => reason !== null);
+  return reasons.length === 0 ? result : { ...result, warning: reasons.join(" ") };
+}
+
+function resultSummaryFor(result: unknown) {
+  return result && typeof result === "object"
+    ? (result as Record<string, unknown>)
+    : { result };
+}
+
+function toErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function recordSkippedXeroTasks({
+  tasks,
+  reason,
+  recordCronRun,
+}: {
+  tasks: XeroCronTask[];
+  reason: string;
+  recordCronRun: (input: RecordCronJobRunInput) => Promise<void> | void;
+}) {
+  await Promise.all(
+    tasks.map((subtask) =>
+      recordCronRun({
+        jobName: XERO_CRON_JOB_NAMES[subtask],
+        startedAt: new Date(),
+        status: "SKIPPED",
+        resultSummary: { skipped: true, reason },
+      })
+    )
+  );
+}
+
+async function runRecordedXeroTask<T>({
+  task,
+  work,
+  recordCronRun,
+  statusFor = cronStatusForResult,
+  errorFor,
+}: {
+  task: XeroCronTask;
+  work: () => Promise<T> | T;
+  recordCronRun: (input: RecordCronJobRunInput) => Promise<void> | void;
+  statusFor?: (result: T) => CronJobRunStatus;
+  errorFor?: (result: T) => string | null;
+}): Promise<T> {
+  const outcome = await runRecordedCronTask({
+    jobName: XERO_CRON_JOB_NAMES[task],
+    work,
+    recordCronRun,
+    statusFor,
+    errorFor,
+    summaryFor: resultSummaryFor,
+  });
+  if (!outcome.ok) throw outcome.error;
+  return outcome.result;
+}
+
+function emptyPayload(task: string, connected = false): XeroCronRunnerPayload {
+  return {
+    message: messageForTask(task),
+    task,
+    connected,
+    membershipRefresh: null,
+    queuedOutboxOperations: null,
+    queuedRetries: null,
+    inboundReconciliation: null,
+    linkBackfill: null,
+    linkCleanup: null,
+    bankRefundVoidFollowUp: null,
+    reconciliationReport: null,
+    creditSyncCheck: null,
+    creditNoteMirror: null,
+    cashCreditRefresh: null,
+  };
+}
+
+function messageForTask(task: string) {
+  switch (task) {
+    case "all":
+      return "Xero cron tasks completed";
+    case "report":
+      return "Xero reconciliation report completed";
+    case "credit-sync":
+      return "Xero credit-sync check completed";
+    case "credit-note-mirror":
+      return "Credit notes spent or un-spent in Xero mirrored into the credit ledger";
+    case "cash-credits":
+      return "Unallocated Xero overpayments and prepayments refreshed";
+    case "backfill":
+      return "Historical Xero link maintenance completed";
+    case "link-cleanup":
+      return "Stale Xero canonical links cleaned up";
+    case "bank-refund-voids":
+      return "Voided bank-transfer refund notes followed up";
+    case "inbound":
+      return "Xero inbound reconciliation cycle completed";
+    case "outbox":
+      return "Queued Xero outbox operations processed";
+    case "retries":
+      return "Queued Xero retries processed";
+    case "xero-queue":
+      return "Queued Xero outbox operations and retries processed";
+    default:
+      return "Membership status refresh completed";
+  }
+}
+
+async function runXeroCronTaskListUnderClaim(
+  taskList: XeroCronTask[],
+  dependencies: XeroCronRunnerDependencies & { taskLabel?: string } = {}
+): Promise<XeroCronRunnerPayload> {
+  const taskLabel = dependencies.taskLabel ?? taskList.join("+");
+  const recordCronRun = dependencies.recordCronRun ?? recordCronJobRunSafe;
+  const isModuleEnabled =
+    dependencies.isModuleEnabled ?? isEffectiveModuleEnabled;
+  const isConnected = dependencies.isConnected ?? isXeroConnected;
+  const isDailyMembershipRefreshEnabled =
+    dependencies.isDailyMembershipRefreshEnabled ??
+    isXeroDailyMembershipRefreshEnabled;
+  const taskDependencies = dependencies.tasks ?? {};
+  const payload = emptyPayload(taskLabel);
+  const failures: Array<{ task: XeroCronTask; message: string }> = [];
+
+  if (!(await isModuleEnabled("xeroIntegration"))) {
+    const reason = "Operational Xero effective module state is disabled";
+    await recordSkippedXeroTasks({
+      tasks: taskList,
+      reason,
+      recordCronRun,
+    });
+    return {
+      ...payload,
+      message: "Xero cron tasks skipped",
+      skipped: true,
+      reason,
+    } as XeroCronRunnerPayload & { skipped: true; reason: string };
+  }
+
+  // The club's format (#3565), resolved once per run and passed to the three
+  // tasks that render money — the retry worker, the reconciliation report and
+  // the credit-sync check — never per row.
+  const format = await clubFormatValues();
+  const connected = await isConnected();
+  payload.connected = connected;
+
+  for (const task of taskList) {
+    await dependencies.assertRunOwned?.();
+    try {
+      if (task === "memberships") {
+        payload.membershipRefresh = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: async () =>
+            !isDailyMembershipRefreshEnabled()
+              ? {
+                  skipped: true,
+                  reason:
+                    "Daily membership refresh disabled by XERO_ENABLE_DAILY_MEMBERSHIP_REFRESH",
+                }
+              : connected
+                ? await (taskDependencies.refreshAllMembershipStatuses ??
+                    refreshAllMembershipStatuses)()
+                : { skipped: true, reason: "Xero not connected" },
+        });
+      } else if (task === "outbox") {
+        payload.queuedOutboxOperations = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: async () =>
+            connected
+              ? withQueueRunWarning(
+                  await (taskDependencies.processQueuedXeroOutboxOperations ??
+                    processQueuedXeroOutboxOperations)()
+                )
+              : { skipped: true, reason: "Xero not connected" },
+        });
+      } else if (task === "retries") {
+        payload.queuedRetries = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: async () =>
+            connected
+              ? withQueueRunWarning(
+                  await (taskDependencies.processQueuedXeroOperationRetries ??
+                    processQueuedXeroOperationRetries)(undefined, format)
+                )
+              : { skipped: true, reason: "Xero not connected" },
+        });
+      } else if (task === "inbound") {
+        payload.inboundReconciliation = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: async () => {
+            // Local committed markers remain owed even if Xero disconnects.
+            const settlementAlertCandidates = await retryCashSettlementAlerts(format);
+            if (!connected) return settlementAlertCandidates > 0
+              ? { settlementAlertCandidates }
+              : { skipped: true, reason: "Xero not connected" };
+            const result = await (taskDependencies.runXeroInboundReconciliationCycle ??
+              runXeroInboundReconciliationCycle)();
+            return { ...result, settlementAlertCandidates };
+          },
+        });
+      } else if (task === "backfill") {
+        payload.linkBackfill = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work:
+            taskDependencies.backfillHistoricalXeroObjectLinks ??
+            backfillHistoricalXeroObjectLinks,
+        });
+      } else if (task === "link-cleanup") {
+        // #4161: a cleanup whose refund-note heals partly failed returns its
+        // result rather than throwing; the run is recorded FAILURE with that
+        // summary and reported like any other task failure.
+        const linkCleanup = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work:
+            taskDependencies.cleanupStaleCanonicalXeroObjectLinks ??
+            cleanupStaleCanonicalXeroObjectLinks,
+          statusFor: (result) => (canonicalLinkCleanupFailureMessage(result) ? "FAILURE" : "SUCCESS"),
+          // The health page's cron error reads this column.
+          errorFor: canonicalLinkCleanupFailureMessage,
+        });
+        payload.linkCleanup = linkCleanup;
+        const healFailure = canonicalLinkCleanupFailureMessage(linkCleanup);
+        if (healFailure) {
+          failures.push({ task, message: healFailure });
+          (dependencies.log ?? logger).error({ task }, healFailure);
+        }
+      } else if (task === "bank-refund-voids") {
+        // #4162: local rows only, so it runs whether or not Xero is connected.
+        // Report-only unless XERO_ENABLE_BANK_REFUND_VOID_WRITES is true. A
+        // note that failed is recorded FAILURE with the summary, like the heal.
+        const followUp = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: () => (taskDependencies.runBankRefundVoidFollowUp ?? runBankRefundVoidFollowUp)(),
+          statusFor: (result) => (bankRefundVoidFollowUpFailureMessage(result) ? "FAILURE" : "SUCCESS"),
+          errorFor: bankRefundVoidFollowUpFailureMessage,
+        });
+        payload.bankRefundVoidFollowUp = followUp;
+        const followUpFailure = bankRefundVoidFollowUpFailureMessage(followUp);
+        if (followUpFailure) {
+          failures.push({ task, message: followUpFailure });
+          (dependencies.log ?? logger).error({ task }, followUpFailure);
+        }
+      } else if (task === "report") {
+        payload.reconciliationReport = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: () =>
+            (taskDependencies.sendXeroReconciliationReport ??
+              sendXeroReconciliationReport)(format),
+        });
+      } else if (task === "credit-note-mirror") {
+        // #4270: backstop for the inbound credit-note mirror. Writes the credit ledger
+        // only (never Xero); a Xero that is not connected has nothing to read.
+        payload.creditNoteMirror = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: async () =>
+            connected
+              ? await (taskDependencies.runCreditNoteMirrorSweep ?? runCreditNoteMirrorSweep)()
+              : { skipped: true, reason: "Xero not connected" },
+        });
+      } else if (task === "cash-credits") {
+        // #5204: reads Xero, writes only the finance queue's snapshot. A failed
+        // read changes nothing and fails the task, so cron health shows it.
+        payload.cashCreditRefresh = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: async () =>
+            connected
+              ? await (taskDependencies.refreshXeroCashCredits ?? refreshXeroCashCredits)()
+              : { skipped: true, reason: "Xero not connected" },
+        });
+      } else {
+        // credit-sync (#2501): reconcile stamped applied credit against Xero's
+        // live invoice allocations and warn admins on drift. A Xero read failure
+        // defers rather than throwing, so a disconnected/unavailable Xero yields
+        // a skipped result here rather than a task failure.
+        payload.creditSyncCheck = await runRecordedXeroTask({
+          task,
+          recordCronRun,
+          work: async () =>
+            connected
+              ? await (taskDependencies.reconcileXeroCreditSync ??
+                  reconcileXeroCreditSync)(format)
+              : { skipped: true, reason: "Xero not connected" },
+        });
+      }
+    } catch (error) {
+      const message = toErrorMessage(error);
+      failures.push({ task, message });
+      (dependencies.log ?? logger).error(
+        { err: error, task },
+        "Xero cron task error"
+      );
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new XeroCronRunnerError(payload, failures);
+  }
+
+  return payload;
+}
+
+/**
+ * Scheduled, HTTP cron and officer whole-club runs share this one claim with
+ * the webhook kick below; only these lists record CronRun rows.
+ */
+export async function runXeroCronTaskList(
+  taskList: XeroCronTask[],
+  dependencies: XeroCronRunnerDependencies & { taskLabel?: string } = {},
+): Promise<XeroCronRunnerPayload> {
+  if (!taskList.some((task) => task === "inbound" || task === "credit-note-mirror")) {
+    return runXeroCronTaskListUnderClaim(taskList, dependencies);
+  }
+  const outcome = await withCronRunClaim(XERO_CRON_JOB_NAMES.inbound, (assertRunOwned) =>
+    runXeroCronTaskListUnderClaim(taskList, { ...dependencies, assertRunOwned }),
+  );
+  return outcome.claimed ? outcome.result : {
+    ...emptyPayload(dependencies.taskLabel ?? taskList.join("+")),
+    message: "A sync is already running.",
+    skipped: true,
+    reason: "already-running",
+  } as XeroCronRunnerPayload;
+}
+
+export type XeroWebhookInboundKickResult =
+  | { claimed: true; cycle: RunXeroInboundReconciliationCycleResult }
+  | { claimed: false; inbound: RunXeroInboundReconciliationCycleResult["inbound"] };
+
+/**
+ * #4922: the Xero webhook's after-response kick. It takes the same inbound run
+ * claim once (no retry) and records no CronRun row. With the claim it runs the
+ * whole cycle; while another run holds it, it applies stored events only, each
+ * row-claimed, and leaves the cursor reconciliations to the holder.
+ */
+export async function runXeroWebhookInboundKick(options: {
+  batchSize: number;
+  maxBatches: number;
+}): Promise<XeroWebhookInboundKickResult> {
+  // A claim that cannot even be attempted (no database connection) must not
+  // strand stored events until the next scheduled run: they are row-claimed, so
+  // applying them unclaimed is the held-elsewhere path. An error from inside the
+  // cycle itself is not swallowed.
+  let cycleStarted = false;
+  let outcome: { claimed: false } | { claimed: true; result: RunXeroInboundReconciliationCycleResult };
+  try {
+    outcome = await withCronRunClaim(XERO_CRON_JOB_NAMES.inbound, () => {
+      cycleStarted = true;
+      return runXeroInboundReconciliationCycle(options);
+    });
+  } catch (error) {
+    if (cycleStarted) throw error;
+    logger.error({ err: error }, "Xero webhook kick could not take the inbound run claim; applying stored events only");
+    outcome = { claimed: false };
+  }
+  if (outcome.claimed) return { claimed: true, cycle: outcome.result };
+  return { claimed: false, inbound: await processStoredXeroInboundEventBatches(options) };
+}
+
+/** One task list for the scheduled callback and whole-club officer action. */
+export function runXeroInboundCronCycle(dependencies: XeroCronRunnerDependencies = {}) {
+  return runXeroCronTaskList(["inbound", "credit-note-mirror"], { ...dependencies, taskLabel: "inbound" });
+}
+
+export async function runXeroCronTasks(
+  task: XeroCronTaskSelection,
+  dependencies: XeroCronRunnerDependencies = {}
+) {
+  const taskList = tasksForSelection(task, {
+    includeLinkCleanupForBackfill:
+      dependencies.includeLinkCleanupForBackfill ?? true,
+  });
+
+  return runXeroCronTaskList(taskList, {
+    ...dependencies,
+    taskLabel: task,
+  });
+}

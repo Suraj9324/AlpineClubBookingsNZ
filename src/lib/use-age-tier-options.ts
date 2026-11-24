@@ -1,0 +1,105 @@
+"use client";
+
+import type { AgeTier } from "@prisma/client";
+import { useEffect, useState } from "react";
+import type { MembershipTypeAgeExemption } from "@/lib/membership-types";
+import { ageTierLabel, formatAgeTierName } from "@/lib/age-tier-name";
+
+export type AgeTierOption = {
+  tier: AgeTier;
+  label: string;
+  sortOrder: number;
+};
+
+type AgeTierSettingsResponse = {
+  settings?: Array<{
+    tier: AgeTier;
+    label: string;
+    sortOrder: number;
+  }>;
+};
+
+const DEFAULT_AGE_TIER_OPTIONS: AgeTierOption[] = [
+  { tier: "INFANT", label: "Infant (under 5)", sortOrder: 0 },
+  { tier: "CHILD", label: "Child (5-9)", sortOrder: 1 },
+  { tier: "YOUTH", label: "Youth (10-17)", sortOrder: 2 },
+  { tier: "ADULT", label: "Adult (18+)", sortOrder: 3 },
+];
+
+// test seam
+export function getAgeTierOptionsFromSettings(
+  settings?: AgeTierSettingsResponse["settings"]
+): AgeTierOption[] {
+  if (!settings || settings.length === 0) {
+    return DEFAULT_AGE_TIER_OPTIONS;
+  }
+
+  return [...settings]
+    .sort((a, b) => a.sortOrder - b.sortOrder)
+    .map((s) => ({ tier: s.tier, label: s.label, sortOrder: s.sortOrder }));
+}
+
+export function useAgeTierOptions(): AgeTierOption[] {
+  const [options, setOptions] = useState<AgeTierOption[]>(DEFAULT_AGE_TIER_OPTIONS);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch("/api/age-tier-settings")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: AgeTierSettingsResponse | null) => {
+        if (!cancelled) {
+          setOptions(getAgeTierOptionsFromSettings(data?.settings));
+        }
+      })
+      .catch(() => {
+        // Keep default labels if the settings lookup fails.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return options;
+}
+
+// The static tier name lives in a plain module so server code (the generated
+// booking invoice, #5066) can use it too; re-exported for this module's callers.
+export { formatAgeTierName };
+
+export function getAgeTierLabel(
+  options: AgeTierOption[],
+  tier: AgeTier | string
+): string {
+  return ageTierLabel(tier, (key) => options.find((option) => option.tier === key)?.label);
+}
+
+// The four real person tiers, always selectable in a member's age-tier picker.
+const AGE_TIER_PERSON_TIERS = [
+  "INFANT",
+  "CHILD",
+  "YOUTH",
+  "ADULT",
+] as const satisfies readonly AgeTier[];
+
+/**
+ * The age tiers a member's age-tier <Select> should offer, given the member's
+ * current-season membership-type age-exemption (#2106).
+ *
+ * The four person tiers are always offered. N/A (NOT_APPLICABLE) is added as a
+ * hand-pickable option ONLY when the type ALLOWS it and we are editing an
+ * existing member — CREATE mode never offers N/A (no assignment exists yet to
+ * carry it), and FORCED / DISALLOWED / null are handled by the caller (a
+ * read-only N/A readout for FORCED, no N/A otherwise).
+ */
+export function ageTierSelectOptions(
+  exemption: MembershipTypeAgeExemption | null | undefined,
+  options?: { isCreate?: boolean }
+): AgeTier[] {
+  const tiers: AgeTier[] = [...AGE_TIER_PERSON_TIERS];
+  if (!options?.isCreate && exemption === "ALLOWED") {
+    tiers.push("NOT_APPLICABLE");
+  }
+  return tiers;
+}

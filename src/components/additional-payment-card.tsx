@@ -1,0 +1,299 @@
+"use client";
+
+import { memberCardFallbackParts, memberCardLeadParts, type AdditionalAskCause } from "@/lib/additional-ask-cause";
+import { useState, useEffect, useEffectEvent, useMemo, useRef } from "react";
+import { useRouter } from "next/navigation";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { formatCents } from "@/lib/utils";
+import StripeProvider from "@/components/stripe/StripeProvider";
+import PaymentForm from "@/components/stripe/PaymentForm";
+import { RedirectFailedNotice } from "@/components/stripe/redirect-failed-notice";
+import { stripeReturnUrl, takeStripeReturn, type StripeReturn } from "@/lib/stripe-return";
+import { useClubFormat } from "@/components/club-format-provider";
+import {
+  CHECKING_PAYMENT_MESSAGE,
+  isAdditionalPaymentAlreadyMade,
+  isPaymentProcessing,
+} from "@/lib/payment-recovery-contract";
+
+/**
+ * Asks the confirm route to settle this card's intent; true only on its "yes".
+ * The one request both exits send: the in-page success and a redirect return.
+ */
+async function postModificationConfirm(bookingId: string, paymentIntentId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/bookings/${bookingId}/confirm-modification-payment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paymentIntentId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** The same secret-response projection that drives the form (`INV-ADDPAY-023`). */
+export type AdditionalPaymentCardDisplay =
+  | { kind: "loading" }
+  | { kind: "payable"; amountCents: number }
+  | { kind: "paid" | "processing"; message: string }
+  | { kind: "unavailable" };
+
+interface AdditionalPaymentCardProps {
+  bookingId: string;
+  /**
+   * The server's view of the outstanding ask, in cents.
+   *
+   * #3340 - THIS IS A REFRESH SIGNAL, NOT THE FIGURE THE MEMBER IS SHOWN. The
+   * amount rendered and charged both come from the secret response below, so the
+   * two cannot disagree. What this prop does is tell the effect that the server
+   * now believes the ask has changed, which is what makes a second booking edit
+   * re-fetch at all: the effect used to be keyed on `[bookingId]` alone, so after
+   * a second edit the page re-rendered with a new displayed total while the
+   * browser kept the FIRST edit's client secret - and confirmed it.
+   */
+  additionalAmountCents: number;
+  /** Why the request exists; words the line shown when the form cannot load (default: a booking change). */
+  askCause?: AdditionalAskCause;
+  onDisplayChange?: (display: AdditionalPaymentCardDisplay) => void;
+}
+
+/**
+ * Shown on the booking detail page when a modification increased the price
+ * and the additional payment has not yet been collected.
+ */
+export function AdditionalPaymentCard({
+  bookingId,
+  additionalAmountCents,
+  askCause = "edit",
+  onDisplayChange,
+}: AdditionalPaymentCardProps) {
+  const format = useClubFormat();
+  const router = useRouter();
+  const [clientSecret, setClientSecret] = useState<string | null>(null);
+  const [askAmountCents, setAskAmountCents] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [paymentComplete, setPaymentComplete] = useState(false);
+  // #3641 / #3635: two of the route's 409s are not failures to load, so they
+  // get neither the "still owing" fallback nor the red error — ONE plain
+  // statement. Told apart by the body's `code`, never by the status: the
+  // currency refusal is a 409 too, and it IS an error (the ask is still owing).
+  const [notice, setNotice] = useState<
+    { kind: "paid" | "processing"; message: string } | null
+  >(null);
+  // ALP-569: a redirect method's return to this card (`takeStripeReturn`), taken
+  // once per mount; a ref, so React strict mode's second effect run sees it.
+  const stripeReturn = useRef<StripeReturn | null>(null);
+  // The confirm request for that return, shared by strict mode's second run.
+  const returnConfirmation = useRef<Promise<boolean> | null>(null);
+  const [checkingPayment, setCheckingPayment] = useState(false);
+  const [redirectFailed, setRedirectFailed] = useState(false);
+  // Bumped when an in-page confirmation resolves `processing`: ask the door again.
+  const [recheck, setRecheck] = useState(0);
+  function completePayment() {
+    setPaymentComplete(true);
+    setTimeout(() => router.refresh(), 1500);
+  }
+  const completeReturnedPayment = useEffectEvent(() => completePayment());
+  const display = useMemo<AdditionalPaymentCardDisplay>(() => paymentComplete
+    ? { kind: "paid", message: "Your additional payment has been processed." }
+    : notice ?? (loading ? { kind: "loading" } : clientSecret && askAmountCents !== null
+      ? { kind: "payable", amountCents: askAmountCents } : { kind: "unavailable" }),
+  [paymentComplete, notice, loading, clientSecret, askAmountCents]);
+  useEffect(() => { onDisplayChange?.(display); }, [onDisplayChange, display]);
+
+  useEffect(() => {
+    let active = true;
+    stripeReturn.current ??= takeStripeReturn("additional-payment");
+    const returned = stripeReturn.current;
+    if (returned.kind === "failed") setRedirectFailed(true);
+    /*
+      ALP-569: a redirect return that succeeded asks the confirm route, which
+      settles only an intent Stripe says succeeded. Anything short of its "yes"
+      falls through to the door below, which reads Stripe too: "already made",
+      "being processed", or (a payment that never happened) the form again.
+    */
+    async function fetchSecret() {
+      try {
+        // Short-circuits without a return: the door is asked synchronously.
+        if (
+          returned.kind === "check" &&
+          returned.confirmation === "succeeded" &&
+          (await (returnConfirmation.current ??= postModificationConfirm(bookingId, returned.intentId)))
+        ) {
+          if (active) completeReturnedPayment();
+          return;
+        }
+        const res = await fetch(
+          `/api/bookings/${bookingId}/additional-payment-secret`
+        );
+        const data = await res.json();
+        if (!active) return;
+        if (!res.ok) {
+          // Clear the stale binding before reporting the failure: a card that
+          // cannot refresh its secret must not go on offering the old one.
+          setClientSecret(null);
+          setAskAmountCents(null);
+          if (isAdditionalPaymentAlreadyMade(data)) {
+            setError(null);
+            setNotice({ kind: "paid", message: data.error });
+            return;
+          }
+          if (isPaymentProcessing(data)) {
+            setError(null);
+            setNotice({ kind: "processing", message: data.error });
+            return;
+          }
+          setNotice(null);
+          setError(data.error || "Failed to load payment details");
+          return;
+        }
+        setError(null);
+        setNotice(null);
+        // Both from the SAME response, always set together (#3340).
+        setClientSecret(data.clientSecret);
+        setAskAmountCents(
+          typeof data.amountCents === "number" ? data.amountCents : null
+        );
+      } catch {
+        if (!active) return;
+        setClientSecret(null);
+        setAskAmountCents(null);
+        setNotice(null);
+        setError("Failed to load payment details");
+      } finally {
+        if (active) {
+          setLoading(false);
+          setCheckingPayment(false);
+          stripeReturn.current = { kind: "none" };
+          returnConfirmation.current = null;
+        }
+      }
+    }
+    /*
+      #3340 fix round: THE OLD BINDING DIES BEFORE THE NEW ONE IS ASKED FOR.
+
+      `setLoading(true)` alone left `clientSecret` and `askAmountCents` holding
+      the PREVIOUS edit's values, and the render gates below do not consult
+      `loading` - so between a second edit's re-render and its response, the
+      member saw the old amount above a mounted, interactive PaymentElement bound
+      to the intent that edit had just cancelled. Bounded (the confirm fails, no
+      money moves) but it is the exact state this change exists to remove, and
+      the error path already cleared them.
+    */
+    setLoading(true);
+    setCheckingPayment(returned.kind === "check");
+    setClientSecret(null);
+    setAskAmountCents(null);
+    fetchSecret();
+    return () => {
+      active = false;
+    };
+  }, [bookingId, additionalAmountCents, recheck]);
+
+  async function handlePaymentSuccess(paymentIntentId: string) {
+    // The answer is not read here: Stripe.js already reported success in the
+    // page, and the webhook also confirms if this request fails.
+    await postModificationConfirm(bookingId, paymentIntentId);
+    completePayment();
+  }
+
+  const returnUrl =
+    typeof window !== "undefined"
+      ? stripeReturnUrl("additional-payment", `${window.location.origin}/bookings/${bookingId}`)
+      : `/bookings/${bookingId}`;
+
+  return (
+    <Card className="border-warning-6 bg-warning-3">
+      <CardHeader>
+        <CardTitle headingLevel={2} className="text-warning-11">
+          Additional Payment Required
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {paymentComplete ? (
+          <div className="rounded-md bg-success-3 p-4 text-sm text-success-11">
+            <p className="font-medium">Payment successful!</p>
+            <p className="mt-1">{display.kind === "paid" ? display.message : null}</p>
+          </div>
+        ) : notice ? (
+          <div
+            role="status"
+            className={
+              notice.kind === "paid"
+                ? "rounded-md bg-success-3 p-4 text-sm text-success-11"
+                : "rounded-md bg-info-3 p-4 text-sm text-info-11"
+            }
+          >
+            <p>{notice.message}</p>
+          </div>
+        ) : (
+          <>
+            {redirectFailed && clientSecret ? (
+              <div className="mb-4"><RedirectFailedNotice /></div>
+            ) : null}
+            {askAmountCents !== null ? (
+              // #3340: the response's figure, never the server prop, so the
+              // sentence a member reads names the amount of the very intent the
+              // button below will confirm. Nothing is stated at all until the
+              // response arrives - a placeholder from a second source is exactly
+              // the disagreement this change exists to remove.
+              <p className="text-sm text-warning-11 mb-4">
+                {memberCardLeadParts(askCause).lead}
+                <strong>{formatCents(askAmountCents, format)}</strong>
+                {memberCardLeadParts(askCause).trail}
+              </p>
+            ) : (
+              error && (
+                /*
+                  #3340 fix round: THE EXPLANATION SURVIVES A FAILED FETCH.
+
+                  The paragraph above is gated on the response's figure, so a 404
+                  - "No pending additional payment", which is exactly the state a
+                  failed mint leaves behind - showed a bare red error where the
+                  sentence used to be, and a member had no idea what the card was
+                  for. This one names the SERVER'S figure and says so, which is
+                  safe precisely because there is no intent here to disagree with:
+                  the form below renders only when a secret arrived.
+                */
+                <p className="text-sm text-warning-11 mb-4">
+                  {memberCardFallbackParts(askCause).lead}
+                  <strong>{formatCents(additionalAmountCents, format)}</strong>
+                  {memberCardFallbackParts(askCause).trail} We could not
+                  load the payment form just now — please try again shortly, or
+                  contact the club if it keeps happening.
+                </p>
+              )
+            )}
+
+            {loading && (
+              <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+                <div className="h-4 w-4 animate-spin rounded-full border-2 border-warning-7 border-t-transparent" />
+                {checkingPayment ? CHECKING_PAYMENT_MESSAGE : "Loading payment details..."}
+              </div>
+            )}
+
+            {error && (
+              <div className="rounded-md bg-danger-3 p-3 text-sm text-danger-11">
+                {error}
+              </div>
+            )}
+
+            {clientSecret && askAmountCents !== null && (
+              <StripeProvider clientSecret={clientSecret}>
+                <PaymentForm
+                  amountCents={askAmountCents}
+                  returnUrl={returnUrl}
+                  onSuccess={handlePaymentSuccess}
+                  onProcessing={() => setRecheck((n) => n + 1)}
+                />
+              </StripeProvider>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

@@ -1,0 +1,108 @@
+/**
+ * Read-only audit of Internet-Banking hold-expiry invoice-clearing that was
+ * under-sized before #1597 (the clearing credit note was sized at the
+ * credit-reduced payment amount, not the invoice's full finalPrice, leaving the
+ * applied-credit slice open on the Xero invoice).
+ *
+ * REPORT ONLY — this script never writes and never calls a live provider. It
+ * lists each affected booking's expected-vs-actual clearing amounts and the open
+ * delta; the operator applies any repair by hand (the existing
+ * xero-booking-repair CLI cannot express the remainder repair — see
+ * docs/MAINTENANCE.md). There is no --apply here by design (owner decision,
+ * 2026-07-08).
+ *
+ * SAFE USAGE — run against a NON-PRODUCTION copy:
+ *
+ *   DATABASE_URL='postgresql://user:pass@127.0.0.1:5432/scratch_copy' \
+ *     pnpm run payments:audit-ib-hold-clearing
+ */
+import "dotenv/config";
+import process from "node:process";
+import {
+  auditCardAppliedCreditDoublePays,
+  formatCardAppliedCreditDoublePayReport,
+} from "../src/lib/ib-hold-clearing-audit";
+import {
+  auditIbHoldClearingUnderclears,
+  formatIbHoldClearingAuditReport,
+} from "../src/lib/ib-hold-clearing-underclear-audit";
+import { prisma } from "../src/lib/prisma";
+import { getClubFormat } from "../src/lib/club-format-settings";
+
+function printUsage() {
+  console.log(`Usage:
+  pnpm run payments:audit-ib-hold-clearing            # read-only audit (default)
+  pnpm run payments:audit-ib-hold-clearing --json  # also emit machine-readable JSON
+
+This audit is read-only. It never writes and never calls Xero/Stripe/SES. The
+operator repairs any finding by hand (see docs/MAINTENANCE.md).
+
+Options:
+  --json          Emit machine-readable JSON alongside the human report.
+  --help, -h      Show this help.
+`);
+}
+
+function parseArgs(argv: string[]) {
+  const options = { json: false };
+
+  for (const arg of argv) {
+    if (arg === "--help" || arg === "-h") {
+      printUsage();
+      process.exit(0);
+    }
+    if (arg === "--json") {
+      options.json = true;
+      continue;
+    }
+    throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  return options;
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  // The club's format (#3565), read once before any audit query.
+  const format = await getClubFormat();
+
+  const result = await auditIbHoldClearingUnderclears();
+
+  console.log(formatIbHoldClearingAuditReport(result, format));
+
+  // #1620's Internet-Banking strand enumeration retired with #3583: its count
+  // is reported by `pnpm run booking-ledger:census`, under the credit identity.
+
+  // #1641 — enumerate every captured CARD payment that also consumed applied
+  // credit against a full-price charge (realized double-pay). Read-only.
+  const cardDoublePayResult = await auditCardAppliedCreditDoublePays();
+
+  console.log("");
+  console.log("=".repeat(70));
+  console.log("");
+  console.log(formatCardAppliedCreditDoublePayReport(cardDoublePayResult, format));
+
+  if (args.json) {
+    console.log("");
+    console.log("---BEGIN IB HOLD CLEARING AUDIT JSON---");
+    console.log(JSON.stringify(result, null, 2));
+    console.log("---END IB HOLD CLEARING AUDIT JSON---");
+    console.log("");
+    console.log("---BEGIN CARD APPLIED-CREDIT DOUBLE-PAY JSON---");
+    console.log(JSON.stringify(cardDoublePayResult, null, 2));
+    console.log("---END CARD APPLIED-CREDIT DOUBLE-PAY JSON---");
+  }
+}
+
+main()
+  .catch((error) => {
+    console.error(
+      error instanceof Error
+        ? error.message
+        : "Unknown IB hold-clearing audit error",
+    );
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await prisma.$disconnect().catch(() => {});
+  });

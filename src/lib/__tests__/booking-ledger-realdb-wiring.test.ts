@@ -1,0 +1,287 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+
+import { stripComments } from "./support/strip-comments";
+
+/**
+ * #3595: the real-PostgreSQL proof of the ledger's idempotency self-skips
+ * without `RUN_CONCURRENCY_RACE_TESTS`, and hosted CI reaches it only because
+ * the race harness imports it. Lose that import and the whole proof silently
+ * becomes a no-op while every suite stays green — so the edge is pinned here,
+ * the way `review-findings-contracts.test.ts` pins the harness's own step.
+ */
+const REPO_ROOT = resolve(__dirname, "../../..");
+
+/**
+ * A suite's code with its comments blanked (strings kept), so a commented-out
+ * import or case cannot keep a pin green (INV-SSOT-004; #3740 SSOT F6).
+ */
+function source(path: string): string {
+  return stripComments(readFileSync(path, "utf8"));
+}
+
+describe("the ledger idempotency proof stays wired into CI (#3595)", () => {
+  it("is imported by the race harness CI runs against a real database", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-posting-key.realdb.test";');
+  });
+
+  it("carries #3581's settlement-sync proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-settlement-sync.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-settlement-sync.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    expect(suite).toContain("matches the mirror's own arithmetic where both read the same rows: captures, and refunds with a refund row");
+    expect(suite).toContain("while the mirror keeps counting it");
+    expect(suite).toContain("posts through a REAL writer");
+    expect(suite).toContain("posts a row paid AGAIN after its mark-paid was reversed");
+  });
+
+  it("carries #3599's credit and hand-back proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-credit-sync.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-credit-sync.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "posts credit applied and a clamp give-back one line per row, summing to what the booking holds applied",
+      "posts a TIERED restore for exactly what was restored, anchored on the cancellation",
+      "posts a cancellation credit against its own row",
+      "posts a reduction credit against its own row",
+      "posts NO hand-back for a task on a card payment",
+      "posts a completed hand-back through the REAL resolver",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("carries #3582's edit and review-closure proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-modification.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-modification.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "TWO EDITS: the second reverses the first edit's re-post, never a line already reversed",
+      "a replayed posting posts nothing and the transaction still commits",
+      "posts nothing for a booking not yet confirmed on the ledger",
+      "a closure's re-price posts under its history row from the real guest rows, and the share posts no second record",
+      "REFUND: the first closure's re-price carries both removals, the second posts nothing, and the ledger bills the booking's price",
+      "REFUND, dismiss then complete: the dismissal's re-price stands and the completion adds nothing",
+      "REFUND, declined then re-priced: the stand-in is reversed by its line id when the re-price carries it",
+      "REFUND, declined then re-priced on a drifted PROMOTION: the re-price still reverses the stand-in (#3740 delta L1)",
+      "CHARGE: the first closure's re-price carries both additions, the second posts nothing",
+      "a same-price category change, then a second edit: the second reverses the FIRST EDIT'S re-post, never the stale confirmation line",
+      "a direct write of a reversal of an already-reversed line inserts nothing, and the transaction stays usable",
+      "a replayed change-fee-only edit posts its fee once: the replay's plan is identical, and ON CONFLICT skips it",
+      "an admin date shift through the REAL door re-dates every night, netting to zero, and a later edit reverses the shifted line (#3741)",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("carries #3611's cancellation proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-cancellation.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-cancellation.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "AFTER AN EDIT: the cancellation reverses the edit's re-post, never a reversed line; a card refund brings owed to zero; a replay posts nothing",
+      "posts nothing for a booking not yet confirmed on the ledger",
+      "the REAL cancelBooking, cash-settled at a 50% tier: reversals and the kept fee post in the claim, and the hand-back brings owed to zero",
+      "the REAL cancelBooking on an unpaid booking confirmed on the ledger (its mark-paid since reversed): the stay is reversed and no fee posts",
+      "A STALE REPLAY inserts nothing: the reversal key, and under another key the unique reversesLineId, each skip it, and the transaction stays usable",
+      "a live review-share stand-in is reversed by the cancellation, and owed reaches zero once its refund posts (review F1)",
+      "the REAL settle's capacity void on a booking a reversed mark-paid left confirmed: the stay is reversed, nothing kept, and owed reaches zero once the card refund posts (review F4)",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("carries #3583's projection-census proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-projection-census.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-projection-census.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "a card booking settled, re-dated and part-refunded by the real writers agrees on every identity",
+      "account credit applied by the real writer, the rest by card: the credit identity agrees too",
+      "cash marked paid, cancelled at 50% by the real cancelBooking: an in-flight hand-back until the real resolver completes it",
+      "names one rogue line posted through the write door: a disagreement with both figures, and source drift",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("carries #3583's back-post proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-back-post.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-back-post.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "--apply posts every history so the census finds nothing to say, each through the live posters' own keys",
+      "a second --apply posts nothing new",
+      "a booking it cannot post is listed with its reason, and nothing is posted for it",
+      "a back-post and a live admin date shift (run %i): one set of lines, census agrees",
+      "a back-post and a live card refund (run %i): the refund posts once, census agrees",
+      "waits for the global lock(1) a live poster holds",
+      // #3854: the group-settled children.
+      "--apply posts each child's confirmation, share, plan refund and kept figure under the live keys",
+      "a back-post and a live organiser cancel (%s): share, refund and kept post once each, census agrees",
+      "a back-post and a live #3653 refund (%s): the refund posts once, census agrees",
+      "shares that do not add up to the settlement are refused",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("runs #3583's seeded-history gate as a step of the migration-drift job, never on its own", () => {
+    const workflow = readFileSync(resolve(REPO_ROOT, ".github/workflows/ci.yml"), "utf8");
+    expect(workflow).toContain("- name: Back-post a seeded booking history and require the census gate");
+    expect(workflow).toContain('run: bash scripts/booking-ledger-seed-gate.sh "${CONCURRENCY_RACE_DATABASE_URL}_ledger_history"');
+    const gate = readFileSync(resolve(REPO_ROOT, "scripts/booking-ledger-seed-gate.sh"), "utf8");
+    for (const command of [
+      "src/lib/__tests__/booking-ledger-history-seed.realdb.test.ts",
+      "booking-ledger:census --fail-on-gap",
+      'grep -q "posted: 0 (0 line(s))"',
+      // Every seeded booking is posted, #3854's group-settled children among them.
+      'grep -q "   cannot post: 0$"',
+      "booking-ledger:census --write-acknowledgement-draft",
+      "booking-ledger:census --acknowledged",
+    ]) {
+      expect(gate).toContain(command);
+    }
+    // The draft must be exactly the class instances the history is built to show, to the cent.
+    expect(gate).toContain(`expected_acknowledgements='[{"bookingId":"seed-3583-cash-cancel-handback","class":"REFUND_MIRROR_HAND_BACK","cents":10000}]'`);
+    expect(gate).toContain('booking-ledger:back-post --apply --confirm-database "$database"');
+    expect(gate).toContain("trap cleanup EXIT");
+  });
+
+  it("carries #3792's late capacity-cancel credit-restore proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./ib-capacity-cancel-credit-restore.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/ib-capacity-cancel-credit-restore.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "THE WORKED EXAMPLE: $80 applied plus a late $120 transfer leaves the member $200 of credit, owed(b) zero, and a replay changes nothing",
+      "A CASH-ONLY booking is unchanged: the $120 comes back as credit and no restore row is written",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("carries #3854's group-settlement proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-group-settlement.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-group-settlement.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "CARD: the real settle confirms each child on the ledger and posts its share under the settlement; owed(b) is zero",
+      "CARD: a replayed webhook, and the poster run again in its own transaction, post nothing more",
+      "#3653: a refund out of the combined card payment posts its card refund from the child's refund row, once",
+      "#3653: a refund Stripe accepted as pending and then failed is reversed on the ledger with its row",
+      "CARD: the organiser's cancel keeps each share less every refund made or owed; once its debts are made, owed(b) is zero",
+      "INTERNET BANKING: the inbound reconcile of the paid combined invoice posts each child's bank receipt; a re-fetch posts nothing more",
+      "INTERNET BANKING: the organiser's cancel posts its frozen plan's bank refund beside each mirror and keeps the rest; owed(b) is zero, and a re-run posts nothing",
+      "FIX ROUND A: an Internet Banking group child cannot take a reduction as account credit; the real credit writer refuses it, so nothing commits",
+      "FIX ROUND F: the pre-#3653 plan's replay posts a mirrored child's refund line by the plan, once",
+      "FIX ROUND A: an ordinary card booking reduced with credit back, then the REAL paid cancel: the kept figure already nets the credit, and owed(b) is zero ($id)",
+      "FIX ROUND H: the census reads AGREE on every group history above, and a corrupted share or plan refund disagrees",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("still gates on the harness's variable and carries its three proofs", () => {
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-posting-key.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "skips a repeated key rather than refusing it, and the transaction survives to commit",
+      "CONTRAST: the same repeat without the door's skip is refused and loses the whole transaction",
+      "the confirmation fence sees a line with NO key, so a line posted before keys existed still fences",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("carries #3979's settle-from-cash proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./ib-settle-from-cash.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/ib-settle-from-cash.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "THE WORKED EXAMPLE: booked at $300, cut to $200 before its invoice, paid $200: the row, the payment and the bank receipt are $200, and the cancel's cap is $200",
+      "RAISED before its invoice: booked at $200, raised to $300, paid $300: everything is $300, and the cancel credits $300 back where the stale $200 used to cap it",
+      "A FINISHED-STAY FEE recorded before the invoice: the invoice bills price and fee, and the settle records both",
+      "THE LATE CAPACITY CANCEL: raised to $300 before its invoice, paid $300 after the beds went: the member's credit is the $300 the invoice collected",
+      "CONTROL: a rise AFTER the invoice stays on its supplementary invoice, so the primary keeps $200",
+      "DECISION 2: invoice $300, an invoice-correction note of $100, paid $200: $200 paid and $0 refunded, and a recount keeps it",
+      "A NOTE WORDED AS A REFUND still counts as refunded, so the settle keeps the stored figure rather than count the reduction twice",
+      "SYNCED AFTER THE SETTLE: a refund-worded note applied before payment keeps the stored figure, and its later fold leaves the net at the cash (review D)",
+      "A CORRECTION FOLDED BEFORE #3979: its re-sync changes nothing, and the settle clears the fold the invoice exactly explains and records the cash (review A)",
+      "GUEST REMOVAL AFTER, the fold cleared at the settle: a later note's recount leaves $50 refunded and the net at the true $150 (review A)",
+      "GUEST REMOVAL AFTER, settled before #3979 at the stored $300: the recount keeps counting the correction, so the net is the true $150, never $250 (review A)",
+      "A CARD REFUNDED BEFORE THE SWITCH (#1765): the receipt is the cash, the payment's figure and status are what the ledger projects, and the cancel credits the $200 back (review B)",
+      "ACCOUNT CREDIT FROM ANOTHER EDIT: an $80 credit kept from another booking's edit, spent here, is the member's own credit, never a refund-worded note (#3979 final review)",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+
+  it("carries #4147's capacity-race census proof into the same harness", () => {
+    const harness = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/concurrency-lock-races.realdb.test.ts"),
+    );
+    expect(harness).toContain('import "./booking-ledger-census-capacity-race.realdb.test";');
+    const suite = source(
+      resolve(REPO_ROOT, "src/lib/__tests__/booking-ledger-census-capacity-race.realdb.test.ts"),
+    );
+    expect(suite).toContain('process.env.RUN_CONCURRENCY_RACE_TESTS === "1"');
+    for (const caseName of [
+      "the refund still being sent: the back-post posts it as IN_FLIGHT_REFUND, and once the runner makes it every identity agrees",
+      "the refund row dead (retries spent) disagrees: nothing will send it",
+      "the refund made inline: the back-post posts it and every identity agrees",
+    ]) {
+      expect(suite).toContain(caseName);
+    }
+  });
+});

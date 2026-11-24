@@ -1,0 +1,213 @@
+# Prisma migrations are generated, immutable, and checksummed by Prisma.
+# Their bytes must stay identical across the public repo and downstream forks,
+# so git must not flag (or try to auto-fix) whitespace in them — e.g. a
+# trailing blank line at EOF would otherwise trip `git diff --check` on merge.
+#
+# `eol=lf` is what actually delivers that "identical bytes" promise. Every blob
+# on `main` is already LF, but this was the one tracked text class left
+# unpinned, so a Windows checkout (`core.autocrlf=true`) silently materialised
+# CRLF while the LF-pinned `*.ts` seed source stayed LF. That made
+# `page-content-starter-backfill.test.ts` compare an LF template literal
+# against CRLF file bytes and fail on Windows only — green on Linux CI, so it
+# was repeatedly written off as an environment flake. It also left Prisma
+# migration checksums platform-dependent. Pinning is zero-churn (the blobs are
+# already LF) and ends both problems.
+prisma/migrations/**/*.sql text eol=lf -whitespace
+
+# ESM scripts are imported by vitest tests as well as run via `node`. A CRLF
+# checkout (Windows autocrlf) of a shebang line breaks vite-node's import of
+# the module, so these always materialise with LF.
+scripts/*.mjs text eol=lf
+
+# The schema is hand-edited (AGENTS.md "Change discipline") and is the file most
+# likely to be ported between the public repo and its forks. A Windows editor
+# silently rewriting it to CRLF turns a 14-line change into a ~9,400-line diff
+# that conflicts on every line at the next port (#2129), so pin it to LF.
+prisma/schema.prisma text eol=lf
+
+# The hand-edited markdown carries the same hazard as the schema, and `AGENTS.md`
+# / `docs/ARCHITECTURE.md` / `CHANGELOG.md` are the files most often ported
+# between the public repo and its forks. A Windows editor rewriting one to CRLF
+# turned a 28-line change into an 848-line diff, destroyed blame, and made
+# `git diff --check` flag every line as trailing whitespace (#2162). Pin the
+# whole set to LF rather than waiting to relearn this per file.
+*.md text eol=lf
+
+# Source files carry the same hazard, and it has now bitten three times: the
+# schema (#2129), the markdown above (#2162), and two source files on the
+# #2160 branch — where a CRLF flip in a test file was independently read as
+# "harmless re-indentation" by three separate reviews, because `git diff -w`
+# ignores whitespace INCLUDING the carriage return and so reports clean on
+# exactly the churn that matters. Every tracked source file on `main` is
+# already LF, so pinning the set is zero-churn today and ends the class.
+*.ts text eol=lf
+# This file builds a composite resolution key with a NUL between the entity and
+# the key, written as the `\u0000` escape. Its blob carries no literal
+# control byte, and did not on `main` either: the comment that used to sit here
+# claimed a `historical literal NUL`, and that was measured wrong (#3072).
+# The `diff` attribute stays, and earns its line. If a literal NUL were ever
+# reintroduced here, `diff` keeps the file inside Git's text scan, so
+# `docs:indexcheck` reports the byte with its line and column instead of
+# reporting that it has lost the whole file.
+src/lib/config-transfer/import-types.ts text eol=lf diff
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+# #2687: complete the LF pins for the file-size ratchet's source-extension
+# scope. Git warned "LF will be replaced by CRLF" on the probe files used to
+# prove the classifier hole — the same Windows-only split that took days to
+# diagnose for the migration SQL and the shell scripts above.
+*.mts text eol=lf
+*.cts text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# #2686: the secret scanner's own two config files were the remaining tracked
+# text class with no pin, and both are parsed in ways CRLF breaks. gitleaks
+# reads `.gitleaksignore` a line at a time and compares each line to a finding
+# fingerprint, so a trailing `\r` makes an entry match nothing and the required
+# `Secret scan (gitleaks)` check goes red over a finding somebody already
+# reviewed and suppressed. `.toml` is pinned as a class rather than by name, so
+# a second TOML file added later inherits it.
+*.toml text eol=lf
+.gitleaksignore text eol=lf
+
+# #2687: tracked plain-text data files are the same class again. Several are
+# read line by line and compared byte-for-byte, so a CRLF checkout would fail on
+# Windows and pass on Linux CI — the exact split that took days to diagnose for
+# the migration SQL (#2399) and the shell scripts. Live examples, because a rule
+# whose only example has been deleted is a rule nobody can check:
+# `src/lib/__tests__/support/email-render-pins.txt` is compared line by line
+# against rendered output by `email-render-equivalence.test.ts`, and
+# `scripts/data-migration-verification-grandfathered.txt` is parsed by
+# `check-data-migration-verification.sh`, which gates a required check.
+# (#2979 deleted the file-size baseline this comment used to cite; the rule
+# outlived it, which is why it is pinned as a class rather than by name.) The
+# class pin also means the next tracked `.txt` inherits it; the existing tracked
+# `.txt` blobs are already LF, so this is zero churn.
+*.txt text eol=lf
+
+# Shell scripts are the fourth instance of the same class, and the worst of
+# them, because the failure does not look like a line-ending problem at all.
+# Every tracked `*.sh` here opens with `set -Eeuo pipefail`. Materialised as
+# CRLF on a Windows checkout, bash reads the option name as `pipefail\r` and
+# dies on that line with `set: pipefail: invalid option name` — pointing at
+# the shell, not at the file. So `scripts/check-migration-safety-coverage.sh`
+# and `scripts/validate-blue-green-migrations.sh` exit 2 before reading a
+# single migration, and `review-findings-contracts.test.ts`, which shells out
+# to both, fails 33 assertions on every Windows checkout and inside any Linux
+# container fed from one. That suite was written off as "environmental, slow
+# MSYS process spawn" for days; it was this. A permanently-red suite is worse
+# than a broken one, because it trains people to ignore failures — and it very
+# nearly hid a real regression on a money path (#2308).
+#
+# Same fix and same zero churn as the migration SQL (#2399): the stored blobs
+# are already LF, so this only stops Windows re-materialising them as CRLF.
+*.sh text eol=lf
+
+# #3843: the reviewed runtime patches pnpm applies (`patchedDependencies`).
+# pnpm records each patch's hash in pnpm-lock.yaml, and the dependency audit's
+# mitigation record binds the SHA256 of these exact bytes, so a CRLF checkout
+# would fail the frozen install and refuse the mitigation on Windows only.
+# `-whitespace` because a patch's context lines must stay byte-exact, trailing
+# spaces included.
+patches/*.patch text eol=lf -whitespace
+# The dependency-mitigation tests' synthetic copies of those inputs: the fixture
+# record binds their SHA256, so they need the same byte-exact checkout.
+scripts/ci/fixtures/dependency-mitigation/** text eol=lf -whitespace
+
+# The blue/green migration-safety ledger is the fifth instance of the same
+# class, and the one where byte-level trust matters most: every row is parsed by
+# `scripts/check-migration-safety-coverage.sh` and hand-audited, and its whole
+# value is that its bytes can be trusted across the public repo and its forks. It
+# was the last tracked text class left without an `eol=lf` pin, so it rode on
+# `core.autocrlf` and git warned on every Windows touch (flagged in #2431's fix
+# round). Same fix and same zero churn as the migration SQL and shell scripts —
+# the stored blob is already LF; this only stops Windows re-materialising CRLF.
+#
+# `merge=union` was added by #3111, which audited the class of artifacts every
+# lane appends to. This ledger is a member nobody had registered: one row per
+# migration, hand-appended by every schema lane, measured at 86-90% pure-append
+# across 37-40 merges, and `blue-green-ledger-lint.test.ts` already calls it
+# "append-only, hand-edited TSV" in its own docblock. Two lanes each adding a
+# migration conflicted on the last line for no reason: neither row has anything
+# to say about the other, and every one of those conflicts was resolved by hand
+# as "keep both", which is exactly what union does.
+#
+# Union is safe HERE, and the reason is worth stating because it is not safe in
+# general. `AGENTS.md` makes the fragment directory the default remedy and union
+# the exception, because union-merging a NARRATIVE document interleaves its
+# sections in arbitrary order and can duplicate headings, silently. This file is
+# the opposite shape: a flat list of unrelated rows, parsed row-by-row and
+# order-independently by `scripts/check-migration-safety-coverage.sh`. And the
+# one bad outcome union could produce - the same row arriving twice - is already
+# a loud failure: the validator rejects a `duplicate safety ledger row`, pinned
+# by `blue-green-ledger-lint.test.ts`. Loud beats silent, which is the whole
+# reason the kernel ledger did NOT get this treatment (#3111).
+docs/BLUE_GREEN_MIGRATION_SAFETY.tsv text eol=lf merge=union
+
+# The rendered-email pin file (#2689) is the sixth instance of the same class.
+# Its parser strips a stray CR defensively, so a CRLF checkout no longer makes
+# the gate cry wolf. The committed file is still a byte-level review contract,
+# though: leaving it on `core.autocrlf` would make a Windows regeneration rewrite
+# every one of its 219 entries and obscure the intended pin changes. Keep it LF so
+# review diffs and generated bytes are platform-independent. Zero churn: the
+# stored blob is already LF.
+src/lib/__tests__/support/email-render-pins.txt text eol=lf
+
+# CHANGELOG.md: every concurrent lane prepends its entry to `## Unreleased`,
+# so plain three-way merge conflicts on nearly every rebase and every
+# update-from-main — all session long, on every agent stream. `union` keeps
+# BOTH sides' added lines automatically, which is exactly the resolution every
+# one of those conflicts got by hand. Caveat: on a release-cut commit (moving
+# Unreleased under a version header) union can concatenate two restructurings
+# silently — eyeball the CHANGELOG on release PRs.
+CHANGELOG.md merge=union
+
+# The audit write-site ledger (#5211) is generated (`pnpm run audit:census
+# --write`), one line per site, sorted by id, and every lane that adds an audit
+# writer regenerates it. Two lanes whose new sites sort next to each other
+# conflicted for no reason; union keeps both lines, which is the right merge.
+# It is safe because every wrong merge union can make here is LOUD, measured on
+# trial merges for PR #5224: a repeated id (two lanes touching the same `#n`
+# line) fails the census by name, because it reads this file's text for repeated
+# keys, and is also a TS1117 duplicate-key compile error; a line union
+# resurrects after one side deleted its site fails the census by name
+# ("REMOVED from ..."). The fix in every case is to regenerate the file on the
+# merged tree; never hand-merge it.
+scripts/audit/audit-write-sites.ts merge=union
+
+# Binary assets, declared rather than left to Git's content sniffing. `binary`
+# is Git's standard macro for `-diff -merge -text`, and all three are already
+# how Git treats these files by auto-detection, so this changes nothing about
+# checkout, diff or merge (measured: zero working-tree churn across all 113).
+#
+# What it changes is that `pnpm run docs:indexcheck` can fail CLOSED. Its
+# coverage check asks whether a file that dropped out of Git's text scan is a
+# declared binary asset; anything else is a text file with a NUL hiding it from
+# every check in that command. The first version keyed on the `text` pins above
+# instead, assuming every tracked text class was pinned. It was not: that made
+# the check vacuous for 43 tracked text files across 18 unpinned classes,
+# `knip.jsonc`, `Dockerfile`, `Caddyfile`, the `.awk` statement splitter and the
+# `.html` mockups among them. A new binary format now reds that check until
+# somebody adds it here, which is the direction an omission should point (#3072).
+*.png binary
+*.ico binary
+*.gif binary
+*.zip binary
+
+# #4463: machine-written files, marked with GitHub's own `linguist-generated`
+# attribute. GitHub collapses them in a PR's diff view, and the soft PR-size
+# gate (`scripts/ci/check-pr-size.mjs`) leaves their lines out of a PR's
+# changed-line count. This is the ONE list for both: mark a new generated file
+# here, never in the gate. Each is rewritten by a tool, not by hand: pnpm for
+# the lockfile, the generator its header names for the rest. Migration SQL is NOT
+# listed: Prisma drafts it, but a person reviews every line of it.
+pnpm-lock.yaml linguist-generated
+src/lib/__tests__/support/email-render-pins.txt linguist-generated
+src/lib/theme/__tests__/theme-goldens.json linguist-generated
+scripts/ci/e2e-spec-durations.mjs linguist-generated

@@ -1,0 +1,387 @@
+import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
+import { requireAdmin } from "@/lib/session-guards";
+import { prisma } from "@/lib/prisma";
+import { z } from "zod";
+import { clubTimeZone } from "@/lib/club-time/server";
+import { clubSeasonYear } from "@/lib/financial-year";
+import logger from "@/lib/logger";
+import { getAgeTierSettings } from "@/lib/age-tier";
+import {
+  getXeroContactGroupMemberships,
+  getXeroContactIdsForGroup,
+} from "@/lib/xero-contact-groups";
+import { loadMembershipLockoutSettings } from "@/lib/membership-lockout-settings";
+import { subscriptionNotRequiredMemberConditions } from "@/lib/subscription-liability-where";
+import {
+  listSubscriptionStatus,
+  SEASON_ROW_STATE_SELECT,
+} from "@/lib/subscription-season-row-note";
+import {
+  isSubscriptionsListMemberNotRequired,
+  subscriptionsListBillingNote,
+} from "@/lib/subscriptions-list-liability";
+import { serializeSubscriptionMemberLoginStage } from "@/lib/subscription-member-login-stage";
+import { adminListPageQueryFields } from "@/lib/admin-list-page";
+
+const subscriptionStatuses = [
+  "PAID",
+  "UNPAID",
+  "OVERDUE",
+  "NOT_INVOICED",
+  "NOT_REQUIRED",
+] as const;
+const subscriptionStatusFilterValues = [...subscriptionStatuses, "all"] as const;
+const subscriptionSortBySchema = z
+  .enum([
+    "member",
+    "email",
+    "ageTier",
+    "xeroContactGroup",
+    "status",
+    "xeroInvoice",
+    "paidAt",
+  ])
+  .optional()
+  .default("member");
+
+const querySchema = z.object({
+  seasonYear: z.coerce.number().int().min(2020).max(2040).optional(),
+  status: z.enum(subscriptionStatusFilterValues).optional().default("all"),
+  ageTier: z.enum(["INFANT", "CHILD", "YOUTH", "ADULT", "all"]).optional().default("all"),
+  xeroContactGroup: z.string().trim().min(1).max(100).optional(),
+  sortBy: subscriptionSortBySchema,
+  sortDir: z.enum(["asc", "desc"]).optional().default("asc"),
+  ...adminListPageQueryFields,
+});
+
+type SubscriptionSortBy = z.infer<typeof subscriptionSortBySchema>;
+type SubscriptionCandidate = {
+  id: string;
+  memberId: string;
+  seasonYear: number;
+  status: (typeof subscriptionStatuses)[number];
+  xeroInvoiceId: string | null;
+  xeroInvoiceNumber: string | null;
+  paidAt: Date | null;
+  manuallyMarkedPaidAt: Date | null;
+  manualPaymentNote: string | null;
+  /**
+   * #5190 (owner decision 22 Nov 2026): set when the saved season row says
+   * "Not required" but billing treats this member as owing
+   * (`hasNotRequiredRowBillingNote`); null otherwise.
+   */
+  billingNote: string | null;
+  xeroContactGroupsLoaded: boolean;
+  xeroContactGroups: Array<{ id: string; name: string }>;
+  member: {
+    firstName: string;
+    lastName: string;
+    email: string;
+    ageTier: string;
+    role: string;
+    canLogin: boolean;
+    hasCompletedAccountSetup: boolean;
+    pendingInviteExpiresAt: Date | null;
+    xeroContactId: string | null;
+    seasonalMembershipAssignments?: Array<{
+      membershipType: { subscriptionBehavior: string };
+    }>;
+  };
+};
+
+function compareValues(left: string | number | Date | null, right: string | number | Date | null) {
+  const normalizedLeft = left instanceof Date ? left.getTime() : left ?? "";
+  const normalizedRight = right instanceof Date ? right.getTime() : right ?? "";
+
+  if (typeof normalizedLeft === "number" && typeof normalizedRight === "number") {
+    return normalizedLeft - normalizedRight;
+  }
+
+  return String(normalizedLeft).localeCompare(String(normalizedRight));
+}
+
+function subscriptionSortValue(candidate: SubscriptionCandidate, sortBy: SubscriptionSortBy) {
+  switch (sortBy) {
+    case "email":
+      return candidate.member.email.toLowerCase();
+    case "ageTier":
+      return candidate.member.ageTier;
+    case "xeroContactGroup":
+      return candidate.xeroContactGroups.map((group) => group.name).join(", ").toLowerCase();
+    case "status":
+      return candidate.status;
+    case "xeroInvoice":
+      return candidate.xeroInvoiceNumber ?? candidate.xeroInvoiceId;
+    case "paidAt":
+      return candidate.paidAt;
+    case "member":
+    default:
+      return `${candidate.member.lastName} ${candidate.member.firstName}`.toLowerCase();
+  }
+}
+
+function sortSubscriptions(
+  candidates: SubscriptionCandidate[],
+  sortBy: SubscriptionSortBy,
+  sortDir: "asc" | "desc"
+) {
+  const direction = sortDir === "asc" ? 1 : -1;
+
+  return [...candidates].sort((left, right) => {
+    const primary =
+      compareValues(subscriptionSortValue(left, sortBy), subscriptionSortValue(right, sortBy)) *
+      direction;
+    if (primary !== 0) {
+      return primary;
+    }
+
+    const memberFallback = compareValues(
+      `${left.member.lastName} ${left.member.firstName}`.toLowerCase(),
+      `${right.member.lastName} ${right.member.firstName}`.toLowerCase()
+    );
+    return memberFallback !== 0 ? memberFallback : left.id.localeCompare(right.id);
+  });
+}
+
+export async function GET(request: NextRequest) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return guard.response;
+  const { searchParams } = new URL(request.url);
+  const parsed = querySchema.safeParse({
+    seasonYear: searchParams.get("seasonYear") ?? undefined,
+    status: searchParams.get("status") ?? undefined,
+    ageTier: searchParams.get("ageTier") ?? undefined,
+    xeroContactGroup: searchParams.get("xeroContactGroup") ?? undefined,
+    sortBy: searchParams.get("sortBy") ?? undefined,
+    sortDir: searchParams.get("sortDir") ?? undefined,
+    page: searchParams.get("page") ?? undefined,
+    pageSize: searchParams.get("pageSize") ?? undefined,
+  });
+
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid query parameters", details: parsed.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  const { status, ageTier, xeroContactGroup, sortBy, sortDir, page, pageSize } = parsed.data;
+  const seasonYear =
+    parsed.data.seasonYear ?? clubSeasonYear(await clubTimeZone());
+
+  try {
+    const [ageTierSettings, lockoutSettings] = await Promise.all([
+      getAgeTierSettings(),
+      loadMembershipLockoutSettings(),
+    ]);
+    const liabilityRule = { seasonYear, ageTierSettings, liabilitySettings: lockoutSettings };
+    const memberWhere: Prisma.MemberWhereInput = { archivedAt: null };
+
+    if (ageTier !== "all") {
+      memberWhere.ageTier = ageTier;
+    }
+
+    if (xeroContactGroup && xeroContactGroup !== "all") {
+      const groupContactIds = await getXeroContactIdsForGroup(xeroContactGroup);
+      memberWhere.xeroContactId = { in: groupContactIds };
+    }
+
+    const summaryWhere: Prisma.MemberSubscriptionWhereInput = { seasonYear };
+    if (Object.keys(memberWhere).length > 0) {
+      summaryWhere.member = memberWhere;
+    }
+
+    // #2149/#5190: the members the shared liability rule exempts, built from the
+    // same settings as the per-row flag. A saved row is judged per row below,
+    // so the row clause is left out here.
+    const notRequiredWhere: Prisma.MemberWhereInput = {
+      ...memberWhere,
+      OR: subscriptionNotRequiredMemberConditions({
+        ...liabilityRule,
+        includeSeasonRowExemption: false,
+      }),
+    };
+
+    const [subscriptions, notRequiredMembers] = await Promise.all([
+      prisma.memberSubscription.findMany({
+        where: summaryWhere,
+        include: {
+          // #5190: the active-claim test the billing note reads.
+          chargeCoverage: SEASON_ROW_STATE_SELECT.chargeCoverage,
+          member: {
+            select: {
+              firstName: true,
+              lastName: true,
+              email: true,
+              ageTier: true,
+              // #5190: read by the liability rule only; never serialised.
+              dateOfBirth: true,
+              // #5190: the billing note speaks only for the billing population.
+              active: true,
+              archivedAt: true,
+              role: true,
+              canLogin: true,
+              passwordChangedAt: true,
+              lastLoginAt: true,
+              passwordResetTokens: {
+                orderBy: { createdAt: "desc" },
+                take: 1,
+                select: { expiresAt: true, used: true },
+              },
+              xeroContactId: true,
+              seasonalMembershipAssignments: {
+                where: { seasonYear },
+                select: {
+                  membershipType: {
+                    select: { subscriptionBehavior: true },
+                  },
+                },
+                take: 1,
+              },
+            },
+          },
+        },
+      }),
+      prisma.member.findMany({
+        where: notRequiredWhere,
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          email: true,
+          ageTier: true,
+          role: true,
+          canLogin: true,
+          passwordChangedAt: true,
+          lastLoginAt: true,
+          passwordResetTokens: {
+            orderBy: { createdAt: "desc" },
+            take: 1,
+            select: { expiresAt: true, used: true },
+          },
+          xeroContactId: true,
+          seasonalMembershipAssignments: {
+            where: { seasonYear },
+            select: {
+              membershipType: {
+                select: { subscriptionBehavior: true },
+              },
+            },
+            take: 1,
+          },
+        },
+      }),
+    ]);
+
+    const candidatesByMemberId = new Map<string, SubscriptionCandidate>();
+    for (const subscription of subscriptions) {
+      const billingNote = subscriptionsListBillingNote(subscription, liabilityRule);
+      // #5190: the members list's status; a noted row shows billing's status,
+      // so the status filter and the counts below place it where it reads.
+      const displayStatus = listSubscriptionStatus({
+        notRequired: isSubscriptionsListMemberNotRequired(
+          subscription.member,
+          liabilityRule,
+          subscription.status
+        ),
+        seasonRowStatus: subscription.status,
+        billingNote,
+      });
+      candidatesByMemberId.set(subscription.memberId, {
+        id: subscription.id,
+        memberId: subscription.memberId,
+        seasonYear: subscription.seasonYear,
+        status: displayStatus as SubscriptionCandidate["status"],
+        xeroInvoiceId: subscription.xeroInvoiceId,
+        xeroInvoiceNumber: subscription.xeroInvoiceNumber,
+        paidAt: subscription.paidAt,
+        manuallyMarkedPaidAt: subscription.manuallyMarkedPaidAt,
+        manualPaymentNote: subscription.manualPaymentNote,
+        billingNote,
+        xeroContactGroupsLoaded: true,
+        xeroContactGroups: [],
+        member: serializeSubscriptionMemberLoginStage(subscription.member),
+      });
+    }
+
+    for (const member of notRequiredMembers) {
+      candidatesByMemberId.set(member.id, {
+        id: `not-required:${member.id}:${seasonYear}`,
+        memberId: member.id,
+        seasonYear,
+        status: "NOT_REQUIRED",
+        xeroInvoiceId: null,
+        xeroInvoiceNumber: null,
+        paidAt: null,
+        manuallyMarkedPaidAt: null,
+        manualPaymentNote: null,
+        // The rule exempts this member, so billing invoices nobody here.
+        billingNote: null,
+        xeroContactGroupsLoaded: true,
+        xeroContactGroups: [],
+        member: serializeSubscriptionMemberLoginStage(member),
+      });
+    }
+
+    const candidates = Array.from(candidatesByMemberId.values());
+
+    const linkedContactIds = candidates
+      .map((subscription) => subscription.member.xeroContactId)
+      .filter((contactId): contactId is string => Boolean(contactId));
+    const xeroContactGroupsByContactId =
+      linkedContactIds.length > 0
+        ? await getXeroContactGroupMemberships(linkedContactIds)
+        : {};
+    const xeroContactGroupsLoaded =
+      linkedContactIds.length === 0 ||
+      linkedContactIds.every((contactId) =>
+        Object.prototype.hasOwnProperty.call(xeroContactGroupsByContactId, contactId)
+      );
+
+    const enrichedCandidates = candidates.map((subscription) => ({
+      ...subscription,
+      xeroContactGroupsLoaded,
+      xeroContactGroups: subscription.member.xeroContactId
+        ? xeroContactGroupsByContactId[subscription.member.xeroContactId] ?? []
+        : [],
+    }));
+
+    const filteredCandidates =
+      status === "all"
+        ? enrichedCandidates
+        : enrichedCandidates.filter((subscription) => subscription.status === status);
+    const sortedCandidates = sortSubscriptions(filteredCandidates, sortBy, sortDir);
+    const data = sortedCandidates.slice((page - 1) * pageSize, page * pageSize);
+    const total = filteredCandidates.length;
+
+    const counts = {
+      total: 0,
+      paid: 0,
+      unpaid: 0,
+      overdue: 0,
+      notInvoiced: 0,
+      notRequired: 0,
+    };
+    for (const row of enrichedCandidates) {
+      counts.total += 1;
+      if (row.status === "PAID") counts.paid += 1;
+      else if (row.status === "UNPAID") counts.unpaid += 1;
+      else if (row.status === "OVERDUE") counts.overdue += 1;
+      else if (row.status === "NOT_INVOICED") counts.notInvoiced += 1;
+      else if (row.status === "NOT_REQUIRED") counts.notRequired += 1;
+    }
+
+    return NextResponse.json({
+      data,
+      total,
+      page,
+      pageSize,
+      summary: counts,
+      xeroContactGroupsLoaded,
+    });
+  } catch (err) {
+    logger.error({ err }, "Error fetching subscriptions");
+    return NextResponse.json({ error: "Failed to fetch subscriptions" }, { status: 500 });
+  }
+}

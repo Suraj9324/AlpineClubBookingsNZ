@@ -1,0 +1,274 @@
+import { prisma } from "./prisma";
+import {
+  addDaysDateOnly,
+  formatDateOnly,
+} from "./date-only";
+import { LODGE_VISIBLE_BOOKING_STATUSES } from "./lodge-date-scoping";
+import {
+  hasAccessRole,
+  hasAdminAccess,
+  hasLodgeAccess,
+  type PrivilegeCheckInput,
+} from "@/lib/access-roles";
+import { bookingOwner } from "@/lib/booking-owner";
+import {
+  hutLeaderAccessWindowCoversDayWhere,
+  hutLeaderAccessWindowOf,
+} from "@/lib/hut-leader-access-window";
+
+export type KioskTier = "admin" | "hut-leader" | "lodge" | "staying-guest" | "none";
+
+export interface KioskAccess {
+  tier: KioskTier;
+  dateRange: { minDate: string; maxDate: string } | null;
+  canManageRoster: boolean;
+  canMarkAttendance: boolean;
+  canCompleteChores: boolean;
+}
+
+/**
+ * Does this tier manage the roster? The `canManageRoster` flag's own rule,
+ * pulled out so it can be READ (#3040).
+ *
+ * `kioskGroupTripCapabilities` below documents that it grants to deliberately
+ * this same set of tiers. That claim sat in a docblock with nothing checking it,
+ * so the two could drift apart silently; `kiosk-group-trip-privacy.test.ts` now
+ * asserts the coincidence across all five tiers against this function.
+ *
+ * DELIBERATELY NOT CALLED by `kioskGroupTripCapabilities`. Sharing the expression
+ * would make the coincidence a dependency — granting cover source to a tier that
+ * does not manage the roster would then be impossible without untangling them
+ * first, which is the same mistake as collapsing the two capabilities into one
+ * flag. Two rules, asserted equal today.
+ */
+export function kioskTierManagesRoster(tier: KioskTier): boolean {
+  return tier === "admin" || tier === "hut-leader";
+}
+
+/**
+ * The two privileged Group Trip capabilities, carried separately because they
+ * ARE separate (#3040).
+ *
+ * The issue requires organiser context and adult-cover source to be
+ * "independently authorized", so they are two booleans, consulted at two
+ * places, gating two payload keys and two database reads. They are granted to
+ * the same tiers today; that is a policy coincidence and NOT a licence to
+ * collapse them into one flag, because collapsing them would make it impossible
+ * to grant one without the other later.
+ * `src/lib/__tests__/kiosk-group-trip-privacy.test.ts` drives all four
+ * combinations.
+ */
+export interface KioskGroupTripCapabilities {
+  organiser: boolean;
+  coverSource: boolean;
+}
+
+/**
+ * Which kiosk tiers hold the two privileged Group Trip capabilities.
+ *
+ * `admin` and `hut-leader` only — deliberately the same set as
+ * `canManageRoster`, the narrower of the two capability sets this module
+ * already grants, and NOT the wider `canMarkAttendance` set that includes
+ * `lodge`.
+ *
+ * The `lodge` tier is a shared, often unattended wall device: anybody who walks
+ * up to it is that tier. Marking a guest arrived from it is an operational
+ * action the club wants available that way; learning who organised another
+ * member's trip, or which account's adult supplies a booking's cover, is
+ * cross-account DISCLOSURE, and disclosure to an unattended screen is
+ * disclosure to everybody in the room. `staying-guest` and `none` hold neither
+ * capability — that is the ordinary tier the whole privacy split exists for,
+ * and it sees Group Trip LINKAGE only.
+ */
+export function kioskGroupTripCapabilities(
+  tier: KioskTier,
+): KioskGroupTripCapabilities {
+  const privileged = tier === "admin" || tier === "hut-leader";
+  // Two fields, written out, rather than one shared boolean reference. A single
+  // expression assigned to both would read as "these are the same capability",
+  // which is exactly what this must not become.
+  return { organiser: privileged, coverSource: privileged };
+}
+
+export type KioskAccessSubject = PrivilegeCheckInput & {
+  id: string;
+};
+
+/**
+ * Returns the highest kiosk access tier for a user on a given date.
+ */
+export async function getKioskAccessTier(
+  user: KioskAccessSubject,
+  date: Date
+): Promise<KioskTier> {
+  if (hasAdminAccess(user)) return "admin";
+  if (hasLodgeAccess(user)) return "lodge";
+
+  if (hasAccessRole(user, "USER")) {
+    // Hut leader: inside an assignment's access window, from the day before
+    // its first night to the day after its last (#3817). The one definition
+    // lives in hut-leader-access-window.ts.
+    const hutLeaderCount = await prisma.hutLeaderAssignment.count({
+      where: {
+        memberId: user.id,
+        ...hutLeaderAccessWindowCoversDayWhere(date),
+      },
+    });
+
+    const nextDay = addDaysDateOnly(date, 1);
+
+    if (hutLeaderCount > 0) return "hut-leader";
+
+    // Check staying guest: booking owner or linked member guest where
+    // (checkIn - 1 day) <= date <= checkOut.
+    const stayingGuestCount = await prisma.booking.count({
+      where: {
+        status: { in: [...LODGE_VISIBLE_BOOKING_STATUSES] },
+        OR: [
+          { memberId: user.id },
+          {
+            guests: {
+              some: {
+                memberId: user.id,
+                stayStart: { lte: nextDay },
+                stayEnd: { gte: date },
+              },
+            },
+          },
+        ],
+        // checkIn - 1 day <= date means checkIn <= date + 1 day
+        checkIn: { lte: nextDay },
+        // date <= checkOut (using the date itself as the day)
+        checkOut: { gte: date },
+      },
+    });
+
+    if (stayingGuestCount > 0) return "staying-guest";
+  }
+
+  return "none";
+}
+
+// test seam
+/**
+ * Returns the date range the user can navigate within on the kiosk,
+ * or null for unrestricted (ADMIN/LODGE).
+ */
+export async function getKioskDateRange(
+  user: KioskAccessSubject,
+  date?: Date
+): Promise<{ minDate: string; maxDate: string } | null> {
+  if (hasAdminAccess(user) || hasLodgeAccess(user)) return null;
+
+  const nextDay = date ? addDaysDateOnly(date, 1) : null;
+
+  // Gather all hut leader assignments
+  const assignments = await prisma.hutLeaderAssignment.findMany({
+    where: {
+      memberId: user.id,
+      ...(date ? hutLeaderAccessWindowCoversDayWhere(date) : {}),
+    },
+    select: { startDate: true, endDate: true },
+  });
+
+  // Gather all visible bookings where the signed-in member is staying.
+  const bookings = await prisma.booking.findMany({
+    where: {
+      status: { in: [...LODGE_VISIBLE_BOOKING_STATUSES] },
+      OR: [
+        { memberId: user.id },
+        {
+          guests: {
+            some: {
+              memberId: user.id,
+              ...(date && nextDay
+                ? {
+                    stayStart: { lte: nextDay },
+                    stayEnd: { gte: date },
+                  }
+                : {}),
+            },
+          },
+        },
+      ],
+      ...(date && nextDay
+        ? {
+            checkIn: { lte: nextDay },
+            checkOut: { gte: date },
+          }
+        : {}),
+    },
+    select: {
+      memberId: true,
+      checkIn: true,
+      checkOut: true,
+      guests: {
+        where: { memberId: user.id },
+        select: {
+          stayStart: true,
+          stayEnd: true,
+        },
+      },
+    },
+  });
+
+  if (assignments.length === 0 && bookings.length === 0) return null;
+
+  let minDate: Date | null = null;
+  let maxDate: Date | null = null;
+
+  for (const a of assignments) {
+    // Day before the first night to the departure day (#3817).
+    const { firstDay: start, lastDay: end } = hutLeaderAccessWindowOf(a);
+
+    if (!minDate || start < minDate) minDate = start;
+    if (!maxDate || end > maxDate) maxDate = end;
+  }
+
+  for (const b of bookings) {
+    const guestRanges =
+      bookingOwner(b).memberId === user.id
+        ? [{ stayStart: b.checkIn, stayEnd: b.checkOut }]
+        : (b.guests ?? []);
+
+    for (const range of guestRanges) {
+      // Day-before access
+      const start = addDaysDateOnly(range.stayStart, -1);
+      const end = range.stayEnd;
+
+      if (!minDate || start < minDate) minDate = start;
+      if (!maxDate || end > maxDate) maxDate = end;
+    }
+  }
+
+  if (!minDate || !maxDate) return null;
+
+  return {
+    minDate: formatDateOnly(minDate),
+    maxDate: formatDateOnly(maxDate),
+  };
+}
+
+/**
+ * Build the full kiosk access response for an API endpoint.
+ */
+export async function getKioskAccessInfo(
+  user: KioskAccessSubject,
+  date: Date
+): Promise<KioskAccess> {
+  const tier = await getKioskAccessTier(user, date);
+  const dateRange = await getKioskDateRange(user, date);
+
+  // The two Group Trip capabilities (#3040) are deliberately NOT reported here.
+  // No client reads them: the guest-list route applies them server-side and
+  // simply omits the keys a viewer may not have, so a flag telling the browser
+  // what it was not sent would be a field with no reader and one more place for
+  // the disclosure rule to drift from `kioskGroupTripCapabilities`.
+  return {
+    tier,
+    dateRange,
+    canManageRoster: kioskTierManagesRoster(tier),
+    canMarkAttendance: tier === "admin" || tier === "hut-leader" || tier === "lodge",
+    canCompleteChores: tier === "admin" || tier === "hut-leader" || tier === "lodge",
+  };
+}

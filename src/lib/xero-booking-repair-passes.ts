@@ -1,0 +1,620 @@
+// Pass reporting plus action application (local field/link backfills, cancelled
+// in-flight payment repair, late-capture refund, and outbox/retry draining) for
+// the booking-vs-Xero repair tool. Extracted verbatim from
+// xero-booking-repair.ts (#1208 item 2). Money stays in integer cents; provider
+// calls stay outside DB transactions (unchanged).
+import { applyRefundNoteSettlementRepair } from "@/lib/xero-refund-note-unsettled";
+import { readClubTimeZoneOutsideRequest } from "@/lib/club-time-zone-runtime";
+import { keptLateCaptureDocumentDate } from "@/lib/xero-kept-late-capture-invoice";
+import logger from "@/lib/logger";
+import { PartialRefundError } from "@/lib/payment-transactions";
+import { sliceAfterRecordedRefusals } from "@/lib/refused-card-refund-retry";
+import { buildXeroInvoiceUrl } from "@/lib/xero-links";
+import { type SupplementaryInvoiceChargeKind } from "./xero-booking-repair-payments";
+import { releaseRepairedSupplementaryInvoiceIfAlreadyPaid } from "./xero-booking-repair-supplementary-release";
+import type { BookingXeroRepairAction, BookingXeroRepairBookingSummary, BookingXeroRepairPassReport, XeroBookingRepairActionStatus } from "./xero-booking-repair-types";
+import { LATE_CAPTURE_REPAIR_REFUND_METADATA_REASON } from "@/lib/payment-recovery-keys";
+import type { RepairDependencies } from "./xero-booking-repair-deps";
+import { describeRefusedRepairedLateCaptureRefund, describeRepairedLateCaptureRefund, madeRepairRefunds } from "@/lib/late-capture-repair-result-message";
+import { createCountMap } from "./xero-booking-repair-utils";
+import { applyAdditionalCaptureReceiptAction, applyKeptChangeCaptureRecordAction } from "./xero-booking-repair-additional-capture";
+import type { ClubFormat } from "@/lib/club-format";
+import { readModificationNoteWording } from "@/lib/xero-refund-method";
+import { applyHistoricalOrganiserInvoiceRepair } from "./xero-booking-repair-organiser-billing";
+export function buildPassReport(pass: number, bookings: BookingXeroRepairBookingSummary[]): BookingXeroRepairPassReport {
+  const bookingsWithFindings = bookings.filter((booking) => booking.findings.length > 0);
+  const findings = bookingsWithFindings.flatMap((booking) => booking.findings.map((finding) => finding.code));
+  const actions = bookingsWithFindings.flatMap((booking) => booking.actions.map((action) => action.type));
+  const actionStatuses = bookingsWithFindings.flatMap((booking) => booking.actions.map((action) => action.status));
+
+  return {
+    pass,
+    bookingsScanned: bookings.length,
+    bookingsWithFindings: bookingsWithFindings.length,
+    findingsByCode: createCountMap(findings),
+    actionsByType: createCountMap(actions),
+    actionStatuses: createCountMap(actionStatuses),
+    bookings,
+  };
+}
+
+async function applyLocalPrimaryInvoiceFieldRepair(
+  action: BookingXeroRepairAction,
+  deps: RepairDependencies
+) {
+  const paymentId = String(action.payload.paymentId);
+  const xeroInvoiceId = String(action.payload.xeroInvoiceId);
+  const xeroInvoiceNumber =
+    typeof action.payload.xeroInvoiceNumber === "string"
+      ? action.payload.xeroInvoiceNumber
+      : null;
+
+  await deps.prisma.payment.update({
+    where: { id: paymentId },
+    data: {
+      xeroInvoiceId,
+      xeroInvoiceNumber,
+    },
+  });
+
+  action.status = "applied";
+  action.resultMessage = `Updated payment ${paymentId} with Xero invoice ${xeroInvoiceId}.`;
+}
+
+async function applyLocalPrimaryInvoiceLinkRepair(
+  action: BookingXeroRepairAction,
+  deps: RepairDependencies
+) {
+  const paymentId = String(action.payload.paymentId);
+  const xeroInvoiceId = String(action.payload.xeroInvoiceId);
+  const xeroInvoiceNumber =
+    typeof action.payload.xeroInvoiceNumber === "string"
+      ? action.payload.xeroInvoiceNumber
+      : null;
+
+  await deps.upsertXeroObjectLink({
+    localModel: "Payment",
+    localId: paymentId,
+    xeroObjectType: "INVOICE",
+    xeroObjectId: xeroInvoiceId,
+    xeroObjectNumber: xeroInvoiceNumber,
+    xeroObjectUrl: buildXeroInvoiceUrl(xeroInvoiceId),
+    role: "PRIMARY_INVOICE",
+  });
+
+  action.status = "applied";
+  action.resultMessage = `Backfilled PRIMARY_INVOICE link for payment ${paymentId}.`;
+}
+
+async function applyLocalRefundCreditNoteFieldRepair(
+  action: BookingXeroRepairAction,
+  deps: RepairDependencies
+) {
+  const paymentId = String(action.payload.paymentId);
+  const xeroRefundCreditNoteId = String(action.payload.xeroRefundCreditNoteId);
+
+  await deps.prisma.payment.update({
+    where: { id: paymentId },
+    data: {
+      xeroRefundCreditNoteId,
+    },
+  });
+
+  action.status = "applied";
+  action.resultMessage = `Updated payment ${paymentId} with refund credit note ${xeroRefundCreditNoteId}.`;
+}
+
+async function applyLinkRepair(
+  action: BookingXeroRepairAction,
+  deps: RepairDependencies
+) {
+  await deps.upsertXeroObjectLink({
+    localModel: String(action.payload.localModel),
+    localId: String(action.payload.localId),
+    xeroObjectType: String(action.payload.xeroObjectType),
+    xeroObjectId: String(action.payload.xeroObjectId),
+    xeroObjectNumber:
+      typeof action.payload.xeroObjectNumber === "string"
+        ? action.payload.xeroObjectNumber
+        : null,
+    xeroObjectUrl:
+      typeof action.payload.xeroObjectUrl === "string"
+        ? action.payload.xeroObjectUrl
+        : null,
+    role: String(action.payload.role),
+  });
+
+  action.status = "applied";
+  action.resultMessage = `Backfilled ${String(action.payload.role)} link for ${String(action.payload.localModel)} ${String(action.payload.localId)}.`;
+}
+
+function getPaymentIntentIdsFromActionPayload(action: BookingXeroRepairAction) {
+  const paymentIntentIds = new Set<string>();
+
+  if (Array.isArray(action.payload.paymentIntentIds)) {
+    for (const paymentIntentId of action.payload.paymentIntentIds) {
+      if (typeof paymentIntentId === "string" && paymentIntentId.trim()) {
+        paymentIntentIds.add(paymentIntentId);
+      }
+    }
+  }
+
+  if (
+    typeof action.payload.stripePaymentIntentId === "string" &&
+    action.payload.stripePaymentIntentId.trim()
+  ) {
+    paymentIntentIds.add(action.payload.stripePaymentIntentId);
+  }
+
+  return [...paymentIntentIds];
+}
+
+async function applyCancelledInFlightPaymentRepair(
+  action: BookingXeroRepairAction,
+  deps: RepairDependencies
+) {
+  const paymentId = String(action.payload.paymentId);
+  const bookingId = String(action.payload.bookingId);
+  const paymentIntentIds = getPaymentIntentIdsFromActionPayload(action);
+
+  if (paymentIntentIds.length === 0) {
+    await deps.prisma.payment.update({
+      where: { id: paymentId },
+      data: {
+        status: "FAILED",
+        additionalPaymentStatus: "FAILED",
+      },
+    });
+    action.status = "applied";
+    action.resultMessage =
+      "Marked the cancelled booking payment as failed because no Stripe payment intent id was stored.";
+    return;
+  }
+
+  const terminalFailureStatuses = new Set([
+    "canceled",
+    "requires_payment_method",
+    "requires_confirmation",
+  ]);
+  const terminalFailures: string[] = [];
+  const succeededIntents: string[] = [];
+  const nonTerminalIntents: string[] = [];
+
+  for (const paymentIntentId of paymentIntentIds) {
+    const cancelledIntent = await deps.cancelPaymentIntentIfCancellable(paymentIntentId);
+    const latestIntent = cancelledIntent ?? (await deps.getPaymentIntent(paymentIntentId));
+
+    if (latestIntent.status === "succeeded") {
+      succeededIntents.push(paymentIntentId);
+      continue;
+    }
+
+    if (!terminalFailureStatuses.has(latestIntent.status)) {
+      nonTerminalIntents.push(`${paymentIntentId}:${latestIntent.status}`);
+      continue;
+    }
+
+    terminalFailures.push(paymentIntentId);
+  }
+
+  if (succeededIntents.length > 0) {
+    action.status = "failed";
+    action.resultMessage = `Stripe reports ${succeededIntents.join(", ")} as succeeded. Re-run the repair so late-capture refund handling can apply.`;
+    return;
+  }
+
+  if (nonTerminalIntents.length > 0) {
+    action.status = "failed";
+    action.resultMessage = `Stripe payment intents are still non-terminal: ${nonTerminalIntents.join(", ")}. Manual review is required.`;
+    return;
+  }
+
+  for (const paymentIntentId of terminalFailures) {
+    await deps.markPaymentIntentTransactionFailed({ paymentIntentId });
+  }
+
+  action.status = "applied";
+  action.resultMessage = `Cancelled ${terminalFailures.length} Stripe payment intent(s) and marked their local transactions failed for cancelled booking ${bookingId}.`;
+}
+
+async function applyLateCaptureRefundRepair(
+  action: BookingXeroRepairAction,
+  deps: RepairDependencies,
+  format: ClubFormat
+) {
+  const paymentId = String(action.payload.paymentId);
+  const refundAmountCents = Number(action.payload.refundAmountCents);
+  const bookingId = String(action.payload.bookingId);
+  // The payload's `invoiceId` (the booking's pre-cancel invoice) no longer
+  // decides the note (#3635 C2); it stays in the payload for the report.
+
+  // #3639 delta D1: the classifier pins the refund to the captures no
+  // treasurer-approval task owns. Without that plan this refuses rather than
+  // letting a newest-first allocation reach a held capture.
+  // A legacy payment with no ledger rows carries no plan (and can hold nothing).
+  const allocation = Array.isArray(action.payload.allocation)
+    ? (action.payload.allocation as { paymentTransactionId: string; amountCents: number }[])
+    : null;
+  if (
+    !Number.isFinite(refundAmountCents) ||
+    refundAmountCents <= 0 ||
+    (allocation !== null &&
+      allocation.reduce((sum, slice) => sum + slice.amountCents, 0) !== refundAmountCents)
+  ) {
+    action.status = "failed";
+    action.resultMessage = "Late-capture repair payload is incomplete.";
+    return;
+  }
+
+  // #4103 (`INV-PAY-130`): each slice's key generation follows the refusals recorded for it.
+  const recorded = allocation
+    ? await deps.prisma.paymentRefund.findMany({ where: { paymentId }, select: { paymentTransactionId: true, amountCents: true, status: true } })
+    : [];
+  let refundResult: Awaited<
+    ReturnType<typeof deps.refundPaymentTransactions>
+  >;
+  try {
+    refundResult = await deps.refundPaymentTransactions({
+      format,
+      paymentId,
+      amountCents: refundAmountCents,
+      allocation: allocation?.map((slice) => sliceAfterRecordedRefusals(slice, recorded)),
+      reason: "requested_by_customer",
+      metadata: {
+        bookingId,
+        reason: LATE_CAPTURE_REPAIR_REFUND_METADATA_REASON,
+      },
+      idempotencyKeyPrefix: `late_cancel_refund_repair_${bookingId}`,
+      // #4516 (M4c): each slice returns its own capture (plan section 5, the runner's map); its R05 posts on reserving.
+      obligation: (slice) => ({ scope: "capture-return", id: slice.paymentIntentId, ensureFaceCents: slice.amountCents }),
+    });
+  } catch (error) {
+    // #1495: a multi-slice refund can fail partway — earlier slices already
+    // refunded at Stripe and recorded to the ledger. Record and note THOSE
+    // before rethrowing, so Xero stays consistent with what actually moved;
+    // the operator's re-run refunds the rest, and the per-capture sizing
+    // (`noteLateCaptureRefunds`) never notes a slice twice.
+    // #4103: only the slices Stripe made; a refused one sent nothing back.
+    if (error instanceof PartialRefundError && madeRepairRefunds(error.refunds).length > 0) {
+      try {
+        await deps.recordAndNoteRepairedLateCaptureRefunds({
+          bookingId,
+          paymentId,
+          refunds: madeRepairRefunds(error.refunds),
+          format,
+        });
+      } catch (recordError) {
+        // Best-effort: never let it mask the refund error the operator needs.
+        logger.error(
+          { err: recordError, bookingId, paymentId, completedRefundCents: error.completedRefundCents },
+          "Failed to record the completed slices of a partially-failed late-capture refund"
+        );
+      }
+    }
+    throw error;
+  }
+
+  // #3635 (C2, `INV-PAY-110`): the webhook's own record first, then a note per
+  // capture only against a receipt the app recorded in Xero. Never the
+  // payment-wide note: for a late capture that names the invoice the cancel
+  // already cleared and posts a Stripe-account refund of money Xero never had.
+  // #4103 (`INV-PAY-130`): a refused slice is never recorded or noted, and the action fails.
+  const xero = await deps.recordAndNoteRepairedLateCaptureRefunds({
+    bookingId,
+    paymentId,
+    refunds: madeRepairRefunds(refundResult.refunds),
+    format,
+  });
+  const refused = describeRefusedRepairedLateCaptureRefund(refundResult.refunds, xero, format);
+  action.status = refused ? "failed" : xero.noted.length > 0 ? "queued" : "applied";
+  action.resultMessage = refused ?? describeRepairedLateCaptureRefund(refundResult.refunds, xero);
+}
+
+async function applyQueuedAction(
+  action: BookingXeroRepairAction,
+  deps: RepairDependencies,
+  format: ClubFormat
+) {
+  switch (action.type) {
+    case "QUEUE_PRIMARY_INVOICE": {
+      const result = await deps.enqueueXeroBookingInvoiceOperation(
+        String(action.payload.bookingId),
+        { invoiceEmailDelivery: null }
+      );
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "QUEUE_KEPT_LATE_CAPTURE_INVOICE": {
+      // #3635 (review F4): on a transaction of its own, where the enqueue takes
+      // the task's row lock and re-reads that the task is still DISMISSED, so a
+      // stale snapshot queues nothing for a capture since reopened or refunded,
+      // and the dismissal's own enqueue on the same task serialises with it.
+      const clubZone = await readClubTimeZoneOutsideRequest();
+      const result = await deps.prisma.$transaction((tx) =>
+        deps.enqueueXeroKeptLateCaptureInvoiceOperation({
+          manualRefundTaskId: String(action.payload.manualRefundTaskId),
+          bookingId: String(action.payload.bookingId),
+          paymentIntentId: String(action.payload.paymentIntentId),
+          capturedCents: Number(action.payload.capturedCents),
+          capturedOn: keptLateCaptureDocumentDate(
+            new Date(String(action.payload.capturedAt)),
+            clubZone,
+          ),
+          store: tx,
+        }),
+      );
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "QUEUE_ADDITIONAL_CAPTURE_RECEIPT": return applyAdditionalCaptureReceiptAction(action, deps); // #3953
+    case "QUEUE_KEPT_LATE_CAPTURE_RECORD": return applyKeptChangeCaptureRecordAction(action, deps); // #4324
+    case "QUEUE_PAID_ANOTHER_WAY_REFUND_NOTE": {
+      // #3924 round 8: the one note step, under the approval task's row lock; it reads the receipt and the
+      // close again there and queues at most once. #4516 round-3 review 2: only a note queued NOW is "queued".
+      const queuedNow = await deps.queueWaitingPaidAnotherWayNote(String(action.payload.paymentIntentId));
+      action.status = queuedNow > 0 ? "queued" : "skipped";
+      action.resultMessage = queuedNow > 0
+        ? "Queued the bank-transfer refund note the paid-another-way close was waiting for."
+        : "Nothing queued: the receipt is not in Xero, or every waiting close's note was already asked for or needs none.";
+      return;
+    }
+    case "QUEUE_PRIMARY_INVOICE_UPDATE": {
+      const result = await deps.enqueueXeroBookingInvoiceUpdateOperation(
+        String(action.payload.bookingId)
+      );
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "QUEUE_HISTORICAL_ORGANISER_INVOICE": return applyHistoricalOrganiserInvoiceRepair(action, deps);
+    case "QUEUE_SUPPLEMENTARY_INVOICE": {
+      /**
+       * #4413: the plan is explicit for every edit. A payload that omits
+       * `recordPayment` is unpaid. Passing that omission through would hit the
+       * enqueue's paid default and book a Stripe receipt for money never taken.
+       * `chargeKind` selects the same request the plan read, for the fresh
+       * capture check.
+       */
+      const recordPayment =
+        typeof action.payload.recordPayment === "boolean"
+          ? action.payload.recordPayment
+          : false;
+      const waitForConfirmedAdditionalPayment =
+        typeof action.payload.waitForConfirmedAdditionalPayment === "boolean"
+          ? action.payload.waitForConfirmedAdditionalPayment
+          : undefined;
+      const paymentIntentId =
+        typeof action.payload.paymentIntentId === "string"
+          ? action.payload.paymentIntentId
+          : undefined;
+      const chargeKind: SupplementaryInvoiceChargeKind =
+        action.payload.chargeKind === "ordinary" ? "ordinary" : "review";
+      const bookingId = String(action.payload.bookingId);
+      const bookingModificationId =
+        typeof action.payload.bookingModificationId === "string"
+          ? action.payload.bookingModificationId
+          : undefined;
+      const priceDiffCents = Number(action.payload.priceDiffCents);
+      const changeFeeCents = Number(action.payload.changeFeeCents);
+      const result = await deps.enqueueXeroSupplementaryInvoiceOperation(
+        {
+          bookingId,
+          bookingModificationId,
+          priceDiffCents,
+          changeFeeCents,
+        },
+        {
+          recordPayment,
+          waitForConfirmedAdditionalPayment,
+          paymentIntentId,
+        }
+      );
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+
+      if (
+        result.queueOperationId &&
+        waitForConfirmedAdditionalPayment === true &&
+        paymentIntentId &&
+        bookingModificationId
+      ) {
+        try {
+          await releaseRepairedSupplementaryInvoiceIfAlreadyPaid({
+            action,
+            deps,
+            bookingId,
+            bookingModificationId,
+            paymentIntentId,
+            expectedNetAmountCents: priceDiffCents + changeFeeCents,
+            format,
+            chargeKind,
+          });
+        } catch (error) {
+          // The invoice IS queued, so reporting this action as `failed` would
+          // be a lie an operator acts on. Say what could not be checked, keep
+          // the queued status, and let the next sweep - or the webhook, if the
+          // capture is still to come - settle it.
+          logger.error(
+            {
+              err: error,
+              bookingId,
+              bookingModificationId,
+              paymentIntentId,
+            },
+            "Failed to re-check a repaired supplementary invoice against a mid-sweep card capture"
+          );
+          action.resultMessage = `${action.resultMessage} Could not re-check whether the member's card was captured while this sweep ran; if it was, this invoice may be waiting for a confirmation that has already happened.`;
+        }
+        // #3403 (`INV-PAY-140`): parked on an ask a later request already
+        // superseded. Called holding nothing, after the enqueue has committed,
+        // as the live edit does. No new lock key, order or site
+        // (`INV-LOCK-001`, `INV-LOCK-002`, `INV-LOCK-003`): the carry takes
+        // the keys it already takes.
+        await deps.followSupersededAskInvoicesForIntentSafely(paymentIntentId);
+      }
+      return;
+    }
+    case "QUEUE_MODIFICATION_CREDIT_NOTE": {
+      const result = await deps.enqueueXeroModificationCreditNoteOperation({
+        bookingId: String(action.payload.bookingId),
+        bookingModificationId:
+          typeof action.payload.bookingModificationId === "string"
+            ? action.payload.bookingModificationId
+            : undefined,
+        refundAmountCents: Number(action.payload.refundAmountCents),
+        // #3535: the cancelled-open-invoice arm clears an unpaid invoice; an
+        // edit's note keeps the default (method) wording.
+        ...readModificationNoteWording(action.payload),
+        // #3809: a give-back note beside another keeps its own scope and keys.
+        ...(typeof action.payload.reviewTaskId === "string" ? { reviewTaskId: action.payload.reviewTaskId } : {}),
+        // #3954 round 8: a billed-offset note waits for the edit's own note.
+        ...(action.payload.ownNoteExpected === true ? { ownNoteExpected: true } : {}),
+      });
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "QUEUE_ACCOUNT_CREDIT_NOTE": {
+      const result = await deps.enqueueXeroAccountCreditNoteOperation(String(action.payload.paymentId), Number(action.payload.refundAmountCents),
+        typeof action.payload.memberCreditId === "string" ? { memberCreditId: action.payload.memberCreditId } : undefined); // #4685: the credit its stamp writes
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "QUEUE_REFUND_CREDIT_NOTE":
+    case "QUEUE_REFUND_REQUEST_CREDIT_NOTE": {
+      // #4231 (`INV-PAY-118`): a request's own note is keyed by the request, never the payment's one note.
+      const result = action.type === "QUEUE_REFUND_REQUEST_CREDIT_NOTE"
+        ? await deps.enqueueXeroRefundRequestCreditNoteOperation({ paymentId: String(action.payload.paymentId), refundRequestId: String(action.payload.refundRequestId), amountCents: Number(action.payload.refundAmountCents) })
+        : await deps.enqueueXeroRefundCreditNoteOperation(String(action.payload.paymentId), Number(action.payload.refundAmountCents));
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "QUEUE_CREDIT_NOTE_ALLOCATION": {
+      const result = await deps.enqueueXeroCreditNoteAllocationOperation({
+        localModel: action.payload.localModel as "Payment" | "Booking" | "BookingModification",
+        localId: String(action.payload.localId),
+        creditNoteId: String(action.payload.creditNoteId),
+        invoiceId: String(action.payload.invoiceId),
+        amountCents: Number(action.payload.amountCents),
+        role:
+          typeof action.payload.role === "string"
+            ? action.payload.role
+            : undefined,
+      });
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "QUEUE_APPLIED_CREDIT_ALLOCATION": {
+      // #3836: the engine re-reads the ledger and allocates only what is unallocated.
+      const result = await deps.enqueueXeroAppliedCreditAllocationOperation(String(action.payload.bookingId));
+      action.status = result.queueOperationId ? "queued" : "skipped";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "REQUEUE_XERO_OPERATION": {
+      const result = await deps.enqueueXeroSyncOperationRetry(
+        String(action.payload.operationId)
+      );
+      action.status = "queued";
+      action.resultMessage = result.message;
+      return;
+    }
+    case "SYNC_PAYMENT_PRIMARY_INVOICE_FIELD":
+      await applyLocalPrimaryInvoiceFieldRepair(action, deps);
+      return;
+    case "SYNC_PAYMENT_PRIMARY_INVOICE_LINK":
+      await applyLocalPrimaryInvoiceLinkRepair(action, deps);
+      return;
+    case "SYNC_PAYMENT_REFUND_CREDIT_NOTE_FIELD":
+      await applyLocalRefundCreditNoteFieldRepair(action, deps);
+      return;
+    case "SYNC_BOOKING_SCOPED_LINK":
+      await applyLinkRepair(action, deps);
+      return;
+    case "REPAIR_CANCELLED_IN_FLIGHT_PAYMENT":
+      await applyCancelledInFlightPaymentRepair(action, deps);
+      return;
+    case "AUTO_REFUND_LATE_CAPTURED_PAYMENT":
+      await applyLateCaptureRefundRepair(action, deps, format);
+      return;
+    case "SETTLE_REFUND_CREDIT_NOTE": {
+      // #3548: operator-applied only, through the one read-back-then-settle.
+      const result = await applyRefundNoteSettlementRepair(action.payload, deps.finishRefundCreditNoteSettlement);
+      action.status = result.status;
+      action.resultMessage = result.message;
+      return;
+    }
+    case "MARK_MANUAL_REVIEW":
+      action.status = "manual_review";
+      action.resultMessage = String(action.payload.reason);
+      return;
+  }
+}
+
+export async function applyActionsForPass(
+  bookings: BookingXeroRepairBookingSummary[],
+  deps: RepairDependencies,
+  xeroConnectionAvailable: boolean,
+  format: ClubFormat,
+  // #1491: exact keys an operator explicitly confirmed for execution even
+  // though they are not safeToAutoApply (from the dry-run report).
+  forcedActionKeys?: Set<string>
+) {
+  let hasStateChanges = false;
+
+  for (const booking of bookings) {
+    for (const action of booking.actions) {
+      const operatorForced = forcedActionKeys?.has(action.key) ?? false;
+      if (
+        (!action.safeToAutoApply && !operatorForced) ||
+        action.status !== "planned"
+      ) {
+        continue;
+      }
+
+      try {
+        await applyQueuedAction(action, deps, format);
+        const updatedStatus = action.status as XeroBookingRepairActionStatus;
+        if (updatedStatus !== "failed" && updatedStatus !== "manual_review") {
+          hasStateChanges = true;
+        }
+      } catch (error) {
+        action.status = "failed";
+        action.resultMessage =
+          error instanceof Error ? error.message : "Unknown repair error";
+        logger.error(
+          {
+            err: error,
+            bookingId: booking.bookingId,
+            actionKey: action.key,
+            actionType: action.type,
+          },
+          "Failed to apply booking/Xero repair action"
+        );
+      }
+    }
+  }
+
+  if (xeroConnectionAvailable) {
+    const [outboxResult, retryResult] = await Promise.all([
+      deps.processQueuedXeroOutboxOperations({ limit: 50 }),
+      deps.processQueuedXeroOperationRetries({ limit: 50 }, format),
+    ]);
+
+    if (
+      outboxResult.processed > 0 ||
+      retryResult.processed > 0 ||
+      outboxResult.succeeded > 0 ||
+      retryResult.succeeded > 0
+    ) {
+      hasStateChanges = true;
+    }
+  }
+
+  return hasStateChanges;
+}

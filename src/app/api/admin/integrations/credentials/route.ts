@@ -1,0 +1,348 @@
+import "server-only";
+
+import { NextResponse } from "next/server";
+import { z } from "zod";
+
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { getAuditRequestContext } from "@/lib/audit";
+import { isFullAdmin } from "@/lib/access-roles";
+import { requireAdmin } from "@/lib/session-guards";
+import {
+  INTEGRATION_CREDENTIAL_VALUE_MAX_LENGTH,
+  setIntegrationCredential,
+  setIntegrationCredentialInTransaction,
+} from "@/lib/integration-credentials";
+import type { CredentialActor, CredentialRequestContext } from "@/lib/integration-credential-actor";
+import { isIntegrationCredentialNamespace, type IntegrationCredentialNamespace } from "@/lib/integration-credential-namespaces";
+import { WeakAuthSecretError } from "@/lib/integration-crypto";
+import {
+  credentialWriteResetsXeroTokens,
+  withXeroVerifyReset,
+} from "@/lib/xero-verify-reset";
+import { XERO_CREDENTIAL_KEYS, XERO_PROVIDER } from "@/lib/xero-config";
+import {
+  STRIPE_PROVIDER,
+  STRIPE_WRITABLE_CREDENTIAL_KEYS,
+  clearStripeWebhookVerified,
+} from "@/lib/stripe-config";
+import {
+  BACKUP_CREDENTIAL_KEYS,
+  BACKUP_PROVIDER,
+  BACKUP_SECRET_CREDENTIAL_KEYS,
+  isValidRestoreValidationUrl,
+} from "@/lib/backup-config";
+import {
+  GOOGLE_PROVIDER,
+  GOOGLE_WRITABLE_CREDENTIAL_KEYS,
+  clearGoogleVerified,
+} from "@/lib/google-config";
+import {
+  ANTHROPIC_PROVIDER,
+  ANTHROPIC_WRITABLE_CREDENTIAL_KEYS,
+} from "@/lib/ai-assistant-config";
+import {
+  DIAGNOSTICS_PROVIDER,
+  DIAGNOSTICS_WRITABLE_CREDENTIAL_KEYS,
+} from "@/lib/ai-diagnostics-config";
+import {
+  ServerNzAddressChangedError,
+  setServerNzApiKey,
+  SERVERNZ_CREDENTIAL_KEYS,
+  SERVERNZ_PROVIDER,
+  SERVERNZ_WRITABLE_CREDENTIAL_KEYS,
+} from "@/lib/servernz-config";
+import { registerAfterKeySave } from "@/lib/servernz-push-registration";
+import { prisma } from "@/lib/prisma";
+import logger from "@/lib/logger";
+import { requireRecentAuth } from "@/lib/require-recent-auth";
+
+// POST /api/admin/integrations/credentials — write-only credential setter.
+//
+// Full Admin only (epic decision 4; precedent requireFullAdminForConfigTransfer)
+// plus the repo's standard admin-mutation protections (authenticated
+// same-origin session, JSON body). Values are NEVER returned — the response
+// confirms metadata only. Audit entries are metadata-only (no value, no body).
+//
+// Exposure contract (#2079): no plaintext or ciphertext/iv/authTag in the
+// response, the log lines, or the audit row.
+
+/**
+ * Allowlist of credentials this endpoint may write, per provider. Prevents
+ * arbitrary (provider, key) rows and keys the verify-reset behaviour. C4/C5/C6
+ * extend this with their providers.
+ */
+const WRITABLE_CREDENTIALS: Partial<Record<IntegrationCredentialNamespace, readonly string[]>> = {
+  [XERO_PROVIDER]: [
+    XERO_CREDENTIAL_KEYS.clientId,
+    XERO_CREDENTIAL_KEYS.clientSecret,
+    XERO_CREDENTIAL_KEYS.webhookKey,
+  ],
+  [STRIPE_PROVIDER]: [...STRIPE_WRITABLE_CREDENTIAL_KEYS],
+  [GOOGLE_PROVIDER]: [...GOOGLE_WRITABLE_CREDENTIAL_KEYS],
+  // Backup S3 access key/secret + the restore-validation shadow DSN (#2095, C6):
+  // write-only secrets, Full Admin. The non-secret destination (bucket/region)
+  // and operational config (enabled/retention) are written on the backups
+  // config route, not here.
+  [BACKUP_PROVIDER]: [...BACKUP_SECRET_CREDENTIAL_KEYS],
+  // AI help assistant Anthropic API key (#2211, C3): a single write-only secret,
+  // Full Admin. No verify-reset branch below — unlike Google/Stripe there is no
+  // verified marker to drop (the verify-ping endpoint was cut per plan); the
+  // key's own needs-reentry state is derived live from the encrypted store.
+  [ANTHROPIC_PROVIDER]: [...ANTHROPIC_WRITABLE_CREDENTIAL_KEYS],
+  // AI Diagnostics DEDICATED Anthropic API key (AID-2, #2371): a SEPARATE
+  // write-only secret under its own provider namespace ("anthropic-diagnostics"),
+  // Full Admin. Deliberately distinct from the page-help ANTHROPIC_PROVIDER key
+  // above so the two are never shared or confused — a diagnostics deployment can
+  // point at a separate Anthropic workspace/key. Same shape as the page-help key:
+  // no verify-reset marker; the needs-reentry state is derived live from the
+  // encrypted store. Reachable whether or not the aiDiagnostics module is on, so
+  // the credential can be entered before the module is enabled.
+  [DIAGNOSTICS_PROVIDER]: [...DIAGNOSTICS_WRITABLE_CREDENTIAL_KEYS],
+  // Alpine Central Server (ServerNZ) API key: a single write-only secret, Full
+  // Admin. No verify-reset marker; the needs-reentry state is derived live from
+  // the encrypted store. Reachable whether or not the module is enabled so the
+  // key can be entered during setup.
+  [SERVERNZ_PROVIDER]: [...SERVERNZ_WRITABLE_CREDENTIAL_KEYS],
+};
+
+// GET /api/admin/integrations/credentials?provider=xero — METADATA-ONLY status.
+//
+// Any admin may read the set/not-set status so area admins keep visibility
+// (epic decision 4); only Full Admins can WRITE (POST below). The response
+// carries NO value or ciphertext/iv/authTag — only whether each key is set, its
+// set-at timestamp, and secretSource. Exposure contract (#2079).
+export async function GET(request: Request) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return guard.response;
+
+  const provider = new URL(request.url).searchParams.get("provider") ?? "";
+  const allowedKeys = isIntegrationCredentialNamespace(provider) ? WRITABLE_CREDENTIALS[provider] : undefined;
+  if (!allowedKeys) {
+    return NextResponse.json(
+      { error: "Unknown provider." },
+      { status: 400 },
+    );
+  }
+
+  // Select METADATA COLUMNS ONLY — never ciphertext/iv/authTag/value.
+  const rows = await prisma.integrationCredential.findMany({
+    where: { provider, key: { in: [...allowedKeys] } },
+    select: { key: true, secretSource: true, updatedAt: true },
+  });
+
+  const credentials: Record<
+    string,
+    { set: boolean; setAt: string; secretSource: string }
+  > = {};
+  for (const row of rows) {
+    credentials[row.key] = {
+      set: true,
+      setAt: row.updatedAt.toISOString(),
+      secretSource: row.secretSource,
+    };
+  }
+
+  return NextResponse.json({ provider, credentials });
+}
+
+const bodySchema = z.object({
+  provider: z.string().min(1).max(64),
+  key: z.string().min(1).max(64),
+  // A credential value; capped by the store's own bound. Never logged, never
+  // returned.
+  value: z.string().min(1).max(INTEGRATION_CREDENTIAL_VALUE_MAX_LENGTH),
+  // The ServerNZ key's page-shown server address (#4470), bounded like its column.
+  expectedBaseUrl: z.string().max(500).nullable().optional(),
+});
+
+async function requireFullAdmin() {
+  const guard = await requireAdmin();
+  if (!guard.ok) return { ok: false as const, response: guard.response };
+  if (!isFullAdmin(guard.session.user)) {
+    return {
+      ok: false as const,
+      response: NextResponse.json(
+        { error: "Full admin access is required." },
+        { status: 403 },
+      ),
+    };
+  }
+  return { ok: true as const, memberId: guard.session.user.id };
+}
+
+/**
+ * Verify-reset (epic decision 6): a credential write clears the provider's
+ * verified/connected state and re-arms verification.
+ *
+ * THE XERO HALF IS NOT HERE ANY MORE (#3454). Destroying the Xero tokens is a
+ * pure database write, so it now commits in the SAME transaction as the
+ * credential write that causes it (`withXeroVerifyReset`, in the POST below):
+ * a crash can no longer leave a saved client secret beside tokens for the old
+ * app, and the token row's audit entry names the credential that caused it.
+ * The Stripe and Google markers below still clear after the write commits.
+ *
+ * THE ACTOR TRAVELS WITH IT (#2723). A verify-reset is part of the
+ * administrator's Save, not a background job, so the marker deletions are
+ * attributed to the same member and the same request as the credential write
+ * itself. They used to name a `google-verify-reset` / `stripe-verify-reset`
+ * system actor, which made one admin action read as two writers in the log.
+ */
+async function applyVerifyReset(
+  provider: string,
+  memberId: string,
+  request: CredentialRequestContext | undefined,
+): Promise<void> {
+  const actor: CredentialActor = { kind: "admin", memberId };
+  // Stripe (epic decision 6): writing ANY Stripe credential — secret,
+  // publishable, or the signing secret — drops the webhook-verified marker so a
+  // green webhook badge can never survive a credential swap. The connection
+  // check itself is live-derived (no persisted verified flag to reset).
+  if (provider === STRIPE_PROVIDER) {
+    await clearStripeWebhookVerified(actor, request);
+  }
+  // Google (epic decision 6 / D2): writing either Google credential drops the
+  // verified marker so the module re-locks until a fresh OAuth round-trip
+  // verifies. The verified state is a stored marker (no live-derived check).
+  if (provider === GOOGLE_PROVIDER) {
+    await clearGoogleVerified(actor, request);
+  }
+  // ServerNZ's answer reset rides in setServerNzApiKey's fenced write (#4436).
+}
+
+export async function POST(request: Request) {
+  const guard = await requireFullAdmin();
+  if (!guard.ok) return guard.response;
+
+  const recent = await requireRecentAuth();
+  if (!recent.ok) return recent.response;
+  const json = await parseJsonRequestBody(request);
+  if (!json.ok) return json.response;
+  const parsed = bodySchema.safeParse(json.body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid request", details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const { provider, key, value, expectedBaseUrl } = parsed.data;
+  const allowedKeys = isIntegrationCredentialNamespace(provider) ? WRITABLE_CREDENTIALS[provider] : undefined;
+  if (!isIntegrationCredentialNamespace(provider) || !allowedKeys?.includes(key)) {
+    return NextResponse.json(
+      { error: "Unknown provider or credential key." },
+      { status: 400 },
+    );
+  }
+
+  // Required for the ServerNZ key (one server issued it) and no other (#4470).
+  const isServerNzApiKey = provider === SERVERNZ_PROVIDER && key === SERVERNZ_CREDENTIAL_KEYS.apiKey;
+  if (isServerNzApiKey !== (expectedBaseUrl !== undefined)) {
+    const error = isServerNzApiKey
+      ? "Reload the page and enter the key again: the save did not say which central server address it was for."
+      : "expectedBaseUrl applies only to the Alpine Central Server API key.";
+    return NextResponse.json({ error }, { status: 400 });
+  }
+
+  // Capture-time gate for the restore-validation DSN (#2095 MAJOR-2): it carries
+  // a password passed to psql, so it must be a parseable postgres:// URI. A
+  // keyword-form conninfo or malformed URI would keep the password on argv (and
+  // in any persisted error), so it is rejected with a clear message here.
+  if (
+    provider === BACKUP_PROVIDER &&
+    key === BACKUP_CREDENTIAL_KEYS.restoreValidationUrl &&
+    !isValidRestoreValidationUrl(value)
+  ) {
+    return NextResponse.json(
+      {
+        error:
+          "The restore-validation URL must be a postgres:// or postgresql:// connection URI (for example postgresql://user:password@host:5432/shadow_db).",
+      },
+      { status: 400 },
+    );
+  }
+
+  // ONE request context for everything this Save does — the credential write
+  // and the verify-reset deletions that follow it are the same administrator's
+  // action, on the same request, and must read that way in the audit log. The
+  // actor is spelled out at each call rather than hoisted, so the credential
+  // census can read "admin" at the write site instead of having to trust a
+  // variable it cannot follow.
+  const requestContext = getAuditRequestContext(request);
+
+  let result;
+  try {
+    // The store writes the audit row itself, inside the same transaction as the
+    // secret (#2723) — this route used to write it two awaits later, so a crash
+    // in between left a rewritten credential with no evidence of who did it.
+    // The request context travels in so the row keeps its id, IP and user agent.
+    // The form posts the value it wants stored; there is no read-modify-write
+    // here for a second Full Admin to make stale, so both writes expect `any`.
+    // ServerNZ's API key (its one writable key) is saved under the connection
+    // fence, and only while the address the page showed is still the stored one.
+    result = isServerNzApiKey
+      ? await setServerNzApiKey(value, expectedBaseUrl ?? null, { kind: "admin", memberId: guard.memberId }, requestContext)
+      : credentialWriteResetsXeroTokens(provider, key)
+      ? await withXeroVerifyReset(
+          {
+            actor: { kind: "admin", memberId: guard.memberId },
+            request: requestContext,
+            causedByCredential: `${provider}:${key}`,
+            providers: [provider],
+          },
+          (tx) =>
+            setIntegrationCredentialInTransaction({
+              tx,
+              provider,
+              key,
+              value,
+              actor: { kind: "admin", memberId: guard.memberId },
+              expect: { expect: "any" },
+              request: requestContext,
+            }),
+        )
+      : await setIntegrationCredential({
+          provider,
+          key,
+          value,
+          actor: { kind: "admin", memberId: guard.memberId },
+          expect: { expect: "any" },
+          request: requestContext,
+        });
+  } catch (error) {
+    // Another Save moved the address (#4470): nothing written; no secret in it.
+    if (error instanceof ServerNzAddressChangedError) {
+      return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+    }
+    if (error instanceof WeakAuthSecretError) {
+      // Plain-English capture-time gate message; safe to surface (no secret).
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
+    // Never echo the request body / value in the error.
+    logger.error(
+      { provider, key, err: error instanceof Error ? error.name : "unknown" },
+      "Failed to store integration credential",
+    );
+    return NextResponse.json(
+      { error: "Could not store the credential." },
+      { status: 500 },
+    );
+  }
+
+  await applyVerifyReset(provider, guard.memberId, requestContext);
+
+  // A saved ServerNZ key registers this site's address at once, after the
+  // key's fenced write has committed (INV-INT-003).
+  const pushRegistration =
+    provider === SERVERNZ_PROVIDER && key === SERVERNZ_CREDENTIAL_KEYS.apiKey
+      ? await registerAfterKeySave(guard.memberId)
+      : undefined;
+
+  // Response confirms metadata only — the value is never returned.
+  return NextResponse.json({
+    ok: true,
+    provider: result.provider,
+    key: result.key,
+    setAt: result.updatedAt.toISOString(),
+    ...(pushRegistration ? { pushRegistration } : {}),
+  });
+}

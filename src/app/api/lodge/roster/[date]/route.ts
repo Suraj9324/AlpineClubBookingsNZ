@@ -1,0 +1,232 @@
+import { NextRequest, NextResponse } from "next/server";
+import { noStoreLodgeResponse } from "@/lib/lodge-cache-headers";
+import { checkLodgeAuth, getLodgeAuthActorMemberId, kioskLodgeAuthErrorResponse, resolveKioskLodgeId } from "@/lib/lodge-auth";
+import { getBookingGuestDisplayAgeTier } from "@/lib/booking-guests";
+import { parseDateOnly } from "@/lib/date-only";
+import { lodgeNullTolerantScope } from "@/lib/lodges";
+import { prisma } from "@/lib/prisma";
+import { logAudit } from "@/lib/audit";
+import { z } from "zod";
+import logger from "@/lib/logger";
+import { lockRosterDate } from "@/lib/roster-lock";
+import { parseJsonRequestBody } from "@/lib/api-json";
+
+const rosterActionSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("complete"),
+    assignmentId: z.string().min(1),
+  }),
+  z.object({
+    action: z.literal("uncomplete"),
+    assignmentId: z.string().min(1),
+  }),
+]);
+
+/**
+ * GET /api/lodge/roster/[date]
+ * Returns the roster for a date (assignments only, no auto-suggest).
+ */
+export async function GET(
+  req: NextRequest,
+  { params }: { params: Promise<{ date: string }> }
+) {
+  return noStoreLodgeResponse(await handleGet(req, (await params).date));
+}
+
+async function handleGet(req: NextRequest, dateStr: string) {
+
+  const authResult = await checkLodgeAuth(dateStr, {
+    request: req,
+    allowPreview: true,
+  });
+  const { error, status } = authResult;
+  if (error) {
+    return NextResponse.json({ error }, { status: status! });
+  }
+
+  const date = parseDateOnly(dateStr);
+
+  let lodgeId: string;
+  try {
+    lodgeId = await resolveKioskLodgeId(authResult, prisma);
+  } catch (err) {
+    const denied = kioskLodgeAuthErrorResponse(err);
+    if (denied) return denied;
+    throw err;
+  }
+
+  const assignments = await prisma.choreAssignment.findMany({
+    where: {
+      date,
+      booking: lodgeNullTolerantScope(lodgeId),
+      choreTemplate: lodgeNullTolerantScope(lodgeId),
+    },
+    include: {
+      choreTemplate: true,
+      bookingGuest: {
+        include: {
+          member: {
+            select: { ageTier: true },
+          },
+        },
+      },
+    },
+    orderBy: [
+      { choreTemplate: { sortOrder: "asc" } },
+    ],
+  });
+
+  return NextResponse.json({
+    date: dateStr,
+    assignments: assignments.map((a) => ({
+      id: a.id,
+      choreTemplateId: a.choreTemplateId,
+      choreTemplateName: a.choreTemplate.name,
+      choreDescription: a.choreTemplate.description,
+      choreSortOrder: a.choreTemplate.sortOrder,
+      choreTimeOfDay: a.choreTemplate.timeOfDay,
+      bookingGuestId: a.bookingGuestId,
+      guestName: a.bookingGuest
+        ? `${a.bookingGuest.firstName} ${a.bookingGuest.lastName}`
+        : null,
+      guestAgeTier: a.bookingGuest ? getBookingGuestDisplayAgeTier(a.bookingGuest) : null,
+      bookingId: a.bookingId,
+      status: a.status,
+      completedAt: a.completedAt?.toISOString() ?? null,
+      completedVia: a.completedVia ?? null,
+    })),
+  });
+}
+
+/**
+ * PUT /api/lodge/roster/[date]
+ * Limited actions: complete and uncomplete only (kiosk use).
+ * Requires tier >= lodge (staying-guest cannot toggle chores).
+ */
+// Deliberately NOT `noStoreLodgeResponse`-wrapped, unlike the GET above; the
+// "Writes" section of `src/lib/lodge-cache-headers.ts` is the reasoning.
+export async function PUT(
+  req: NextRequest,
+  { params }: { params: Promise<{ date: string }> }
+) {
+  const { date: dateStr } = await params;
+
+  const authResult = await checkLodgeAuth(dateStr, { request: req });
+  const { error, status, tier } = authResult;
+  if (error) {
+    return NextResponse.json({ error }, { status: status! });
+  }
+
+  // Staying guests cannot toggle chores
+  if (tier === "staying-guest") {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  const date = parseDateOnly(dateStr);
+
+  const jsonBody = await parseJsonRequestBody(req, { error: "Invalid JSON" });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = rosterActionSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid input", details: parsed.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  const data = parsed.data;
+
+  try {
+    const lodgeId = await resolveKioskLodgeId(authResult, prisma);
+
+    const assignment = await prisma.$transaction(async (tx) => {
+      await lockRosterDate(tx, date);
+      const current = await tx.choreAssignment.findFirst({
+        where: {
+          id: data.assignmentId,
+          date,
+          booking: lodgeNullTolerantScope(lodgeId),
+          choreTemplate: lodgeNullTolerantScope(lodgeId),
+        },
+        select: {
+          id: true,
+          choreTemplateId: true,
+          bookingId: true,
+          bookingGuestId: true,
+          bookingGuest: {
+            select: {
+              memberId: true,
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+      });
+      if (!current) return null;
+
+      if (data.action === "complete") {
+        await tx.choreAssignment.update({
+          where: { id: data.assignmentId },
+          data: {
+            status: "COMPLETED",
+            completedAt: new Date(),
+            completedVia: "KIOSK",
+          },
+        });
+      } else {
+        await tx.choreAssignment.update({
+          where: { id: data.assignmentId },
+          data: {
+            status: "CONFIRMED",
+            completedAt: null,
+            completedVia: null,
+          },
+        });
+      }
+      return current;
+    });
+    if (!assignment) {
+      return NextResponse.json(
+        { error: "Assignment not found for this date" },
+        { status: 404 }
+      );
+    }
+
+    const completed = data.action === "complete";
+    logAudit({
+      action: completed ? "lodge.chore.completed" : "lodge.chore.uncompleted",
+      memberId: getLodgeAuthActorMemberId(authResult),
+      targetId: data.assignmentId,
+      subjectMemberId: assignment.bookingGuest?.memberId ?? null,
+      entityType: "ChoreAssignment",
+      entityId: data.assignmentId,
+      category: "lodge",
+      outcome: "success",
+      summary: completed ? "Lodge chore completed" : "Lodge chore reopened",
+      details: `${completed ? "Completed" : "Reopened"} chore assignment for ${dateStr}`,
+      metadata: {
+        date: dateStr,
+        tier,
+        bookingId: assignment.bookingId,
+        bookingGuestId: assignment.bookingGuestId,
+        choreTemplateId: assignment.choreTemplateId,
+        completedVia: completed ? "KIOSK" : null,
+        guestName: assignment.bookingGuest
+          ? `${assignment.bookingGuest.firstName} ${assignment.bookingGuest.lastName}`
+          : null,
+      },
+    });
+  } catch (err) {
+    const denied = kioskLodgeAuthErrorResponse(err);
+    if (denied) return denied;
+    logger.error({ err }, "Error toggling chore completion");
+    return NextResponse.json(
+      { error: "Failed to update assignment" },
+      { status: 500 }
+    );
+  }
+
+  return NextResponse.json({ success: true });
+}

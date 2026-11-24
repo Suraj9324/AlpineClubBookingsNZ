@@ -1,0 +1,1255 @@
+# Money
+
+Audience: Developer, Agent.
+
+Prefix defined in this file: **`INV-MONEY`** — how money is represented and where
+a price comes from: integer cents, fee authorities, whole-lodge pricing, promo
+caps, subscription charges and subscription-invoice selection.
+
+Read this file when you are changing anything that holds cents — fee
+authorities, whole-lodge or promo pricing, membership subscription charges, or
+the Xero invoice identity behind them.
+
+Index: [`docs/DOMAIN_INVARIANTS.md`](../DOMAIN_INVARIANTS.md) — every `INV-*` ID
+with a one-line description of what it covers. ID scheme and allocation rules:
+[`SCHEME.md`](SCHEME.md).
+
+Every heading below whose whole text is an `INV-*` ID defines that invariant. IDs
+are permanent: never renumbered, never reused. **The text under each ID is a
+verbatim move from the source document and must not be reworded in place** —
+only the ID heading lines, and the editorial **Related:** lines directly beneath
+some of them (#2707), were added. A `Related:` line is navigation, never part of
+the rule: it names sibling IDs so a change to one prompts checking the others.
+
+## INV-MONEY-001
+
+**Related: `INV-MONEY-003`** (the mechanically checkable half — a lint rule can
+catch floating-point arithmetic, where "store as integer cents" is not
+checkable by machine) and **`INV-MONEY-006`** (the reconciliation obligation the
+representation exists to serve). Three facets, not three statements of one rule
+(#2707, owner decision 9 Aug 2026). Change one, check the others.
+
+- Store and calculate money as integer cents.
+
+## INV-MONEY-002
+
+- Annual membership and joining fee authorities store non-negative integer
+  cents in inclusive, non-overlapping effective-date ranges. Both annual fees
+  (`MembershipAnnualFee`, #2067) and joining fees (`JoiningFee`, #1931) key on
+  membership type × **optional** age tier: a per-tier row wins at resolution,
+  else the flat NULL-tier row is the fallback (a member of any tier, and every
+  `NOT_APPLICABLE` member, resolves the flat row when no per-tier row matches).
+  "Non-overlapping" is per (type, tier): different tiers may share a window, but
+  two windows of the same tier — or two flat windows — may not overlap.
+  `PER_FAMILY` annual fees stay **flat-only** (a per-family fee bills the family
+  once regardless of age): a per-tier per-family row is rejected at the API
+  (409), by a DB CHECK, and at config-transfer plan time, and a flat per-family
+  window may not overlap per-tier per-member windows for the same type.
+  `NO_INVOICE` annual rows are zero cents. The joining fee is strictly
+  type-driven — the Family fee applies only to members assigned the Family type
+  (the composition heuristic is removed). Fee changes affect future resolution
+  only.
+
+## INV-MONEY-003
+
+**Related: `INV-MONEY-001`** (the representation rule this one makes
+enforceable) and **`INV-MONEY-006`** (reconciling back to cent-based ledger
+records). Three facets, not three statements of one rule (#2707, owner decision
+9 Aug 2026). Change one, check the others.
+
+- Do not introduce floating point money arithmetic.
+
+- **Cents are built at one of two boundaries, never inline (#2685, owner
+  decision 9 Aug 2026).** Money a PERSON typed still has its decimal text, so it
+  goes through `parseDecimalDollarsToCents` in `src/lib/money-input.ts` — the
+  digit groups are read as integers and never scaled through a double — or
+  through `parseSignedDecimalDollarsToCents` where a negative is a real amount
+  (a member credit debit adjustment). It returns `null` for anything outside the
+  grammar, and **that `null` must reach the person as a validation error**: no
+  caller may substitute a zero, a `null` payload field, or a previous value
+  silently. A money box is therefore spelled `type="text"` with
+  `inputMode="decimal"` via shared `MoneyInput` (owner decision 13 Sep 2026):
+  a `type="number"` control's value-sanitization strips
+  anything that is not a floating-point number to `""` before any handler runs,
+  so the parser never saw `"50abc"`, `"$45.00"` or `"1,000.00"` and the box read
+  as deliberately cleared. An amount an accounting provider has ALREADY parsed into a number —
+  a Xero API amount — cannot use that parser, because the decimal text is gone;
+  it goes through `providerAmountToCents` in `src/lib/money-provider-amount.ts`,
+  whose rounding is `Math.round(value * 100)` and is FROZEN at that, since it is
+  what every reconciliation currently in production computes. Changing it is an
+  owner decision, not a refactor. `exactProviderAmountToCents` is the variant
+  that refuses sub-cent precision, and `parseProviderReportAmountToCents` is the
+  one Xero report-cell text parser.
+
+  An `eslint` `no-restricted-syntax` rule enforces this over `src/`, `scripts/`
+  and `prisma/`. It matches the dangerous COMPOSITION rather than a function
+  name — an inline numeric parse scaled by 100, a unary `+` coercion scaled by
+  100, anything scaled by 100 on the way into a `…Cents` binding, and the two
+  spellings that carry no `* 100` at all (`c *= 100` and `x / 0.01`) — plus, in
+  the money-domain modules, a bare `x * 100`. Banning `parseFloat` by name was
+  measured on this tree and rejected: it added no coverage and four false
+  positives.
+
+  The money-domain glob is the Xero, finance, membership-cancellation, payment,
+  credit, refund, promo, fee, invoice, subscription, pricing and Stripe modules
+  under `src/lib/`, plus every route under `src/app/api/`. That breadth is what
+  catches the intermediate-variable form — `const d = parseFloat(raw); const c =
+  Math.round(d * 100);` — which no shape-based arm can see, because by the time
+  the multiplication happens there is nothing left in it to recognise. Inside
+  those modules ONE shape is excluded on purpose: a division sitting directly
+  inside the multiplication (`(calls / budget) * 100`) is a percentage by
+  construction, and nothing here builds cents from a quotient.
+
+  That exclusion is narrow only because the money-domain block states the arms
+  the broad one does not cover. It does NOT subsume them, and while the config
+  claimed it did, a typed amount that was DIVIDED and then scaled — a GST split
+  `(parseFloat(gross) / 1.15) * 100`, a per-guest share
+  `(parseFloat(raw) / guests) * 100`, a unit price
+  `(parseFloat(line.total) / line.qty) * 100` — was caught in an ordinary
+  `src/lib` file and caught nowhere at all in a Xero module, a payment module or
+  an API route, which is the guard at its weakest exactly where money lives.
+  Both give-backs are therefore explicit: a quotient of PARSED TEXT, and a
+  quotient scaled into a `…Cents` binding. What stays legal is a quotient that
+  is neither.
+
+  Percentages, `Math.round(n * 100) / 100` two-decimal rounding and date-key
+  packing are deliberately untouched OUTSIDE the money-domain modules. Inside
+  them a bare `x * 100` IS reported, whatever it computes — that is what the
+  narrower glob buys, and it is why the glob covers only files that compute no
+  percentages. All of it is pinned as fixtures in
+  `src/lib/__tests__/money-cents-guard.test.ts`, which runs the REAL config.
+
+  That suite decides whether the guard reaches production code by asking ESLint,
+  never by reading glob text. It resolves `no-restricted-syntax` through
+  `calculateConfigForFile()` at a roster of representative production paths,
+  requires an `error`-severity rule still carrying every arm that path needs, and
+  then lints an actual violation at each of them. A glob that avoids the `src/`
+  prefix, a config block with no `files` key at all, and a severity quietly
+  downgraded to `warn` each disarm the guard while leaving a glob-text check
+  green, so none of the three is trusted. The roster and both audits live in
+  `src/lib/__tests__/support/eslint-guard-coverage.ts`, shared with the date
+  guard, which has the same hazard.
+
+  The exported `MONEY_GUARD_EXEMPTIONS` array in `eslint.config.mjs` is the only
+  escape hatch — never an `eslint-disable`, and the guard test asserts there are
+  none in the tree. Each entry names a path and states in writing why it is
+  allowed to build cents itself; the test READS that array rather than a copy of
+  it, so adding an entry passes CI. It currently holds exactly the two helper
+  modules, and both are on the roster, so an exemption still has to resolve to an
+  armed `error` rule carrying the date and raw-SQL restrictions.
+
+## INV-MONEY-004
+
+- **Member whole-lodge approval pricing has a fixed precedence (#2338, owner
+  decision 1 Aug 2026).** A season may carry an optional flat whole-lodge night
+  rate (`Season.flatWholeLodgeNightCents`, integer cents, nullable = not set).
+  When the approving officer prices a member whole-lodge request
+  (`approveMemberWholeLodgeRequest`), the total is chosen in this order and no
+  other: (1) the officer's manual total override, if given, wins over everything;
+  (2) else, if the officer ticked "price as whole lodge" AND a flat rate covers
+  **every** night of the stay, the total is the sum of each night's covering
+  season's flat rate, and **headcount is ignored for price** (it still drives the
+  guest rows and the capacity check); (3) else per-guest pricing, exactly as
+  before. The flat branch is never automatic — it is the officer's per-approval
+  choice, defaulting to per-guest so nothing changes silently — and a stay only
+  ever falls out of it when a night has no flat rate, in which case it reverts to
+  per-guest rather than charging zero. A stay spanning a season boundary is
+  charged each night at that night's season flat rate. The pure per-night math is
+  `priceWholeLodgeFlat` (`src/lib/policies/pricing.ts`); the same figure is
+  previewed in the admin queue and computed authoritatively at approval time.
+
+## INV-MONEY-005
+
+- **A promo "use" means the member actually got something (#2299).** A
+  `PromoRedemptionAllocation` row exists only where the application delivered a
+  benefit — `discountCents > 0`, `priceAdjustmentCents ≠ 0`, or
+  `freeNightsUsed > 0` (a price-RAISING fixed-nightly application counts).
+  All three usage caps count those rows and
+  nothing else: uses per member, unique members, and total redemptions via the
+  denormalised `PromoCode.currentRedemptions`. The single write-time choke point
+  is `normalizeAllocations` in `src/lib/promo.ts`; every cap query additionally
+  applies `BENEFICIAL_PROMO_ALLOCATION_FILTER` so a legacy all-zero row cannot
+  occupy a slot. Corollaries: (a) `currentRedemptions` is always the RAW
+  count of a code's allocation rows, so `redeemPromoCode`,
+  `replacePromoRedemptionAllocations` and `deletePromoRedemptionAndAdjustCount`
+  must measure their delta against the raw row count, never a filtered one;
+  (b) a reprice that destroys a booking's promo benefit RELEASES the slot it
+  held, in the same transaction that removes the benefit — a member holds
+  exactly as many slots as they hold benefits, at every instant; and (c) a
+  cancellation releases its slots in its CANCELLED transaction
+  (`cancelled-booking-promo-release-census.test.ts`, #4909). The
+  `PromoRedemption` row is never benefit-gated: it persists for any application
+  with eligible guests and is the audit and reporting trail, so a code's
+  archive-or-delete decision counts redemptions, not
+  allocations (`PromoRedemption.promoCodeId` is `onDelete: Restrict`).
+  **Statement order in the two redemption writers is load-bearing**, because the
+  `PromoRedemption_sync_allocation_insert` / `..._update` triggers
+  (`20260527120000_add_promo_redemption_allocations`) upsert a booker allocation
+  row straight from the redemption's own scalars on every `PromoRedemption`
+  write — they exist so an old blue/green colour that writes only
+  `PromoRedemption` still records an allocation. For a zero-benefit application
+  that row is all-zero, so the allocation `deleteMany` must stay AFTER the
+  redemption create/update (or the database silently puts back the row this
+  invariant removes), and `replacePromoRedemptionAllocations` must count the
+  existing rows BEFORE its update (or it counts the trigger's transient row and
+  skews the counter delta).
+
+## INV-MONEY-023
+
+- **Reading `currentRedemptions` for a cap check requires the row lock, and a
+  read under it.** Every path that may write the counter for an existing
+  booking — `booking-modify-plan.ts`, the add-guests route,
+  `booking-date-modification-service.ts`,
+  `booking-guest-removal-service.ts` — takes the `FOR UPDATE` promo row lock
+  before its first cap read, and re-reads the counter under that lock, because
+  the `PromoCode` snapshot it carries was loaded with the booking, before the
+  locks. All four reprice call sites do that re-read through
+  `lockAndRefreshPromoCodeUsage` (including `booking-modify-plan.ts` on its
+  no-swap reprice branch; its swap branch re-reads the whole promo row under
+  the same lock instead), and each must then validate against the object the
+  wrapper RETURNS — validating the snapshot that went in reopens the race. See
+  `docs/CONCURRENCY_AND_LOCKING.md` → "Narrow row-lock protocols".
+
+## INV-MONEY-024
+
+- **A reprice narrows a promotion's coverage; it never refuses the edit
+  (#2390).** On the four reprice paths (and the edit preview, which must match
+  them) the cap question is "who does this code still cover?", not "may this
+  booking use it?". Members already holding a **beneficial** allocation on the
+  booking being repriced are counted first and kept unconditionally — even
+  where they alone exceed a cap, which is the stated behaviour when an admin
+  lowers a cap under bookings that already have the discount; everyone else is
+  admitted in the order the promotion applies to them — **most expensive stay
+  first**, the order `selectPromoDiscountGuests` produces — until the
+  allowance runs out. Booking creation and applying a newly-entered code still
+  refuse, because nobody holds a discount from the code yet.
+  - Protection is applied **inside** that selection, not after it: a
+    `maxGuestsPerBooking` cap is spent while the beneficiary list is built, so
+    an expensive newly-added guest would otherwise evict a member who already
+    held the discount before any protection check could see them. Anyone a
+    protected member keeps their slot ahead of is named in the coverage
+    notice, so nobody is left out silently.
+  - A member who has personally used the code up is left out **by the trim**,
+    not filtered away before it, so they reach the notice rather than being
+    priced normally with nothing said.
+  - For a `FREE_NIGHTS` code the lifetime cap is a budget, not a slot, so a
+    protected member's remaining nights are floored at what this booking's own
+    allocation rows already granted them. Keeping them on the list is not
+    enough: a lowered cap would otherwise award them zero nights while still
+    reporting them as covered.
+  - The protected set is read from `PromoRedemptionAllocation` **before the
+    redemption write**, for the same trigger reason as the two orderings
+    above: `PromoRedemption_sync_allocation_update` upserts a booker
+    allocation row, and a protected-set read placed after it would grant
+    protection nobody earned.
+  - An empty covered set is refused explicitly rather than falling through.
+    Downstream an empty beneficiary list means "unassigned promo", which would
+    price the code for every guest on the booking, cap and all.
+
+## INV-MONEY-025
+
+- **A cap check that excludes a booking must exclude it from
+  `currentRedemptions` too.** The counter includes the rows the excluded
+  booking holds right now, and unlike every other cap it cannot be filtered by
+  a `where`. So `excludeBookingId` is paired with an explicit raw count of
+  that booking's own allocation rows, subtracted before the total-redemptions
+  cap is applied. Omitting it makes a booking holding a code's last slot fail
+  its OWN reprice, silently drop the discount, and bill the member the
+  discount back for a date change.
+
+## INV-MONEY-026
+
+- **TRAP: the in-memory `PromoDiscountResult.allocations` is NOT
+  benefit-filtered on the assigned-member path.** `policies/pricing.ts`
+  deliberately emits a zero entry for a `SET_PRICE` guest whose rate already
+  equals the fixed price (`includeWhenZero`), and
+  `calculatePromoDiscountForGuestRates` returns the assigned-member result
+  before `normalizeAllocations` runs. The filter is applied at WRITE time
+  instead, inside `redeemPromoCode` / `replacePromoRedemptionAllocations`.
+  Anything that reads that in-memory list as "who benefited" must apply
+  `isBeneficialPromoAllocation` itself.
+
+## INV-MONEY-027
+
+- **A `SET_PRICE` application whose per-guest adjustments net to exactly zero
+  counts as no use** (deliberate; #2299). In `SET_PRICE` mode every night is
+  re-priced, so a fixed price of $30 against nights of $50 and $10 nets to
+  zero, as does one member owning two guest rows that cancel. The member's
+  total is byte-identical with and without the code, so under the "any price
+  effect" rule there is no effect, and it consumes nothing. The accepted
+  consequence is that such a stay can carry the code indefinitely — which
+  costs nothing, because it gives nothing.
+
+## INV-MONEY-028
+
+- **Every `BookingGuestNight.priceCents` records where that amount came from.**
+  `SOLD` means a live sale or reprice wrote the per-night quote;
+  `OFFICER_PRICED` means a person supplied the amount while resolving stored
+  history; `EVEN_SPLIT` means a writer mechanically divided a guest total across
+  nights (including the three historical backfills); and `UNKNOWN` means the
+  origin cannot be proved. `EVEN_SPLIT` is not evidence of what any individual
+  night was sold for. Unknown provenance stays
+  unknown: no reader or migration may re-derive it from the amount, rate table,
+  guest total, timestamp, or any other present-day data (#3275, programme
+  #3272). Migration verification must mutation-prove both the historical
+  writer classifiers (including zero and null amounts) and every predicate that
+  admits a draining-colour officer-repair audit. Provenance decides what a
+  night may be read as, not whether the booking ledger posts it: every priced
+  night posts one `GUEST_NIGHT` line, an inexact strand's included (#3583,
+  decision A). Since #4317 an edit prices every night by the D1 valuation
+  (`INV-MOD-028`), which supersedes the evidence clause above: every usable row,
+  `EVEN_SPLIT` and `UNKNOWN` included, keeps its figure.
+
+## INV-MONEY-029
+
+- **What a promotion took off each night or guest is recorded beside it, at
+  the grain the pricing engine decided it; the rows reconcile to the recorded
+  promo totals; and whether a booking's build-up can be trusted is DERIVED from
+  that reconciliation, never stored** (#3276, stage 2 of programme #3272; D1
+  on #3272 as refined 8 Sep 2026; owner decision 10 Sep 2026 on derived
+  validity). `BookingGuestNightAdjustment` holds one row per adjustment per
+  target: the NIGHT for a percentage, free-night or fixed-nightly promotion,
+  whose arithmetic is per night; the GUEST for a fixed-amount promotion, which
+  is `min(value, guest total)` with no per-night rule. The amount is the
+  engine's own figure — the very term its totals were summed from — never
+  translated to a finer grain by a rule, bar the one exception below. It is a
+  signed delta in integer cents like `priceAdjustmentCents`: negative for a discount, positive where a
+  `SET_PRICE` code raised a night, and `0` where it set a night to exactly its
+  rate, a real value. A row's beneficiary is decided in the same
+  function and branch that decides the allocation it decomposes
+  (`calculatePromoDiscountForGuestRates`), so the two can never name different
+  people. **The identity:** the rows of one redemption sum, per beneficiary, to
+  that member's `PromoRedemptionAllocation.priceAdjustmentCents` (an absent
+  allocation row means the member received nothing, per `INV-MONEY-005`) and,
+  overall, to `PromoRedemption.priceAdjustmentCents`. The one writer of an
+  engine AMOUNT, `recordBookingNightAdjustments` in `night-adjustment-write.ts`
+  (a member merge only moves or deletes rows and never invents one), enforces
+  it at write time and REFUSES BEFORE IT MUTATES — every read and check
+  precedes its first write, so a refusal rolls the edit back; the waitlist
+  reprice, whose own catch degrades to the stored snapshot instead of rolling
+  back, therefore calls the recorder outside that catch, where a refusal fails
+  the sweep. `amountCents = NULL` means NOT KNOWN and is
+  written only where the engine genuinely has no per-target figure — the
+  per-member safety-cap rescale; unknown rows are excluded from the sums, and
+  `?? 0` on the column is prohibited exactly as it is on
+  `BookingGuestNight.priceCents`. **A reader asks `deriveNightAdjustmentState`
+  — the one home — over every redemption (#3826), or per code (`INV-MONEY-040`):** a booking with no redemption had
+  nothing taken off (`NO_PROMOTION`); rows that reconcile are `KNOWN`; anything
+  else — rows missing, rows that do not sum, a NULL amount — is `NOT_KNOWN`.
+  No column stores that answer: a flag can be left asserting what a draining
+  colour or a rollback has since made false; a sum cannot. An officer-priced night, an even split
+  and a parked edit need no special state: their rows are absent or no longer
+  sum, so they derive as not known until the settle re-base re-runs the
+  promotion over the stored prices and records the engine's figure. Stated
+  limit (owner-accepted): an old-colour officer price repair that
+  changes a night's rate without touching the promotion is not detected. A
+  mechanical rewrite that moves no money (a name-only correction, an
+  in-progress extension, an admin date shift) carries the recorded rows across
+  by guest and stay date byte for byte, and where it cannot, leaves the
+  booking's rows absent rather than guess. **The one exception** (owner
+  decision 24 Oct 2026 on #4302; #4317): an in-progress edit capping its
+  carried promotion at the new total scales the rows left on the stay, per
+  redemption and beneficiary, in proportion to their stored amounts,
+  leftover cents on the earliest night, to the capped allocations
+  (`scaleCappedCarriedRows`, via `restoreBookingNightAdjustments`). It writes
+  no row for a code, which reads not known (build-up and Xero promotion lines
+  fall back to the aggregate), where an amount is NOT KNOWN, an allocation
+  lost every row, a beneficiary's rows mix signs, a scaled row would take more
+  than its night's price (a guest row, its guest's total) or raise a night
+  further, or across codes a guest's night or a guest would lose more than it
+  is held at (every code on it; an unpriced night is not measured); and none
+  where the redemptions could not be scaled (`capCarriedPromotionRecords`).
+  A member merge that drops a
+  duplicate's colliding allocation deletes that duplicate's rows on the same
+  redemption in the same step, so each surviving allocation still matches its
+  rows per beneficiary — but the redemption total still carries the dropped
+  share, so it derives as not known until the next engine run
+  rewrites it. An allocation may name no member — a school's booker slot
+  (#3369), which decomposes no member's benefit; `memberBenefitAllocations`,
+  the one helper, excludes it from the per-member identity for writer and
+  reader alike, so a redemption carrying a non-zero member-less allocation
+  derives `NOT_KNOWN`, never `KNOWN`. **Account credit is not in this table**:
+  it has one home, the `MemberCredit` ledger entry with its booking link, and
+  is composed from there, never split across nights. Stage 2 added the record
+  and changed no reader or member-visible figure (D3), pinned by
+  `promo-money-byte-identical.test.ts`.
+
+
+## INV-MONEY-038
+
+**Related: `INV-MONEY-039`** (which nights each code may take) and
+**`INV-MONEY-024`** (the re-price rule each code keeps).
+
+- **Several promo codes on one booking are priced by ONE orchestrator, in the
+  booker's order, and only guests actually staying can benefit** (#3827; owner
+  decisions D-3813-1..4 on #3492). `applyBookingPromotions` in
+  `src/lib/booking-promotions.ts` runs the unchanged single-code engine
+  (`validateAndCalculatePromoDiscount`) once per code; there is no second
+  pricing engine, so single-code arithmetic cannot drift. The order is the
+  stored `PromoRedemption.applicationOrder`, which the booker sets and can
+  change, except that a work-party (internal) discount always applies first.
+  Any number of codes of any kind combine. A guest whose cross-family place is
+  still `PENDING` is shown to no code — a typed code included — and their
+  acceptance re-prices the booking's codes through the ordinary edit
+  machinery; a decline consumed nothing. A lower price on a paid booking goes
+  back in full, with no cancellation-policy tier, the way it was paid
+  (D-3813-5): refundable cash first — a card refund, or an officer's bank
+  transfer (`INV-PAY-117`) — then account credit for the rest; a re-price
+  that cannot return the whole reduction is not written, so no code is used
+  beyond what is returned. Each code keeps its own caps, its own allocations and its own
+  integer cents: `Booking.promoAdjustmentCents` is the sum of the redemptions'
+  adjustments, with no rounding across codes, and `discountCents` is
+  `bookingDiscountCents` of that sum (`INV-MONEY-031`). Every
+  write path — create, every edit and re-price, the waitlist offer, the review
+  re-base, a guest's acceptance — prices through this orchestrator, and a
+  re-price locks every code row in one sorted call before its first cap read
+  (`INV-MONEY-023`). While the `multiPromoCodes` switch is off a second code is
+  refused (#3826).
+
+## INV-MONEY-039
+
+**Related: `INV-MONEY-038`** (the order the codes run in) and
+**`INV-MONEY-029`** (the rows a claim is written as).
+
+- **A night is discounted by at most one promo code, and the earliest code
+  that reaches it claims it** (#3827, D-3813-2). Each code is priced over only
+  the nights no earlier code claimed. Any target an earlier code emitted claims
+  its night — a partial (`maxNightlyValueCents`) or zero-amount night included —
+  and a per-guest fixed amount claims that guest's remaining nights, at
+  `min(value, the guest's unclaimed total)`. Claims are recomputed from scratch
+  on every pricing; nothing is carried from the last one, so a reorder or a
+  removed code lands where a fresh application in that order would. A code
+  that would claim nothing is refused at application as "already covered by"
+  the code holding its nights, and on a re-price is released on its own, with
+  a notice naming why (`INV-MONEY-024`, per code). The database holds the
+  same promise: one promotion row per night
+  (`BookingGuestNightAdjustment(bookingGuestNightId, kind)`, #3826).
+
+## INV-MONEY-040
+
+**Related: `INV-MONEY-029`** (each code's rows), **`INV-MONEY-030`** (the
+verified aggregate) and **`INV-MOD-058`** (an edit's stored lines).
+
+- **A booking's promotion reaches Xero, an edit document and a member as one
+  line per promo code** (#3828; #3492). A booking invoice, and each child of a
+  combined group invoice, carries one `Promo adjustment - CODE` line per code
+  with a non-zero adjustment, in the booker's order, coded by
+  `resolvePromoLineCodes` for that code (`xero-promo-adjustment-lines.ts`).
+  A code's amount is its own redemption's rows, used only when
+  `deriveNightAdjustmentState` over that redemption alone is `KNOWN`; the
+  lines must sum to the verified aggregate. Otherwise the invoice carries one
+  aggregate line naming every code at the generic promotion coding, and the
+  operation records `promoLines` with the reason (`CODE_BUILDUP_NOT_KNOWN`,
+  `CODE_LINES_DO_NOT_SUM`); the total never depends on the split.
+
+  An edit stores one `PROMO_DELTA` per code that moved, plus `codesBefore`
+  where it held several; where the per-code changes do not sum to the aggregate
+  change, one line naming no code. Its document codes each line by the code it
+  names, generically for none; a lone line naming the booking's sole code, or
+  with no code left and no `codesBefore`, keeps its one-code coding. The one-code edit fields (`promoCode`,
+  `removePromoCode`) are refused on a booking holding several of the booker's
+  codes, since they would replace or release them all. Confirmation emails,
+  the booking page and the data export name each code with its amount, falling
+  back together to one row (`perCodePromoAdjustmentRows`).
+
+  A booking with one code is not split: its invoice line, coding, payload,
+  edit lines and emails are byte-identical to before. Pinned by
+  `xero-promo-adjustment-lines.test.ts`, `xero-booking-invoice.test.ts`,
+  `xero-group-settlement-invoice-lines.test.ts`,
+  `booking-modification-lines.test.ts`,
+  `xero-modification-line-items.test.ts` and `multi-promo-pricing.test.ts`.
+
+## INV-MONEY-030
+
+- **Stored money readers use one operation-aware projection and one pure
+  discriminator, preserve today's member-visible amounts, and record which
+  source they used** (#3277, programme #3272; owner-approved D3 blueprint,
+  12 September 2026). The caller names its operation because the required grain
+  differs: whole-guest removal, and a strand an edit does not touch at all
+  (#3531 D-3531-1), may use a reconciling guest total even when its nights are
+  `EVEN_SPLIT`; since #4317 an edit values every strand it moves, and the
+  legacy review re-base every strand, by `INV-MOD-028`; credit election
+  verifies the booking headline; Xero verifies the booking promotion aggregate.
+
+  `selectBookingMoneyBuildUp` returns `STORED`,
+  `DERIVED_COMPATIBILITY_FALLBACK`, or `BASE_EVIDENCE_UNKNOWN`, with its reason,
+  known cents, and history metadata. Stored money is selected only when it is
+  byte-identical to today's result. A disagreement must be classified as
+  `STORED_SIDE_DEFECT`, `DERIVATION_DEFECT`, or `LEGITIMATE_DIVERGENCE`, and
+  today's result still wins. `ADJUSTMENT_BUILDUP_NOT_KNOWN` means historical
+  evidence is missing or unrecorded, not necessarily corrupt. Unknown base
+  evidence has no selectable amount and is never re-derived or defaulted to
+  zero.
+
+  Guest removal decides before deleting its targets and records the verdict on
+  the existing `BookingModification`. Review closure writes a fresh build-up
+  and records the verdict in existing audit and `PRICE_REBASE` history. Credit
+  election preserves its headline, clamp, shortfall, and ledger arithmetic and
+  records the verdict with its atomic credit result. Per-booking Xero invoices
+  retain gross guest/night lines plus the verified promotion, as one line per
+  code (`INV-MONEY-040`), and record its source on the existing operation.
+  **Correction (#3828):** group invoices carry each child's promotion line
+  (#3642, `INV-PAY-105`); the omission this rule once stated was the D3 defect
+  a fixture proved, a discounted joiner failing the settlement's cash check.
+
+## INV-MONEY-031
+
+- **A stored booking headline is trusted only with its derived reconciliation
+  state; missing or disagreeing recorded parts are explicit and never repaired
+  by the read** (#3278, stage 4 of programme #3272; owner-approved D1-D4,
+  14 September 2026). `reconcileBookingMoney` is the one pure projection. It
+  returns `RECONCILED`, or `UNRECONCILED` with every applicable reason in this
+  order: no surviving strands, unreadable strand evidence, a guest total
+  disagreeing with its own night prices (#3547), headline-total mismatch,
+  promotion build-up not known, promotion build-up mismatch,
+  discount-component mismatch, and final-price relation mismatch.
+
+  It checks recorded facts: `Booking.totalPriceCents` against readable
+  whole-guest sold-price evidence; `promoAdjustmentCents` against the
+  `INV-MONEY-029` adjustment build-up when known; `discountCents` against
+  `max(0, -promoAdjustmentCents)`; and `finalPriceCents` through
+  `bookingFinalPriceCents`. `EVEN_SPLIT` is usable only at whole-guest grain.
+  Unknown provenance, a missing build-up or a null adjustment becomes a reason,
+  never zero or a present-day reprice. Account credit stays solely in
+  `MemberCredit`.
+
+  **The verdict is officer-only** (owner decision, 20 September 2026): a member
+  sees their amounts unmarked and their data export carries no verdict.
+  `booking-money-reconciliation-audience.ts` is the one home for that gate, the
+  named `WITHHELD` state replacing a nullable absence, and the wording. Behind
+  it, booking detail and lists, officer history, finance metrics, reports,
+  exports and per-booking Xero reconciliation input carry the same state and
+  ordered reasons; every displayed or settled amount and, bar `INV-MONEY-040`,
+  the invoice shape are unchanged. A read-only repeatable-read census
+  (`pnpm run booking-money:census`) reports state/reason counts, night rows by
+  provenance and strands by `INV-MOD-028` verdict per booking month, and edit
+  reviews by cause per task month (#3531 3c), from one snapshot, read-only. The mutation-verified `booking-money-writer-census.test.ts`
+  names direct headline/component writers and rejects raw-SQL or
+  forwarded-delegate bypasses. A partly-refunded guest-add mismatch is
+  therefore visible for #3244 to repair separately; this rule chooses no card,
+  charge, refund, credit, or invoice correction.
+
+## INV-MONEY-032
+
+- **A booking's money ledger is append-only, and one module writes it**
+  (#3580, programme #3527 stage 4; design
+  [`design/booking-ledger.md`](../design/booking-ledger.md)).
+  `BookingLedgerLine` records a booking's money as posted lines: charge,
+  settlement or adjustment, each with a sign, a quantity, a unit price and the
+  event that anchored it. A line is never updated or deleted; a correction is
+  a new line naming the one it reverses, and `reversesLineId` is unique.
+
+  **The balance is derived, never stored.** `booking-ledger-balance.ts` is the
+  one place charged, settled, adjusted and owed are summed. No running total
+  or status: a stored copy of a derived figure is the mirror this table
+  retires.
+
+  **`booking-ledger-write.ts` is the only door**, exposing creation alone;
+  every posting goes inside the transaction of the writer whose act it
+  records — a settle that rolls back leaves no line saying it did not.
+  Building rows is pure and may be refused safely; writing them is a statement
+  and is never wrapped, because a refused statement has already aborted the
+  transaction. The database holds the shape rules: a sign is 1 or -1,
+  `amountCents` IS `sign * unitCents * quantity` with a non-negative unit and
+  quantity, a `GUEST_NIGHT` line names its strand and its nights, and nothing
+  else names any of them. The strand and the acting member are plain columns,
+  not keys, so no cascade can rewrite a posted line.
+  `booking-ledger-append-only-census.test.ts` fails a second writer, or any
+  update, upsert or delete of a line, anywhere — including in the door.
+
+  Stage C1 posts charge lines at confirmation, from the night rows, and
+  nothing reads them: `INV-PAY-047`'s mirror is still the answer until the
+  reads move (#3584). A strand with an unpriced night posts nothing, because
+  `INV-MOD-028` says a blank is not evidence of an amount.
+
+  Member journal: `INV-MONEY-041`, `INV-MONEY-042`.
+
+## INV-MONEY-033
+
+- **A booking-ledger posting is idempotent, and a booking's confirmation posts
+  once** (#3595). Two rules, because one was not enough.
+
+  **Each posting carries a key** derived from the event it records, built only
+  in `booking-ledger-posting-keys.ts`, and unique. The write door inserts with
+  `ON CONFLICT DO NOTHING`, so the same event posted twice is skipped: not a
+  duplicate line, and not a refused statement that would abort the caller's
+  transaction (`INV-MONEY-032`). A reversal is keyed by the reversed line's id,
+  so a second reversal of one line is a skipped replay, never a different
+  posting the unique `reversesLineId` could silently absorb. The same key, or
+  the same reversal target, twice in one batch is refused before anything is
+  sent.
+
+  **A key makes one event idempotent, not a booking's confirmation.** A
+  booking can pass the settle's PAID claim twice — mark-paid, its reversal
+  (`INV-PAY-045`), then a card payment — and its nights can change in between,
+  so their keys change too. The settle therefore fences per booking
+  (`bookingHasConfirmationLines`, under its own `lock(1)`), counting un-keyed
+  lines as well, and posts nothing if the booking is already confirmed on the
+  ledger. What changes after confirmation is a modification (#3582).
+
+  `booking-ledger-posting-key.realdb.test.ts` proves the skip, the surviving
+  transaction and the fence against PostgreSQL itself.
+
+  Whole-batch keys in the member journal: `INV-MONEY-041`, `INV-MONEY-042`. From
+  M3b the journal's booking charge is keyed once per booking too, and a door's
+  repeat of an event already posted is a no-op (`INV-MONEY-044`).
+
+## INV-MONEY-034
+
+- **A booking's settlement lines converge from its payment rows, at the place
+  the mirror is derived from them** (#3581). `syncBookingLedgerSettlements`
+  runs at the end of `reconcilePaymentAggregates` and from the five writers
+  that set the payment's columns themselves: the manual mark-paid settle, its
+  reversal, the Xero payment-received receipt, and #3653's organiser-child
+  refund recorder and its pending-refund sweep (#3854). It posts one line
+  per captured transaction (`CARD_CAPTURE`, `BANK_RECEIPT`, or `CASH_RECORDED`
+  when `manuallyMarkedPaidAt` is set, `INV-PAY-001`) and one per recorded
+  refund (`CARD_REFUND`), keyed on the row (`INV-MONEY-033`), and posts
+  nothing for a $0 capture.
+
+  **A source that stops holding is reversed, never edited.** A mark-paid
+  reversal flips its row to `FAILED` (`INV-PAY-045`) and a refund can fail
+  after it was recorded; the sync then posts a reversal copied from the line,
+  once, keyed by the line's id. It never re-derives a method from the
+  payment's provenance, which a reversal clears.
+
+  **"Captured" and "recorded" are the mirror's own predicates**, in
+  `payment-transaction-status.ts`, so the ledger's captures equal
+  `Payment.amountCents` whenever anything is captured. Its refunds do NOT
+  always equal `refundedAmountCents`: that column only rises, is seeded
+  without rows on legacy payments, and is moved by credit and hand-back
+  refunds (#3599) — `INV-PAY-050` already says it is not cash evidence. C4's
+  census names those as `REFUND_MIRROR_*` classes (`INV-MONEY-037`). A line
+  whose source amount later changes is reported, not corrected.
+
+  **A group organiser's settlement posts on its children** (#3854). The group
+  settle confirms each child on the ledger and posts its share, its own price,
+  as `CARD_CAPTURE` or `BANK_RECEIPT` anchored `GROUP_SETTLEMENT`; a frozen
+  cancel plan posts the matching refund there (design §5.2). #3583's back-post
+  posts a child settled before it through the same planners and keys, so a
+  later live event finds its line posted.
+
+## INV-MONEY-035
+
+- **Every credit row a booking owns, and every hand-back, posts exactly one
+  settlement line, inside its writer's transaction** (#3599). Credit rows
+  have no chokepoint, so each writer calls `syncBookingLedgerCredits`; which
+  rows are the booking's is `member-credit-booking-rows.ts`'s, shared with
+  `deriveBookingAppliedCreditCents`. `booking-ledger-credit-writers.test.ts`
+  fails a credit write with no sync after it.
+
+  **Insert-only, because credit rows are.** No code changes a row's amount,
+  type or booking link — the census fails one that tries, and the database
+  refuses to delete a booking a row names (`INV-MONEY-043`) — so each row posts one
+  line keyed `credit:<id>`, never reversed, for the row's negation: applied
+  credit `CREDIT_APPLIED` (a give-back is negative), minted credit
+  `CREDIT_ISSUED`. While a booking's applied rows net to zero or less — every
+  current writer keeps them so — Σ `CREDIT_APPLIED` equals
+  `deriveBookingAppliedCreditCents`.
+
+  **A restore is not a reversal.** Restores are tiered by policy, so one can
+  be less than was applied; it posts `CREDIT_ISSUED` for exactly the restore,
+  anchored on the `CANCELLATION` because it returns credit already spent.
+
+  **A hand-back posts `BANK_REFUND`** when a task completes on the
+  `local-allocation` route, keyed `handback:<taskId>`, naming the officer, by
+  internet banking (#3529's wording decision, `INV-PAY-101`) — except on a
+  card payment, whose refund posts from its refund row. A card refund closed
+  as paid another way has no refund row, so its close posts the line on its
+  own completed task (`INV-PAY-122`); so does a cancel's card refund
+  shortfall, on its completion (`INV-PAY-129`).
+  `booking-ledger-credit-sync.realdb.test.ts` proves the `member-credit.ts`
+  writers and the real resolver.
+
+## INV-MONEY-036
+
+- **An edit posts its own lines, per guest-night, or none; a review closure
+  records one parked edit's money once** (#3582). Rule and reason: design
+  `booking-ledger.md` §5.1 (edits: reversal plus re-post per night at its
+  `INV-MOD-028` value, sum or nothing, only on a booking confirmed on the
+  ledger, asked under `lock(1)`; no edit parks since #4317) and §5.3 (a legacy
+  closure's share, decided at booking grain). No review share posts a settlement line
+  (`INV-MONEY-034`, `INV-MONEY-035`). Pins:
+  `booking-ledger-modification-posting.test.ts`,
+  `booking-ledger-modification-sync.test.ts` (two-sibling fixtures per
+  direction), `booking-ledger-modification.realdb.test.ts`.
+
+## INV-MONEY-037
+
+- **Until the reads move, every booking's ledger is proved against its money
+  columns, and the cut-over waits on that proof** (#3583, design
+  `booking-ledger.md` §6, §7). `pnpm run booking-ledger:census` reads one
+  `RepeatableRead`, `READ ONLY` snapshot, writes nothing, and checks seven
+  identities per booking: `finalPriceCents` is Σ `GUEST_NIGHT`, `PROMOTION`
+  and `GROUP_DISCOUNT` plus `adjusted(b)` less agreed give-backs, or, once
+  cancelled, `owed(b)` is zero; `amountCents` is Σ captures; `creditAppliedCents` is
+  Σ `CREDIT_APPLIED`; `refundedAmountCents` is −Σ `CARD_REFUND`;
+  `changeFeeCents` is Σ `CHANGE_FEE`; the uncollected ask is `max(0, owed(b))`
+  while an ask is live; and a live booking's `owed(b)` is what its columns say
+  is owed (`INV-PAY-047`'s residual plus the ask, less evidenced give-backs),
+  so no line can be wrong while every column agrees. A review line must match
+  what its closure credited, from credit rows and its own refund; rows it
+  cannot attribute fail closed (`AMBIGUOUS_REVIEW_GIVE_BACK`, §6). A disagreement names the
+  booking, both figures and the delta.
+
+  **A class explains an exact amount, from evidence the delta does not
+  hold.** It is classified only where components computed from the booking's
+  own rows sum to the delta to the cent; a cent either way, or the evidence
+  removed, is a disagreement (`booking-ledger-projection-census.test.ts`).
+
+  **The gate opens only on zero unclassified disagreements, coverage gaps and
+  integrity findings, and every class instance acknowledged.** Coverage is
+  money with no lines, a paid booking unconfirmed on the ledger, or an edit,
+  fee, credit row, capture or refund no live line records. Every class holds
+  the gate until the owner's `--acknowledged` file, kept outside the
+  repository, names its instance to the cent — `KNOWN_DEFECT_HISTORY` too —
+  except `GROUP_SETTLEMENT_OFF_LEDGER` (#3583, while #3854's lines agree) and
+  `REFUND_APPEAL_PAID` (#4075), listed only. A moved figure is stale and still holds. `booking-ledger-projection-census.realdb.test.ts` proves it
+  on real-writer bookings.
+
+## INV-MONEY-006
+
+**Related: `INV-MONEY-001`** (money is held as integer cents) and
+**`INV-MONEY-003`** (the lintable form of that). This one is a distinct
+obligation rather than a restatement — the named surfaces must reconcile, not
+merely be represented correctly (#2707, owner decision 9 Aug 2026). Change one,
+check the others.
+
+- Refunds, credits, discounts, Stripe amounts, Xero invoice amounts, and
+  membership fees must reconcile back to cent-based ledger records.
+
+## INV-MONEY-007
+
+- Admin adjustments need audit, approval, and a visible business reason.
+- The one system-written adjustment (#4219; owner decision, 17 Oct 2026): when a
+  credit note was spent in Xero outside the app, the app writes the lot down with a
+  negative `ADMIN_ADJUSTMENT` row and releases the booking's applied credit with a
+  matching row, both marked `outsideSpendConvergedAt`. It has no requester or
+  approver by design (Xero's figure for the note is the decision), but it still has
+  an audit row and a visible business reason, and it moves no member's balance.
+- The same holds for the inbound credit-note mirror (#4270; owner decision, 24 Oct
+  2026): it writes down only the free part of a lot Xero shows spent outside the app
+  and restores it, as a positive row marked and stamped the same way, when Xero shows
+  the spend undone, never more than was written down. Its audit rows are
+  `xero.credit_note.outside_spend_mirrored` and `.outside_spend_restored`. A
+  write-down never takes the member's balance below zero, and the member is not
+  emailed.
+
+## INV-MONEY-008
+
+- A confirmed `MembershipSubscriptionCharge` is an immutable snapshot: fee and
+  membership type, billing basis, annual/charged cents, proration, dates/months,
+  covered subscriptions, family, recipient name/email, due days, frozen
+  `subscriptionIncome` account/item identifiers, reference, **and its frozen
+  `MembershipSubscriptionChargeComponent` rows** (one per Xero invoice line —
+  label, description, annual/charged cents, prorated flag, account/item, order)
+  never change. Only delivery/status/Xero metadata may advance.
+
+## INV-MONEY-009
+
+- An annual fee has ≥1 `MembershipAnnualFeeComponent` at all times unless it is
+  `NO_INVOICE` (zero total, no components); the components' `amountCents` sum
+  exactly to the fee total (validated in the one transaction that writes the
+  fee), a charge's `chargedAmountCents` is Σ its components, and the invoice
+  carries one line per component. A single-component fee is byte-identical to the
+  pre-component single-line behaviour; a multi-component prorated fee may diverge
+  by up to (n−1) cents by design because the charge total is authoritative as Σ
+  components.
+
+## INV-MONEY-010
+
+- Every `MemberSubscription` can be covered by at most one charge. A
+  season-scoped advisory lock plus the unique coverage constraint makes annual
+  confirmation, approval replay, and concurrent operators idempotent.
+
+## INV-MONEY-011
+
+- `PER_MEMBER` bills that member. `PER_FAMILY` requires one explicit active,
+  unarchived recipient in the exact family. `NO_INVOICE` is an explicit
+  zero-cent outcome, not missing configuration.
+
+## INV-MONEY-012
+
+- The club-level `familyBillingMode` on `MembershipSubscriptionBillingSettings`
+  decides whether family billing exists at all. `BILL_FAMILY_VIA_BILLING_MEMBER`
+  (the default, preserving pre-#159 behaviour) allows `PER_FAMILY` schedules and
+  invoices each family via its nominated billing member.
+  `BILL_MEMBERS_INDIVIDUALLY` invoices every member directly: the fee-config
+  family-billing card is hidden, no billing-member exception is ever raised, and
+  `PER_FAMILY` schedules are blocked server-side on create/update. A stale
+  `PER_FAMILY` schedule left over from a mode switch is never silently
+  reinterpreted as per-member; the billing engine surfaces it as a visible
+  `PER_FAMILY_FEE_IN_INDIVIDUAL_MODE` exception and invoices nothing for it. The
+  guard sits ahead of every per-family branch, so it makes the per-family
+  family-resolution branches (including `MISSING_FAMILY` / `AMBIGUOUS_FAMILY` /
+  `MISSING_FAMILY_RECIPIENT` / `INVALID_FAMILY_RECIPIENT`) unreachable in
+  individual mode by construction.
+
+## INV-MONEY-013
+
+- A member in more than one family is billed for a `PER_FAMILY` fee only via
+  their admin-chosen `Member.billingFamilyGroupId` (consulted solely in
+  `BILL_FAMILY_VIA_BILLING_MEMBER` mode, through the same recipient checks as an
+  unambiguous family): valid selection bills that family, a stale selection
+  raises `INVALID_BILLING_FAMILY_SELECTION`, and an unset selection raises
+  `AMBIGUOUS_FAMILY`. The selection is NULLed in the same transaction as any
+  removal of the member from that family across all six removal paths, so a stale
+  pointer can only ever degrade to that visible exception — never silent
+  misbilling.
+
+## INV-MONEY-014
+
+- One family/membership-type/membership-year tuple can have at most one durable
+  charge. A later family member produces a visible exception; neither coverage
+  mutation nor a second invoice is allowed.
+
+## INV-MONEY-046
+
+- Subscription category is a second, independent billing axis (`INV-LIFE-094`),
+  resolved separately from `MembershipType`'s own fee. A
+  `SubscriptionCategoryFee` has no `billingBasis`: each bills one flat charge
+  per set of family members sharing it (a charge of one with no partner),
+  `INV-MONEY-014`'s uniqueness extended onto
+  `(subscriptionCategoryId, familyGroupId, seasonYear)` by a sibling raw-SQL
+  partial unique index. A `MembershipSubscriptionCharge` bills on exactly one
+  axis: one DB CHECK makes `membershipTypeId` and `subscriptionCategoryId`
+  mutually exclusive and each axis's column group (the `membershipType*` trio,
+  the `subscriptionCategory*` quartet) all-null or all-set. Every reader of
+  those columns goes through `chargeFamilyAxisKey`/`chargeAxisDisplayName`
+  (`INV-SSOT-009`), never a raw template literal, so the closed-family
+  reversal rules (`INV-MONEY-018`, #4110) apply to both axes. Booking rights,
+  rate and lockout stay with `MembershipType`.
+- **Exemption** (#4554 option A, owner, 11 Nov 2026: the type exemption
+  wins): both axes ask the one liability rule, billing side
+  (`resolveMemberSubscriptionLiability`, `INV-CONFIG-009`), the rule booking
+  access also reads. While the club is `NOT_CHOSEN` that is the pre-#5190
+  billing rule: a `REQUIRED` type always owes, a `BASED_ON_AGE_TIER` type owes
+  by its season-start tier, and a saved `NOT_REQUIRED` row is ignored. Once the
+  club chooses, its pair decides for both sides. A tier-exempt child is exempt
+  inside a category family too, outside its coverage: the type axis's
+  `PER_FAMILY` carve-out (#2148 Q5) would bill a solo exempt child the flat fee.
+- **One category per family:** a member whose family already has a charge,
+  this run or earlier, on the other axis or another category raises
+  `MIXED_AXIS_FAMILY_BILLING` and is withheld.
+
+## INV-MONEY-015
+
+- Membership approval remains authoritative when billing setup is incomplete:
+  billing records a visible post-approval exception/warning and never rolls the
+  member transaction back.
+
+## INV-MONEY-016
+
+- **Membership type is the sole subscription authority; role carries no
+  exemption (#2149).** Whether a member owes a subscription is decided ONLY by
+  their effective membership type (`subscriptionBehavior`, plus the per-age-tier
+  flag where the type is `BASED_ON_AGE_TIER`, or where the club's chosen rule
+  lets an exempt tier exempt a `REQUIRED` type — `INV-CONFIG-009`). Access **role is a pure permission
+  concept** and grants no exemption of its own — the retired
+  `roleNeverRequiresSubscription` short-circuit is gone from every derivation
+  (booking gate, profile, subscriptions list, admin members list + its SQL
+  filters, CSV export, member-guest booking block, Xero sync). Admin lists
+  show billing until the club chooses (#5190 Q2). Operational
+  and non-member accounts are exempt only because they resolve to a `NOT_REQUIRED`
+  membership type: a member with no explicit season assignment falls back through
+  `defaultMembershipTypeKeyForRole`, which maps `ADMIN`→built-in `ADMIN`
+  (BLOCK_BOOKING, NOT_REQUIRED), `LODGE`→built-in `LODGE` (MEMBER_RATE,
+  NOT_REQUIRED — so the kiosk still books, including across a season rollover),
+  and `SCHOOL`/`NON_MEMBER` to their NOT_REQUIRED built-ins; `USER` falls back to
+  `FULL` (REQUIRED). A real fee-paying human who holds the admin permission is
+  assigned a normal REQUIRED/BASED_ON_AGE_TIER type and owes a subscription like
+  anyone else — showing their real Paid/Unpaid status on every surface. Those
+  two built-in operational types are DB-seeded by a real idempotent migration
+  because the annual-billing preview resolves fallback types from the database.
+  `Member.lifeMemberDate` is **informational only** and is never read by any
+  subscription derivation — the Life exemption is the `LIFE` membership type
+  (subscriptionBehavior `NOT_REQUIRED`).
+
+- **Archived stored role-default types govern unassigned members (#3685).**
+  Booking and billing resolve the stored row by role-default key regardless of
+  active status. Billing uses its `subscriptionBehavior` and effective fee. A
+  legacy family holder's `PER_MEMBER` basis can lift suppression. Explicit
+  season assignments take precedence. Missing rows, or missing fees when
+  billing is required, produce exceptions; booking's synthetic fallback cannot bill.
+
+## INV-MONEY-017
+
+- **Paid-up semantics (one meaning).** A member counts as paid-up (not owing an
+  unpaid subscription) when the one liability rule (`INV-CONFIG-009`, access
+  side) says they owe none, or their current-season `MemberSubscription.status`
+  is `PAID`, or an active coverage claim on a `NO_INVOICE` charge covers them
+  (#5190: such a fee sends no invoice, so its member could never reach `PAID`).
+  The rule says they owe none when their type is `NOT_REQUIRED`
+  (Life/honorary/operational — no row needed), or their type is
+  `BASED_ON_AGE_TIER` (#2041) and their age tier does not require a
+  subscription. While the club is `NOT_CHOSEN`, two pre-#5190 facts also hold:
+  an exempt stored tier exempts a `REQUIRED` type, and a `BASED_ON_AGE_TIER`
+  member's saved `NOT_REQUIRED` row (the sweep writes it for a member tier-exempt
+  at season start) stays authoritative through a mid-season tier promotion. Once
+  the club chooses, its pair decides and the row exempts nobody.
+  Booking (`findUnpaidMemberGuests` and the owner gate), notices and
+  `/api/member/subscription-status` resolve paid-up through that rule and the
+  settlement loader; the Xero sync (`checkMembershipStatus`) asks the rule's
+  access side for one member through `owesSubscriptionForAccess`. Never a copy.
+  The admin members list and export and the subscriptions list call the same
+  rule on its billing side, so while `NOT_CHOSEN` the two pre-#5190 access facts
+  above do not exempt anyone there (#5190 Q2). An active member's untouched
+  saved `NOT_REQUIRED` row whose member billing treats as owing shows
+  `NOT_INVOICED` with a note, from the same rule (`hasNotRequiredRowBillingNote`).
+  Nomination deliberately honours ONLY the membership-type `NOT_REQUIRED` rule,
+  NOT the junior age-tier exemption (`requiresPaidSubscriptionForAgeTier`):
+  nominating is an adult-member act and widening it to un-subscribed junior
+  tiers is an owner policy decision. `BASED_ON_AGE_TIER` defers to the
+  per-age-tier `AgeTierSetting.subscriptionRequiredForBooking` flag, the SAME
+  flag the billing sweep reads, so one flag governs both booking-lockout and
+  annual-fee invoice minting.
+
+## INV-MONEY-018
+
+- **Manual mark-paid provenance (non-Xero clubs / cash).** `status = "PAID"` can
+  be set outside the Xero pipeline by an audited finance:edit action, recorded by
+  `manuallyMarkedPaidAt` / `manuallyMarkedPaidByMemberId` / `manualPaymentNote`.
+  This path never calls Xero and never creates or voids an invoice, and it exists
+  only for cash payments where NO Xero invoice exists: marking paid is rejected
+  when the row carries a Xero invoice link (record the payment against the
+  invoice in Xero instead) or is `NOT_REQUIRED`, and both manual writes are
+  status-fenced conditional updates so concurrent actions cannot double-apply.
+  No writer may clobber a manual PAID: the annual-invoice sweep never invoices a
+  subscription already `PAID` (a manual PAID has no charge-coverage row, so the
+  guard keys off status, not coverage); a queued/retrying invoice charge
+  conflicts (`SUBSCRIPTION_ALREADY_PAID`) instead of minting an invoice for a
+  covered subscription that became `PAID`, and its coverage write never
+  downgrades a `PAID` row; Xero discovery/reconciliation
+  (`checkMembershipStatus`) never downgrades a manually marked-paid row that
+  carries no Xero invoice link (a write-time fence, so a manual mark-paid
+  landing mid-sync is also safe); and `flushMemberSubscriptionHistory` treats a
+  manual-PAID row as financial history and never deletes it on contact
+  link/push/unlink. An audited finance:edit close (#4098) moves that conflict
+  to `NOT_REQUIRED` only while every covered subscription is settled (`PAID`,
+  or exempt `NOT_REQUIRED`), releasing its coverage claims and bumping
+  `voidGeneration`, so a later payment reversal re-bills that member; a closed
+  family stays billed until then (#4110). Once a real Xero
+  subscription invoice links to the row,
+  Xero is authoritative again and the linking write clears the manual
+  provenance columns (a row can never read "UNPAID (manual)"). Reversal
+  (finance:edit) restores `NOT_INVOICED` (or `UNPAID` on a legacy row with an
+  invoice link) and clears the provenance columns; both directions are audited
+  with the acting admin, including the previous status.
+
+## INV-MONEY-019
+
+- **Closed-loop item-code detection (#2109).** When the opt-in
+  `MembershipLockoutSettings.useFeeScheduleItemCodes` look-through is on, paid
+  detection matches ANY item code stamped on the fee schedule — the resolver
+  `getSubscriptionItemCodes()` returns the distinct non-null
+  `MembershipAnnualFeeComponent.xeroItemCode` values (every historical fee row
+  contributes; prior seasons were billed under retired rows) UNION the single
+  `subscriptionIncome.itemCode`. Because billing stamps exactly those component
+  codes onto invoice lines, the detection set is always a **superset** of the
+  codes the billing pipeline can stamp: a member billed under the fee schedule is
+  always detectable by item code. Default off reproduces single-item-code
+  detection byte-for-byte. Detection is UNION (never per-member) so family
+  invoices and the member-less inbound reconciler resolve the same set.
+
+## INV-MONEY-020
+
+- **Strong-first subscription-invoice selection (#2109).** Widening the item-code
+  set means several season invoices can match (e.g. a paid subscription plus an
+  earlier unpaid hut-fee invoice sharing a code), so — WHEN look-through is on —
+  `findSubscriptionInvoice` never returns the first match over the widened set.
+  It collects ALL matches and selects preferring (1) a STRONG match (the account
+  code, the flat fallback item code, or the text fallback) over a union-only
+  fee-schedule match, then (2) a PAID/settled invoice over UNPAID/OVERDUE, then
+  (3) earliest/stable order. Strong-first is deliberate: a PAID union-only match
+  must never outrank an UNPAID strong match, or the lockout would unlock exactly
+  the member it should hold. In the motivating scenario the paid subscription is
+  itself strong, so it still wins and a genuinely paid member is never marked
+  unpaid — the `matchedInvoiceId` upsert picks the paid subscription invoice, so
+  manual mark-paid provenance survives — even when an overlapping code exists.
+  With look-through OFF (a single-code set) selection is skipped and the legacy
+  first-match-in-list-order invoice is returned, byte-for-byte. The member-less
+  inbound reconciler sees one invoice at a time and treats it as a subscription
+  ONLY on a strong match (never a union-only fee-schedule code), so a shared-code
+  fee invoice writes no subscription audit links and triggers no per-member
+  refresh there; per-member detection still sees such invoices when a member's
+  full set is evaluated. The settings overlap warning still steers admins to give
+  subscriptions dedicated item codes.
+
+## INV-MONEY-021
+
+- Xero invoice identity is persisted before Xero email. Email retries reuse it.
+  Existing invoices are adopted only on an exact `AUTHORISED` snapshot match;
+  conflicts are visible and never trigger a silent provider rewrite. Xero
+  delivery resolves the snapshotted recipient member's current contact/email;
+  frozen name/email remain audit evidence rather than a stale delivery target.
+
+## INV-MONEY-022
+
+- A member has at most one joining-fee invoice (#1886, F21; formerly
+  "entrance-fee" — the Xero reference `` `Entrance fee (<Label>) - <memberId>` ``,
+  the `ENTRANCE_FEE_INVOICE` link role, and the member-scoped v1 mint key stay
+  frozen so the rename never re-invoices, #1931). The worker mints
+  only after re-checking the durable `ENTRANCE_FEE_INVOICE` link and, failing
+  that, looking the member-unique invoice reference (full member id, not a
+  truncated prefix) up in Xero. A found invoice is adopted only when it is THIS
+  member's own `AUTHORISED` invoice for the expected amount; a voided/deleted/
+  draft invoice is ignored (so it never blocks a legitimate re-issue), a
+  different-contact match is never adopted, and a wrong-amount or >1-match case
+  surfaces a visible `PROVIDER_MISMATCH`/`DUPLICATE_REFERENCE` conflict for
+  human reconciliation rather than a silent adopt-first. The enqueue-time guard
+  and its amount/category-keyed correlation dedupe are not sufficient — a
+  re-enqueue carrying a different amount override or a reclassified category
+  produces a fresh key. Concurrent double-minting is prevented by a member-scoped
+  Xero mint idempotency key (concurrent mints converge on one invoice, the same
+  provider-side convergence pattern as the contact path, F7/#1355) rather than a
+  DB lock held across the provider call; the DB-level backstop is the raw partial
+  unique index `XeroObjectLink_entrance_fee_active_unique` guaranteeing at most
+  one ACTIVE entrance-fee link per member. Residual: a same-day re-issue after a
+  void can be returned the voided invoice by the idempotency key within Xero's
+  key-retention window — acceptable for a one-time charge. Second residual: the
+  member-scoped mint key makes convergence Xero's responsibility, so if Xero ever
+  failed to collapse a concurrent duplicate, a second invoice could mint and its
+  link upsert would then fail on the partial unique index — leaving an orphan
+  invoice in Xero (no local double-link, so no local double-charge) that needs
+  operator reconciliation.
+
+## INV-MONEY-041
+
+A member-money event has exactly one complete journal at commit. Every line has
+positive integer cents and a source link in that journal; the event's own
+source kind, identity and version have a durable link. Debits equal credits in
+the header's single currency. The header's declared line, obligation and
+application counts must match. A nonzero event has at least two legs; an
+explicit zero event has none. `effectiveDate` is the club civil date of
+`effectiveAt`, derived through the club-time kernel (`INV-DATE`,
+`INV-CONFIG-002`); a date more than a day from the instant's UTC date is refused.
+A debtor is exactly one member or one organisation, as a booking's owner is.
+Receivable, credit and refund-payable legs name one, a member-credit leg names a
+member, never an organisation, and a leg or application tied to an obligation
+names the obligation's debtor. Tax evidence is either
+absent or a complete, nonnegative gross/net/tax split with gross = net + tax and
+a tax code. A taxed revenue leg carries its net cents, and on each side a
+batch's `GST_PAYABLE` legs sum to the tax its taxed revenue legs record.
+Corrections reverse exact frozen legs, swapping debit/credit; each original
+batch and line can be reversed only once. Reversals preserve currency, coding,
+policy, dimensions and evidence.
+
+PostgreSQL CHECKs, foreign keys, unique indexes and deferred constraint triggers
+enforce this even through direct SQL. `member_money_batch_errors` is the shared
+validation rule used by the triggers and the read-only verifier.
+M1 shipped inert: no legacy writer cohort is activated and no old source is required
+to have a journal link. M3a (#4626) adds one command, `postMemberMoneyEvent`;
+its store is the only writer; the booking doors reach it from M3b (`INV-MONEY-044`). Mandatory legacy links need backfill and worker drain
+in their writer milestone; a nullable bridge is never universal posting proof.
+
+## INV-MONEY-042
+
+A journal header records its creating PostgreSQL transaction id and the
+cluster's system identifier, both stamped by a trigger rather than trusted from
+a caller. Lines, obligations and applications can only be inserted in that
+transaction on that cluster, so a restore into a new cluster, which reuses
+transaction ids, cannot reopen a batch. A later balanced pair cannot extend a
+sealed batch. Immutable source links may be appended later to associate legacy
+confirmation evidence with an existing charge, without posting another charge.
+Every bridge to `BookingLedgerLine` retains its exact source identity through a
+unique RESTRICT foreign key. Its `MemberMoneySourcePosting` rows name exact
+legs in that same journal; a bridge to a nonzero journal requires leg coverage.
+Posted financial parents use RESTRICT with no
+update cascade. No legacy cascade was changed by M1; M2 did (`INV-MONEY-043`).
+
+The account chart uses stable internal enums; Xero account codes remain settings
+in the existing mapping registry. Keys the chart only proposes live in
+`PROPOSED_MEMBER_MONEY_MAPPING_KEYS`, outside every settings list, until the
+step that first reads one registers it. System receivables, member-credit and
+tax controls are reached through document/control bridges, never direct
+journals. An unset mapping cannot prevent local posting. No provider adapter is
+activated by registering an account.
+
+## INV-MONEY-043
+
+Financial history outlives its booking (#4514, Ledger M2; owner decision D1 on
+[#4482](https://github.com/thatskiff33/AlpineClubBookingsNZ/issues/4482), 28 Oct
+2026). These keys are `ON DELETE RESTRICT ON UPDATE RESTRICT`: every key a money
+line holds (`BookingLedgerLine`'s booking, lodge and reversed line, and every
+`MemberMoney*` key), a `MemberCredit` row's three booking links and a
+`GroupBookingSettlement`'s group. A referential action runs with the table
+owner's rights, so a cascade or a set-null would be a route around the
+application role's INSERT/SELECT grant; none exists. With the payment and
+refund records, already RESTRICT, they are the relations
+`booking-financial-history.ts` names once: the database refuses, for every
+role, to delete a booking any of them names.
+
+Such a booking is soft-deleted or left as it is, never hard-deleted. Only
+drafts are hard-deleted, and a draft never carries money. The draft route
+answers 409 and writes nothing for a draft those relations name; the nightly
+cleanup leaves such a draft out and reports it. Should money reach a draft
+between that read and the delete, the refusal rolls the night's whole batch
+back, nothing deleted. Member hard delete refuses a member the journal names as
+debtor, a retained identity string rather than a key. Personal data follows the
+retention schedule (#4457), which keeps these rows. Pins:
+`booking-financial-history-census.test.ts` (relations classified, money-line
+keys RESTRICT both ways), `booking-financial-history.realdb.test.ts` and
+`database-roles.realdb.test.ts` (an application-role delete is refused).
+
+## INV-MONEY-044
+
+From Ledger M3b (#4627), every legacy booking charge line a door writes is
+posted into the member-money journal once, in the same transaction, from the
+same stored lines: the confirmation poster (R01, group children included), the
+modification poster (R02/R03), review close (R21, keyed per closure), the
+cancellation poster (R04) and the back-post filling a door's gap (R26), each
+through `postBookingLedgerJournal` with a context resolved before the
+transaction. Nothing is re-priced: `journalComponentOfLegacyLine` maps each line
+to a component. Nights, the promotion, agreed adjustments and a kept
+cancellation fee fold into the booking's charge component; each change fee is
+its own. An event corrects a whole component and charges the remainder; a
+component a reduction would take below zero draws on the booking's others, and
+only a negative total is refused. Each line with money is bridged by its own
+receivable leg; the debtor is the booking's owner, read under its row lock. A
+first confirmation always posts R01, a ZERO event when it carries no money,
+and opens the booking's CHARGE obligation. Later events post only for a booking
+whose R01 is in the journal; one confirmed before M3b is M9's. A repeated event
+is a no-op, and a refusal is never caught. A club whose currency no card can be
+charged in has an inactive journal: decided before the transaction, its doors
+post nothing and proceed; once active, a booking's next event first fills what
+was missed, and the back-post fills the rest. Member merge refuses while it is
+inactive, and otherwise transfers the merged-away member's receivable balances
+after the owner move, under its `Member … FOR UPDATE` set (D4). `booking-ledger:census` checks each R01 booking's total (`JOURNAL`), and
+raises `UNBRIDGED_CHARGE_LINE`, `CONFIRMED_WITHOUT_R01` and `JOURNAL_INACTIVE`.
+Pins: `member-money-booking-charges.test.ts`,
+`member-money-journal-activity.test.ts`,
+`booking-ledger-projection-census-journal.test.ts`,
+`booking-ledger-journal.realdb.test.ts`.
+
+## INV-MONEY-045
+
+From Ledger M3c (#4628), a bank-transfer booking's charge is in the
+member-money journal from its binding moment: internet-banking create, switch
+to internet banking, and both school pay-on-account paths post R01 inside their
+`lock(1)` and lodge-key transaction, before any money arrives. No legacy line
+exists yet (`INV-MONEY-032`), so the door's legacy side plans, without writing,
+the lines its confirmation would post (`planConfirmationPostings`, the one plan
+the confirmation also writes), and each maps to its component by
+`journalComponentOfLegacyLine`; nothing is re-priced. R01 keeps the
+confirmation's key, so a booking charges once; its source version, `binding`,
+marks it pending. Until the legacy confirmation, an edit (R02) or cancellation
+(R04) re-states the pending charge from the same planners, the cancellation
+planner over the planned lines; a booking never bound posts nothing. The
+booking's first legacy lines, whichever door writes them (the settle, the Xero
+receipt, which now posts the confirmation's lines, an edit's auto-pay, the
+back-post), are linked to the binding R01 by source links appended to that
+sealed batch, with postings naming its receivable leg (`INV-MONEY-042`). They
+post no second charge; where a writer moved the price without posting, the
+journal is re-stated to the lines once (`chargeRestatement`), and that is
+logged. `booking-ledger:census` compares a pending charge with the booking's
+final price plus its recorded fees, or what a cancellation kept
+(`JOURNAL_PENDING`). Every booking write setting PAID or CANCELLED is
+classified as posting or not a sale; each posting write's own enclosing
+function calls its named poster at least once per such write, checked by
+function, not per file or per branch (#4928). Pins:
+`member-money-pending-charges.test.ts`,
+`booking-sale-status-writer-census.test.ts`,
+`booking-ledger-pending-charge.realdb.test.ts`.
+
+## INV-MONEY-047
+
+From Ledger M4b (#4516), every legacy cash writer records the money it receives
+in the member-money journal, in its own transaction, for a booking whose R01 is
+in the journal (`postBookingReceipts`): R06 for a card capture, keyed to its
+intent; R07 for a bank receipt; R08 for cash or an officer's settle. Cash posts
+in full. Collecting it is a separate, exact application to the booking's CHARGE
+obligation, capped by the receipt's room (C1) and the booking's live charge (C2,
+`INV-MONEY-050`), and made only for the instruments the writer wrote or decided
+in that transaction: the settle that paid the booking, an additional capture on
+a booking neither cancelled nor deleted, a Xero receipt that took the paid arm,
+a part payment or close for the row it wrote. A saved-card answer defers to its
+settle; a superseded or held capture never collects. Each receipt records how it
+was posted (`postedAs`), and only a `deferred` one is collected later. Each hook
+catches up the payment's other receipts unapplied. A ZERO R01 opens its CHARGE
+obligation lazily, with no second charge. An officer reversal first reverses
+the collection exactly, through whichever credit applied it, then the receipt.
+A merged member's survivor gets CHARGE successors from the chain's one live tip,
+lazily under the Payment row, never inside merge (D4). Organiser shares stay
+M6's; no legacy decision reader changes. `pnpm run
+member-money:receipt-catch-up` is a read-only census unless `--execute`. Pins:
+`member-money-capture-writer-census.test.ts` (every transaction mutation
+classified; a receipt hook at each capturing chokepoint),
+`member-money-receipts.test.ts`, `member-money-receipts.realdb.test.ts`.
+
+## INV-MONEY-048
+
+From Ledger M4c (#4516), each card-refund door posts its refund debt (R05) in
+its own transaction, for a booking whose R01 is in the journal: one obligation
+per debt record, keyed `refund-obligation|<scope>|<id>`, re-posted only under
+its reversal chain's next key. A superseded intent's and an automatic late
+capture's refund defer R05 to the sender. Before each slice,
+`refundPaymentTransactions` reserves it under Stripe's own key, in a short
+transaction holding only the Payment row, funded from that capture's own
+receipt after taking back exactly the shortfall of its collection
+(`refund-uncollect`). A key whose reservations were all released without a
+refund reserves its next generation (`<key>#<n>`) while Stripe is sent the key
+unchanged; a key a refund answered reserves nothing. With no receipt, no R05 or
+a merged debtor's receipt, nothing is reserved and the refund posts unapplied.
+The cash writer posts R12 once per counted refund, applied only through the
+reservation its own key names; R13 reverses an answer once. No refund is
+matched to a debt by amount or time. A failed refund releases its open
+reservation (REFUSED). A "Paid another way" close posts R14 from its record,
+trimmed to what is open, and a kept rest one close-out per record. Stripe
+requests, keys and metadata are unchanged. `pnpm run
+member-money:refund-reservations` lists stranded reservations, answers those a
+recovery row marks made, and releases another only on the owner's audited
+OPERATOR command. Pins: `member-money-refunds.test.ts`,
+`member-money-refunds.realdb.test.ts`,
+`card-refund-reservation-operator.test.ts`.
+
+## INV-MONEY-049
+
+From Ledger M4d (#4516), a hand-back the club pays by bank or in cash
+(`isJournalHandBackTask`) posts its refund debt (R05, scope `hand-back`) with
+its task, in the raise's transaction; marking it paid posts R14
+(`hand-back-paid:<task>`), funded only from the receipts that completion
+allocated. Cash is never refused for a cap: the applied part trims to what is
+open and the rest debits the owner's receivable. A task raised before M4d has
+no debt, so its payment posts unapplied. Dismissing a real bank or cash
+hand-back is refused for now (owner decision, 14 Nov 2026); a card shortfall's
+part to check, and a disputed card payment's hand-back once a lost dispute
+covers it, dismiss and withdraw the debt exactly, and a dispute lost for part
+of one reduces it by those cents. A kept late capture closes its unpaid,
+unreserved capture-return R05, then posts its keep (`kept-capture:<intent>`);
+approving it later reverses the keep first. Every `ManualRefundTask` creation
+in production code is classified as posting R05 (its own function calls
+`postHandBackObligation`), recorded by another step, or not a debt
+(`manual-refund-task-creation-census.test.ts`). `booking-ledger:census`
+reports `HAND_BACK_WITHOUT_EVENT`, `HAND_BACK_PAID_WITHOUT_EVENT`,
+`UNAPPLIED_HAND_BACK`, `HAND_BACK_OBLIGATION_DRIFT` and `KEEP_WITHOUT_EVENT` as
+integrity findings, excluding history before the journal's first M4d event.
+Its report v3 (`JOURNAL_REFUND_PAYABLE`) holds each R01 booking's open refund
+payable equal to what its legacy records still owe on the debts the journal
+holds: hand-backs at their owed cents, open card refund rows whose debt is
+still live at their unmade slices, and a late capture held open with its
+capture-return R05 and no such row at its task's amount. Pins:
+`member-money-hand-backs.realdb.test.ts`, `member-money-hand-back-census.test.ts`,
+`dispute-loss-hand-backs.realdb.test.ts`.
+
+## INV-MONEY-050
+
+Every member-money application obeys the conservation caps, checked by the
+store inside the batch's transaction under the booking's Payment row and by the
+read-only verifier (`memberMoneyConservationProblems`); a refusal names its
+code (`cap-problems.ts`) and is classified by that code, never by its text. C1:
+what a source line applies stays between zero and its amount. C2: a collection
+never takes the booking's collected total past its live charge, as the applying
+caller read it in the same transaction; it caps collection, never a refund. C3:
+a refund family's funding, and its paid plus reserved cents, never exceed its
+root obligation's face. C4: for each capture, a family's paid plus reserved
+cents never exceed what that capture funded. A refund's broken cap is a
+`MemberMoneyReservationRefused`; any other plan error is a fault. What a refusal
+does depends on the writer. Money handed back by bank or in cash is never
+refused: its applied part trims to what is open and the rest debits the
+receivable. A booking door's batch is part of the door's transaction, so a
+refusal rolls the door back (`INV-MONEY-044`). A card reservation is refused
+before Stripe is asked, in its own short transaction: the committed door
+stands, the sender throws, the recovery runner stops the row without a retry
+for the treasurer's "Paid another way", and a webhook sender holds the capture
+rather than ask for redelivery. Pins: `member-money-application-store.test.ts`,
+`member-money-applications.test.ts`, `member-money-refunds.test.ts`.

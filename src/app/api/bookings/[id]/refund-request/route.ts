@@ -1,0 +1,322 @@
+import { NextRequest, NextResponse } from "next/server";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { bookingOwner } from "@/lib/booking-owner";
+import { auth } from "@/lib/auth";
+import { requireActiveSessionUser } from "@/lib/session-guards";
+import { prisma } from "@/lib/prisma";
+import { logAudit } from "@/lib/audit";
+import { getClientIp } from "@/lib/rate-limit-http";
+import { sendAdminRefundRequestAlert } from "@/lib/email";
+import {
+  getRemainingRefundableCents,
+  getRemainingRefundableCentsNetOf,
+} from "@/lib/booking-payment-state";
+import { refundAppealHandedBackCents } from "@/lib/edit-refund-hand-back";
+import { hasAdminAccess } from "@/lib/access-roles";
+import { deletedBookingRefusalResponse } from "@/lib/deleted-booking-refusal";
+import { clubFormat } from "@/lib/club-format-server";
+import { organiserCardAppealCeilingFor } from "@/lib/organiser-child-refund";
+import { readSupersededCaptureHeldBack } from "@/lib/superseded-capture-hold-back";
+import { ORGANISER_CARD_APPEAL_PENDING_MEMBER_NOTE } from "@/lib/group-organiser-paid";
+import { refundAppealRequestSchema } from "@/lib/refund-appeal-request";
+import {
+  REFUND_APPEAL_CONNECTION_SHAPE,
+  REFUND_APPEAL_LIST_CONNECTION_SHAPE,
+} from "@/lib/connection-shapes-bookings";
+import {
+  arrivesAsMcpConnection,
+  connectionJson,
+  memberOnlySessionUser,
+} from "@/lib/mcp-connection-request";
+
+/*
+ * Refund appeals on a cancelled booking. Also the AI app actions
+ * `request_refund_review` (POST) and `list_my_refund_reviews` (GET), ALP-794.
+ * Both act as the member only: a Full Admin's reach to another member's
+ * booking reads the member-only user.
+ */
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const session = await auth();
+  if (!session?.user) {
+    return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+  }
+  const inactiveResponse = await requireActiveSessionUser(session.user.id);
+  if (inactiveResponse) return inactiveResponse;
+
+  const { id: bookingId } = await params;
+  const money = await clubFormat();
+
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    // #3369: the owner may be an Organisation; bookingOwner() reads both.
+    include: { payment: true, member: true, organisation: { select: { name: true, email: true } } },
+  });
+
+  if (!booking) {
+    return NextResponse.json({ error: "Booking not found" }, { status: 404 });
+  }
+
+  if (bookingOwner(booking).memberId !== session.user.id && !hasAdminAccess(memberOnlySessionUser(req, session.user))) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // #2674: a SOFT-DELETED booking is NOT FOUND here, for every caller.
+  //
+  // WHY THIS ROUTE, AND NOT THE ONE THE ISSUE WAS FILED ABOUT. #2674 came in
+  // against the arrival-time write, but that handler already refuses a deleted
+  // booking as a side effect of a gate it has for another reason: its status
+  // check admits only bookings that are still live. `Booking.deletedAt` has
+  // exactly ONE writer — `softDeleteCancelledBooking` in
+  // `src/lib/booking-delete.ts` — which refuses anything that is not already
+  // CANCELLED and never clears the column, and nothing in the codebase moves a
+  // booking back OUT of CANCELLED. A soft-deleted booking is therefore
+  // CANCELLED, permanently. Most of the write surface under this route folder
+  // inherits a free refusal from that fact.
+  //
+  // THIS ROUTE INVERTS IT, and that asymmetry is the whole finding. Its status
+  // gate immediately below is not a block, it is a REQUIREMENT: it demands
+  // `status === "CANCELLED"` and 400s everything else. So the one status a
+  // soft-deleted booking is guaranteed to carry is precisely the status this
+  // handler is looking for, and the appeal sailed straight through by
+  // construction — creating a RefundRequest row, a `refund-request.create`
+  // audit entry and an admin alert email about a booking the club has deleted
+  // from its own records. Nothing on the path read `deletedAt` at all.
+  //
+  // AND IT IS PRODUCIBLE, not merely reachable on paper. Soft-delete is blocked
+  // when money history exists, but the two sides count DIFFERENT tables:
+  // `getCancelledBookingDeleteBlockers` (booking-delete.ts) counts the
+  // PaymentTransaction LEDGER, while `getRemainingRefundableCents`
+  // (booking-payment-state.ts) reads the Payment MIRROR — SUCCEEDED or
+  // PARTIALLY_REFUNDED with a positive amount. A legacy mirror-only payment,
+  // a shape booking-cancel.ts explicitly acknowledges ("no ledger row for the
+  // outstanding intent (legacy mirror-only payment)"), satisfies both at once:
+  // deletable by the ledger's reckoning, still refundable by the mirror's. The
+  // ORDER is the other half of it — that same blocker list refuses a delete
+  // while a RefundRequest exists, so appeal-then-delete is already covered and
+  // delete-then-appeal is exactly the hole that check cannot close. This guard
+  // closes it from the other end.
+  //
+  // 404 FOR EVERY ROLE, INCLUDING A FULL ADMIN. `bookings/[id]/page.tsx`
+  // exempts admins (`booking.deletedAt && !isAdmin`) because a page is a
+  // record-VIEWING surface and an officer has a real reason to read a deleted
+  // booking. This is a write, and no downstream surface can act on the row it
+  // would create, so nobody of any role should be able to create it. Same shape
+  // as the sibling writes `send-guest-payment-link` and
+  // `requested-room/options` (#2673).
+  //
+  // AFTER the authorisation check, deliberately. Checked first it would answer
+  // 404 for a deleted booking and 403 for a live one, handing a caller with no
+  // claim on the booking a deleted-or-live oracle. This way an unauthorised
+  // caller gets 403 either way, and only someone entitled to the booking learns
+  // its state.
+  //
+  // No select change was needed: the read above uses `include`, so the whole
+  // booking row — `deletedAt` with it — is already in hand.
+  if (booking.deletedAt) {
+    return NextResponse.json({ error: "Booking not found" }, { status: 404 });
+  }
+
+  // Only cancelled bookings with partial or zero refund are eligible
+  if (booking.status !== "CANCELLED") {
+    return NextResponse.json(
+      { error: "Refund appeals are only available for cancelled bookings" },
+      { status: 400 }
+    );
+  }
+
+  if (!booking.payment || booking.payment.status === "REFUNDED") {
+    return NextResponse.json(
+      { error: "This booking already received a full refund" },
+      { status: 400 }
+    );
+  }
+
+  // Check for existing pending request
+  const existingRequest = await prisma.refundRequest.findFirst({
+    where: { bookingId, status: "PENDING" },
+  });
+
+  if (existingRequest) {
+    return NextResponse.json(
+      { error: "A refund appeal is already pending for this booking" },
+      { status: 400 }
+    );
+  }
+
+  const jsonBody = await parseJsonRequestBody(req);
+  if (!jsonBody.ok) return jsonBody.response;
+  const parsed = refundAppealRequestSchema.safeParse(jsonBody.body);
+  if (!parsed.success) {
+    return NextResponse.json({ error: "Validation failed", details: parsed.error.flatten() }, { status: 400 });
+  }
+
+  const { reason, requestedAmountCents } = parsed.data;
+
+  if (getRemainingRefundableCents(booking.payment) <= 0) {
+    return NextResponse.json(
+      { error: "No successful payment was captured for this booking" },
+      { status: 400 }
+    );
+  }
+
+  // #3827 (`INV-PAY-118`): what the member may ask for is the refundable cash
+  // NET of every refund promised back by bank transfer and not yet sent, of
+  // the account credit minted from a late bank transfer, and (#4124) of card
+  // refunds not yet made - the figure the approval caps at. Advisory, read
+  // without a lock: an appeal moves no money, and the approval re-reads it
+  // under `lock(1)` and the Payment row before anything is approved.
+  // #3956 (`INV-PAY-123`): a booking the group organiser paid for by card is
+  // refunded out of the organiser's combined payment, so what it can return is
+  // the room that payment and this booking still have - the figure the
+  // approval refuses past. Advisory here too, for the same reason.
+  const organiserCard = await organiserCardAppealCeilingFor(prisma, booking, booking.payment);
+  // A wait, not "nothing left": the group cancellation's own refund to the
+  // organiser's card is still to be made, and the appeal can be made after it.
+  if (organiserCard?.combinedRefundPending) {
+    return NextResponse.json({ error: ORGANISER_CARD_APPEAL_PENDING_MEMBER_NOTE }, { status: 409 });
+  }
+  const organiserCardCeiling = organiserCard?.ceilingCents ?? null;
+  const maxRefundable =
+    organiserCardCeiling ??
+    getRemainingRefundableCentsNetOf(booking.payment, await refundAppealHandedBackCents(prisma, booking.payment) + // #4872: less the hold-back, as approved
+      (await readSupersededCaptureHeldBack(prisma, booking.payment.id)).totalCents);
+  if (organiserCardCeiling !== null && maxRefundable <= 0) {
+    return NextResponse.json(
+      {
+        error:
+          "This booking was paid for by the group organiser's card, and that payment has nothing left to refund for it, so there is nothing further to appeal for.",
+      },
+      { status: 400 }
+    );
+  }
+  if (maxRefundable <= 0) {
+    return NextResponse.json(
+      {
+        error:
+          "Everything still refundable on this booking is already being returned to you, to your card, by bank transfer or as account credit, so there is nothing further to appeal for.",
+      },
+      { status: 400 }
+    );
+  }
+
+  if (requestedAmountCents && requestedAmountCents > maxRefundable) {
+    return NextResponse.json(
+      {
+        error: `Requested amount exceeds maximum refundable amount of ${money.cents(maxRefundable)}`,
+      },
+      { status: 400 }
+    );
+  }
+
+  const refundRequest = await prisma.refundRequest.create({
+    data: {
+      bookingId,
+      memberId: session.user.id,
+      reason,
+      requestedAmountCents: requestedAmountCents ?? null,
+    },
+  });
+
+  logAudit({
+    action: "refund-request.create",
+    memberId: session.user.id,
+    targetId: bookingId,
+    subjectMemberId: bookingOwner(booking).memberId,
+    entityType: "RefundRequest",
+    entityId: refundRequest.id,
+    category: "payment",
+    outcome: "success",
+    summary: "Refund appeal submitted",
+    details: `Refund appeal submitted${requestedAmountCents ? ` for ${money.cents(requestedAmountCents)}` : ""}`,
+    metadata: {
+      bookingId,
+      requestedAmountCents: requestedAmountCents ?? null,
+      maxRefundableCents: maxRefundable,
+    },
+    ipAddress: getClientIp(req),
+  });
+
+  // Notify admins
+  sendAdminRefundRequestAlert({
+    memberName: `${bookingOwner(booking).member.firstName} ${bookingOwner(booking).member.lastName}`,
+    bookingId,
+    checkIn: booking.checkIn,
+    checkOut: booking.checkOut,
+    reason,
+    requestedAmountCents: requestedAmountCents ?? null,
+    paidAmountCents: booking.payment.amountCents,
+    refundedAmountCents: booking.payment.refundedAmountCents,
+  }, money.format).catch(() => {});
+
+  return connectionJson(req, refundRequest, REFUND_APPEAL_CONNECTION_SHAPE, { status: 201 });
+}
+
+export async function GET(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const session = await auth();
+  if (!session?.user) {
+    return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+  }
+  const inactiveResponse = await requireActiveSessionUser(session.user.id);
+  if (inactiveResponse) return inactiveResponse;
+
+  const { id: bookingId } = await params;
+
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    // #2700: `deletedAt` selected beside the authority field, the way
+    // `requested-room/options` does it (`INV-ADDPAY-031`). The POST above reads
+    // the booking with `include` and already had it; this read did not, which is
+    // how the GET stayed unguarded while its own POST was closed in #2674.
+    select: { memberId: true, deletedAt: true },
+  });
+
+  if (!booking) {
+    return NextResponse.json({ error: "Booking not found" }, { status: 404 });
+  }
+
+  if (bookingOwner(booking).memberId !== session.user.id && !hasAdminAccess(memberOnlySessionUser(req, session.user))) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // The rule is `INV-ADDPAY-034`; `INV-ADDPAY-033`, which tracked this as an
+  // open decision, is now a superseded stub pointing there. Note the POST above
+  // deliberately keeps `INV-ADDPAY-031`'s byte-identical body while this GET
+  // carries the shared sentence — both are correct, and the difference is
+  // asserted in this route's deleted-booking test rather than accidental.
+  //
+  // #2700 — one of the two reads `INV-ADDPAY-033` tracked: it served a deleted
+  // booking's own refund appeals to its owner, while the booking page that links
+  // here refuses the record outright. Owner decision, 10 Aug 2026: refuse, with
+  // the SAME sentence the consent write uses rather than a bare 404, so a member
+  // following a stale link is told what happened.
+  //
+  // AFTER the 403 above, deliberately: a caller with no claim on the booking
+  // gets the same answer whether it is deleted or live, so this discloses
+  // nothing to anyone not already entitled to read it.
+  //
+  // No UI regression: `RefundAppealButton` — the only client of this endpoint —
+  // is rendered on `bookings/[id]/page.tsx` behind `!isDeleted`, so it never
+  // mounts against a deleted booking for any role, Full Admin included.
+  if (booking.deletedAt) {
+    return deletedBookingRefusalResponse();
+  }
+
+  const requests = await prisma.refundRequest.findMany({
+    where: { bookingId },
+    orderBy: { createdAt: "desc" },
+  });
+
+  // A connection is answered `{ refundReviews }`, an object its allow-list can
+  // project; the website's answer is the bare list, unchanged.
+  if (arrivesAsMcpConnection(req)) {
+    return connectionJson(req, { refundReviews: requests }, REFUND_APPEAL_LIST_CONNECTION_SHAPE);
+  }
+  return NextResponse.json(requests);
+}

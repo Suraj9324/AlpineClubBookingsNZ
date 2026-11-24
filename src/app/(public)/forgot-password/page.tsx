@@ -1,0 +1,117 @@
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { FieldHint, useFieldHint } from "@/components/ui/field-hint";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { FocusedActionError } from "@/components/focused-action-error";
+
+export default function ForgotPasswordPage() {
+  const [email, setEmail] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  // #2264 — the example address moves below the box. Greyed inside it, it reads
+  // as an address already filled in, which on a reset form invites a submit
+  // against the wrong account.
+  const emailHint = useFieldHint();
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+
+    try {
+      const res = await fetch("/api/auth/forgot-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error || "Something went wrong. Please try again.");
+        return;
+      }
+
+      setSubmitted(true);
+    } catch {
+      setError("Something went wrong. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (submitted) {
+    return (
+      <Card className="w-full max-w-md">
+        <CardHeader className="space-y-1">
+          <h1 className="sr-only">Reset your password</h1>
+          <CardTitle headingLevel={2} className="text-2xl font-bold text-center">Check your email</CardTitle>
+          <CardDescription className="text-center">
+            If an account exists for <strong>{email}</strong>, we&apos;ve sent a password
+            reset link. The link expires in 1 hour.
+          </CardDescription>
+        </CardHeader>
+        <CardFooter>
+          <Button asChild variant="outline" className="w-full">
+            <Link href="/login">Back to sign in</Link>
+          </Button>
+        </CardFooter>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="w-full max-w-md">
+      <CardHeader className="space-y-1">
+        <h1 className="sr-only">Reset your password</h1>
+        <CardTitle headingLevel={2} className="text-2xl font-bold text-center">Forgot your password?</CardTitle>
+        <CardDescription className="text-center">
+          Enter your email address and we&apos;ll send you a reset link.
+        </CardDescription>
+      </CardHeader>
+
+      <form onSubmit={handleSubmit}>
+        <CardContent className="space-y-4">
+          <FocusedActionError id="forgot-password-error" error={error} />
+
+          <div className="space-y-2">
+            <Label htmlFor="email">Email</Label>
+            <Input
+              id="email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              autoComplete="email"
+              {...emailHint.fieldProps}
+            />
+            <FieldHint {...emailHint.hintProps}>
+              Example: you@example.com
+            </FieldHint>
+          </div>
+        </CardContent>
+
+        <CardFooter className="flex flex-col gap-4">
+          <Button type="submit" className="w-full" disabled={loading}>
+            {loading ? "Sending…" : "Send reset link"}
+          </Button>
+
+          <p className="text-sm text-center text-muted-foreground">
+            Remembered it?{" "}
+            <Link
+              href="/login"
+              className="text-foreground font-medium underline-offset-4 hover:underline"
+            >
+              Back to sign in
+            </Link>
+          </p>
+        </CardFooter>
+      </form>
+    </Card>
+  );
+}

@@ -1,0 +1,703 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { CLUB_FORMAT_TEST } from "./support/club-format-fixture";
+
+// DB-only credential resolution (#2082): the secret key now comes from the
+// encrypted store via stripe-config, so mock that resolver instead of the env.
+vi.mock("@/lib/stripe-config", () => ({
+  getOperationalStripeSecretKey: vi.fn().mockResolvedValue("sk_test_fake"),
+}));
+
+// #4911 (`INV-PAY-154`): `processRefund` reads the capture's holding disputes
+// first; none unless a test says otherwise.
+const mockStripeDisputeFindMany = vi.fn();
+vi.mock("@/lib/prisma", () => ({
+  prisma: { stripeDispute: { findMany: (...args: unknown[]) => mockStripeDisputeFindMany(...args) } },
+}));
+
+// Mock Stripe before importing the module
+const mockPaymentIntentsCreate = vi.fn();
+const mockSetupIntentsCreate = vi.fn();
+const mockRefundsCreate = vi.fn();
+const mockRefundsList = vi.fn();
+const mockPaymentIntentsRetrieve = vi.fn();
+const mockPaymentIntentsCancel = vi.fn();
+const mockPaymentIntentsUpdate = vi.fn();
+// #3954 round 8: the metadata lookup's list, an async iterable per call.
+const mockPaymentIntentsList = vi.fn();
+const mockSetupIntentsRetrieve = vi.fn();
+const mockPaymentMethodsRetrieve = vi.fn();
+// #3268: retiring a permanently unusable saved card.
+const mockPaymentMethodsDetach = vi.fn();
+const mockCustomersCreate = vi.fn();
+const mockCustomersList = vi.fn();
+const mockWebhooksConstructEvent = vi.fn();
+// #4532: the Checkout Session a payment the app did not create went through.
+const mockCheckoutSessionsList = vi.fn();
+
+vi.mock("stripe", () => {
+  const MockStripe = function () {
+    return {
+      paymentIntents: {
+        create: mockPaymentIntentsCreate,
+        retrieve: mockPaymentIntentsRetrieve,
+        cancel: mockPaymentIntentsCancel,
+        list: mockPaymentIntentsList,
+        update: mockPaymentIntentsUpdate,
+      },
+      setupIntents: {
+        create: mockSetupIntentsCreate,
+        retrieve: mockSetupIntentsRetrieve,
+      },
+      paymentMethods: {
+        retrieve: mockPaymentMethodsRetrieve,
+        detach: mockPaymentMethodsDetach,
+      },
+      refunds: {
+        create: mockRefundsCreate,
+        list: mockRefundsList,
+      },
+      customers: {
+        create: mockCustomersCreate,
+        list: mockCustomersList,
+      },
+      webhooks: {
+        constructEvent: mockWebhooksConstructEvent,
+      },
+      checkout: {
+        sessions: { list: mockCheckoutSessionsList },
+      },
+    };
+  };
+  return { default: MockStripe };
+});
+
+const {
+  createPaymentIntent,
+  createSetupIntent,
+  chargePaymentMethod,
+  findOrCreateCustomer,
+  processRefund,
+  listRefundsForPaymentIntent,
+  getPaymentIntent,
+  cancelPaymentIntentIfCancellable,
+  getSetupIntent,
+  getPaymentMethod,
+  detachPaymentMethod,
+  constructWebhookEvent,
+  STRIPE_WEBHOOK_TOLERANCE_SECONDS,
+  stripeChargeCurrency,
+  UnsupportedChargeCurrencyError,
+  findRecentPaymentIntentByMetadata,
+  listRecentPaymentIntentsMatching,
+  findCheckoutSessionForPaymentIntent,
+  cancelPaymentIntentIfCancellableWithResult,
+  stampPaymentIntentMetadata,
+} = await import("../stripe");
+
+describe("Stripe library", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("createPaymentIntent", () => {
+    it("creates a PaymentIntent with correct params", async () => {
+      const mockPI = {
+        id: "pi_test_123",
+        client_secret: "pi_test_123_secret",
+        amount: 5000,
+        currency: "nzd",
+      };
+      mockPaymentIntentsCreate.mockResolvedValue(mockPI);
+
+      const result = await createPaymentIntent({
+        format: CLUB_FORMAT_TEST,
+        amountCents: 5000,
+        customerId: "cus_test",
+        metadata: { bookingId: "booking_1" },
+      });
+
+      expect(mockPaymentIntentsCreate).toHaveBeenCalledWith(
+        {
+          amount: 5000,
+          currency: "nzd",
+          customer: "cus_test",
+          metadata: { bookingId: "booking_1" },
+          automatic_payment_methods: { enabled: true },
+        },
+        undefined,
+      );
+      expect(result.id).toBe("pi_test_123");
+    });
+
+    /*
+      THE CHARGE CURRENCY IS THE CLUB'S STORED CURRENCY (#3567, owner decision
+      D1). There is no `currency` argument any more: the wire value is worked out
+      from the `format` every caller already passes, so shown and charged cannot
+      diverge. These pin the NZ default byte-for-byte, prove the argument is
+      load-bearing with a second currency, prove the server's CURRENCY has no
+      say, and prove a currency without two decimal places is refused before
+      Stripe is called (D3).
+    */
+    it("charges a club on the NZ default in nzd", async () => {
+      mockPaymentIntentsCreate.mockResolvedValue({ id: "pi_test" });
+
+      await createPaymentIntent({ format: CLUB_FORMAT_TEST, amountCents: 1000, metadata: { bookingId: "booking_1" } });
+
+      expect(mockPaymentIntentsCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ currency: "nzd" }),
+        undefined,
+      );
+    });
+
+    it("charges a club stored on AUD in aud", async () => {
+      mockPaymentIntentsCreate.mockResolvedValue({ id: "pi_test" });
+
+      await createPaymentIntent({
+        format: { currencyCode: "AUD", locale: "en-AU" },
+        amountCents: 1000,
+        metadata: { bookingId: "booking_1" },
+      });
+
+      expect(mockPaymentIntentsCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ currency: "aud" }),
+        undefined,
+      );
+    });
+
+    it("ignores the server's CURRENCY: a club stored on NZD is charged nzd under CURRENCY=AUD", async () => {
+      vi.stubEnv("CURRENCY", "AUD");
+      vi.stubEnv("NEXT_PUBLIC_CURRENCY", "AUD");
+      try {
+        mockPaymentIntentsCreate.mockResolvedValue({ id: "pi_test" });
+
+        await createPaymentIntent({ format: CLUB_FORMAT_TEST, amountCents: 1000, metadata: { bookingId: "booking_1" } });
+
+        expect(mockPaymentIntentsCreate).toHaveBeenCalledWith(
+          expect.objectContaining({ currency: "nzd" }),
+          undefined,
+        );
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it.each(["JPY", "KWD", "jpy"])(
+      "refuses to charge in %s, which does not count in hundredths, before calling Stripe",
+      async (currencyCode) => {
+        await expect(
+          createPaymentIntent({
+            format: { currencyCode, locale: "en-NZ" },
+            amountCents: 845000,
+            metadata: { bookingId: "booking_1" },
+          }),
+        ).rejects.toBeInstanceOf(UnsupportedChargeCurrencyError);
+        await expect(
+          chargePaymentMethod({
+            format: { currencyCode, locale: "en-NZ" },
+            amountCents: 845000,
+            customerId: "cus_test",
+            paymentMethodId: "pm_test",
+            metadata: { bookingId: "booking_1" },
+          }),
+        ).rejects.toThrow(/does not count in hundredths/);
+        expect(mockPaymentIntentsCreate).not.toHaveBeenCalled();
+      },
+    );
+
+    it("refuses to charge for a club whose STORED currency is JPY, though it displays NZD (#3567 re-review)", async () => {
+      const stored = { currencyCode: "NZD", locale: "en-NZ", unusableStoredCurrency: "JPY" };
+      await expect(createPaymentIntent({ format: stored, amountCents: 500000, metadata: { bookingId: "booking_1" } })).rejects.toBeInstanceOf(
+        UnsupportedChargeCurrencyError,
+      );
+      expect(mockPaymentIntentsCreate).not.toHaveBeenCalled();
+    });
+
+    it("exposes the derivation it uses, so a caller can never pass a second answer", () => {
+      expect(stripeChargeCurrency(CLUB_FORMAT_TEST)).toBe("nzd");
+      expect(stripeChargeCurrency({ currencyCode: "CHF", locale: "de-CH" })).toBe("chf");
+    });
+  });
+
+  describe("createSetupIntent", () => {
+    it("creates a SetupIntent with correct params", async () => {
+      const mockSI = {
+        id: "seti_test_123",
+        client_secret: "seti_test_123_secret",
+      };
+      mockSetupIntentsCreate.mockResolvedValue(mockSI);
+
+      const result = await createSetupIntent({
+        customerId: "cus_test",
+        metadata: { bookingId: "booking_1" },
+      });
+
+      expect(mockSetupIntentsCreate).toHaveBeenCalledWith(
+        {
+          customer: "cus_test",
+          metadata: { bookingId: "booking_1" },
+          automatic_payment_methods: { enabled: true },
+        },
+        undefined,
+      );
+      expect(result.id).toBe("seti_test_123");
+    });
+  });
+
+  describe("findCheckoutSessionForPaymentIntent (#4532)", () => {
+    it("asks for the intent's session with its line items, bounded, and returns it", async () => {
+      mockCheckoutSessionsList.mockResolvedValue({ data: [{ id: "cs_1", payment_link: "plink_1" }] });
+
+      await expect(findCheckoutSessionForPaymentIntent("pi_1")).resolves.toEqual({ id: "cs_1", payment_link: "plink_1" });
+      expect(mockCheckoutSessionsList).toHaveBeenCalledWith(
+        { payment_intent: "pi_1", limit: 1, expand: ["data.line_items"] },
+        { timeout: 10_000, maxNetworkRetries: 0 },
+      );
+    });
+
+    it("returns null for an intent taken outside Checkout (a dashboard charge)", async () => {
+      mockCheckoutSessionsList.mockResolvedValue({ data: [] });
+
+      await expect(findCheckoutSessionForPaymentIntent("pi_2")).resolves.toBeNull();
+    });
+  });
+
+  describe("chargePaymentMethod", () => {
+    it("creates an off-session PaymentIntent with confirm=true", async () => {
+      const mockPI = { id: "pi_charge_123", status: "succeeded" };
+      mockPaymentIntentsCreate.mockResolvedValue(mockPI);
+
+      const result = await chargePaymentMethod({
+        format: CLUB_FORMAT_TEST,
+        amountCents: 8000,
+        customerId: "cus_test",
+        paymentMethodId: "pm_test",
+        metadata: { bookingId: "booking_2" },
+      });
+
+      expect(mockPaymentIntentsCreate).toHaveBeenCalledWith(
+        {
+          amount: 8000,
+          currency: "nzd",
+          customer: "cus_test",
+          payment_method: "pm_test",
+          off_session: true,
+          confirm: true,
+          metadata: { bookingId: "booking_2" },
+        },
+        undefined,
+      );
+      expect(result.id).toBe("pi_charge_123");
+    });
+  });
+
+  describe("findOrCreateCustomer", () => {
+    it("returns the existing customer for the same member", async () => {
+      const existingCustomer = {
+        id: "cus_existing",
+        email: "test@example.com",
+        metadata: { memberId: "member_1" },
+      };
+      const otherCustomer = {
+        id: "cus_other",
+        email: "test@example.com",
+        metadata: { memberId: "member_other" },
+      };
+      mockCustomersList.mockResolvedValue({ data: [otherCustomer, existingCustomer] });
+
+      const result = await findOrCreateCustomer({
+        email: "test@example.com",
+        name: "Test User",
+        memberId: "member_1",
+      });
+
+      expect(mockCustomersList).toHaveBeenCalledWith({
+        email: "test@example.com",
+        limit: 100,
+      });
+      expect(result.id).toBe("cus_existing");
+      expect(mockCustomersCreate).not.toHaveBeenCalled();
+    });
+
+    it("creates a new customer when the email belongs to a different member", async () => {
+      mockCustomersList.mockResolvedValue({
+        data: [
+          {
+            id: "cus_other",
+            email: "shared@example.com",
+            metadata: { memberId: "member_1" },
+          },
+        ],
+      });
+      const newCustomer = { id: "cus_new", email: "shared@example.com" };
+      mockCustomersCreate.mockResolvedValue(newCustomer);
+
+      const result = await findOrCreateCustomer({
+        email: "shared@example.com",
+        name: "Second User",
+        memberId: "member_2",
+      });
+
+      expect(mockCustomersCreate).toHaveBeenCalledWith({
+        email: "shared@example.com",
+        name: "Second User",
+        metadata: { memberId: "member_2" },
+      });
+      expect(result.id).toBe("cus_new");
+    });
+  });
+
+  describe("processRefund", () => {
+    beforeEach(() => {
+      mockStripeDisputeFindMany.mockReset().mockResolvedValue([]);
+    });
+
+    it("#4911 (INV-PAY-154): refuses a capture with an open or lost dispute before Stripe is asked", async () => {
+      mockStripeDisputeFindMany.mockResolvedValue([
+        { stripeDisputeId: "dp_1", stripePaymentIntentId: "pi_test_123", status: "LOST", amountCents: 5000 },
+      ]);
+
+      const refused = processRefund({ paymentIntentId: "pi_test_123", amountCents: 5000, metadata: { bookingId: "booking_1" } });
+
+      await expect(refused).rejects.toMatchObject({ name: "DisputedCaptureRefundRefusedError", paymentIntentId: "pi_test_123", lost: true });
+      await expect(refused).rejects.toThrow(/Stripe dispute dp_1 \(lost\)/);
+      expect(mockRefundsCreate).not.toHaveBeenCalled();
+      expect(mockStripeDisputeFindMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: { stripePaymentIntentId: { in: ["pi_test_123"] }, status: { in: ["OPEN", "LOST"] } },
+      }));
+    });
+
+    it("#4911: with no open or lost dispute on the capture (a won one is not read), the refund is sent", async () => {
+      mockRefundsCreate.mockResolvedValue({ id: "re_test_123", amount: 5000 });
+
+      await processRefund({ paymentIntentId: "pi_test_123", amountCents: 5000, metadata: { bookingId: "booking_1" } });
+
+      expect(mockRefundsCreate).toHaveBeenCalledTimes(1);
+    });
+
+    it("creates a refund with correct params", async () => {
+      const mockRefund = { id: "re_test_123", amount: 5000 };
+      mockRefundsCreate.mockResolvedValue(mockRefund);
+
+      const result = await processRefund({
+        paymentIntentId: "pi_test_123",
+        amountCents: 5000,
+        metadata: { bookingId: "booking_1", reason: "cancellation" },
+      });
+
+      expect(mockRefundsCreate).toHaveBeenCalledWith({
+        payment_intent: "pi_test_123",
+        amount: 5000,
+        reason: "requested_by_customer",
+        metadata: { bookingId: "booking_1", reason: "cancellation" },
+      });
+      expect(result.id).toBe("re_test_123");
+    });
+
+    it("#4510 (INV-PAY-147): stamps the request's own key as refundSliceKey only when asked", async () => {
+      mockRefundsCreate.mockResolvedValue({ id: "re_test_123", amount: 5000 });
+      const metadata = { bookingId: "booking_1", reason: "cancellation" };
+      const request = { paymentIntentId: "pi_test_123", amountCents: 5000, metadata, idempotencyKey: "prefix_txn_1_5000" };
+      const params = { payment_intent: "pi_test_123", amount: 5000, reason: "requested_by_customer" };
+
+      await processRefund({ ...request, stampRefundSliceKey: true });
+      await processRefund({ ...request, stampRefundSliceKey: false });
+      await processRefund(request);
+
+      expect(mockRefundsCreate.mock.calls).toEqual([
+        [{ ...params, metadata: { ...metadata, refundSliceKey: "prefix_txn_1_5000" } }, { idempotencyKey: "prefix_txn_1_5000" }],
+        [{ ...params, metadata }, { idempotencyKey: "prefix_txn_1_5000" }],
+        [{ ...params, metadata }, { idempotencyKey: "prefix_txn_1_5000" }],
+      ]);
+      expect(metadata).toEqual({ bookingId: "booking_1", reason: "cancellation" });
+      // A stamp with no key would name no request: refused before Stripe is asked.
+      mockRefundsCreate.mockClear();
+      await expect(processRefund({ ...request, idempotencyKey: undefined, stampRefundSliceKey: true })).rejects.toThrow(/INV-PAY-147/);
+      expect(mockRefundsCreate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("getPaymentIntent", () => {
+    it("retrieves a PaymentIntent by ID", async () => {
+      mockPaymentIntentsRetrieve.mockResolvedValue({
+        id: "pi_test_123",
+        status: "succeeded",
+      });
+
+      const result = await getPaymentIntent("pi_test_123");
+      expect(mockPaymentIntentsRetrieve).toHaveBeenCalledWith("pi_test_123");
+      expect(result.id).toBe("pi_test_123");
+    });
+  });
+
+  describe("cancelPaymentIntentIfCancellable", () => {
+    it("cancels intents that are still open with a customer-requested reason", async () => {
+      mockPaymentIntentsRetrieve.mockResolvedValue({
+        id: "pi_open",
+        status: "requires_payment_method",
+      });
+      mockPaymentIntentsCancel.mockResolvedValue({
+        id: "pi_open",
+        status: "canceled",
+      });
+
+      const result = await cancelPaymentIntentIfCancellable("pi_open");
+
+      expect(mockPaymentIntentsCancel).toHaveBeenCalledWith("pi_open", {
+        cancellation_reason: "requested_by_customer",
+      });
+      expect(result).toEqual({
+        id: "pi_open",
+        status: "canceled",
+      });
+    });
+
+    it("does not cancel intents that are already terminal", async () => {
+      mockPaymentIntentsRetrieve.mockResolvedValue({
+        id: "pi_done",
+        status: "succeeded",
+      });
+
+      const result = await cancelPaymentIntentIfCancellable("pi_done");
+
+      expect(mockPaymentIntentsCancel).not.toHaveBeenCalled();
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("getSetupIntent", () => {
+    it("retrieves a SetupIntent by ID", async () => {
+      mockSetupIntentsRetrieve.mockResolvedValue({
+        id: "seti_test_123",
+        status: "succeeded",
+      });
+
+      const result = await getSetupIntent("seti_test_123");
+      expect(mockSetupIntentsRetrieve).toHaveBeenCalledWith("seti_test_123");
+      expect(result.id).toBe("seti_test_123");
+    });
+  });
+
+  describe("getPaymentMethod (#3266)", () => {
+    it("retrieves a PaymentMethod by ID", async () => {
+      mockPaymentMethodsRetrieve.mockResolvedValue({
+        id: "pm_test_123",
+        customer: "cus_test",
+      });
+
+      const result = await getPaymentMethod("pm_test_123");
+      expect(mockPaymentMethodsRetrieve).toHaveBeenCalledWith("pm_test_123");
+      expect(result.customer).toBe("cus_test");
+    });
+
+    it("throws the Stripe error unchanged so the caller can read its code", async () => {
+      const missing = Object.assign(new Error("No such PaymentMethod"), {
+        code: "resource_missing",
+        statusCode: 404,
+      });
+      mockPaymentMethodsRetrieve.mockRejectedValue(missing);
+
+      await expect(getPaymentMethod("pm_gone")).rejects.toBe(missing);
+    });
+  });
+
+  describe("detachPaymentMethod (#3268)", () => {
+    it("detaches the PaymentMethod by id and returns Stripe's object", async () => {
+      mockPaymentMethodsDetach.mockResolvedValue({ id: "pm_dead", customer: null });
+
+      const result = await detachPaymentMethod("pm_dead");
+
+      expect(mockPaymentMethodsDetach).toHaveBeenCalledWith("pm_dead");
+      expect(result).toEqual({ id: "pm_dead", customer: null });
+    });
+
+    it("lets a Stripe rejection propagate — the caller decides it is harmless", async () => {
+      mockPaymentMethodsDetach.mockRejectedValue(new Error("not attached"));
+
+      await expect(detachPaymentMethod("pm_dead")).rejects.toThrow("not attached");
+    });
+  });
+
+  describe("constructWebhookEvent", () => {
+    it("calls Stripe webhooks.constructEvent with correct params", async () => {
+      const mockEvent = { id: "evt_test", type: "payment_intent.succeeded" };
+      mockWebhooksConstructEvent.mockReturnValue(mockEvent);
+
+      const result = await constructWebhookEvent(
+        "payload_body",
+        "sig_header",
+        "whsec_test"
+      );
+
+      expect(mockWebhooksConstructEvent).toHaveBeenCalledWith(
+        "payload_body",
+        "sig_header",
+        "whsec_test",
+        STRIPE_WEBHOOK_TOLERANCE_SECONDS
+      );
+      expect(STRIPE_WEBHOOK_TOLERANCE_SECONDS).toBe(300);
+      expect(result.type).toBe("payment_intent.succeeded");
+    });
+  });
+});
+
+/**
+ * #3954 round 8 (F3): a re-issue's earlier intent is looked for by the
+ * customer the caller resolved first, and then across the account - the
+ * earlier request may have named another customer.
+ */
+describe("findRecentPaymentIntentByMetadata", () => {
+  const listOf = (intents: Array<{ id: string; metadata: Record<string, string> }>) => ({
+    async *[Symbol.asyncIterator]() {
+      yield* intents;
+    },
+  });
+  const CALL = {
+    metadataKey: "reissuedAskKey",
+    metadataValue: "mod_reissued_ask_mod_1",
+    createdSince: new Date("2026-07-01T00:00:00.000Z"),
+  };
+
+  beforeEach(() => {
+    mockPaymentIntentsList.mockReset();
+  });
+
+  it("finds it among the caller's customer's intents without scanning the account", async () => {
+    mockPaymentIntentsList.mockReturnValueOnce(listOf([{ id: "pi_found", metadata: { reissuedAskKey: "mod_reissued_ask_mod_1" } }]));
+    const found = await findRecentPaymentIntentByMetadata({ ...CALL, customerId: "cus_1" });
+    expect(found?.id).toBe("pi_found");
+    expect(mockPaymentIntentsList).toHaveBeenCalledTimes(1);
+    expect(mockPaymentIntentsList).toHaveBeenCalledWith(expect.objectContaining({ customer: "cus_1" }));
+  });
+
+  it("MUTATION: not found under the caller's customer, it falls back to a bounded scan of the account with no customer filter", async () => {
+    mockPaymentIntentsList
+      .mockReturnValueOnce(listOf([{ id: "pi_other", metadata: {} }]))
+      .mockReturnValueOnce(listOf([{ id: "pi_found", metadata: { reissuedAskKey: "mod_reissued_ask_mod_1" } }]));
+    const found = await findRecentPaymentIntentByMetadata({ ...CALL, customerId: "cus_1", maxScanned: 5 });
+    expect(found?.id).toBe("pi_found");
+    expect(mockPaymentIntentsList).toHaveBeenCalledTimes(2);
+    expect(mockPaymentIntentsList.mock.calls[1]![0]).not.toHaveProperty("customer");
+  });
+
+  it("stops each scan at maxScanned and answers null when neither finds it", async () => {
+    const many = Array.from({ length: 10 }, (_, index) => ({ id: `pi_${index}`, metadata: {} }));
+    mockPaymentIntentsList.mockReturnValueOnce(listOf(many)).mockReturnValueOnce(listOf([
+      ...many,
+      { id: "pi_late", metadata: { reissuedAskKey: "mod_reissued_ask_mod_1" } },
+    ]));
+    expect(await findRecentPaymentIntentByMetadata({ ...CALL, customerId: "cus_1", maxScanned: 10 })).toBeNull();
+  });
+});
+
+/*
+ * #4036: an ordinary ask's refused replay must tell one candidate from several,
+ * so the listing returns every match from BOTH bounded scans - the caller's
+ * customer's and the account's - merged by id, and says when a scan stopped at
+ * its bound with intents unread (review round: a truncated scan fails closed).
+ */
+describe("listRecentPaymentIntentsMatching", () => {
+  const listOf = (intents: Array<{ id: string; amount: number }>) => ({
+    async *[Symbol.asyncIterator]() {
+      yield* intents;
+    },
+  });
+  const matches = (intent: { amount: number }) => intent.amount === 6_000;
+  const createdSince = new Date("2026-07-01T00:00:00.000Z");
+
+  beforeEach(() => {
+    mockPaymentIntentsList.mockReset();
+  });
+
+  it("MUTATION: a match under the caller's customer never hides a second one under another customer", async () => {
+    mockPaymentIntentsList
+      .mockReturnValueOnce(listOf([{ id: "pi_mine", amount: 6_000 }, { id: "pi_small", amount: 10 }]))
+      .mockReturnValueOnce(listOf([{ id: "pi_mine", amount: 6_000 }, { id: "pi_theirs", amount: 6_000 }]));
+    const found = await listRecentPaymentIntentsMatching({ matches: matches as never, createdSince, customerId: "cus_1" });
+    expect(found.intents.map((intent) => intent.id)).toEqual(["pi_mine", "pi_theirs"]);
+    expect(found.complete).toBe(true);
+    expect(mockPaymentIntentsList.mock.calls[0]![0]).toEqual(expect.objectContaining({ customer: "cus_1", created: { gte: 1782864000 } }));
+    expect(mockPaymentIntentsList.mock.calls[1]![0]).not.toHaveProperty("customer");
+  });
+
+  it("MUTATION: a scan that stops at maxScanned with intents unread says the list is incomplete", async () => {
+    mockPaymentIntentsList.mockReturnValueOnce(
+      listOf([{ id: "pi_1", amount: 6_000 }, { id: "pi_2", amount: 6_000 }, { id: "pi_3", amount: 6_000 }]),
+    );
+    const found = await listRecentPaymentIntentsMatching({ matches: matches as never, createdSince, maxScanned: 2 });
+    expect(found).toEqual({ intents: [expect.objectContaining({ id: "pi_1" }), expect.objectContaining({ id: "pi_2" })], complete: false });
+    expect(mockPaymentIntentsList).toHaveBeenCalledTimes(1);
+  });
+
+  it("only the customer's scan truncated still makes the whole list incomplete", async () => {
+    mockPaymentIntentsList
+      .mockReturnValueOnce(listOf([{ id: "pi_1", amount: 6_000 }, { id: "pi_2", amount: 6_000 }]))
+      .mockReturnValueOnce(listOf([{ id: "pi_1", amount: 6_000 }]));
+    const found = await listRecentPaymentIntentsMatching({ matches: matches as never, createdSince, customerId: "cus_1", maxScanned: 2 });
+    expect(found.complete).toBe(false);
+  });
+
+  it("MUTATION: #4079 - an upper bound reaches both scans as Stripe's created.lte, so later intents are never read", async () => {
+    mockPaymentIntentsList.mockReturnValueOnce(listOf([])).mockReturnValueOnce(listOf([]));
+    const createdUntil = new Date("2026-07-01T00:01:00.500Z");
+    await listRecentPaymentIntentsMatching({ matches: matches as never, createdSince, createdUntil, customerId: "cus_1" });
+    for (const [args] of mockPaymentIntentsList.mock.calls) {
+      expect((args as { created: unknown }).created).toEqual({ gte: 1782864000, lte: 1782864060 });
+    }
+    expect(mockPaymentIntentsList).toHaveBeenCalledTimes(2);
+  });
+
+  it("MUTATION (#4693 review): a bounded scan sends every page request with its timeout and no retries", async () => {
+    mockPaymentIntentsList.mockReturnValueOnce(listOf([])).mockReturnValueOnce(listOf([]));
+    await listRecentPaymentIntentsMatching({ matches: matches as never, createdSince, customerId: "cus_1", timeoutMs: 5_000 });
+    for (const call of mockPaymentIntentsList.mock.calls) expect(call[1]).toEqual({ timeout: 5_000, maxNetworkRetries: 0 });
+    expect(mockPaymentIntentsList).toHaveBeenCalledTimes(2);
+  });
+
+  it("a window read to its end is complete", async () => {
+    mockPaymentIntentsList.mockReturnValueOnce(listOf([{ id: "pi_1", amount: 6_000 }, { id: "pi_2", amount: 10 }]));
+    const found = await listRecentPaymentIntentsMatching({ matches: matches as never, createdSince, maxScanned: 3 });
+    expect(found).toEqual({ intents: [expect.objectContaining({ id: "pi_1" })], complete: true });
+  });
+});
+
+
+describe("bounded refund preflight listing", () => {
+  it("makes one request with no network retries and a timeout", async () => {
+    mockRefundsList.mockResolvedValue({ data: [{ id: "re_test" }], has_more: false });
+    await expect(listRefundsForPaymentIntent("pi_test", { timeoutMs: 10_000, singlePage: true }))
+      .resolves.toEqual([{ id: "re_test" }]);
+    expect(mockRefundsList).toHaveBeenCalledExactlyOnceWith(
+      { payment_intent: "pi_test", limit: 100 }, { timeout: 10_000, maxNetworkRetries: 0 },
+    );
+  });
+
+  it("refuses an incomplete page instead of silently allowing a re-send", async () => {
+    mockRefundsList.mockResolvedValue({ data: [], has_more: true });
+    await expect(listRefundsForPaymentIntent("pi_test", { timeoutMs: 10_000, singlePage: true }))
+      .rejects.toThrow("INV-PAY-145");
+    expect(mockRefundsList).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("#4693 review: an abandoned ask's cleanup bounds each Stripe request", () => {
+  it("MUTATION: a bounded cancel bounds its read and its cancel, with no retries", async () => {
+    mockPaymentIntentsRetrieve.mockResolvedValueOnce({ id: "pi_1", status: "requires_payment_method" });
+    mockPaymentIntentsCancel.mockResolvedValueOnce({ id: "pi_1", status: "canceled" });
+    await cancelPaymentIntentIfCancellableWithResult("pi_1", { cancellationReason: "abandoned", timeoutMs: 5_000 });
+    expect(mockPaymentIntentsRetrieve).toHaveBeenLastCalledWith("pi_1", {}, { timeout: 5_000, maxNetworkRetries: 0 });
+    expect(mockPaymentIntentsCancel).toHaveBeenLastCalledWith("pi_1", { cancellation_reason: "abandoned" }, { timeout: 5_000, maxNetworkRetries: 0 });
+  });
+
+  it("an unbounded cancel sends exactly what it always sent", async () => {
+    mockPaymentIntentsRetrieve.mockResolvedValueOnce({ id: "pi_1", status: "requires_payment_method" });
+    mockPaymentIntentsCancel.mockResolvedValueOnce({ id: "pi_1", status: "canceled" });
+    await cancelPaymentIntentIfCancellableWithResult("pi_1");
+    expect(mockPaymentIntentsRetrieve).toHaveBeenLastCalledWith("pi_1");
+    expect(mockPaymentIntentsCancel).toHaveBeenLastCalledWith("pi_1", { cancellation_reason: "requested_by_customer" });
+  });
+
+  it("the runner's stamp is a bounded metadata update", async () => {
+    await stampPaymentIntentMetadata("pi_1", { askRecoveryId: "op_1" }, { timeoutMs: 5_000 });
+    expect(mockPaymentIntentsUpdate).toHaveBeenLastCalledWith("pi_1", { metadata: { askRecoveryId: "op_1" } }, { timeout: 5_000, maxNetworkRetries: 0 });
+  });
+});

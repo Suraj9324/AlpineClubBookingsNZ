@@ -1,0 +1,591 @@
+import { renderToStaticMarkup } from "react-dom/server";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  auth: vi.fn(),
+  bookingFindFirst: vi.fn(),
+  bookingFindMany: vi.fn(),
+  calendarEventFindMany: vi.fn(),
+  checkCapacity: vi.fn(),
+  deriveBookingAppliedCreditCents: vi.fn(),
+  getAvailablePromoCodesForMember: vi.fn(),
+  getMemberCreditBalance: vi.fn(),
+  hasAccessRole: vi.fn(),
+  isHutLeader: vi.fn(),
+  loadEffectiveModuleFlags: vi.fn(),
+  lockerFindMany: vi.fn(),
+  lodgeCount: vi.fn(async () => 1),
+  memberFindUnique: vi.fn(),
+  memberInductionFindFirst: vi.fn(),
+}));
+
+vi.mock("next/navigation", () => ({
+  redirect: vi.fn((path: string) => {
+    throw new Error(`redirect:${path}`);
+  }),
+}));
+
+vi.mock("@/lib/auth", () => ({
+  auth: mocks.auth,
+}));
+
+vi.mock("@/lib/prisma", () => ({
+  prisma: {
+    booking: {
+      findFirst: mocks.bookingFindFirst,
+      findMany: mocks.bookingFindMany,
+    },
+    locker: {
+      findMany: mocks.lockerFindMany,
+    },
+    // INV-CAP-039: the active-lodge count behind the rows' lodge line.
+    // Defaulted to a single-lodge club, whose rows carry no lodge name.
+    lodge: {
+      count: mocks.lodgeCount,
+    },
+    member: {
+      findUnique: mocks.memberFindUnique,
+    },
+    memberInduction: { findFirst: mocks.memberInductionFindFirst },
+    calendarEvent: {
+      findMany: mocks.calendarEventFindMany,
+    },
+  },
+}));
+
+vi.mock("@/lib/member-credit", () => ({
+  getMemberCreditBalance: mocks.getMemberCreditBalance,
+  // The ledger credit applied to a booking, which `readBookingAmountOwed` (real)
+  // nets from what the Payment Owed card quotes (#4944).
+  deriveBookingAppliedCreditCents: mocks.deriveBookingAppliedCreditCents,
+  // #3369: the one home for the account-credit refusal four settlement paths
+  // share. Real, not stubbed: the mock must not turn a refusal into a pass.
+  requireMemberCreditRecipient: (memberId: string | null) => {
+    if (!memberId) throw new Error("no account to credit (#3369)");
+    return memberId;
+  },
+}));
+
+vi.mock("@/lib/promo", () => ({
+  getAvailablePromoCodesForMember: mocks.getAvailablePromoCodesForMember,
+}));
+
+vi.mock("@/lib/module-settings", () => ({
+  loadEffectiveModuleFlags: mocks.loadEffectiveModuleFlags,
+}));
+
+vi.mock("@/lib/access-roles", async (importOriginal) => ({
+  ...((await importOriginal()) as typeof import("@/lib/access-roles")),
+  hasAccessRole: mocks.hasAccessRole,
+}));
+
+vi.mock("@/lib/hut-leader", () => ({
+  isHutLeader: mocks.isHutLeader,
+}));
+
+vi.mock("@/lib/capacity", () => ({
+  checkCapacity: mocks.checkCapacity,
+}));
+
+import DashboardPage from "../page";
+
+function moduleFlags() {
+  return {
+    kiosk: false,
+    chores: false,
+    financeDashboard: false,
+    waitlist: false,
+    xeroIntegration: false,
+    bedAllocation: false,
+    internetBankingPayments: false,
+    addressAutocomplete: false,
+    groupBookings: false,
+    lockers: false,
+    induction: false,
+    workParties: false,
+    promoCodes: true,
+    hutLeaders: false,
+    communications: false,
+    skifieldConditions: false,
+    skifieldWhakapapa: false,
+    twoFactor: false,
+    analytics: false,
+  };
+}
+
+async function renderDashboardPage() {
+  return renderToStaticMarkup(await DashboardPage());
+}
+
+describe("DashboardPage summary card drill-downs", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.auth.mockResolvedValue({
+      user: {
+        id: "member-1",
+        name: "Mere Member",
+      },
+    });
+    mocks.bookingFindFirst.mockResolvedValue(null);
+    mocks.bookingFindMany
+      .mockResolvedValueOnce([
+        {
+          id: "upcoming-1",
+          memberId: "member-1",
+          lodgeId: "lodge-1",
+          checkIn: new Date("2026-08-10T00:00:00.000Z"),
+          checkOut: new Date("2026-08-12T00:00:00.000Z"),
+          status: "CONFIRMED",
+          finalPriceCents: 18000,
+          lodge: { name: "Ruapehu Lodge", active: true },
+          _count: { guests: 2 },
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          id: "owed-1",
+          status: "CONFIRMED",
+          finalPriceCents: 18000,
+          payment: null,
+        },
+      ]);
+    mocks.getMemberCreditBalance.mockResolvedValue(2500);
+    mocks.deriveBookingAppliedCreditCents.mockResolvedValue(0);
+    mocks.getAvailablePromoCodesForMember.mockResolvedValue([
+      {
+        code: "SAVE10",
+        description: "Winter special",
+        fixedNightlyMode: null,
+        fixedNightlyPriceCents: null,
+        freeNightsPerIndividual: null,
+        lifetimeFreeNightsCap: null,
+        percentOff: 10,
+        type: "PERCENTAGE",
+        valueCents: null,
+      },
+    ]);
+    mocks.lockerFindMany.mockResolvedValue([]);
+    mocks.calendarEventFindMany.mockResolvedValue([]);
+    mocks.memberFindUnique.mockResolvedValue({ requiresInduction: false });
+    mocks.memberInductionFindFirst.mockResolvedValue(null);
+    mocks.loadEffectiveModuleFlags.mockResolvedValue(moduleFlags());
+    mocks.hasAccessRole.mockReturnValue(false);
+    // Peak occupancy 22 across a 30-bed lodge: night one 20/30, night two
+    // 22/30 → minAvailable 8, capacity (occupied + available) 30, filled
+    // (capacity - minAvailable) 22. Both figures come from this one call.
+    mocks.checkCapacity.mockResolvedValue({
+      available: true,
+      minAvailable: 8,
+      nightDetails: [
+        {
+          date: new Date("2026-08-10T00:00:00.000Z"),
+          occupiedBeds: 20,
+          availableBeds: 10,
+        },
+        {
+          date: new Date("2026-08-11T00:00:00.000Z"),
+          occupiedBeds: 22,
+          availableBeds: 8,
+        },
+      ],
+    });
+  });
+
+  it("links summary cards to their drill-down targets", async () => {
+    const html = await renderDashboardPage();
+
+    expect(html).toContain('href="/bookings"');
+    expect(html).toContain('href="/bookings/upcoming-1?returnTo=%2Fdashboard"');
+    expect(html).toContain(
+      'href="/profile?returnTo=%2Fdashboard#account-credit"',
+    );
+    expect(html).toContain('href="/bookings/owed-1?returnTo=%2Fdashboard"');
+    expect(html).toContain('href="/profile?returnTo=%2Fdashboard#promo-codes"');
+    expect(html).toContain("SAVE10");
+    expect(html).toContain("10% off per individual");
+  });
+
+  // #4944 (`INV-PAY-119`): the card quotes the booking page's Amount due -
+  // price less the ledger credit applied - not the bare price.
+  it("nets the credit applied to an owed booking from the Payment Owed card", async () => {
+    mocks.deriveBookingAppliedCreditCents.mockResolvedValue(5000);
+    const html = await renderDashboardPage();
+
+    expect(mocks.deriveBookingAppliedCreditCents).toHaveBeenCalledWith(
+      "owed-1",
+      expect.anything(),
+    );
+    expect(html).toContain("$130.00");
+    expect(html).toContain("1 booking needs payment");
+    expect(html).toContain('href="/bookings/owed-1?returnTo=%2Fdashboard"');
+  });
+
+  // The card's copy agrees in number: one booking "needs", several "need".
+  it("pluralises the Payment Owed count for more than one owed booking", async () => {
+    mocks.bookingFindMany.mockReset();
+    mocks.bookingFindMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { id: "owed-1", status: "CONFIRMED", finalPriceCents: 18000, payment: null },
+        { id: "owed-2", status: "CONFIRMED", finalPriceCents: 6000, payment: null },
+      ]);
+    const html = await renderDashboardPage();
+
+    expect(html).toContain("2 bookings need payment");
+    expect(html).not.toContain("1 booking needs payment");
+  });
+
+  it("neither counts nor links a booking its applied credit covers", async () => {
+    mocks.deriveBookingAppliedCreditCents.mockResolvedValue(18000);
+    const html = await renderDashboardPage();
+
+    expect(html).toContain("No payment due");
+    expect(html).not.toContain("owed-1");
+  });
+
+  it("offers the lodge roster under Open Kiosk while its module is on", async () => {
+    mocks.loadEffectiveModuleFlags.mockResolvedValue({
+      ...moduleFlags(),
+      kiosk: true,
+      memberLodgeRoster: true,
+    });
+    const html = await renderDashboardPage();
+
+    const kiosk = html.indexOf('href="/lodge/kiosk"');
+    const roster = html.indexOf('href="/lodge-roster"');
+    expect(kiosk).toBeGreaterThan(-1);
+    expect(roster).toBeGreaterThan(kiosk);
+  });
+
+  it("leaves the lodge roster off the card while its module is off", async () => {
+    mocks.loadEffectiveModuleFlags.mockResolvedValue({
+      ...moduleFlags(),
+      kiosk: true,
+      memberLodgeRoster: false,
+    });
+    const html = await renderDashboardPage();
+
+    expect(html).toContain('href="/lodge/kiosk"');
+    expect(html).not.toContain('href="/lodge-roster"');
+  });
+
+  it("keeps the roster's card while the kiosk module is off", async () => {
+    mocks.loadEffectiveModuleFlags.mockResolvedValue({
+      ...moduleFlags(),
+      kiosk: false,
+      memberLodgeRoster: true,
+    });
+    const html = await renderDashboardPage();
+
+    expect(html).toContain('href="/lodge-roster"');
+    expect(html).not.toContain('href="/lodge/kiosk"');
+  });
+
+  // Fork triyder/AlpineClubBookingsNZ#121: the Order food card sits beside "Report an issue" only while the
+  // foodOrders module is on, and never for an organisation account.
+  it("offers Order food while the food orders module is on", async () => {
+    mocks.loadEffectiveModuleFlags.mockResolvedValue({
+      ...moduleFlags(),
+      foodOrders: true,
+    });
+    const html = await renderDashboardPage();
+    expect(html).toContain('href="/food-order"');
+    expect(html).toContain('href="/food-orders"');
+  });
+
+  it("hides Order food while the food orders module is off", async () => {
+    mocks.loadEffectiveModuleFlags.mockResolvedValue({
+      ...moduleFlags(),
+      foodOrders: false,
+    });
+    const html = await renderDashboardPage();
+    expect(html).not.toContain('href="/food-order"');
+    expect(html).not.toContain('href="/food-orders"');
+  });
+
+  it("hides Order food from an organisation account", async () => {
+    mocks.auth.mockResolvedValue({
+      user: { id: "member-1", name: "School", accessRoles: ["ORG"] },
+    });
+    mocks.loadEffectiveModuleFlags.mockResolvedValue({
+      ...moduleFlags(),
+      foodOrders: true,
+    });
+    const html = await renderDashboardPage();
+    expect(html).not.toContain('href="/food-order"');
+  });
+
+  it("shows a lodge occupancy meter for the next stay's dates", async () => {
+    const html = await renderDashboardPage();
+
+    expect(mocks.checkCapacity).toHaveBeenCalledWith(
+      "lodge-1",
+      new Date("2026-08-10T00:00:00.000Z"),
+      new Date("2026-08-12T00:00:00.000Z"),
+      1,
+    );
+    // filled (peak occupancy) / capacity, both derived from the one call.
+    expect(html).toContain("Lodge occupancy for your dates");
+    expect(html).toContain('role="progressbar"');
+    expect(html).toContain("22 / 30");
+  });
+
+  it("omits the occupancy meter when the next stay has no lodge", async () => {
+    mocks.bookingFindMany.mockReset();
+    mocks.bookingFindMany
+      .mockResolvedValueOnce([
+        {
+          id: "upcoming-1",
+          memberId: "member-1",
+          lodgeId: null,
+          checkIn: new Date("2026-08-10T00:00:00.000Z"),
+          checkOut: new Date("2026-08-12T00:00:00.000Z"),
+          status: "CONFIRMED",
+          finalPriceCents: 18000,
+          lodge: { name: "Ruapehu Lodge", active: true },
+          _count: { guests: 2 },
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    const html = await renderDashboardPage();
+
+    expect(mocks.checkCapacity).not.toHaveBeenCalled();
+    expect(html).not.toContain("Lodge occupancy for your dates");
+  });
+});
+
+/**
+ * #2779 — the draft card is the locked-out member's only route back to a booking
+ * the club made for them, so it has to read as the club's booking and lead with
+ * paying. "Resume" describes something you started; nobody started this one.
+ */
+describe("DashboardPage draft bookings saved by the club (#2779)", () => {
+  function draftRow(createdById: string | null, finalPriceCents = 24000) {
+    return {
+      id: "draft-1",
+      checkIn: new Date("2026-09-07T00:00:00.000Z"),
+      checkOut: new Date("2026-09-09T00:00:00.000Z"),
+      finalPriceCents,
+      draftExpiresAt: new Date("2026-08-13T00:00:00.000Z"),
+      createdById,
+      lodge: { name: "Ruapehu Lodge", active: true },
+      _count: { guests: 1 },
+    };
+  }
+
+  function seedWithZeroPricedDraft(createdById: string | null) {
+    mocks.bookingFindMany.mockReset();
+    mocks.bookingFindMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([draftRow(createdById, 0)])
+      .mockResolvedValueOnce([]);
+  }
+
+  function seedWithDraft(createdById: string | null) {
+    mocks.bookingFindMany.mockReset();
+    mocks.bookingFindMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([draftRow(createdById)])
+      .mockResolvedValueOnce([]);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.auth.mockResolvedValue({ user: { id: "member-1", name: "Mere Member" } });
+    mocks.bookingFindFirst.mockResolvedValue(null);
+    mocks.getMemberCreditBalance.mockResolvedValue(0);
+    mocks.getAvailablePromoCodesForMember.mockResolvedValue([]);
+    mocks.lockerFindMany.mockResolvedValue([]);
+    mocks.calendarEventFindMany.mockResolvedValue([]);
+    mocks.memberFindUnique.mockResolvedValue({ requiresInduction: false });
+    mocks.memberInductionFindFirst.mockResolvedValue(null);
+    mocks.loadEffectiveModuleFlags.mockResolvedValue(moduleFlags());
+    mocks.hasAccessRole.mockReturnValue(false);
+  });
+
+  it("labels an admin-created draft and leads with paying it", async () => {
+    seedWithDraft("admin-9");
+
+    const html = await renderDashboardPage();
+
+    expect(html).toContain("Saved for you by the club");
+    expect(html).toContain("Review &amp; pay");
+    expect(html).not.toContain(">Resume<");
+    // The acting admin's identity belongs on the booking page's own "Created by"
+    // line, not on a dashboard card.
+    expect(html).not.toContain("admin-9");
+    // The deletion deadline stays visible, because the draft is deleted rather
+    // than cancelled when it expires.
+    expect(html).toContain("Expires");
+  });
+
+  it("leaves a draft the member saved themselves reading as their own", async () => {
+    seedWithDraft(null);
+
+    const html = await renderDashboardPage();
+
+    expect(html).toContain("Resume");
+    expect(html).not.toContain("Saved for you by the club");
+  });
+
+  // A $0 club-saved draft has no pay step at all: the booking page gates its
+  // payment card on `finalPriceCents > 0` and offers ConfirmDraftButton instead,
+  // which `confirm-draft` refuses for a locked-out non-admin. "Review & pay" on
+  // that row sends the one member this journey exists for to a button that 403s
+  // them (INV-LOCKOUT-070). The price is already selected for the line above, so
+  // there is nothing to trade off.
+  it("does not promise a payment step for a $0 draft the club saved", async () => {
+    seedWithZeroPricedDraft("admin-9");
+
+    const html = await renderDashboardPage();
+
+    expect(html).toContain("Saved for you by the club");
+    expect(html).toContain("there is nothing to pay, so ask the club to confirm it");
+    expect(html).not.toContain("Review &amp; pay");
+    expect(html).not.toContain("open it to check the details and pay");
+    // Still reachable — the member should be able to look at it.
+    expect(html).toContain(">Open<");
+  });
+});
+
+/**
+ * INV-CAP-039: the dashboard's Next Stay card, draft rows and Recent Bookings
+ * rows name each booking's own lodge under ADR-002's presentation rule — once
+ * the club has a second active lodge, or on any row at an archived lodge — so a
+ * draft the club saved at the wrong lodge is visible before the member pays it.
+ */
+describe("DashboardPage names each booking's lodge per ADR-002 (INV-CAP-039)", () => {
+  const stay = {
+    memberId: "member-1",
+    status: "CONFIRMED",
+    finalPriceCents: 18000,
+    _count: { guests: 2 },
+  };
+
+  function seed(lodges: {
+    upcoming: { name: string; active: boolean };
+    recent: { name: string; active: boolean };
+    draft: { name: string; active: boolean };
+  }) {
+    mocks.bookingFindMany.mockReset();
+    mocks.bookingFindMany
+      .mockResolvedValueOnce([
+        {
+          ...stay,
+          id: "upcoming-1",
+          lodgeId: "lodge-1",
+          lodge: lodges.upcoming,
+          checkIn: new Date("2026-08-10T00:00:00.000Z"),
+          checkOut: new Date("2026-08-12T00:00:00.000Z"),
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          ...stay,
+          id: "recent-1",
+          lodge: lodges.recent,
+          checkIn: new Date("2026-06-10T00:00:00.000Z"),
+          checkOut: new Date("2026-06-12T00:00:00.000Z"),
+          createdAt: new Date("2026-05-01T00:00:00.000Z"),
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: "draft-1",
+          lodge: lodges.draft,
+          checkIn: new Date("2026-08-03T00:00:00.000Z"),
+          checkOut: new Date("2026-08-05T00:00:00.000Z"),
+          finalPriceCents: 24000,
+          draftExpiresAt: new Date("2026-07-13T00:00:00.000Z"),
+          createdById: "admin-9",
+          _count: { guests: 2 },
+        },
+      ])
+      .mockResolvedValueOnce([]);
+  }
+
+  /** The draft row's markup, from its dates to its call to action. */
+  function draftRow(html: string): string {
+    const start = html.indexOf("Draft Bookings");
+    return html.slice(start, html.indexOf("Review &amp; pay", start));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.auth.mockResolvedValue({ user: { id: "member-1", name: "Mere Member" } });
+    mocks.bookingFindFirst.mockResolvedValue(null);
+    mocks.getMemberCreditBalance.mockResolvedValue(0);
+    mocks.getAvailablePromoCodesForMember.mockResolvedValue([]);
+    mocks.lockerFindMany.mockResolvedValue([]);
+    mocks.calendarEventFindMany.mockResolvedValue([]);
+    mocks.memberFindUnique.mockResolvedValue({
+      requiresInduction: false,
+      inductions: [],
+    });
+    mocks.loadEffectiveModuleFlags.mockResolvedValue(moduleFlags());
+    mocks.hasAccessRole.mockReturnValue(false);
+    mocks.checkCapacity.mockRejectedValue(new Error("no meter in these cases"));
+  });
+
+  it("names the lodge on Next Stay, the draft and Recent Bookings in a two-lodge club", async () => {
+    mocks.lodgeCount.mockResolvedValueOnce(2);
+    seed({
+      upcoming: { name: "Upper Hut", active: true },
+      recent: { name: "Lower Hut", active: true },
+      draft: { name: "Second Lodge", active: true },
+    });
+
+    const html = await renderDashboardPage();
+
+    expect(html).toContain("Upper Hut");
+    expect(html).toContain("Lower Hut");
+    expect(draftRow(html)).toContain("Second Lodge");
+    expect(html.match(/data-testid="booking-list-lodge"/g)).toHaveLength(3);
+  });
+
+  it("leaves a single-lodge club's rows as they were", async () => {
+    mocks.lodgeCount.mockResolvedValueOnce(1);
+    const only = { name: "Ruapehu Lodge", active: true };
+    seed({ upcoming: only, recent: only, draft: only });
+
+    const html = await renderDashboardPage();
+
+    expect(html).not.toContain("Ruapehu Lodge");
+    expect(html).not.toContain('data-testid="booking-list-lodge"');
+  });
+
+  it("still renders, and names every row's lodge, when the lodge count cannot be read", async () => {
+    mocks.lodgeCount.mockRejectedValueOnce(new Error("statement timeout"));
+    const only = { name: "Ruapehu Lodge", active: true };
+    seed({ upcoming: only, recent: only, draft: only });
+
+    const html = await renderDashboardPage();
+
+    expect(html.match(/data-testid="booking-list-lodge"/g)).toHaveLength(3);
+    expect(draftRow(html)).toContain("Ruapehu Lodge");
+  });
+
+  it("names a row left at an archived lodge even with one active lodge", async () => {
+    mocks.lodgeCount.mockResolvedValueOnce(1);
+    const only = { name: "Ruapehu Lodge", active: true };
+    seed({
+      upcoming: only,
+      recent: { name: "Old Hut", active: false },
+      draft: only,
+    });
+
+    const html = await renderDashboardPage();
+
+    expect(html).toContain("Old Hut");
+    expect(html).not.toContain("Ruapehu Lodge");
+  });
+});

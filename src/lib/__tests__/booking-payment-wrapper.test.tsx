@@ -1,0 +1,1072 @@
+// @vitest-environment jsdom
+
+import "@testing-library/jest-dom/vitest";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { render } from "@/lib/__tests__/support/club-time-render";
+import { useState } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as Sentry from "@sentry/nextjs";
+import BookingPaymentWrapper from "@/components/stripe/BookingPaymentWrapper";
+import {
+  CREDIT_ELECTION_NOT_APPLIED_BODIES,
+  EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE,
+  PAYMENT_PROCESSING_BODY,
+  SUPERSEDED_PAYMENT_PROCESSING_BODY,
+  PAYMENT_RECEIVED_STATUS_UNCONFIRMED_BODY,
+  PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE,
+  REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_BODY,
+  REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_MESSAGE,
+  SUPERSEDED_CARD_PAYMENT_REFUNDING_BODY,
+  SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE,
+  PREVIOUS_PAYMENT_REFUNDING_NOTICE,
+  SWITCHED_TO_INTERNET_BANKING_BODY,
+  SWITCHED_TO_INTERNET_BANKING_MESSAGE,
+} from "@/lib/payment-recovery-contract";
+import { BELOW_STRIPE_MINIMUM_MEMBER_BODY, BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE } from "@/lib/stripe-charge-currency";
+import { expectRecoveryAlertToHoldFocus } from "@/lib/__tests__/helpers/focus";
+
+const invalidCapacityRefundFacts = [
+  { label: "confirmed zero plan", capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: 0 } },
+  { label: "fractional charge", capacityRefund: { chargedAmountCents: 12500.5, plannedRefundCents: 9000 } },
+  { label: "fractional refund", capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: 9000.5 } },
+  { label: "negative charge", capacityRefund: { chargedAmountCents: -12500, plannedRefundCents: 9000 } },
+  { label: "negative refund", capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: -9000 } },
+  { label: "unsafe integer charge", capacityRefund: { chargedAmountCents: Number.MAX_SAFE_INTEGER + 1, plannedRefundCents: 9000 } },
+  { label: "missing refund amount", capacityRefund: { chargedAmountCents: 12500 } },
+];
+
+const capacityCancellationCases = [
+  ...invalidCapacityRefundFacts.map(({ label, capacityRefund }) => ({
+    label, capacityRefund, refunded: true,
+    heading: "Booking cancelled - refund needs attention",
+    copy: "The club will be in touch about your refund",
+  })),
+  { label: "full", refunded: true, capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: 12500 }, heading: "Booking cancelled - payment refunded", copy: "$125.00 was refunded to your card" },
+  { label: "partial", refunded: true, capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: 9000 }, heading: "Booking cancelled - refund needs attention", copy: "$90.00 was refunded to your card; the club will be in touch about the remaining $35.00" },
+  { label: "empty plan", refunded: false, capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: 0 }, heading: "Booking cancelled - refund needs attention", copy: "The club will be in touch about your refund" },
+  { label: "failed positive plan", refunded: false, capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: 9000 }, heading: "Booking cancelled - refund needs attention", copy: "The club will be in touch about your refund" },
+  { label: "legacy success without amounts", refunded: true, capacityRefund: undefined, heading: "Booking cancelled - refund needs attention", copy: "The club will be in touch about your refund" },
+  { label: "legacy failure without amounts", refunded: false, capacityRefund: undefined, heading: "Booking cancelled - refund needs attention", copy: "The club will be in touch about your refund" },
+  { label: "invalid amounts", refunded: true, capacityRefund: { chargedAmountCents: 12500, plannedRefundCents: 13000 }, heading: "Booking cancelled - refund needs attention", copy: "The club will be in touch about your refund" },
+];
+
+const fetchMock = vi.fn();
+const scrollIntoView = vi.fn();
+
+vi.mock("@sentry/nextjs", () => ({
+  captureException: vi.fn(),
+}));
+
+vi.mock("@/components/stripe/StripeProvider", () => ({
+  default: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="stripe-provider">{children}</div>
+  ),
+}));
+
+vi.mock("@/components/stripe/PaymentForm", () => ({
+  default: function MockPaymentForm({
+    onSuccess,
+    chargedAmountCents,
+    isSplit,
+    deferredGuestAmountCents,
+  }: {
+    onSuccess: (paymentIntentId: string) => void;
+    chargedAmountCents?: number | null;
+    isSplit?: boolean | null;
+    deferredGuestAmountCents?: number | null;
+  }) {
+    const [paid, setPaid] = useState(false);
+    if (paid) {
+      return <div>Payment successful!</div>;
+    }
+    return (
+      <div>
+        <div>payment-form</div>
+        <div data-testid="charged-amount">{String(chargedAmountCents)}</div>
+        <div data-testid="is-split">{String(isSplit)}</div>
+        <div data-testid="deferred-amount">
+          {String(deferredGuestAmountCents)}
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setPaid(true);
+            onSuccess("pi_success");
+          }}
+        >
+          trigger-success
+        </button>
+      </div>
+    );
+  },
+}));
+
+vi.mock("@/components/stripe/SetupForm", () => ({
+  default: () => <div>setup-form</div>,
+}));
+
+describe("BookingPaymentWrapper", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    global.fetch = fetchMock as typeof fetch;
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+  });
+
+  const creditElection = {
+    requestedCents: 10000, appliedCents: 4000, shortfallCents: 6000,
+    shortfallReason: "balance", availableBalanceCents: 4000, fullyCovered: false,
+  };
+  function renderCreditPayment(onPaymentComplete = vi.fn()) {
+    return render(<BookingPaymentWrapper bookingId="booking-credit" amountCents={30000}
+      paymentMode="payment"
+      onPaymentComplete={onPaymentComplete} />);
+  }
+
+  it.each([
+    ["balance", "you no longer hold that much credit"],
+    ["price", "the booking no longer costs that much"],
+    ["balance_and_price", "you no longer hold that much credit and the booking no longer costs that much"],
+  ])("discloses a %s shortfall on a card response", async (shortfallReason, reason) => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({
+      clientSecret: "cs_test", chargedAmountCents: 26000,
+      creditElection: { ...creditElection, shortfallReason },
+    }) });
+    renderCreditPayment();
+    const notice = await screen.findByRole("status", { name: "Saved account credit" });
+    expect(notice).toHaveTextContent(`You asked to use $100.00 credit. $40.00 was applied because ${reason}.`);
+    expect(notice).toHaveTextContent("Any unused credit stays on your account.");
+    expect(notice).toHaveTextContent("Your card will be charged $260.00 today.");
+    expect(screen.getByTestId("charged-amount")).toHaveTextContent("26000");
+  });
+
+  it("discloses a full election on a reused intent", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({
+      clientSecret: "cs_reused", chargedAmountCents: 20000,
+      creditElection: { ...creditElection, appliedCents: 10000, shortfallCents: 0,
+        shortfallReason: "none", availableBalanceCents: 10000 },
+    }) });
+    renderCreditPayment();
+    expect(await screen.findByRole("status", { name: "Saved account credit" })).toHaveTextContent("Your credit of $100.00 was applied. Your card will be charged $200.00 today.");
+  });
+
+  it.each([null, undefined, { ...creditElection, appliedCents: 1.5 },
+    { ...creditElection, shortfallReason: "unknown" }, { ...creditElection, shortfallCents: -1 }])(
+    "does not invent a credit outcome for absent or invalid response data %j", async (outcome) => {
+      fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ clientSecret: "cs_test", creditElection: outcome }) });
+      renderCreditPayment();
+      await screen.findByText("payment-form");
+      expect(screen.queryByRole("status", { name: "Saved account credit" })).toBeNull();
+    },
+  );
+
+  it("lets the member read that credit covered the booking before continuing", async () => {
+    const complete = vi.fn();
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ alreadyPaid: true,
+      creditElection: { ...creditElection, fullyCovered: true },
+    }) });
+    renderCreditPayment(complete);
+    expect(await screen.findByRole("status", { name: "Saved account credit" })).toHaveTextContent("Your credit covered it all. No card payment is needed.");
+    expect(screen.queryByText("payment-form")).toBeNull();
+    expect(screen.queryByText(/Unable to initialize/)).toBeNull();
+    expect(complete).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("completes an already-paid response without inventing a credit notice", async () => {
+    const complete = vi.fn();
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ alreadyPaid: true, creditElection: null }) });
+    renderCreditPayment(complete);
+    await waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("status", { name: "Saved account credit" })).toBeNull();
+  });
+
+  it.each([PAYMENT_PROCESSING_BODY, SUPERSEDED_PAYMENT_PROCESSING_BODY, SUPERSEDED_CARD_PAYMENT_REFUNDING_BODY,
+    BELOW_STRIPE_MINIMUM_MEMBER_BODY])("discloses consumed credit on a 409 recovery %j", async (body) => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 409,
+      json: async () => ({ ...body, creditElection }) });
+    renderCreditPayment();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("$40.00 was applied");
+    expect(alert).toHaveTextContent("you no longer hold that much credit");
+    expect(alert).not.toHaveTextContent("Your card will be charged");
+    expect(screen.queryByText("payment-form")).toBeNull();
+  });
+
+  it("retains the zero-dollar short-circuit without creating a card intent", () => {
+    render(<BookingPaymentWrapper bookingId="booking-zero" amountCents={0}
+      paymentMode="payment" onPaymentComplete={vi.fn()} />);
+    expect(screen.getByText("No payment is required for this booking.")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not promise another charge when confirmation needs recovery", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({
+      clientSecret: "cs_test", chargedAmountCents: 26000, creditElection,
+    }) }).mockResolvedValueOnce({ ok: false, status: 409,
+      json: async () => PAYMENT_RECEIVED_STATUS_UNCONFIRMED_BODY });
+    renderCreditPayment();
+    fireEvent.click(await screen.findByText("trigger-success"));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("$40.00 was applied"));
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Your card will be charged");
+    // #4943 review: the recovery alert is the only place the credit sentence appears.
+    expect(screen.queryByRole("status", { name: "Saved account credit" })).toBeNull();
+    expect(screen.getAllByText(/\$40\.00 was applied/)).toHaveLength(1);
+  });
+
+  // #4949: "Preparing payment..." is silent to a screen reader unless it sits in
+  // a status region.
+  it("says it is preparing payment through a status region while the payment is set up", async () => {
+    fetchMock.mockReturnValueOnce(new Promise(() => undefined));
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing payment...");
+  });
+
+  it("shows generic copy and never renders the raw provider error when init fails", async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+
+    const rawProviderError = "Invalid API Key provided: sk_test_51SecretKeyMaterial";
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: rawProviderError }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />
+    );
+
+    await waitFor(() => expect(screen.queryByText("Payment Error")).not.toBeNull());
+
+    // Generic, member-safe copy is shown (the pay-later recovery affordance).
+    expect(
+      screen.queryByText(/you can\s+pay later from your booking page/i)
+    ).not.toBeNull();
+
+    // The raw provider detail (and any partial key material) must NOT reach the DOM.
+    expect(document.body.textContent).not.toContain("sk_test");
+    expect(document.body.textContent).not.toContain("Invalid API Key");
+    expect(screen.queryByText(/Invalid API Key/i)).toBeNull();
+
+    // The detail is reported to Sentry (scrubbed by beforeSend), NOT to the
+    // member's browser console — the client console log carries bookingId only,
+    // so no raw provider/key material lands in a member's DevTools (#1223).
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "Booking payment initialization failed",
+      { bookingId: "booking-1" }
+    );
+    const consoleArgs = JSON.stringify(consoleErrorSpy.mock.calls);
+    expect(consoleArgs).not.toContain("sk_test");
+    expect(consoleArgs).not.toContain("Invalid API Key");
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("keeps a refunded-payment replacement failure on the retryable initialization UI", async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: "Failed to create payment intent" }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    await waitFor(() => expect(alert).toHaveTextContent("Payment Error"));
+    expect(alert).toHaveTextContent(/pay later from your booking page/i);
+    expect(alert).not.toHaveTextContent(
+      "Card transaction found - check payment status",
+    );
+    expect(alert).not.toHaveTextContent(
+      "Payment received - check booking status",
+    );
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("says the account credit was not applied yet, in the server's words, without reporting a payment-start failure (#3864)", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => CREDIT_ELECTION_NOT_APPLIED_BODIES.cancelUnconfirmed,
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    await waitFor(() => expect(alert).toHaveTextContent("Account credit not applied yet"));
+    expect(alert).toHaveTextContent(CREDIT_ELECTION_NOT_APPLIED_BODIES.cancelUnconfirmed.error);
+    expect(screen.queryByText("Payment Error")).toBeNull();
+    expect(document.body.textContent).not.toContain("We couldn't start the card payment");
+    expect(screen.queryByText("payment-form")).toBeNull();
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("says an earlier payment is still processing, without reporting a payment-start failure (#3567)", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ ...PAYMENT_PROCESSING_BODY, creditElection: null }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    await waitFor(() => expect(alert).toHaveTextContent("Payment being processed"));
+    expect(alert).toHaveTextContent(
+      "This payment is being processed. Refresh the page in a minute to see it confirmed.",
+    );
+    expect(screen.queryByText("Payment Error")).toBeNull();
+    expect(document.body.textContent).not.toContain("We couldn't start the card payment");
+    expect(screen.queryByText("payment-form")).toBeNull();
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("reports captured-card finalisation recovery instead of a payment-start failure", async () => {
+    const onPaymentComplete = vi.fn();
+    const retryMessage =
+      "The database update could not be completed because this booking or member changed. Reload before trying again. If a payment was involved, check its status before retrying.";
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        error: retryMessage,
+        code: "HOSTING_COVERAGE_PARTICIPANT_RETRY",
+        paymentReceived: true,
+        finalisationPending: true,
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={onPaymentComplete}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    await waitFor(() => expect(alert.textContent).toContain(retryMessage));
+    expect(alert.textContent).toContain(
+      "Your card payment was received, but booking finalisation is still pending.",
+    );
+    expect(alert.textContent).toContain(
+      "Reload this page and check the booking status before trying any payment again.",
+    );
+    expect(screen.queryByText("Payment Error")).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "We couldn't start the card payment",
+    );
+    expect(screen.queryByText("payment-form")).toBeNull();
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+    expect(onPaymentComplete).not.toHaveBeenCalled();
+    await expectRecoveryAlertToHoldFocus(alert);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+  });
+
+  it("suppresses payment retry and focuses ordinary post-capture status recovery", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        code: "PAYMENT_RECEIVED_STATUS_UNCONFIRMED",
+        error: "raw server text must not be shown",
+        paymentReceived: true,
+        bookingStatusUnconfirmed: true,
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    await waitFor(() =>
+      expect(alert).toHaveTextContent("Payment received - check booking status"),
+    );
+    expect(alert).toHaveTextContent(PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE);
+    expect(alert).not.toHaveTextContent("raw server text");
+    expect(alert).not.toHaveTextContent("finalisation pending");
+    expect(screen.queryByText("payment-form")).toBeNull();
+    await expectRecoveryAlertToHoldFocus(alert);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+  });
+
+  it("requires the exact ordinary post-capture marker before suppressing payment", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        code: "PAYMENT_RECEIVED_STATUS_UNCONFIRMED",
+        error: "not an accepted recovery marker",
+        paymentReceived: true,
+        bookingStatusUnconfirmed: true,
+        finalisationPending: true,
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    await waitFor(() => expect(alert).toHaveTextContent("Payment Error"));
+    expect(alert).not.toHaveTextContent("Payment received - check booking status");
+    consoleErrorSpy.mockRestore();
+  });
+
+  // #3638 review (SSOT F1): the pay route refuses a card payment on a booking
+  // being paid by Internet Banking. The member must be told that, not shown
+  // "you can pay later" (a card retry is refused again), and it is not a fault
+  // to report to Sentry.
+  it("tells the member the booking is being paid by Internet Banking, with no card form and no error report (#3638)", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ ...SWITCHED_TO_INTERNET_BANKING_BODY }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() =>
+      expect(alert).toHaveTextContent("Paying by Internet Banking"),
+    );
+    expect(alert).toHaveTextContent(SWITCHED_TO_INTERNET_BANKING_MESSAGE);
+    expect(alert).not.toHaveTextContent(/pay later/i);
+    expect(screen.queryByText("payment-form")).toBeNull();
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("says the amount is too small to pay by card, with no card form and no error report (#99)", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ ...BELOW_STRIPE_MINIMUM_MEMBER_BODY, error: "internal detail that must not render", creditElection: null }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={32}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() =>
+      expect(alert).toHaveTextContent("Amount too small to pay by card"),
+    );
+    expect(alert).toHaveTextContent(BELOW_STRIPE_MINIMUM_MEMBER_MESSAGE);
+    expect(alert).not.toHaveTextContent("internal detail");
+    expect(alert).not.toHaveTextContent(/pay later/i);
+    expect(screen.queryByText("payment-form")).toBeNull();
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("shows the contract's own wording, not the response's error text (#3638)", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        code: "SWITCHED_TO_INTERNET_BANKING",
+        error: "internal detail that must not render",
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() =>
+      expect(alert).toHaveTextContent(SWITCHED_TO_INTERNET_BANKING_MESSAGE),
+    );
+    expect(alert).not.toHaveTextContent("internal detail");
+  });
+
+  it("suppresses payment without claiming receipt when only Stripe success is known", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        code: "EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED",
+        error: "private refund lookup detail",
+        existingCardTransactionFound: true,
+        paymentStatusUnconfirmed: true,
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() =>
+      expect(alert).toHaveTextContent(
+        "Card transaction found - check payment status",
+      ),
+    );
+    expect(alert).toHaveTextContent(
+      EXISTING_CARD_TRANSACTION_STATUS_UNCONFIRMED_MESSAGE,
+    );
+    expect(alert).not.toHaveTextContent("private refund lookup detail");
+    expect(alert).not.toHaveTextContent("Your card payment was received");
+    expect(screen.queryByText("payment-form")).toBeNull();
+    await expectRecoveryAlertToHoldFocus(alert);
+  });
+
+  it.each(capacityCancellationCases)(
+    "suppresses payment for an initialization-time cancellation ($label)",
+    async ({ refunded, capacityRefund, heading, copy }) => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          error: "server detail is not rendered",
+          status: "CANCELLED",
+          refunded,
+          capacityRefund,
+        }),
+      });
+
+      render(
+        <BookingPaymentWrapper
+          bookingId="booking-1"
+          amountCents={12500}
+          paymentMode="payment"
+          onPaymentComplete={vi.fn()}
+        />,
+      );
+
+      const alert = screen.getByRole("alert", { hidden: true });
+      await waitFor(() => expect(alert).toHaveTextContent(heading));
+      expect(alert).toHaveTextContent(copy);
+      expect(alert).not.toHaveTextContent("Automatic refund recovery is pending");
+      expect(alert).not.toHaveTextContent("the card payment was refunded");
+      if (!refunded) expect(alert).not.toHaveTextContent("was refunded to your card");
+      expect(alert).toHaveTextContent(/Do not try another payment/i);
+      expect(alert).not.toHaveTextContent("server detail");
+      expect(alert).not.toHaveTextContent(/pay later from your booking page/i);
+      expect(screen.queryByText("payment-form")).toBeNull();
+      await expectRecoveryAlertToHoldFocus(alert);
+    },
+  );
+
+  it("keeps a pre-capture participant retry on the ordinary payment-start recovery", async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        error:
+          "The database update could not be completed because this booking or member changed. Reload before trying again. If a payment was involved, check its status before retrying.",
+        code: "HOSTING_COVERAGE_PARTICIPANT_RETRY",
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Payment Error")).not.toBeNull();
+    expect(
+      screen.queryByText("Payment received - finalisation pending"),
+    ).toBeNull();
+    expect(
+      screen.queryByText(/your card payment was received/i),
+    ).toBeNull();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("forwards the server charge figures to PaymentForm for a split parent (#1976)", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        clientSecret: "cs_test",
+        chargedAmountCents: 12000,
+        isSplit: true,
+        deferredGuestAmountCents: 8000,
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={20000}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />
+    );
+
+    await waitFor(() => expect(screen.queryByText("payment-form")).not.toBeNull());
+    expect(screen.getByTestId("charged-amount").textContent).toBe("12000");
+    expect(screen.getByTestId("is-split").textContent).toBe("true");
+    expect(screen.getByTestId("deferred-amount").textContent).toBe("8000");
+  });
+
+  it("passes null deferred amount to PaymentForm for a non-split booking (#1976)", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        clientSecret: "cs_test",
+        chargedAmountCents: 12500,
+        isSplit: false,
+        deferredGuestAmountCents: null,
+      }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />
+    );
+
+    await waitFor(() => expect(screen.queryByText("payment-form")).not.toBeNull());
+    expect(screen.getByTestId("charged-amount").textContent).toBe("12500");
+    expect(screen.getByTestId("is-split").textContent).toBe("false");
+    expect(screen.getByTestId("deferred-amount").textContent).toBe("null");
+  });
+
+  it("reconciles a successful payment before refreshing the page", async () => {
+    const onPaymentComplete = vi.fn();
+
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ clientSecret: "cs_test" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ success: true }),
+      });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={onPaymentComplete}
+      />
+    );
+
+    await waitFor(() => expect(screen.queryByText("payment-form")).not.toBeNull());
+
+    fireEvent.click(screen.getByText("trigger-success"));
+
+    await waitFor(() => expect(onPaymentComplete).toHaveBeenCalledTimes(1));
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/bookings/booking-1/confirm-payment",
+      expect.objectContaining({
+        method: "POST",
+      })
+    );
+  });
+
+  it("keeps the successful payment panel mounted when hosting finalisation must be retried", async () => {
+    const onPaymentComplete = vi.fn();
+    const retryMessage =
+      "The database update could not be completed because this booking or member changed. Reload before trying again. If a payment was involved, check its status before retrying.";
+
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ clientSecret: "cs_test" }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          error: retryMessage,
+          code: "HOSTING_COVERAGE_PARTICIPANT_RETRY",
+          paymentReceived: true,
+          finalisationPending: true,
+        }),
+      });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={onPaymentComplete}
+      />
+    );
+
+    await screen.findByText("payment-form");
+    const alert = screen.getByRole("alert", { hidden: true });
+    expect(alert.textContent).toBe("");
+    fireEvent.click(screen.getByText("trigger-success"));
+
+    await waitFor(() => expect(alert.textContent).toContain(retryMessage));
+    expect(alert.textContent).toContain(
+      "Your card payment was received, but booking finalisation is still pending.",
+    );
+    expect(alert.classList.contains("sr-only")).toBe(false);
+    expect(screen.queryByText("payment-form")).toBeNull();
+    expect(screen.getByText("Payment successful!")).not.toBeNull();
+    expect(onPaymentComplete).not.toHaveBeenCalled();
+    await expectRecoveryAlertToHoldFocus(alert);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+  });
+
+  it("keeps the successful payment panel mounted for ordinary post-capture status recovery", async () => {
+    const onPaymentComplete = vi.fn();
+
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ clientSecret: "cs_test" }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          ...PAYMENT_RECEIVED_STATUS_UNCONFIRMED_BODY,
+          error: "raw server text must not be shown",
+        }),
+      });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={onPaymentComplete}
+      />,
+    );
+
+    fireEvent.click(await screen.findByText("trigger-success"));
+
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() =>
+      expect(alert).toHaveTextContent("Payment received - check booking status"),
+    );
+    expect(alert).toHaveTextContent(PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE);
+    expect(alert).not.toHaveTextContent("raw server text");
+    expect(screen.getByText("Payment successful!")).not.toBeNull();
+    expect(onPaymentComplete).not.toHaveBeenCalled();
+    await expectRecoveryAlertToHoldFocus(alert);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+  });
+
+  it("shows locally proven refund recovery without claiming payment receipt", async () => {
+    const onPaymentComplete = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ clientSecret: "cs_test" }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          ...REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_BODY,
+          error: "raw server text must not be shown",
+        }),
+      });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={onPaymentComplete}
+      />,
+    );
+    fireEvent.click(await screen.findByText("trigger-success"));
+
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() =>
+      expect(alert).toHaveTextContent("Previous card payment refunded"),
+    );
+    expect(alert).toHaveTextContent(
+      REFUNDED_CARD_TRANSACTION_REPAYMENT_REQUIRED_MESSAGE,
+    );
+    expect(alert).not.toHaveTextContent("Payment received");
+    expect(alert).not.toHaveTextContent("raw server text");
+    expect(onPaymentComplete).not.toHaveBeenCalled();
+    expect(screen.getByText("Payment successful!")).not.toBeNull();
+  });
+
+  it("#4300: says a payment on a superseded intent is being refunded, never that the booking is paid", async () => {
+    const onPaymentComplete = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ clientSecret: "cs_test" }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          ...SUPERSEDED_CARD_PAYMENT_REFUNDING_BODY,
+          error: "raw server text must not be shown",
+        }),
+      });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={onPaymentComplete}
+      />,
+    );
+    fireEvent.click(await screen.findByText("trigger-success"));
+
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() => expect(alert).toHaveTextContent("Card payment being returned"));
+    expect(alert).toHaveTextContent(SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE);
+    expect(alert).not.toHaveTextContent("Payment received");
+    expect(alert).not.toHaveTextContent("raw server text");
+    expect(onPaymentComplete).not.toHaveBeenCalled();
+    // No green "Payment successful!" box beside it, and a way to reload.
+    await waitFor(() => expect(screen.queryByText("Payment successful!")).toBeNull());
+    expect(screen.getByRole("button", { name: "Reload booking", hidden: true })).not.toBeNull();
+  });
+
+  it("#4300: the pay step's own superseded refusal is shown with a reload, and no payment form", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ ...SUPERSEDED_CARD_PAYMENT_REFUNDING_BODY, error: "raw server text must not be shown" }),
+    });
+
+    render(
+      <BookingPaymentWrapper
+        bookingId="booking-1"
+        amountCents={12500}
+        paymentMode="payment"
+        onPaymentComplete={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert", { hidden: true });
+    await waitFor(() => expect(alert).toHaveTextContent(SUPERSEDED_CARD_PAYMENT_REFUNDING_MESSAGE));
+    expect(alert).not.toHaveTextContent("raw server text");
+    expect(screen.queryByText("trigger-success")).toBeNull();
+    expect(screen.getByRole("button", { name: "Reload booking", hidden: true })).not.toBeNull();
+  });
+
+  it("#4300: 'Reload booking' opens the booking's own page, so the /book wizard never loses it", async () => {
+    const assign = vi.fn();
+    const original = window.location;
+    Object.defineProperty(window, "location", { configurable: true, value: { ...original, assign } });
+    try {
+      fetchMock.mockResolvedValueOnce({ ok: false, status: 409, json: async () => SUPERSEDED_CARD_PAYMENT_REFUNDING_BODY });
+      render(
+        <BookingPaymentWrapper bookingId="booking-1" amountCents={12500} paymentMode="payment" onPaymentComplete={vi.fn()} />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Reload booking", hidden: true }));
+      expect(assign).toHaveBeenCalledWith("/bookings/booking-1");
+    } finally {
+      Object.defineProperty(window, "location", { configurable: true, value: original });
+    }
+  });
+
+  it("#4300: the pay step's going-back notice is shown beside the fresh form", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ clientSecret: "cs_test", previousPaymentRefunding: true }) });
+    render(
+      <BookingPaymentWrapper bookingId="booking-1" amountCents={12500} paymentMode="payment" onPaymentComplete={vi.fn()} />,
+    );
+    expect(await screen.findByText(PREVIOUS_PAYMENT_REFUNDING_NOTICE)).not.toBeNull();
+    expect(screen.getByText("trigger-success")).not.toBeNull();
+  });
+
+  it("#4300: a 400 from the confirm route after a card success is never called complete", async () => {
+    const onPaymentComplete = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ clientSecret: "cs_test" }) })
+      .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: "PaymentIntent does not match booking" }) });
+    render(
+      <BookingPaymentWrapper bookingId="booking-1" amountCents={12500} paymentMode="payment" onPaymentComplete={onPaymentComplete} />,
+    );
+    fireEvent.click(await screen.findByText("trigger-success"));
+    const alert = screen.getByRole("alert", { hidden: true });
+    await waitFor(() => expect(alert).toHaveTextContent("Payment received - check booking status"));
+    expect(alert).toHaveTextContent(PAYMENT_RECEIVED_STATUS_UNCONFIRMED_MESSAGE);
+    expect(alert).not.toHaveTextContent("does not match");
+    expect(onPaymentComplete).not.toHaveBeenCalled();
+  });
+
+  it.each(capacityCancellationCases)(
+    "retains the cancelled-booking recovery after confirmation ($label)",
+    async ({ refunded, capacityRefund, heading, copy }) => {
+      const onPaymentComplete = vi.fn();
+
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ clientSecret: "cs_test" }),
+        })
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 409,
+          json: async () => ({
+            error: "private provider or database detail",
+            status: "CANCELLED",
+            refunded,
+          capacityRefund,
+          }),
+        });
+
+      render(
+        <BookingPaymentWrapper
+          bookingId="booking-1"
+          amountCents={12500}
+          paymentMode="payment"
+          onPaymentComplete={onPaymentComplete}
+        />,
+      );
+
+      fireEvent.click(await screen.findByText("trigger-success"));
+
+      const alert = screen.getByRole("alert", { hidden: true });
+      await waitFor(() => expect(alert).toHaveTextContent(heading));
+      expect(alert).toHaveTextContent(copy);
+      expect(alert).not.toHaveTextContent("Automatic refund recovery is pending");
+      expect(alert).not.toHaveTextContent("the card payment was refunded");
+      if (!refunded) expect(alert).not.toHaveTextContent("was refunded to your card");
+      expect(alert).toHaveTextContent(/Do not try another payment/i);
+      expect(alert).not.toHaveTextContent("private provider or database detail");
+      expect(onPaymentComplete).not.toHaveBeenCalled();
+      expect(screen.queryByText("payment-form")).toBeNull();
+      expect(screen.getByText("Payment successful!")).not.toBeNull();
+      await expectRecoveryAlertToHoldFocus(alert);
+    },
+  );
+
+  it.each([
+    ["refunded", { status: "CANCELLED" }],
+    ["status", { refunded: false }],
+  ])(
+    "does not invent capacity-cancellation recovery without %s",
+    async (_missingFact, partialFacts) => {
+      const onPaymentComplete = vi.fn();
+
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ clientSecret: "cs_test" }),
+        })
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 409,
+          json: async () => ({
+            error: "unrecognised recovery",
+            ...partialFacts,
+          }),
+        });
+
+      render(
+        <BookingPaymentWrapper
+          bookingId="booking-1"
+          amountCents={12500}
+          paymentMode="payment"
+          onPaymentComplete={onPaymentComplete}
+        />,
+      );
+
+      fireEvent.click(await screen.findByText("trigger-success"));
+
+      await waitFor(() => expect(onPaymentComplete).toHaveBeenCalledTimes(1));
+      expect(screen.getByRole("alert", { hidden: true }).textContent).toBe("");
+      expect(screen.queryByText(/refund needs attention/i)).toBeNull();
+    },
+  );
+});

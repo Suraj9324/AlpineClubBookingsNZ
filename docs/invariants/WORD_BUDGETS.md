@@ -1,0 +1,207 @@
+# Word-budget register: invariant exceptions, migration ratchet, agent-doc ceilings
+
+Audience: Developer, Agent.
+
+Index: [`docs/DOMAIN_INVARIANTS.md`](../DOMAIN_INVARIANTS.md) · the rule this
+register serves: [`SCHEME.md`](SCHEME.md) §8.1 · deciding issues: #2789 (the
+invariant tables), #4462 (the agent-doc table).
+
+Every invariant entry is at most **300 words** and every index-row description
+at most **12 words** (`SCHEME.md` §8.1). This file is the only place an entry
+may be allowed more, and `pnpm run docs:indexcheck` reads it: an id listed here
+is held to the limit on its row, an id not listed here is held to 300, and the
+index cap has no register at all. **Nothing in the two invariant tables is a
+rule and nothing there has an id**; they are an inventory the gate enforces
+exactly, so a row that is stale, duplicated, malformed or for an id nothing
+defines fails the check.
+
+The [Agent docs](#agent-docs) table holds the ceilings for the agent
+guides under `docs/agents/`, under the looser rules stated there.
+
+To read a figure the way the gate does, run
+`node scripts/ci/check-doc-index-integrity.mjs --words`. Do not measure with a
+script of your own: two instruments that measure differently agree where both
+are blind (`INV-SSOT-004`).
+
+## Approved exceptions
+
+An entry may exceed 300 words only where it is genuinely one atomic standing
+rule that cannot be split or compacted without semantic damage or artificial
+fragmentation. Convenience, history, copied rationale, rejected alternatives
+and narrative are not reasons. Each row is an owner approval taken on the
+deciding issue, and the ceiling on the row is the exact number CI enforces.
+The reason may not contain a `|`, even inside backticks (cells are split on pipes). Exact form, one row per id:
+
+| ID | Ceiling | Deciding issue | Reason |
+| --- | ---: | --- | --- |
+
+There are no approved exceptions yet. Candidates are proposed on each entry's
+deciding issue as the compaction waves (#4990) reach them; until the owner
+approves one, an oversize entry is migration debt below.
+
+## Migration ratchet
+
+Temporary. Each row is the exact word count an oversize entry had when it was
+last measured, and the gate holds the entry to that number: it may only shrink
+(record the new count when it does) and it leaves this table the moment it is
+within budget. A compliant entry can never join it. One row is a restore rather than a
+regression: `INV-CAP-027` measured 317 words on the epic base (82f820dfb), was
+briefly 298 after a lossy rewrite, and stands at 303 with its original wording
+put back — a shrink against the base. A row can also ARRIVE, and one has:
+`INV-MOD-055` came in on the fourth `main`-into-epic sync as #3219/#3257's
+settle-time re-price rule, written on `main` where this register does not exist
+and therefore never measured against a budget. The sync gave it its own id
+rather than leaving it stacked under `INV-MOD-038`, whose own 263 words it had
+pushed to 1420 while they were sharing a heading. Nothing was reworded to fit:
+compacting an owner-decided rule is a compaction-wave job on #4990, not
+something a conflict resolution should do. The fifth sync added `INV-MONEY-029`
+the same way, at 667 words: #3276's promo build-up rule, also written on `main`.
+The sixth added two more from #3340 — `INV-PAY-047` at 1211 and `INV-ADDPAY-023`
+at 598 — and the pattern is now established enough to state plainly: a long-lived
+epic branch inherits every oversize entry `main` writes while it is open, because
+`main` has no register to measure them against. That is not debt this branch
+created and it is not this branch's to pay down.
+
+**And a row can GROW, which the "may only shrink" rule above forbids and which
+this one nonetheless did.** `INV-MOD-005` went 351 to 381 on that same sync. It
+is not a regression by this epic: the entry here is byte-identical to `main`'s,
+so `main` grew it where no register was watching, and the merge took that side
+cleanly without a conflict. The number is therefore re-measured rather than
+enforced downward, for the same reason nothing was reworded to fit above. What
+the shrink-only rule protects is this branch's own edits, and it still does:
+every row an epic child touches may only go down — with one owner-decided
+exception: `INV-MONEY-029` went 655 to 808 on #4317, because the owner amended
+the rule itself (24 Oct 2026, on #4302: a capped carried promotion's night rows
+are scaled, the one rule-derived amount it allows, with every case that writes
+none listed), and an amendment the owner decides is new rule text, not drift to
+be compacted. When the last row goes, delete this section's table; the file
+stays for the agent-doc ceilings below.
+
+The waves that empty it are owned by #4990, which carries the wave plan. Wave 1
+compacted the ten largest rows to rule, pin and link; none reached 300 without
+semantic damage. By owner decision on #4990 (15 Nov 2026) each stays here at its
+new, lower count, and later waves take them off. After wave 1 the table held 88
+rows and 56,846 words (70,395 before it). Wave 2 compacted the sixteen
+`INV-HOST` rows: twelve reached 300 and left, and `INV-HOST-029`,
+`INV-HOST-045`, `INV-HOST-046` and `INV-HOST-050` stay at their new counts
+while exceptions are proposed on their deciding issues (#2576, #3040, #3039,
+#3232). The table now holds 76 rows and 46,711 words.
+
+| ID | Words |
+| --- | ---: |
+| `INV-MOD-025` | 1717 |
+| `INV-ADDPAY-037` | 1417 |
+| `INV-SSOT-004` | 471 |
+| `INV-HOST-050` | 532 |
+| `INV-PRIV-012` | 857 |
+| `INV-CONFIG-005` | 676 |
+| `INV-HOST-046` | 410 |
+| `INV-HOST-045` | 476 |
+| `INV-ADDPAY-039` | 931 |
+| `INV-SSOT-001` | 427 |
+| `INV-PRIV-016` | 1512 |
+| `INV-OPS-013` | 1354 |
+| `INV-CONFIG-004` | 1304 |
+| `INV-OPS-012` | 1200 |
+| `INV-PAY-047` | 1164 |
+| `INV-MOD-055` | 1002 |
+| `INV-ADDPAY-036` | 1137 |
+| `INV-SSOT-003` | 1094 |
+| `INV-ADDPAY-038` | 1025 |
+| `INV-CONFIG-002` | 874 |
+| `INV-MONEY-003` | 867 |
+| `INV-ADDPAY-034` | 583 |
+| `INV-MOD-026` | 828 |
+| `INV-PRIV-011` | 809 |
+| `INV-DATE-013` | 780 |
+| `INV-GUEST-016` | 781 |
+| `INV-INT-016` | 762 |
+| `INV-HOST-029` | 530 |
+| `INV-MOD-021` | 672 |
+| `INV-MONEY-029` | 808 |
+| `INV-LIFE-062` | 639 |
+| `INV-ADDPAY-017` | 637 |
+| `INV-PRIV-013` | 625 |
+| `INV-MOD-006` | 623 |
+| `INV-ADDPAY-023` | 584 |
+| `INV-LOCK-002` | 589 |
+| `INV-CONFIG-003` | 578 |
+| `INV-LIFE-042` | 562 |
+| `INV-OPS-014` | 561 |
+| `INV-ADDPAY-030` | 559 |
+| `INV-LIFE-064` | 516 |
+| `INV-LOCK-004` | 512 |
+| `INV-EXCEPT-009` | 505 |
+| `INV-INT-017` | 489 |
+| `INV-PRIV-015` | 458 |
+| `INV-LIFE-054` | 449 |
+| `INV-LIFE-024` | 346 |
+| `INV-DATE-026` | 430 |
+| `INV-PRIV-014` | 425 |
+| `INV-DATE-025` | 418 |
+| `INV-MOD-017` | 412 |
+| `INV-OPS-001` | 406 |
+| `INV-REQ-007` | 391 |
+| `INV-MOD-005` | 330 |
+| `INV-ADDPAY-011` | 380 |
+| `INV-CAP-023` | 360 |
+| `INV-PAY-058` | 363 |
+| `INV-LIFE-050` | 359 |
+| `INV-LIFE-085` | 352 |
+| `INV-CAP-031` | 351 |
+| `INV-DATE-024` | 350 |
+| `INV-MONEY-024` | 348 |
+| `INV-PAY-025` | 348 |
+| `INV-PAY-023` | 332 |
+| `INV-ADDPAY-035` | 340 |
+| `INV-LIFE-018` | 338 |
+| `INV-CAP-030` | 337 |
+| `INV-ADDPAY-009` | 333 |
+| `INV-CAP-032` | 331 |
+| `INV-LIFE-065` | 325 |
+| `INV-MOD-016` | 319 |
+| `INV-DATE-027` | 316 |
+| `INV-PAY-046` | 308 |
+| `INV-CAP-027` | 303 |
+| `INV-CAP-036` | 303 |
+
+## Agent docs
+
+Every top-level `docs/agents/*.md` page has a word ceiling here (#4462), measured
+over the whole file the same way. Agent guidance is read under context
+pressure, so it may not grow by default: a page over its ceiling fails, and a
+page with no row fails. A ceiling a change adds or alters must sit at most 50
+words above its page; a row the change leaves alone is never failed for sitting
+further above a page that shrank (two lanes shrinking one page would otherwise
+redden `main` between them), and the check prints a note suggesting it be
+lowered. Raising one is a deliberate edit a reviewer sees; the cheaper fix is
+usually to compact, to move detail to the doc that owns it, or to turn a
+mechanical rule into a hook (`scripts/agent-hooks/rules.mjs`). Exact form, one
+row per page:
+
+| File | Ceiling |
+| --- | ---: |
+| `docs/agents/CODEX_PROMPTS.md` | 1050 |
+| `docs/agents/CODEX_WORKFLOW.md` | 2450 |
+| `docs/agents/COORDINATION.md` | 2300 |
+| `docs/agents/DATASET_RESET_INVENTORY.md` | 750 |
+| `docs/agents/EPIC_PLAYBOOK.md` | 3150 |
+| `docs/agents/ISSUE_WORKFLOW.md` | 3400 |
+| `docs/agents/MODELS.md` | 850 |
+| `docs/agents/PROFILE_GUIDE.md` | 200 |
+| `docs/agents/PROMPT_INJECTION_GUIDE.md` | 300 |
+| `docs/agents/REVIEW_SEVERITY.md` | 400 |
+| `docs/agents/SCOPED_CONTEXT.md` | 850 |
+| `docs/agents/SEKRETON_ORCHESTRATOR.md` | 1800 |
+| `docs/agents/SUBAGENT_GUIDE.md` | 1100 |
+
+## Screen map
+
+The [UX flow map](../UX_FLOW_MAP.md) is a screen directory, grouped by area,
+with short journeys and links to the detailed guides. `docs:indexcheck` enforces
+this ceiling using its existing word counter. History belongs in the linked
+[archive](../UX_FLOW_HISTORY.md), rather than being appended to the map.
+
+| Document | Ceiling |
+| --- | ---: |
+| `docs/UX_FLOW_MAP.md` | 8000 |

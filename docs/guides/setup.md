@@ -1,0 +1,116 @@
+# Setup
+
+Audience: Operator
+
+## What it is
+
+The installation and configuration hub: a **readiness checklist** that grades
+your club's setup (with live provider tests for Stripe, SMTP, Sentry, and Xero)
+plus a grid of **hub cards** that jump into each configuration area — foundations,
+finance, booking rules, integrations, membership, cancellation, and
+notifications. Find it at **Admin → Setup & Configuration → Setup**
+(`/admin/setup`).
+
+The page's own route is the **support** area, but it embeds cross-area cards
+whose backing pages enforce their own permission areas — so which cards you can
+open depends on your role. It is the natural starting point after a fresh
+install and the map to everything else in Setup & Configuration.
+
+## When you'd use it
+
+- You've just stood up a fork and want a guided checklist of what still needs
+  configuring.
+- You want to test that Stripe, email (SMTP), Sentry, or Xero are actually
+  reachable from this environment.
+- You need to find the right configuration sub-area and don't want to hunt the
+  sidebar.
+
+## Step-by-step
+
+### Work the checklist and jump to a sub-area
+
+Each hub card opens an aggregator surface that regroups settings owned and
+documented in their own areas' guides, so this hub's single screenshot is
+enough — every sub-page is captured and detailed where it lives.
+
+1. Go to **Admin → Setup & Configuration → Setup**. The readiness summary shows
+   how many checks are complete, warning, or blocked.
+
+   ![Setup hub showing the readiness checklist summary, provider test actions, and the grid of configuration hub cards](../images/admin/admin-setup.png)
+
+2. Work through the **checklist categories**. A check can be marked done or
+   skipped, and provider checks offer a **test** button (Stripe, SMTP, Sentry,
+   Xero) that pings the live service and reports the result.
+   **Built-in Membership Types** warns if Full or Non-Member was archived or its
+   booking behavior changed before the guard existed. Follow its link to
+   [Membership Types](membership-types.md), reactivate the type, and restore the
+   expected booking behavior if prompted.
+3. Use the **hub cards** to open a configuration area: Foundations Setup,
+   Finance Setup, Bookings Setup, Integration Readiness, Membership & Members,
+   Cancellation Requests, or Notifications & Email. Booking Rules, Operational
+   Integrations and Cancellation were drill-downs of their own until #4796
+   merged each into the page it linked to; their old addresses still work.
+
+## Settings reference
+
+The Setup page itself only tracks checklist progress; the real settings live in
+the areas it links to:
+
+| Hub card | Opens | Its permission area |
+| --- | --- | --- |
+| Foundations Setup | Club identity, modules, lodge records, health (`/admin/setup/foundations`); its back link returns here | support |
+| Finance Setup | Finance reporting, Xero setup, sync tools, report mappings — collapsed by default (`/admin/setup/finance`) | finance |
+| Bookings Setup | Booking policy, seasons, age groups, promos, inventory, copy ([bookings-setup](bookings-setup.md)) | bookings; each of its cards shows only to an admin who can open it |
+| Integration Readiness | Xero connection, modules, delivery health: a section of System Health ([health](health.md#integration-readiness)) | support; its Xero cards need finance |
+| Membership & Members | Membership types, member fields, subscription lockout ([membership-setup](membership-setup.md)) | membership |
+| Cancellation Requests | Cancellation settings and the request queue: the Settings tab of [Cancellation Requests](membership-cancellations.md) | membership |
+| Notifications & Email | Delivery rules, recipients, templates, member copy ([notifications](notifications.md)) | support |
+
+Provider tests cover Stripe, SMTP (email), Sentry, and Xero. Each check is
+**complete**, **warning**, **blocked**, or **not started**.
+
+One checklist step does not sit behind a hub card, because it is a single
+setting: **Club Time Zone** links straight to [`/admin/club-time`](club-time.md).
+On a fresh install it reads **blocked** until a time zone is recorded, so setup
+cannot be finished without one. After an upgrade it usually reads *complete* and
+names the zone — the application records the zone it was already effectively
+using the first time it starts, so nothing needs choosing.
+
+Two other answers are worth recognising. A **warning** means the zone could not be
+confirmed: the server's `TZ` named no actual place (`UTC`, `Etc/UTC`), so
+`Pacific/Auckland` was recorded and the checklist is asking you to confirm it —
+act on this one if the club is not in New Zealand. Still **blocked** after an
+upgrade means the application has not restarted since the migration; restart it,
+or run `pnpm run config:self-heal`.
+
+The **Data Encryption Key** step is about the server, not a setting you can
+change here. It reads **blocked** until whoever runs the server sets a
+data-encryption key whenever a provider credential or an authenticator-app
+secret is stored, because those are still protected only by the server's
+sign-in secret. It also reads blocked if a key that was set has gone missing.
+The site works normally meanwhile. The step counts what is still on the
+old secret and, once a key is set, how to move it; the server steps are in
+[`CONFIGURATION.md` → Data-encryption keys](../../CONFIGURATION.md#data-encryption-keys-4456).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| A provider test fails | The credentials/config for that provider are missing or wrong | Fix them per [`CONFIGURATION.md`](../../CONFIGURATION.md); re-run the test |
+| A hub card is missing or greyed | Your role lacks the card's permission area | Ask a full admin, or an admin with that area, to complete it |
+| A check stays "blocked" | A required dependency isn't in place | Open the linked area and resolve the named requirement |
+| **Club Time Zone** stays blocked right after an upgrade | The application has not restarted since the migration, so the zone has not been recorded yet. The zone in use is still the right one | Restart the application, or run `pnpm run config:self-heal`. See the [Club Time Zone guide](club-time.md) |
+| **Club Time Zone** shows a warning about confirming the zone | The server's `TZ` named no actual place, so `Pacific/Auckland` was recorded rather than guessed at from a value that names no location | If the club is in New Zealand, acknowledge the step. If not, set the real zone at [`/admin/club-time`](club-time.md) — this is the case that would otherwise put a non-NZ club's times out by hours |
+| **Database role** warns that the app is connected as a superuser | The connection can rewrite booking-ledger and audit rows, directly, through membership in a superuser role, or through a superuser login narrowed by `SET ROLE` | Ask whoever runs the server to follow [Least-privilege database roles](../../DEPLOYMENT.md#least-privilege-database-roles); new installs use [First Bootstrap](../../DEPLOYMENT.md#first-bootstrap). This warning does not block setup |
+| **Database role** is not checked | The database role could not be read | Check the database connection and retry; this is not confirmation of restricted rights |
+| **Data Encryption Key** is blocked | No data-encryption key is set on the server yet, or one that was set is now missing or invalid (the step says which) | Ask whoever runs the server to set or restore `DATA_ENCRYPTION_KEYS`, per [`DEPLOYMENT.md`](../../DEPLOYMENT.md#adding-a-data-encryption-key-4456) |
+| Setup shows incomplete after go-live | Optional checks were left unskipped | Mark genuinely-skipped checks as skipped so the summary reflects reality |
+
+## Related links
+
+- Back to the [documentation hub](../README.md).
+- Sibling guides: [Modules](modules.md), [Integrations](integrations.md),
+  [Login & Security](security.md), [Membership & Members setup](membership-setup.md),
+  [Notifications & Email](notifications.md), [Club Time Zone](club-time.md).
+- Reference: [`CONFIGURATION.md`](../../CONFIGURATION.md) and the
+  [`IMPLEMENTATION_GUIDE.md`](../IMPLEMENTATION_GUIDE.md).

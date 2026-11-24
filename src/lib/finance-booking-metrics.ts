@@ -1,0 +1,1366 @@
+import { readRefundsAndCreditsOwed } from "@/lib/refunds-and-credits-owed";
+import {
+  BookingStatus,
+  PaymentStatus,
+  Prisma,
+} from "@prisma/client";
+import {
+  netCollectedPaymentSelect as sharedNetCollectedPaymentSelect,
+  summarizeNetCollectedWithLedgerGap,
+  type AdditionalLedgerGapSummary,
+} from "@/lib/additional-ledger-gap";
+import { isAdditionalPaymentOwed } from "@/lib/additional-payment-chase";
+import { getDefaultLodgeCapacity, getLodgeCapacity } from "@/lib/lodge-capacity";
+import { getDefaultLodgeId, lodgeNullTolerantScope } from "@/lib/lodges";
+import logger from "@/lib/logger";
+import { buildBookingDeletedWhere } from "@/lib/booking-delete-visibility";
+import { prisma } from "@/lib/prisma";
+import { countActiveGuestsForNight } from "@/lib/booking-guest-stay-ranges";
+import { type CalendarDate } from "@/lib/club-time";
+import { clubTime } from "@/lib/club-time/server";
+import { formatDateOnly } from "@/lib/date-only";
+import {
+  OPERATIONAL_STAY_BOOKING_STATUSES,
+  PAYMENT_OWED_BOOKING_STATUSES,
+} from "@/lib/booking-status";
+import {
+  addUtcDays,
+  allocateCentsEvenly,
+  buildIsoDateRange,
+  differenceInUtcDays,
+  getFinanceBookingMetricsWindowDayCount,
+  parseFinanceBookingMetricDate as parseIsoDate,
+} from "@/lib/finance-booking-metric-calculations";
+import {
+  summarizeBookingMoneyReconciliations,
+  type BookingMoneyReconciliationSummary,
+} from "@/lib/booking-money-reconciliation";
+import { isCapturedPaymentStatus } from "@/lib/booking-payment-state";
+import { type CollectedCashSummary } from "@/lib/payment-net-collected";
+
+export const MAX_FINANCE_BOOKING_METRICS_WINDOW_DAYS = 366;
+export { getFinanceBookingMetricsWindowDayCount };
+
+export const FINANCE_REALIZED_BOOKING_STATUSES = [
+  ...OPERATIONAL_STAY_BOOKING_STATUSES,
+] as const;
+
+export const FINANCE_FORWARD_COMMITTED_BOOKING_STATUSES = [
+  BookingStatus.PAID,
+] as const;
+
+export const FINANCE_FORWARD_AT_RISK_BOOKING_STATUSES = [
+  BookingStatus.PENDING,
+  ...PAYMENT_OWED_BOOKING_STATUSES,
+] as const;
+
+const PAYMENT_STATUS_KEYS = [
+  PaymentStatus.PENDING,
+  PaymentStatus.PROCESSING,
+  PaymentStatus.SUCCEEDED,
+  PaymentStatus.FAILED,
+  PaymentStatus.REFUNDED,
+  PaymentStatus.PARTIALLY_REFUNDED,
+  "NONE",
+] as const;
+
+const ADDITIONAL_PAYMENT_STATUS_KEYS = [
+  "PENDING",
+  "SUCCEEDED",
+  "FAILED",
+  "NONE",
+] as const;
+
+const bookingMetricsSelect = Prisma.validator<Prisma.BookingSelect>()({
+  id: true,
+  checkIn: true,
+  checkOut: true,
+  status: true,
+  totalPriceCents: true,
+  discountCents: true,
+  promoAdjustmentCents: true,
+  finalPriceCents: true,
+  guests: {
+    select: {
+      id: true,
+      priceCents: true,
+      stayStart: true,
+      stayEnd: true,
+      nights: {
+        select: {
+          stayDate: true,
+          priceCents: true,
+          priceSource: true,
+        },
+      },
+    },
+  },
+  promoRedemptions: {
+    select: {
+      priceAdjustmentCents: true,
+      allocations: {
+        select: { memberId: true, priceAdjustmentCents: true },
+      },
+    },
+  },
+  nightAdjustments: {
+    select: { beneficiaryMemberId: true, amountCents: true },
+  },
+  payment: {
+    select: {
+      status: true,
+      amountCents: true,
+      refundedAmountCents: true,
+      changeFeeCents: true,
+      creditAppliedCents: true,
+      additionalAmountCents: true,
+      additionalPaymentStatus: true,
+    },
+  },
+});
+
+type BookingMetricsRecord = Prisma.BookingGetPayload<{
+  select: typeof bookingMetricsSelect;
+}>;
+
+/**
+ * #3637 (#3372 decision A): Net Collected reads its own payments - every
+ * booking staying in the window, ANY status - through the shared Net Collected
+ * select, widened by the stay dates the window test reads.
+ * `summarizeNetCollectedWithLedgerGap` drops soft-deleted bookings and runs the
+ * #2408 ledger-gap guard over the same payments.
+ */
+const netCollectedPaymentSelect = Prisma.validator<Prisma.PaymentSelect>()({
+  ...sharedNetCollectedPaymentSelect,
+  booking: {
+    select: {
+      ...sharedNetCollectedPaymentSelect.booking.select,
+      checkIn: true,
+      checkOut: true,
+    },
+  },
+});
+
+type NetCollectedCandidate = Prisma.PaymentGetPayload<{
+  select: typeof netCollectedPaymentSelect;
+}>;
+
+/**
+ * How many booking ids to name in the ledger-gap alarm. Enough to act on,
+ * bounded so one bad import cannot flood the log.
+ */
+const MAX_LOGGED_LEDGER_GAP_BOOKINGS = 20;
+
+type RealizedBookingStatus = (typeof FINANCE_REALIZED_BOOKING_STATUSES)[number];
+type ForwardCommittedBookingStatus =
+  (typeof FINANCE_FORWARD_COMMITTED_BOOKING_STATUSES)[number];
+type ForwardAtRiskBookingStatus =
+  (typeof FINANCE_FORWARD_AT_RISK_BOOKING_STATUSES)[number];
+type FinancePaymentStatusKey = (typeof PAYMENT_STATUS_KEYS)[number];
+type FinanceAdditionalPaymentStatusKey =
+  (typeof ADDITIONAL_PAYMENT_STATUS_KEYS)[number];
+
+interface FinanceBookingMetricsDateRangeInput {
+  from: string;
+  to: string;
+}
+
+interface FinanceRealizedStayMetricsQuery
+  extends FinanceBookingMetricsDateRangeInput {
+  cutoffDate?: string;
+}
+
+interface FinanceForwardBookingMetricsQuery
+  extends FinanceBookingMetricsDateRangeInput {
+  asOfDate?: string;
+}
+
+export interface FinanceBookingMetricsQuery {
+  realized?: FinanceRealizedStayMetricsQuery;
+  forward?: FinanceForwardBookingMetricsQuery;
+  // Reporting lodge scope (multi-lodge). When set, metrics cover only that
+  // lodge (its bookings, its capacity). When omitted, metrics cover ALL active
+  // lodges and the occupancy denominator is the SUM of their capacities — a
+  // deliberate, reporting-only exception to the "never sum across lodges"
+  // scoping rule (see docs/multi-lodge/scoping-contract).
+  lodgeId?: string | null;
+  /**
+   * #3372 (owner, 7 Oct 2026): read "Refunds owed" and "Credits owed" into the
+   * payment summary. They are as at today and club-wide, the same for every
+   * window, so a page that asks for several windows (the finance dashboard's
+   * comparison, the pricing view) reads them once: only the request that shows
+   * them sets this. Left out, both are null.
+   */
+  includeRefundsAndCreditsOwed?: boolean;
+}
+
+interface FinanceBookingMetricsWindow {
+  from: string;
+  to: string;
+  effectiveFrom: string | null;
+  effectiveTo: string | null;
+  dayCount: number;
+}
+
+interface FinanceBookingOccupancySummary {
+  occupiedBedNights: number;
+  capacityBedNights: number;
+  occupancyRate: number;
+}
+
+interface FinanceBookingStatusSummary {
+  bookingCount: number;
+  bookingNights: number;
+  guestNights: number;
+  bookedRevenueCents: number;
+}
+
+interface FinanceBookingDailyMetric {
+  date: string;
+  bookingCount: number;
+  guestNights: number;
+  occupiedBeds: number;
+  availableBeds: number;
+  occupancyRate: number;
+  bookedRevenueCents: number;
+}
+
+interface FinanceBookingPipelineDailyMetric {
+  date: string;
+  committed: FinanceBookingDailyMetric;
+  atRisk: FinanceBookingDailyMetric;
+  totalPipeline: FinanceBookingDailyMetric;
+}
+
+interface FinanceBookingBucketSummary {
+  bookingCount: number;
+  bookingNights: number;
+  guestNights: number;
+  bookedRevenueCents: number;
+  occupancy: FinanceBookingOccupancySummary;
+}
+
+interface FinanceBookingMetricsPaymentSummary {
+  bookingCount: number;
+  bookingsWithPayment: number;
+  bookingsWithoutPayment: number;
+  paymentStatusBreakdown: Record<FinancePaymentStatusKey, number>;
+  additionalPaymentStatusBreakdown: Record<
+    FinanceAdditionalPaymentStatusKey,
+    number
+  >;
+  /**
+   * Gross captured cash: `Payment.amountCents` summed over the payments whose
+   * status says money was taken. It, `refundedCents`, `handBackOwedCents`, `keptCreditCents`, `netCollectedCents` and
+   * the two ledger-gap fields count the Net Collected scope (#3637): every
+   * booking staying in the window, ANY status. Every OTHER field here counts
+   * the status-listed contributing bookings. Neither counts a soft-deleted one.
+   *
+   * `reconcilePaymentAggregates` sets the column to the sum of EVERY captured
+   * ledger row, PRIMARY and ADDITIONAL alike, so this figure ALREADY contains a
+   * collected price increase. #2408 renamed it from `capturedPrimaryCents`,
+   * which invited the double count it caused ($121 + $21 reported as $142).
+   */
+  capturedGrossCents: number;
+  /**
+   * How much captured money came from a later price increase — a BREAKDOWN,
+   * never an addend beside the gross (#2408). It counts the STATUS-LISTED
+   * bookings, not the Net Collected scope, so a cancelled booking's collected
+   * increase is in the gross but not here.
+   */
+  capturedAdditionalCents: number;
+  /**
+   * #2350: upward booking changes whose extra was never collected (PENDING,
+   * FAILED, or a legacy null status). Priced into the booking total, so it is
+   * money the club has counted as booked but does not hold.
+   */
+  outstandingAdditionalCents: number;
+  outstandingAdditionalBookings: number;
+  /**
+   * #2408 guard. Money on payments that CLAIM a collected price increase
+   * (`additionalPaymentStatus = "SUCCEEDED"`, non-zero `additionalAmountCents`)
+   * with no captured ADDITIONAL `PaymentTransaction` behind it. Over the Net
+   * Collected scope (#3637): the same payments `netCollectedCents` counts.
+   *
+   * That is the one shape in which `capturedGrossCents` does NOT contain the
+   * addition, and therefore the one shape in which `netCollectedCents`
+   * understates the cash — by up to this amount. It does not exist in healthy
+   * data (`reconcilePaymentAggregates` derives both columns from the latest
+   * ADDITIONAL row, so a SUCCEEDED status implies a captured row), but an
+   * import, a repair pass, or a future write path could produce it, and a
+   * finance figure must never be quietly wrong. Non-zero means: reconcile those
+   * payments' ledgers before trusting the collected total.
+   */
+  additionalLedgerGapCents: number;
+  additionalLedgerGapBookings: number;
+  refundedCents: number;
+  /** Open hand-back refunds, taken off at once (#3372, 3 and 7 Oct 2026). */
+  handBackOwedCents: number;
+  /** Card refunds not yet paid by Stripe, taken off at once (#3372, 7 Oct 2026). */
+  cardRefundOwedCents: number;
+  /** Late card charges awaiting the treasurer, taken off until kept (#3372, 7 Oct 2026). */
+  lateCaptureOwedCents: number;
+  /** A cancelled booking's late bank-transfer cash credited back (#3372). */
+  lateCashCreditedCents: number;
+  /** Applied account credit cancellations kept (#3372 owner decision, 3 Oct 2026). */
+  keptCreditCents: number;
+  /**
+   * `summarizeCollectedCash`'s figure: `capturedGrossCents - refundedCents -
+   * handBackOwedCents - cardRefundOwedCents - lateCaptureOwedCents -
+   * lateCashCreditedCents + keptCreditCents`, each payment netted on its own.
+   * Never sums the gross and additional columns — see `capturedGrossCents`
+   * (#2408).
+   */
+  netCollectedCents: number;
+  /**
+   * #3372 (owner, 7 Oct 2026): beside Net Collected, as at today and
+   * club-wide - NOT narrowed by the window or lodge (`readRefundsAndCreditsOwed`).
+   * Null unless the request set `includeRefundsAndCreditsOwed`.
+   */
+  refundsOwedCents: number | null;
+  creditsOwedCents: number | null;
+  creditAppliedCents: number;
+  changeFeeCents: number;
+}
+
+interface FinanceRealizedStayMetrics {
+  window: FinanceBookingMetricsWindow & {
+    cutoffDate: string;
+  };
+  totals: FinanceBookingBucketSummary & {
+    averageNightlyRevenueCents: number | null;
+  };
+  statusBreakdown: Record<RealizedBookingStatus, FinanceBookingStatusSummary>;
+  byDate: FinanceBookingDailyMetric[];
+}
+
+interface FinanceForwardBookingMetrics {
+  window: FinanceBookingMetricsWindow & {
+    asOfDate: string;
+  };
+  totals: {
+    committed: FinanceBookingBucketSummary & {
+      statusBreakdown: Record<
+        ForwardCommittedBookingStatus,
+        FinanceBookingStatusSummary
+      >;
+    };
+    atRisk: FinanceBookingBucketSummary & {
+      statusBreakdown: Record<
+        ForwardAtRiskBookingStatus,
+        FinanceBookingStatusSummary
+      >;
+    };
+    totalPipeline: FinanceBookingBucketSummary;
+  };
+  byDate: FinanceBookingPipelineDailyMetric[];
+}
+
+export interface FinanceBookingMetricsResult {
+  generatedAt: string;
+  bookingCount: number;
+  moneyReconciliation: BookingMoneyReconciliationSummary;
+  paymentSummary: FinanceBookingMetricsPaymentSummary;
+  realized?: FinanceRealizedStayMetrics;
+  forward?: FinanceForwardBookingMetrics;
+}
+
+type DailyMetricAccumulator = {
+  bookingCount: number;
+  guestNights: number;
+  bookedRevenueCents: number;
+};
+
+type StatusAccumulator = {
+  bookingIds: Set<string>;
+  bookingNights: number;
+  guestNights: number;
+  bookedRevenueCents: number;
+};
+
+type BucketAccumulator<Status extends string> = {
+  bookingIds: Set<string>;
+  bookingNights: number;
+  guestNights: number;
+  bookedRevenueCents: number;
+  byDate: Map<string, DailyMetricAccumulator>;
+  statusBreakdown: Record<Status, StatusAccumulator>;
+};
+
+type NormalizedDateWindow = {
+  from: string;
+  to: string;
+  fromDate: Date;
+  toDate: Date;
+};
+
+type NormalizedRealizedWindow = NormalizedDateWindow & {
+  cutoffDate: string;
+  effectiveFrom: string | null;
+  effectiveFromDate: Date | null;
+  effectiveTo: string | null;
+  effectiveToDate: Date | null;
+  dayCount: number;
+};
+
+type NormalizedForwardWindow = NormalizedDateWindow & {
+  asOfDate: string;
+  effectiveFrom: string | null;
+  effectiveFromDate: Date | null;
+  effectiveTo: string | null;
+  effectiveToDate: Date | null;
+  dayCount: number;
+};
+
+function zeroStatusBreakdown<Status extends string>(
+  statuses: readonly Status[]
+): Record<Status, number> {
+  return statuses.reduce(
+    (accumulator, status) => {
+      accumulator[status] = 0;
+      return accumulator;
+    },
+    {} as Record<Status, number>
+  );
+}
+
+function createZeroPaymentSummary(): FinanceBookingMetricsPaymentSummary {
+  return {
+    bookingCount: 0,
+    bookingsWithPayment: 0,
+    bookingsWithoutPayment: 0,
+    paymentStatusBreakdown: zeroStatusBreakdown(PAYMENT_STATUS_KEYS),
+    additionalPaymentStatusBreakdown: zeroStatusBreakdown(
+      ADDITIONAL_PAYMENT_STATUS_KEYS
+    ),
+    capturedGrossCents: 0,
+    capturedAdditionalCents: 0,
+    outstandingAdditionalCents: 0,
+    outstandingAdditionalBookings: 0,
+    additionalLedgerGapCents: 0,
+    additionalLedgerGapBookings: 0,
+    refundedCents: 0,
+    handBackOwedCents: 0,
+    cardRefundOwedCents: 0,
+    lateCaptureOwedCents: 0,
+    lateCashCreditedCents: 0,
+    keptCreditCents: 0,
+    netCollectedCents: 0,
+    refundsOwedCents: null,
+    creditsOwedCents: null,
+    creditAppliedCents: 0,
+    changeFeeCents: 0,
+  };
+}
+
+function createEmptyDailyMetric(
+  date: string,
+  lodgeCapacity: number,
+): FinanceBookingDailyMetric {
+  return {
+    date,
+    bookingCount: 0,
+    guestNights: 0,
+    occupiedBeds: 0,
+    availableBeds: lodgeCapacity,
+    occupancyRate: 0,
+    bookedRevenueCents: 0,
+  };
+}
+
+function normalizeDateWindow(
+  input: FinanceBookingMetricsDateRangeInput,
+  prefix: string
+): NormalizedDateWindow {
+  const fromDate = parseIsoDate(input.from, `${prefix}.from`);
+  const toDate = parseIsoDate(input.to, `${prefix}.to`);
+
+  if (fromDate.getTime() > toDate.getTime()) {
+    throw new Error(`${prefix}.to must be on or after ${prefix}.from`);
+  }
+
+  const dayCount = getFinanceBookingMetricsWindowDayCount(input.from, input.to);
+  if (dayCount > MAX_FINANCE_BOOKING_METRICS_WINDOW_DAYS) {
+    throw new Error(
+      `${prefix} window cannot exceed ${MAX_FINANCE_BOOKING_METRICS_WINDOW_DAYS} days`
+    );
+  }
+
+  return {
+    from: input.from,
+    to: input.to,
+    fromDate,
+    toDate,
+  };
+}
+
+function minDate(left: Date, right: Date): Date {
+  return left.getTime() <= right.getTime() ? left : right;
+}
+
+function maxDate(left: Date, right: Date): Date {
+  return left.getTime() >= right.getTime() ? left : right;
+}
+
+function normalizeRealizedWindow(
+  input: FinanceRealizedStayMetricsQuery
+): NormalizedRealizedWindow {
+  const base = normalizeDateWindow(input, "realized");
+  const cutoffDate = input.cutoffDate ?? input.to;
+  const cutoff = parseIsoDate(cutoffDate, "realized.cutoffDate");
+  const effectiveToDate =
+    cutoff.getTime() < base.fromDate.getTime()
+      ? null
+      : minDate(base.toDate, cutoff);
+
+  return {
+    ...base,
+    cutoffDate,
+    effectiveFrom: effectiveToDate ? base.from : null,
+    effectiveFromDate: effectiveToDate ? base.fromDate : null,
+    effectiveTo: effectiveToDate ? formatDateOnly(effectiveToDate) : null,
+    effectiveToDate,
+    dayCount: effectiveToDate
+      ? differenceInUtcDays(base.fromDate, addUtcDays(effectiveToDate, 1))
+      : 0,
+  };
+}
+
+/**
+ * `todayAtClub` is the default `asOfDate` — the cut-off deciding which stays
+ * count as forward-booked rather than realised.
+ *
+ * It used to be read here from `todayDateOnlyForTimeZone()`, which answers from
+ * the CONTAINER's timezone rather than the club's persisted one (#3123,
+ * `INV-CONFIG-002`). A club whose configured zone differs from its deployment's
+ * would split one day's stays across the realised/forward boundary depending
+ * on which side of the container's midnight the report ran — the same
+ * "different figures with no input changed" complaint #2682 fixed from the UTC
+ * side. This helper is pure and sync, so the day is resolved once in
+ * `getFinanceBookingMetrics` and passed down (`INV-DATE-019`,
+ * `docs/invariants/booking-dates-and-capacity.md`).
+ */
+function normalizeForwardWindow(
+  input: FinanceForwardBookingMetricsQuery,
+  todayAtClub: CalendarDate,
+): NormalizedForwardWindow {
+  const base = normalizeDateWindow(input, "forward");
+  const asOfDate = input.asOfDate ?? todayAtClub;
+  const asOf = parseIsoDate(asOfDate, "forward.asOfDate");
+  const effectiveFromDate = maxDate(base.fromDate, addUtcDays(asOf, 1));
+  const hasEffectiveWindow =
+    effectiveFromDate.getTime() <= base.toDate.getTime();
+
+  return {
+    ...base,
+    asOfDate,
+    effectiveFrom: hasEffectiveWindow ? formatDateOnly(effectiveFromDate) : null,
+    effectiveFromDate: hasEffectiveWindow ? effectiveFromDate : null,
+    effectiveTo: hasEffectiveWindow ? base.to : null,
+    effectiveToDate: hasEffectiveWindow ? base.toDate : null,
+    dayCount: hasEffectiveWindow
+      ? differenceInUtcDays(effectiveFromDate, addUtcDays(base.toDate, 1))
+      : 0,
+  };
+}
+
+function createBucketAccumulator<Status extends string>(
+  dates: string[],
+  statuses: readonly Status[]
+): BucketAccumulator<Status> {
+  const byDate = new Map<string, DailyMetricAccumulator>();
+  for (const date of dates) {
+    byDate.set(date, {
+      bookingCount: 0,
+      guestNights: 0,
+      bookedRevenueCents: 0,
+    });
+  }
+
+  return {
+    bookingIds: new Set<string>(),
+    bookingNights: 0,
+    guestNights: 0,
+    bookedRevenueCents: 0,
+    byDate,
+    statusBreakdown: statuses.reduce(
+      (accumulator, status) => {
+        accumulator[status] = {
+          bookingIds: new Set<string>(),
+          bookingNights: 0,
+          guestNights: 0,
+          bookedRevenueCents: 0,
+        };
+        return accumulator;
+      },
+      {} as Record<Status, StatusAccumulator>
+    ),
+  };
+}
+
+function initializeDateMetrics(
+  dates: string[],
+  lodgeCapacity: number,
+): FinanceBookingDailyMetric[] {
+  return dates.map((date) => createEmptyDailyMetric(date, lodgeCapacity));
+}
+
+function getDailyMetricMap(
+  rows: FinanceBookingDailyMetric[]
+): Map<string, FinanceBookingDailyMetric> {
+  return new Map(rows.map((row) => [row.date, row]));
+}
+
+function toOccupancySummary(
+  guestNights: number,
+  dayCount: number,
+  lodgeCapacity: number,
+): FinanceBookingOccupancySummary {
+  const capacityBedNights = dayCount * lodgeCapacity;
+
+  return {
+    occupiedBedNights: guestNights,
+    capacityBedNights,
+    occupancyRate:
+      capacityBedNights > 0
+        ? Number((guestNights / capacityBedNights).toFixed(4))
+        : 0,
+  };
+}
+
+function finalizeStatusBreakdown<Status extends string>(
+  accumulators: Record<Status, StatusAccumulator>
+): Record<Status, FinanceBookingStatusSummary> {
+  const breakdown = {} as Record<Status, FinanceBookingStatusSummary>;
+
+  for (const status of Object.keys(accumulators) as Status[]) {
+    const accumulator = accumulators[status];
+
+    breakdown[status] = {
+      bookingCount: accumulator.bookingIds.size,
+      bookingNights: accumulator.bookingNights,
+      guestNights: accumulator.guestNights,
+      bookedRevenueCents: accumulator.bookedRevenueCents,
+    };
+  }
+
+  return breakdown;
+}
+
+function finalizeBucketSummary<Status extends string>(
+  accumulator: BucketAccumulator<Status>,
+  dayCount: number,
+  lodgeCapacity: number,
+): FinanceBookingBucketSummary {
+  return {
+    bookingCount: accumulator.bookingIds.size,
+    bookingNights: accumulator.bookingNights,
+    guestNights: accumulator.guestNights,
+    bookedRevenueCents: accumulator.bookedRevenueCents,
+    occupancy: toOccupancySummary(
+      accumulator.guestNights,
+      dayCount,
+      lodgeCapacity,
+    ),
+  };
+}
+
+function applyDailyMetrics<Status extends string>(
+  accumulator: BucketAccumulator<Status>,
+  dailyMetricMap: Map<string, FinanceBookingDailyMetric>,
+  lodgeCapacity: number,
+) {
+  for (const [date, dailyAccumulator] of accumulator.byDate.entries()) {
+    const row = dailyMetricMap.get(date);
+
+    if (!row) {
+      continue;
+    }
+
+    row.bookingCount = dailyAccumulator.bookingCount;
+    row.guestNights = dailyAccumulator.guestNights;
+    row.occupiedBeds = dailyAccumulator.guestNights;
+    row.availableBeds = lodgeCapacity - dailyAccumulator.guestNights;
+    row.occupancyRate =
+      lodgeCapacity > 0
+        ? Number((dailyAccumulator.guestNights / lodgeCapacity).toFixed(4))
+        : 0;
+    row.bookedRevenueCents = dailyAccumulator.bookedRevenueCents;
+  }
+}
+
+function getPaymentStatusKey(
+  booking: BookingMetricsRecord
+): FinancePaymentStatusKey {
+  return booking.payment?.status ?? "NONE";
+}
+
+/**
+ * Which bucket of the additional-payment split does this booking belong in?
+ *
+ * PENDING and FAILED mean "still owed", and they are gated on the SAME
+ * `isAdditionalPaymentOwed` predicate as `outstandingAdditionalCents` /
+ * `outstandingAdditionalBookings` below — because the finance panel renders the
+ * three side by side as a split and its total. Without the gate they measured
+ * different populations: the metrics window includes PENDING and
+ * PAYMENT_PENDING bookings, and a PAYMENT_PENDING booking can legitimately
+ * carry a delta (adding a guest to a booking with an issued Xero invoice raises
+ * one), so "Awaiting payment 3 / Payment failed 0 / Total outstanding across 1
+ * booking" was a panel disagreeing with itself. Legacy null-status rows read as
+ * PENDING for the same reason — the owed test counts them, so the split must.
+ *
+ * SUCCEEDED stays ungated: it is a fact about the money, not about the queue,
+ * and it is not part of the outstanding split. Everything else — including an
+ * uncollected delta on a booking the owed test excludes — is NONE, meaning "not
+ * in this queue", which is exactly what the total says about it too.
+ */
+function getAdditionalPaymentStatusKey(
+  booking: BookingMetricsRecord
+): FinanceAdditionalPaymentStatusKey {
+  if (booking.payment?.additionalPaymentStatus === "SUCCEEDED") {
+    return "SUCCEEDED";
+  }
+
+  if (
+    !isAdditionalPaymentOwed({
+      bookingStatus: booking.status,
+      payment: booking.payment,
+    })
+  ) {
+    return "NONE";
+  }
+
+  return booking.payment?.additionalPaymentStatus === "FAILED"
+    ? "FAILED"
+    : "PENDING";
+}
+
+function summarizePayments(
+  bookings: BookingMetricsRecord[],
+  collectedCash: CollectedCashSummary,
+  ledgerGap: AdditionalLedgerGapSummary,
+): FinanceBookingMetricsPaymentSummary {
+  const summary = createZeroPaymentSummary();
+
+  summary.bookingCount = bookings.length;
+  // #3637: these seven are over the Net Collected scope, not the loop below.
+  summary.capturedGrossCents = collectedCash.capturedGrossCents;
+  summary.refundedCents = collectedCash.refundedCents;
+  summary.handBackOwedCents = collectedCash.handBackOwedCents;
+  summary.cardRefundOwedCents = collectedCash.cardRefundOwedCents;
+  summary.lateCaptureOwedCents = collectedCash.lateCaptureOwedCents;
+  summary.lateCashCreditedCents = collectedCash.lateCashCreditedCents;
+  summary.keptCreditCents = collectedCash.keptCreditCents;
+  summary.netCollectedCents = collectedCash.netCollectedCents;
+  summary.additionalLedgerGapCents = ledgerGap.additionalLedgerGapCents;
+  summary.additionalLedgerGapBookings = ledgerGap.additionalLedgerGapBookings;
+
+  for (const booking of bookings) {
+    const payment = booking.payment;
+
+    if (!payment) {
+      summary.bookingsWithoutPayment += 1;
+      summary.paymentStatusBreakdown.NONE += 1;
+      summary.additionalPaymentStatusBreakdown.NONE += 1;
+      continue;
+    }
+
+    summary.bookingsWithPayment += 1;
+    summary.paymentStatusBreakdown[getPaymentStatusKey(booking)] += 1;
+    summary.additionalPaymentStatusBreakdown[
+      getAdditionalPaymentStatusKey(booking)
+    ] += 1;
+
+    // #2408: a BREAKDOWN of the gross `amountCents` (which already holds a
+    // captured increase), never added back to it.
+    const claimsCollectedAdditional =
+      payment.additionalPaymentStatus === "SUCCEEDED" &&
+      payment.additionalAmountCents > 0;
+    const capturedAdditionalCents = claimsCollectedAdditional
+      ? payment.additionalAmountCents
+      : 0;
+
+    summary.capturedAdditionalCents += capturedAdditionalCents;
+    if (
+      isAdditionalPaymentOwed({ bookingStatus: booking.status, payment })
+    ) {
+      summary.outstandingAdditionalCents += payment.additionalAmountCents;
+      summary.outstandingAdditionalBookings += 1;
+    }
+    summary.creditAppliedCents += payment.creditAppliedCents;
+    // #3955 review F9: a change fee is income once the money that pays it is
+    // in. A fee added to what an UNPAID booking owes (#3750) is recorded on
+    // its payment before anything is captured, so it counts only from capture.
+    if (isCapturedPaymentStatus(payment.status)) {
+      summary.changeFeeCents += payment.changeFeeCents;
+    }
+  }
+
+  if (ledgerGap.bookingIds.length > 0) {
+    logger.error(
+      {
+        bookingIds: ledgerGap.bookingIds.slice(
+          0,
+          MAX_LOGGED_LEDGER_GAP_BOOKINGS
+        ),
+        bookingCount: summary.additionalLedgerGapBookings,
+        additionalLedgerGapCents: summary.additionalLedgerGapCents,
+        netCollectedCents: summary.netCollectedCents,
+      },
+      "Finance metrics: payments record a collected additional payment with no captured ADDITIONAL PaymentTransaction behind it. Net Collected may understate by additionalLedgerGapCents. Reconcile those payments' ledgers (reconcilePaymentAggregates) before trusting the collected figure."
+    );
+  }
+
+  return summary;
+}
+
+function accumulateBookingIntoBucket<Status extends string>(input: {
+  booking: BookingMetricsRecord;
+  bucket: BucketAccumulator<Status>;
+  bucketStatus: Status;
+  contributingDates: string[];
+  revenueByNight: number[];
+  bookingIndexOffset: number;
+}) {
+  const {
+    booking,
+    bucket,
+    bucketStatus,
+    contributingDates,
+    revenueByNight,
+    bookingIndexOffset,
+  } = input;
+  const activeGuestCounts = contributingDates.map((date) =>
+    countActiveGuestsForNight(
+      booking.guests,
+      new Date(`${date}T00:00:00.000Z`),
+      booking
+    )
+  );
+  const activeDateCount = activeGuestCounts.filter((count) => count > 0).length;
+  const guestNightCount = activeGuestCounts.reduce(
+    (total, count) => total + count,
+    0
+  );
+
+  if (guestNightCount < 1 || activeDateCount < 1) {
+    return;
+  }
+
+  bucket.bookingIds.add(booking.id);
+  bucket.bookingNights += activeDateCount;
+  bucket.guestNights += guestNightCount;
+
+  const statusAccumulator = bucket.statusBreakdown[bucketStatus];
+  statusAccumulator.bookingIds.add(booking.id);
+  statusAccumulator.bookingNights += activeDateCount;
+  statusAccumulator.guestNights += guestNightCount;
+
+  for (const [index, date] of contributingDates.entries()) {
+    const activeGuestCount = activeGuestCounts[index] ?? 0;
+    if (activeGuestCount < 1) {
+      continue;
+    }
+
+    const dailyAccumulator = bucket.byDate.get(date);
+    const nightlyRevenue = revenueByNight[bookingIndexOffset + index] ?? 0;
+
+    if (!dailyAccumulator) {
+      continue;
+    }
+
+    dailyAccumulator.bookingCount += 1;
+    dailyAccumulator.guestNights += activeGuestCount;
+    dailyAccumulator.bookedRevenueCents += nightlyRevenue;
+
+    bucket.bookedRevenueCents += nightlyRevenue;
+    statusAccumulator.bookedRevenueCents += nightlyRevenue;
+  }
+}
+
+type BookingStayDates = Pick<BookingMetricsRecord, "checkIn" | "checkOut">;
+
+function getBookingDateRange(booking: BookingStayDates) {
+  return {
+    checkInDate: new Date(formatDateOnly(booking.checkIn) + "T00:00:00.000Z"),
+    checkOutDate: new Date(
+      formatDateOnly(booking.checkOut) + "T00:00:00.000Z"
+    ),
+  };
+}
+
+function getContributingDates(input: {
+  booking: BookingStayDates;
+  effectiveFromDate: Date | null;
+  effectiveToDate: Date | null;
+}) {
+  if (!input.effectiveFromDate || !input.effectiveToDate) {
+    return {
+      dates: [] as string[],
+      bookingIndexOffset: 0,
+      totalStayNights: 0,
+    };
+  }
+
+  const { checkInDate, checkOutDate } = getBookingDateRange(input.booking);
+  const totalStayNights = differenceInUtcDays(checkInDate, checkOutDate);
+
+  if (totalStayNights < 1) {
+    return {
+      dates: [] as string[],
+      bookingIndexOffset: 0,
+      totalStayNights: 0,
+    };
+  }
+
+  const effectiveEndExclusive = addUtcDays(input.effectiveToDate, 1);
+  const overlapStart = maxDate(checkInDate, input.effectiveFromDate);
+  const overlapEndExclusive = minDate(checkOutDate, effectiveEndExclusive);
+
+  if (overlapStart.getTime() >= overlapEndExclusive.getTime()) {
+    return {
+      dates: [] as string[],
+      bookingIndexOffset: 0,
+      totalStayNights,
+    };
+  }
+
+  return {
+    dates: buildIsoDateRange(overlapStart, addUtcDays(overlapEndExclusive, -1)),
+    bookingIndexOffset: differenceInUtcDays(checkInDate, overlapStart),
+    totalStayNights,
+  };
+}
+
+function buildRealizedMetrics(
+  window: NormalizedRealizedWindow,
+  bookings: BookingMetricsRecord[],
+  contributingBookingIds: Set<string>,
+  lodgeCapacity: number,
+): FinanceRealizedStayMetrics {
+  const dates =
+    window.effectiveFromDate && window.effectiveToDate
+      ? buildIsoDateRange(window.effectiveFromDate, window.effectiveToDate)
+      : [];
+  const byDate = initializeDateMetrics(dates, lodgeCapacity);
+  const bucket = createBucketAccumulator(
+    dates,
+    FINANCE_REALIZED_BOOKING_STATUSES
+  );
+
+  for (const booking of bookings) {
+    if (!FINANCE_REALIZED_BOOKING_STATUSES.includes(booking.status as never)) {
+      continue;
+    }
+
+    const { dates: contributingDates, bookingIndexOffset, totalStayNights } =
+      getContributingDates({
+        booking,
+        effectiveFromDate: window.effectiveFromDate,
+        effectiveToDate: window.effectiveToDate,
+      });
+
+    if (contributingDates.length < 1 || totalStayNights < 1) {
+      continue;
+    }
+
+    contributingBookingIds.add(booking.id);
+
+    accumulateBookingIntoBucket({
+      booking,
+      bucket,
+      bucketStatus: booking.status as RealizedBookingStatus,
+      contributingDates,
+      revenueByNight: allocateCentsEvenly(
+        booking.finalPriceCents,
+        totalStayNights
+      ),
+      bookingIndexOffset,
+    });
+  }
+
+  applyDailyMetrics(bucket, getDailyMetricMap(byDate), lodgeCapacity);
+
+  const totals = finalizeBucketSummary(bucket, window.dayCount, lodgeCapacity);
+
+  return {
+    window: {
+      from: window.from,
+      to: window.to,
+      cutoffDate: window.cutoffDate,
+      effectiveFrom: window.effectiveFrom,
+      effectiveTo: window.effectiveTo,
+      dayCount: window.dayCount,
+    },
+    totals: {
+      ...totals,
+      averageNightlyRevenueCents:
+        totals.bookingNights > 0
+          ? Math.round(totals.bookedRevenueCents / totals.bookingNights)
+          : null,
+    },
+    statusBreakdown: finalizeStatusBreakdown(bucket.statusBreakdown),
+    byDate,
+  };
+}
+
+function combineDailyMetrics(
+  date: string,
+  left: FinanceBookingDailyMetric,
+  right: FinanceBookingDailyMetric,
+  lodgeCapacity: number,
+): FinanceBookingDailyMetric {
+  const occupiedBeds = left.occupiedBeds + right.occupiedBeds;
+
+  return {
+    date,
+    bookingCount: left.bookingCount + right.bookingCount,
+    guestNights: left.guestNights + right.guestNights,
+    occupiedBeds,
+    availableBeds: lodgeCapacity - occupiedBeds,
+    occupancyRate:
+      lodgeCapacity > 0
+        ? Number((occupiedBeds / lodgeCapacity).toFixed(4))
+        : 0,
+    bookedRevenueCents:
+      left.bookedRevenueCents + right.bookedRevenueCents,
+  };
+}
+
+function buildForwardMetrics(
+  window: NormalizedForwardWindow,
+  bookings: BookingMetricsRecord[],
+  contributingBookingIds: Set<string>,
+  lodgeCapacity: number,
+): FinanceForwardBookingMetrics {
+  const dates =
+    window.effectiveFromDate && window.effectiveToDate
+      ? buildIsoDateRange(window.effectiveFromDate, window.effectiveToDate)
+      : [];
+  const committedBucket = createBucketAccumulator(
+    dates,
+    FINANCE_FORWARD_COMMITTED_BOOKING_STATUSES
+  );
+  const atRiskBucket = createBucketAccumulator(
+    dates,
+    FINANCE_FORWARD_AT_RISK_BOOKING_STATUSES
+  );
+  const committedByDate = initializeDateMetrics(dates, lodgeCapacity);
+  const atRiskByDate = initializeDateMetrics(dates, lodgeCapacity);
+
+  for (const booking of bookings) {
+    const committedStatus = FINANCE_FORWARD_COMMITTED_BOOKING_STATUSES.includes(
+      booking.status as never
+    );
+    const atRiskStatus = FINANCE_FORWARD_AT_RISK_BOOKING_STATUSES.includes(
+      booking.status as never
+    );
+
+    if (!committedStatus && !atRiskStatus) {
+      continue;
+    }
+
+    const { dates: contributingDates, bookingIndexOffset, totalStayNights } =
+      getContributingDates({
+        booking,
+        effectiveFromDate: window.effectiveFromDate,
+        effectiveToDate: window.effectiveToDate,
+      });
+
+    if (contributingDates.length < 1 || totalStayNights < 1) {
+      continue;
+    }
+
+    contributingBookingIds.add(booking.id);
+
+    const revenueByNight = allocateCentsEvenly(
+      booking.finalPriceCents,
+      totalStayNights
+    );
+
+    if (committedStatus) {
+      accumulateBookingIntoBucket({
+        booking,
+        bucket: committedBucket,
+        bucketStatus: booking.status as ForwardCommittedBookingStatus,
+        contributingDates,
+        revenueByNight,
+        bookingIndexOffset,
+      });
+    } else {
+      accumulateBookingIntoBucket({
+        booking,
+        bucket: atRiskBucket,
+        bucketStatus: booking.status as ForwardAtRiskBookingStatus,
+        contributingDates,
+        revenueByNight,
+        bookingIndexOffset,
+      });
+    }
+  }
+
+  applyDailyMetrics(
+    committedBucket,
+    getDailyMetricMap(committedByDate),
+    lodgeCapacity,
+  );
+  applyDailyMetrics(
+    atRiskBucket,
+    getDailyMetricMap(atRiskByDate),
+    lodgeCapacity,
+  );
+
+  // Both series are built one entry per date, in this order. A date with no
+  // entry would be a hole in a finance series read as a chart, and there is no
+  // metric to invent for it, so it refuses (#2800).
+  const byDate = dates.map((date, index) => {
+    const committed = committedByDate[index];
+    const atRisk = atRiskByDate[index];
+    if (committed === undefined || atRisk === undefined) {
+      throw new Error(
+        `Booking pipeline metrics have no daily entry for ${date} (${committedByDate.length} committed, ${atRiskByDate.length} at-risk, ${dates.length} date(s)).`,
+      );
+    }
+    return {
+      date,
+      committed,
+      atRisk,
+      totalPipeline: combineDailyMetrics(date, committed, atRisk, lodgeCapacity),
+    };
+  });
+
+  const committedTotals = finalizeBucketSummary(
+    committedBucket,
+    window.dayCount,
+    lodgeCapacity,
+  );
+  const atRiskTotals = finalizeBucketSummary(
+    atRiskBucket,
+    window.dayCount,
+    lodgeCapacity,
+  );
+
+  return {
+    window: {
+      from: window.from,
+      to: window.to,
+      asOfDate: window.asOfDate,
+      effectiveFrom: window.effectiveFrom,
+      effectiveTo: window.effectiveTo,
+      dayCount: window.dayCount,
+    },
+    totals: {
+      committed: {
+        ...committedTotals,
+        statusBreakdown: finalizeStatusBreakdown(committedBucket.statusBreakdown),
+      },
+      atRisk: {
+        ...atRiskTotals,
+        statusBreakdown: finalizeStatusBreakdown(atRiskBucket.statusBreakdown),
+      },
+      totalPipeline: {
+        bookingCount:
+          committedTotals.bookingCount + atRiskTotals.bookingCount,
+        bookingNights:
+          committedTotals.bookingNights + atRiskTotals.bookingNights,
+        guestNights:
+          committedTotals.guestNights + atRiskTotals.guestNights,
+        bookedRevenueCents:
+          committedTotals.bookedRevenueCents + atRiskTotals.bookedRevenueCents,
+        occupancy: toOccupancySummary(
+          committedTotals.guestNights + atRiskTotals.guestNights,
+          window.dayCount,
+          lodgeCapacity,
+        ),
+      },
+    },
+    byDate,
+  };
+}
+
+function getStatusFilter(query: FinanceBookingMetricsQuery): BookingStatus[] {
+  const statuses = new Set<BookingStatus>();
+
+  if (query.realized) {
+    for (const status of FINANCE_REALIZED_BOOKING_STATUSES) {
+      statuses.add(status);
+    }
+  }
+
+  if (query.forward) {
+    for (const status of FINANCE_FORWARD_COMMITTED_BOOKING_STATUSES) {
+      statuses.add(status);
+    }
+
+    for (const status of FINANCE_FORWARD_AT_RISK_BOOKING_STATUSES) {
+      statuses.add(status);
+    }
+  }
+
+  return [...statuses];
+}
+
+/**
+ * Resolve the occupancy capacity denominator and the booking lodge filter for a
+ * metrics query. A specific lodge uses that lodge's capacity and its bookings
+ * (tolerating legacy null-lodge rows only when it is the default lodge); the
+ * all-lodges view sums active-lodge capacity (the reporting-only exception to
+ * the no-cross-lodge-sum rule) and counts every lodge's bookings.
+ */
+export async function resolveMetricsCapacityAndScope(
+  lodgeId: string | null | undefined,
+): Promise<{ capacity: number; bookingLodgeWhere: Prisma.BookingWhereInput }> {
+  // Structural test mocks may omit the lodge delegate; fall back to the
+  // default-lodge capacity (single-lodge behaviour), mirroring
+  // getDefaultLodgeCapacity. In production the delegate is always present.
+  const lodgeClient = prisma as { lodge?: { findMany?: unknown } };
+  if (!lodgeClient.lodge?.findMany) {
+    return {
+      capacity: await getDefaultLodgeCapacity(),
+      bookingLodgeWhere: lodgeId ? { lodgeId } : {},
+    };
+  }
+  if (lodgeId) {
+    const [capacity, defaultLodgeId] = await Promise.all([
+      getLodgeCapacity(lodgeId),
+      getDefaultLodgeId(prisma),
+    ]);
+    const bookingLodgeWhere: Prisma.BookingWhereInput =
+      lodgeId === defaultLodgeId ? lodgeNullTolerantScope(lodgeId) : { lodgeId };
+    return { capacity, bookingLodgeWhere };
+  }
+  const activeLodges = await prisma.lodge.findMany({
+    where: { active: true },
+    select: { id: true },
+  });
+  if (activeLodges.length === 0) {
+    return { capacity: await getDefaultLodgeCapacity(), bookingLodgeWhere: {} };
+  }
+  const capacities = await Promise.all(
+    activeLodges.map((lodge) => getLodgeCapacity(lodge.id)),
+  );
+  return {
+    capacity: capacities.reduce((sum, value) => sum + value, 0),
+    bookingLodgeWhere: {},
+  };
+}
+
+export async function getFinanceBookingMetrics(
+  query: FinanceBookingMetricsQuery
+): Promise<FinanceBookingMetricsResult> {
+  if (!query.realized && !query.forward) {
+    throw new Error("At least one finance booking metrics section is required");
+  }
+
+  const realizedWindow = query.realized
+    ? normalizeRealizedWindow(query.realized)
+    : null;
+  // ONE read of the club's persisted timezone and ONE clock read for this
+  // report (#3123). `club-time/server` rather than the CLI-safe reader: nothing
+  // outside a React request reaches this module, so the memo is free.
+  const forwardWindow = query.forward
+    ? normalizeForwardWindow(query.forward, (await clubTime()).today())
+    : null;
+
+  const activeWindows = [
+    realizedWindow?.effectiveFromDate && realizedWindow.effectiveToDate
+      ? {
+          fromDate: realizedWindow.effectiveFromDate,
+          toDate: realizedWindow.effectiveToDate,
+        }
+      : null,
+    forwardWindow?.effectiveFromDate && forwardWindow.effectiveToDate
+      ? {
+          fromDate: forwardWindow.effectiveFromDate,
+          toDate: forwardWindow.effectiveToDate,
+        }
+      : null,
+  ].filter(
+    (
+      value
+    ): value is {
+      fromDate: Date;
+      toDate: Date;
+    } => Boolean(value)
+  );
+
+  const { capacity: lodgeCapacity, bookingLodgeWhere } =
+    await resolveMetricsCapacityAndScope(query.lodgeId);
+  // #3637: each window's own overlap, ORed - not one span from the earlier
+  // start to the later end, which reads every stay between two distant
+  // windows. Both reads still drop a stay with no night in a window below.
+  const stayOverlapWhere: Prisma.BookingWhereInput | null =
+    activeWindows.length > 0 ? {
+      ...bookingLodgeWhere,
+      OR: activeWindows.map((w) => ({
+        checkIn: { lte: w.toDate },
+        checkOut: { gt: w.fromDate },
+      })),
+    } : null;
+  const [[bookings, netCollectedCandidates], owed] = await Promise.all([
+    stayOverlapWhere
+      ? Promise.all([
+          prisma.booking.findMany({
+            where: { ...stayOverlapWhere, ...buildBookingDeletedWhere("hide"), status: { in: getStatusFilter(query) } },
+            orderBy: [{ checkIn: "asc" }, { id: "asc" }],
+            select: bookingMetricsSelect,
+          }),
+          prisma.payment.findMany({
+            where: { booking: { is: stayOverlapWhere } },
+            select: netCollectedPaymentSelect,
+          }),
+        ])
+      : Promise.resolve<[BookingMetricsRecord[], NetCollectedCandidate[]]>([[], []]),
+    // #3372 (owner, 7 Oct 2026): as at today, club-wide - not the window's;
+    // read once per page (`includeRefundsAndCreditsOwed`).
+    query.includeRefundsAndCreditsOwed ? readRefundsAndCreditsOwed() : Promise.resolve(null),
+  ]);
+  const contributingBookingIds = new Set<string>();
+  const realized = realizedWindow
+    ? buildRealizedMetrics(
+        realizedWindow,
+        bookings,
+        contributingBookingIds,
+        lodgeCapacity,
+      )
+    : undefined;
+  const forward = forwardWindow
+    ? buildForwardMetrics(
+        forwardWindow,
+        bookings,
+        contributingBookingIds,
+        lodgeCapacity,
+      )
+    : undefined;
+  // #3637: the stay figures' window test without their status list; the read
+  // above is only each window's overlap.
+  const staysInAWindow = ({ booking }: { booking: BookingStayDates }) =>
+    [realizedWindow, forwardWindow].some(
+      (window) => window !== null && getContributingDates({ booking, ...window }).dates.length > 0,
+    );
+  const { collected, ledgerGap } = summarizeNetCollectedWithLedgerGap(
+    netCollectedCandidates.filter(staysInAWindow),
+  );
+  const paymentSummary = {
+    ...summarizePayments(
+      bookings.filter((booking) => contributingBookingIds.has(booking.id)),
+      collected,
+      ledgerGap,
+    ),
+    refundsOwedCents: owed?.refundsOwedCents ?? null,
+    creditsOwedCents: owed?.creditsOwedCents ?? null,
+  };
+  const contributingBookings = bookings.filter((booking) =>
+    contributingBookingIds.has(booking.id),
+  );
+
+  return {
+    generatedAt: new Date().toISOString(),
+    bookingCount: contributingBookingIds.size,
+    moneyReconciliation:
+      summarizeBookingMoneyReconciliations(contributingBookings),
+    paymentSummary,
+    ...(realized ? { realized } : {}),
+    ...(forward ? { forward } : {}),
+  };
+}

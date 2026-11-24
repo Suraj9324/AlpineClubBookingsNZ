@@ -1,0 +1,763 @@
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { memberImportIdentityKey } from "@/lib/member-import-identity";
+import { NextRequest, NextResponse } from "next/server";
+import type { AgeTier, Gender, Title } from "@prisma/client";
+import { UNUSABLE_PLACEHOLDER_PASSWORD_HASH } from "@/lib/password-hashing";
+import { requireAdmin } from "@/lib/session-guards";
+import { prisma } from "@/lib/prisma";
+import { computeAgeTier, getSeasonStartDate } from "@/lib/age-tier";
+import { clubTimeZone } from "@/lib/club-time/server";
+import { clubSeasonYear } from "@/lib/financial-year";
+import { sendMemberSetupInviteEmail } from "@/lib/email";
+import { applyRateLimit } from "@/lib/rate-limit";
+import { createAuditLog } from "@/lib/audit";
+import logger from "@/lib/logger";
+import {
+  describeUniqueConstraintTarget,
+  isPrismaUniqueConstraintError,
+} from "@/lib/prisma-errors";
+import { isLoginEmailUniqueConflict } from "@/lib/member-email";
+import { issueActionToken } from "@/lib/action-tokens";
+import { getMemberSetupInviteExpiryDate } from "@/lib/member-setup-invite";
+import { ensureMemberAccessRolesFromCompatibilityFields } from "@/lib/member-access-role-writes";
+import {
+  DEFAULT_MEMBER_IMPORT_DATE_FORMAT,
+  deriveMemberImportNameFields,
+  MEMBER_IMPORT_DATE_FIELD_KEYS,
+  MEMBER_IMPORT_CANCELLED_DATE_FLAG_HINT,
+  MEMBER_IMPORT_FIELD_DEFINITIONS,
+  isMemberImportCancelledDateInFuture,
+  normalizeMemberImportDateValue,
+  type MemberImportDateFieldKey,
+  type MemberImportDateFormatMapping,
+} from "@/lib/member-csv-import";
+import { clubTime } from "@/lib/club-time/server";
+import { formatDateOnly, parseDateOnly } from "@/lib/date-only";
+import { dateOnlyInstantOf } from "@/lib/club-time";
+import { findOversizedMemberImportFamilyKeys } from "@/lib/member-csv-import-type-family";
+import { memberImportBodySchema, type MemberImportRow } from "@/lib/member-import-request-schema";
+import {
+  assignImportedMembershipTypes,
+  createImportFamilyGroups,
+  resolveImportTypeAndFamily,
+} from "@/lib/member-import-type-family";
+import { loadMemberFieldsFlags } from "@/lib/member-fields-settings";
+import {
+  GENDER_OPTIONS,
+  TITLE_OPTIONS,
+  parseGenderValue,
+  parseTitleValue,
+} from "@/lib/member-enums";
+import { MEMBER_IMPORT_ROLE_VALUES } from "@/lib/member-roles";
+import { isFullAdmin } from "@/lib/access-roles";
+import {
+  DIETARY_REQUIREMENTS_LABEL,
+  DIETARY_REQUIREMENTS_TOO_LONG_MESSAGE,
+  isDietaryRequirementsWithinLimit,
+  normalizeImportedDietaryRequirements,
+} from "@/lib/member-dietary-field";
+import { grantMembershipAdminDietaryAccess } from "@/lib/member-dietary";
+import { requireRecentAuth } from "@/lib/require-recent-auth";
+
+type ImportRow = MemberImportRow;
+
+type ImportIdentity = {
+  email: string;
+  firstName: string;
+  lastName: string;
+};
+
+type ExistingImportMember = ImportIdentity & {
+  dateOfBirth: Date | null;
+  canLogin: boolean;
+};
+
+function getImportFieldLabel(fieldKey: MemberImportDateFieldKey) {
+  return (
+    MEMBER_IMPORT_FIELD_DEFINITIONS.find(
+      (definition) => definition.key === fieldKey,
+    )?.label ?? fieldKey
+  );
+}
+
+function getImportRowNumber(row: ImportRow, rowIndex: number) {
+  return row.sourceLineNumber ?? rowIndex + 1;
+}
+
+function getImportColumnContext(row: ImportRow, fieldKey: string) {
+  const label = row.sourceColumnLabels?.[fieldKey];
+  return label ? ` (column ${label})` : "";
+}
+
+function normalizeImportDateField(
+  row: ImportRow,
+  fieldKey: MemberImportDateFieldKey,
+  dateFormats: MemberImportDateFormatMapping,
+) {
+  const rawValue = row[fieldKey]?.trim();
+  if (!rawValue) {
+    return { date: null, error: null };
+  }
+
+  const normalized = normalizeMemberImportDateValue(
+    rawValue,
+    dateFormats[fieldKey],
+  );
+  if (!normalized.ok) {
+    const cancelledFlagHint =
+      fieldKey === "cancelledDate"
+        ? ` — ${MEMBER_IMPORT_CANCELLED_DATE_FLAG_HINT}`
+        : "";
+    return {
+      date: null,
+      error: `${getImportFieldLabel(fieldKey)}${getImportColumnContext(row, fieldKey)} ${normalized.error}${cancelledFlagHint}`,
+    };
+  }
+
+  const date = parseDateOnly(normalized.value);
+  if (Number.isNaN(date.getTime())) {
+    return {
+      date: null,
+      error: `${getImportFieldLabel(fieldKey)}${getImportColumnContext(row, fieldKey)} is invalid`,
+    };
+  }
+
+  return { date, error: null };
+}
+
+/**
+ * POST /api/admin/members/import
+ * Bulk import members from CSV data.
+ */
+export async function POST(req: NextRequest) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+  const recent = await requireRecentAuth();
+  if (!recent.ok) return recent.response;
+  // Rate limit: 5 imports per hour
+  const rateLimitResponse = await applyRateLimit(
+    { id: "member-import", limit: 5, windowSeconds: 60 * 60 },
+    req,
+  );
+  if (rateLimitResponse) return rateLimitResponse;
+
+  const jsonBody = await parseJsonRequestBody(req, { error: "Invalid JSON" });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = memberImportBodySchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: parsed.error.flatten() },
+      { status: 422 },
+    );
+  }
+
+  const { rows, sendInvites } = parsed.data;
+
+  // Full Admin gate (issue #1012): a CSV row with role=ADMIN mints a
+  // login-capable Full Admin, so only a Full Admin may import such rows.
+  if (
+    rows.some((row) => row.role === "ADMIN") &&
+    !isFullAdmin(session.user)
+  ) {
+    return NextResponse.json(
+      { error: "Only a Full Admin can import members with the Admin role" },
+      { status: 403 },
+    );
+  }
+
+  // Optional-field visibility settings. When a field is switched off club-wide
+  // we ignore any value present in the CSV rather than importing it.
+  const [flags, club] = await Promise.all([loadMemberFieldsFlags(), clubTime()]);
+  // #2941 (INV-PRIV-022): a dietary/allergy column is imported only while the
+  // club has the field ON and the importing admin holds membership edit access;
+  // otherwise any value in the file is ignored, exactly like occupation.
+  const importsDietaryRequirements =
+    flags.showDietaryRequirements &&
+    (await grantMembershipAdminDietaryAccess(guard, "edit")) !== null;
+  const dateFormats: MemberImportDateFormatMapping = {
+    dateOfBirth:
+      parsed.data.dateFormats?.dateOfBirth ?? DEFAULT_MEMBER_IMPORT_DATE_FORMAT,
+    joinedDate:
+      parsed.data.dateFormats?.joinedDate ?? DEFAULT_MEMBER_IMPORT_DATE_FORMAT,
+    lifeMemberDate:
+      parsed.data.dateFormats?.lifeMemberDate ??
+      DEFAULT_MEMBER_IMPORT_DATE_FORMAT,
+    cancelledDate:
+      parsed.data.dateFormats?.cancelledDate ??
+      DEFAULT_MEMBER_IMPORT_DATE_FORMAT,
+  };
+  const results = {
+    created: 0,
+    createdLoginEnabled: 0,
+    createdNonLogin: 0,
+    createdCancelled: 0,
+    skipped: 0,
+    skippedRows: [] as Array<{ row: number; email: string; reason: string }>,
+    rowNotes: [] as Array<{ row: number; email: string; note: string }>,
+    errors: [] as Array<{ row: number; errors: string[] }>,
+    // #4988: the Membership Type and Family Key columns.
+    familyGroupsCreated: 0,
+    membershipTypesAssigned: 0,
+    membershipTypeFailures: [] as Array<{ row: number; email: string; error: string }>,
+    total: rows.length,
+  };
+
+  // #4988: the club's ACTIVE membership types, read once and only when the
+  // file uses the column. Matched by name; an unknown name blocks its row.
+  const activeMembershipTypes = rows.some((row) => row.membershipType?.trim())
+    ? await prisma.membershipType.findMany({
+        where: { isActive: true },
+        select: { id: true, name: true },
+      })
+    : [];
+  // A key shared by more rows than one family group may hold blocks every one
+  // of those rows; counted over the whole file, exactly as the preview does.
+  const oversizedFamilyKeys = findOversizedMemberImportFamilyKeys(
+    rows.map((row) => row.familyKey ?? undefined),
+  );
+  // What a skipped row's ignored #4988 columns mean, appended to its reason.
+  const skippedColumnsNote = (row: ImportRow) =>
+    row.membershipType?.trim() || row.familyKey?.trim()
+      ? "; its Membership Type and Family Key were not applied"
+      : "";
+
+  // Load existing members for duplicate identity checks and login ownership.
+  const allEmails = [...new Set(rows.map((r) => r.email.toLowerCase().trim()))];
+  const existingMembers = await prisma.member.findMany({
+    where: { email: { in: allEmails } },
+    select: {
+      email: true,
+      firstName: true,
+      lastName: true,
+      dateOfBirth: true,
+      canLogin: true,
+    },
+  });
+  const existingMembersByEmail = new Map<string, ExistingImportMember[]>();
+  const loginEmailClaimed = new Set<string>();
+  const existingIdentityKeys = new Set(
+    existingMembers.map((member) => {
+      const email = member.email.toLowerCase().trim();
+      if (member.canLogin) {
+        loginEmailClaimed.add(email);
+      }
+      const normalizedMember = {
+        email,
+        firstName: member.firstName,
+        lastName: member.lastName,
+        dateOfBirth: member.dateOfBirth,
+        canLogin: member.canLogin,
+      };
+      existingMembersByEmail.set(email, [
+        ...(existingMembersByEmail.get(email) ?? []),
+        normalizedMember,
+      ]);
+      return memberImportIdentityKey(normalizedMember);
+    }),
+  );
+  const acceptedIdentityKeys = new Set<string>();
+  // Tracks whether the *kept* (first accepted) row for an identity carried a
+  // cancelled date, so a later duplicate that is skipped can tell the admin when
+  // it would have imported a different lifecycle state (issue #1946 review).
+  const acceptedCancelledStateByKey = new Map<string, boolean>();
+
+  // A row "carries" a cancelled date when its Cancelled Date column is populated;
+  // that alone decides the imported lifecycle (an unparseable value would have
+  // already failed validation), so presence is the right signal for the skip
+  // note even though the skip happens before dates are parsed.
+  const rowCarriesCancelledDate = (row: ImportRow) =>
+    Boolean(row.cancelledDate?.trim());
+
+  // Pre-validate all rows before committing (all-or-nothing)
+  interface ValidatedRow {
+    rowNum: number;
+    email: string;
+    title: Title | null;
+    firstName: string;
+    lastName: string;
+    gender: Gender | null;
+    occupation: string | null;
+    dietaryRequirements: string | null;
+    phoneCountryCode: string | null;
+    phoneAreaCode: string | null;
+    phoneNumber: string | null;
+    dateOfBirth: Date | null;
+    joinedDate: Date | null;
+    cancelledAt: Date | null;
+    streetAddressLine1: string | null;
+    streetAddressLine2: string | null;
+    streetCity: string | null;
+    streetRegion: string | null;
+    streetCountry: string | null;
+    streetPostalCode: string | null;
+    lifeMemberDate: Date | null;
+    comments: string | null;
+    ageTier: AgeTier;
+    role: (typeof MEMBER_IMPORT_ROLE_VALUES)[number];
+    canLogin: boolean;
+    rowNote: string | null;
+    membershipTypeId: string | null;
+    familyKey: string | null;
+  }
+  const validatedRows: ValidatedRow[] = [];
+  // ONE read of the club's season for the whole import (#2870, correctness
+  // review). It was derived inside the per-row loop below, and an import that
+  // straddles club midnight on a season boundary would then classify its early
+  // and late rows against different seasons — an age tier decides a price band.
+  const clubSeason = clubSeasonYear(await clubTimeZone());
+  const clubCurrentSeasonStart = getSeasonStartDate(clubSeason);
+
+  // `rows.entries()` rather than a counting loop: the index is only ever used
+  // to number the row for the admin's error report, and iterating the array
+  // hands the row over as an `ImportRow` instead of a lookup the compiler has
+  // to treat as possibly absent (#2801).
+  for (const [i, row] of rows.entries()) {
+    const rowNum = getImportRowNumber(row, i);
+
+    const email = row.email.toLowerCase().trim();
+    const names = deriveMemberImportNameFields(row);
+    const identity = {
+      email,
+      firstName: names.firstName,
+      lastName: names.lastName,
+    };
+    const identityKey = memberImportIdentityKey(identity);
+
+    if (existingIdentityKeys.has(identityKey)) {
+      results.skipped++;
+      results.skippedRows.push({
+        row: rowNum,
+        email,
+        reason: `Matching member already exists for this email and name${skippedColumnsNote(row)}`,
+      });
+      continue;
+    }
+
+    if (acceptedIdentityKeys.has(identityKey)) {
+      results.skipped++;
+      const keptCancelled =
+        acceptedCancelledStateByKey.get(identityKey) ?? false;
+      const skippedCancelled = rowCarriesCancelledDate(row);
+      // A silent first-wins skip hides a lifecycle mismatch: e.g. an active row
+      // is kept and a later cancelled duplicate is dropped, or vice versa. Call
+      // it out so the admin knows the dropped row's cancelled state was not
+      // applied. Still a skip, never an error (the import stays all-or-nothing).
+      const lifecycleNote =
+        keptCancelled !== skippedCancelled
+          ? `; the kept row is ${keptCancelled ? "cancelled" : "active"} but this skipped row is ${skippedCancelled ? "cancelled" : "active"}, so its cancelled state was not applied`
+          : "";
+      results.skippedRows.push({
+        row: rowNum,
+        email,
+        reason: `Duplicate member identity already appears earlier in this import${lifecycleNote}${skippedColumnsNote(row)}`,
+      });
+      continue;
+    }
+
+    // Determine age tier
+    let ageTier: AgeTier = "ADULT";
+    const rowErrors: string[] = [];
+    const parsedDates = Object.fromEntries(
+      MEMBER_IMPORT_DATE_FIELD_KEYS.map((fieldKey) => [
+        fieldKey,
+        normalizeImportDateField(row, fieldKey, dateFormats),
+      ]),
+    ) as Record<
+      MemberImportDateFieldKey,
+      { date: Date | null; error: string | null }
+    >;
+
+    for (const fieldKey of MEMBER_IMPORT_DATE_FIELD_KEYS) {
+      const error = parsedDates[fieldKey].error;
+      if (error) {
+        rowErrors.push(error);
+      }
+    }
+
+    // A membership cancellation is always dated to when it happens, so a future
+    // cancelled date is never legitimate (mirrors the admin cancellation flow's
+    // `cancelledAt = now`). Re-checked server-side in the club time zone.
+    const cancelledDateForFutureCheck = parsedDates.cancelledDate.date;
+    if (
+      cancelledDateForFutureCheck &&
+      isMemberImportCancelledDateInFuture(
+        formatDateOnly(cancelledDateForFutureCheck),
+        club.today(),
+      )
+    ) {
+      rowErrors.push(
+        `Cancelled Date${getImportColumnContext(row, "cancelledDate")} cannot be in the future`,
+      );
+    }
+
+    // Title/Gender are only parsed and validated when the field is enabled
+    // club-wide; when disabled any CSV value is ignored.
+    let title: Title | null | undefined = null;
+    if (flags.showTitle) {
+      title = parseTitleValue(row.title);
+      if (title === undefined) {
+        rowErrors.push(
+          `Title${getImportColumnContext(row, "title")} must be one of ${TITLE_OPTIONS.map((option) => option.label).join(", ")}`,
+        );
+      }
+    }
+
+    let gender: Gender | null | undefined = null;
+    if (flags.showGender) {
+      gender = parseGenderValue(row.gender);
+      if (gender === undefined) {
+        rowErrors.push(
+          `Gender${getImportColumnContext(row, "gender")} must be one of ${GENDER_OPTIONS.map((option) => option.label).join(", ")}`,
+        );
+      }
+    }
+
+    // #2941: the length rule applies only when this import takes the column
+    // (field ON and a membership:edit grant); otherwise the value is discarded
+    // and cannot block the row. Judged after the export's formula guard is
+    // undone, so an exported 500-character value round-trips.
+    const dietaryRequirements = importsDietaryRequirements
+      ? normalizeImportedDietaryRequirements(row.dietaryRequirements)
+      : null;
+    if (
+      importsDietaryRequirements &&
+      !isDietaryRequirementsWithinLimit(dietaryRequirements)
+    ) {
+      rowErrors.push(
+        DIETARY_REQUIREMENTS_TOO_LONG_MESSAGE.replace(
+          DIETARY_REQUIREMENTS_LABEL,
+          `${DIETARY_REQUIREMENTS_LABEL}${getImportColumnContext(row, "dietaryRequirements")}`,
+        ),
+      );
+    }
+
+    const { membershipTypeId, familyKey } = resolveImportTypeAndFamily({
+      membershipType: row.membershipType,
+      familyKey: row.familyKey,
+      activeMembershipTypes,
+      oversizedFamilyKeys,
+      columnContext: (key) => getImportColumnContext(row, key),
+      rowErrors,
+    });
+
+    if (rowErrors.length > 0) {
+      results.errors.push({ row: rowNum, errors: rowErrors });
+      continue;
+    }
+
+    const dateOfBirth = parsedDates.dateOfBirth.date;
+    const joinedDate = parsedDates.joinedDate.date;
+    const lifeMemberDate = parsedDates.lifeMemberDate.date;
+    // A populated cancelled date imports the member in the cancelled end-state
+    // (issue #1946): inactive and non-login, matching what the normal admin
+    // cancellation flow produces (minus notifications / Xero — a freshly
+    // imported member has no Xero contact to cancel and gets no invite email).
+    const cancelledAt = parsedDates.cancelledDate.date;
+    const isCancelled = cancelledAt !== null;
+
+    if (dateOfBirth) {
+      ageTier = (await computeAgeTier(dateOfBirth, clubCurrentSeasonStart)) as AgeTier;
+    }
+
+    // Occupation is adult-only and gated by the club-wide field setting.
+    const occupation =
+      flags.showOccupation && ageTier === "ADULT"
+        ? row.occupation?.trim() || null
+        : null;
+
+    // A cancelled member can never log in, so it is forced non-login and — key
+    // interaction — it does NOT claim the login email, leaving that email free
+    // for an active member (existing or another row) to own the login.
+    const canLogin = isCancelled ? false : !loginEmailClaimed.has(email);
+    const rowNote = isCancelled
+      ? "Imported as a cancelled member (inactive, Can't Login)"
+      : canLogin
+        ? null
+        : existingMembersByEmail.get(email)?.some((member) => member.canLogin)
+          ? "Imported as Can't Login because this email already has a login-enabled member"
+          : "Imported as Can't Login because an earlier row in this import uses this email for login";
+
+    acceptedIdentityKeys.add(identityKey);
+    acceptedCancelledStateByKey.set(identityKey, isCancelled);
+    if (canLogin) {
+      loginEmailClaimed.add(email);
+    }
+
+    validatedRows.push({
+      rowNum,
+      email,
+      title: title ?? null,
+      firstName: names.firstName,
+      lastName: names.lastName,
+      gender: gender ?? null,
+      occupation,
+      dietaryRequirements,
+      phoneCountryCode: row.phoneCountryCode?.trim() || null,
+      phoneAreaCode: row.phoneAreaCode?.trim() || null,
+      phoneNumber: row.phoneNumber?.trim() || row.phone?.trim() || null,
+      dateOfBirth,
+      joinedDate,
+      cancelledAt,
+      streetAddressLine1: row.streetAddressLine1?.trim() || null,
+      streetAddressLine2: row.streetAddressLine2?.trim() || null,
+      streetCity: row.streetCity?.trim() || null,
+      streetRegion: row.streetRegion?.trim() || null,
+      streetCountry: row.streetCountry?.trim() || null,
+      streetPostalCode: row.streetPostalCode?.trim() || null,
+      lifeMemberDate,
+      comments: row.comments?.trim() || null,
+      ageTier,
+      role: (row.role || "USER") as (typeof MEMBER_IMPORT_ROLE_VALUES)[number],
+      canLogin,
+      rowNote,
+      membershipTypeId,
+      familyKey,
+    });
+  }
+
+  // If there are validation errors, abort the entire import
+  if (results.errors.length > 0) {
+    return NextResponse.json(results, { status: 200 });
+  }
+
+  if (validatedRows.length === 0) {
+    return NextResponse.json(results, { status: 200 });
+  }
+
+  // No per-row hashing: imported accounts use the shared unusable hash until
+  // the member sets a password through the screened setup/reset flow (#4934).
+  // Keep expensive password work out of this transaction (#768).
+
+  // All-or-nothing: create all members in a transaction
+  try {
+    const createdImport = await prisma.$transaction(
+      async (tx) => {
+        const created: Array<{
+          id: string;
+          email: string;
+          firstName: string;
+          lastName: string;
+          canLogin: boolean;
+          cancelled: boolean;
+          rowNum: number;
+          rowNote: string | null;
+          membershipTypeId: string | null;
+          familyKey: string | null;
+        }> = [];
+        for (const row of validatedRows) {
+          const member = await tx.member.create({
+            data: {
+              email: row.email,
+              title: row.title,
+              firstName: row.firstName,
+              lastName: row.lastName,
+              gender: row.gender,
+              occupation: row.occupation,
+              dietaryRequirements: row.dietaryRequirements,
+              phoneCountryCode: row.phoneCountryCode,
+              phoneAreaCode: row.phoneAreaCode,
+              phoneNumber: row.phoneNumber,
+              dateOfBirth: row.dateOfBirth,
+              joinedDate: row.joinedDate,
+              streetAddressLine1: row.streetAddressLine1,
+              streetAddressLine2: row.streetAddressLine2,
+              streetCity: row.streetCity,
+              streetRegion: row.streetRegion,
+              streetCountry: row.streetCountry,
+              streetPostalCode: row.streetPostalCode,
+              lifeMemberDate: row.lifeMemberDate,
+              comments: row.comments,
+              role: row.role,
+              ageTier: row.ageTier,
+              // A cancelled date imports the member in the cancelled end-state
+              // (issue #1946). No cancellation request exists for a legacy
+              // import, so cancelledViaRequestId stays null; cancelledReason has
+              // no CSV column and stays null.
+              active: row.cancelledAt ? false : true,
+              cancelledAt: row.cancelledAt,
+              // Cancellation history is not evidence of an explicit leaving date.
+              leavingDate: null,
+              canLogin: row.canLogin,
+              emailVerified: true, // Admin-imported members don't need email verification
+              passwordHash: UNUSABLE_PLACEHOLDER_PASSWORD_HASH,
+            },
+            select: {
+              id: true,
+              email: true,
+              firstName: true,
+              lastName: true,
+              canLogin: true,
+            },
+          });
+          created.push({
+            ...member,
+            canLogin: row.canLogin,
+            cancelled: row.cancelledAt !== null,
+            rowNum: row.rowNum,
+            rowNote: row.rowNote,
+            membershipTypeId: row.membershipTypeId,
+            familyKey: row.familyKey,
+          });
+          await ensureMemberAccessRolesFromCompatibilityFields(tx, {
+            memberId: member.id,
+            role: row.role,
+            canLogin: row.canLogin,
+            assignedByMemberId: session.user.id,
+          });
+
+          await createAuditLog(
+            {
+              action: "member.imported",
+              memberId: session.user.id,
+              targetId: member.id,
+              entityType: "Member",
+              entityId: member.id,
+              category: "admin",
+              severity: "important",
+              outcome: "success",
+              summary: "Member imported",
+              details: `Imported member: ${member.firstName} ${member.lastName} (${member.email})`,
+              metadata: {
+                memberId: member.id,
+                email: member.email,
+                sendInvites,
+                canLogin: row.canLogin,
+                cancelled: row.cancelledAt !== null,
+                cancelledAt: row.cancelledAt
+                  ? formatDateOnly(row.cancelledAt)
+                  : null,
+                // That the field was set, never what it holds (INV-PRIV-022).
+                dietaryRequirementsSet: row.dietaryRequirements !== null,
+              },
+            },
+            tx,
+          );
+        }
+
+        // #4988: members created here that share a Family Key become one group.
+        const familyGroupsCreated = await createImportFamilyGroups(
+          tx,
+          created,
+          session.user.id,
+        );
+        return { created, familyGroupsCreated };
+      },
+      { timeout: 30000 },
+    );
+    const createdMembers = createdImport.created;
+    results.familyGroupsCreated = createdImport.familyGroupsCreated;
+
+    results.created = createdMembers.length;
+    results.createdLoginEnabled = createdMembers.filter(
+      (member) => member.canLogin,
+    ).length;
+    results.createdNonLogin = createdMembers.length - results.createdLoginEnabled;
+    results.createdCancelled = createdMembers.filter(
+      (member) => member.cancelled,
+    ).length;
+    results.rowNotes = createdMembers.flatMap((member) =>
+      member.rowNote
+        ? [
+            {
+              row: member.rowNum,
+              email: member.email,
+              note: member.rowNote,
+            },
+          ]
+        : [],
+    );
+
+    // #4988: the Membership Type column assigns the current season, after commit.
+    const assignment = await assignImportedMembershipTypes({
+      members: createdMembers,
+      seasonYear: clubSeason,
+      clubTodayDateOnly: dateOnlyInstantOf(club.today()),
+      adminMemberId: session.user.id,
+      request: req,
+    });
+    results.membershipTypesAssigned = assignment.assigned;
+    results.membershipTypeFailures = assignment.failures;
+    results.rowNotes.push(...assignment.rowNotes);
+
+    // Invite emails remain post-commit best-effort; import/audit durability is
+    // handled inside the transaction above.
+    for (const member of createdMembers) {
+      if (sendInvites && member.canLogin) {
+        try {
+          const { token, tokenHash } = issueActionToken();
+          const expiresAt = getMemberSetupInviteExpiryDate();
+          await prisma.passwordResetToken.create({
+            data: { tokenHash, memberId: member.id, expiresAt },
+          });
+          await sendMemberSetupInviteEmail(
+            member.email,
+            member.firstName,
+            token,
+          );
+        } catch (emailErr) {
+          logger.error(
+            { err: emailErr, memberId: member.id },
+            "Failed to send import invite email",
+          );
+        }
+      }
+    }
+  } catch (err) {
+    // Narrowed from "any P2002 here means a login email already exists"
+    // (#2455, the same treatment #2412 gave the member create): the import
+    // pre-checks the addresses before it writes, so this only has to catch the
+    // race that pre-check cannot close — a concurrent write claiming an address
+    // in between, which the partial unique index `Member_email_login_unique`
+    // rejects. A collision the database names as some OTHER constraint is still
+    // a 409, because something really is already taken, but it no longer sends
+    // the admin off to hunt for a duplicate address in a CSV where every
+    // address is fine.
+    //
+    // A P2002 that names nothing is read as the address clash only when this
+    // import actually creates someone who can log in: the index is
+    // `WHERE "canLogin" = true`, so a batch of non-login rows cannot have hit
+    // it. Nothing else in the transaction can collide either — the access-role
+    // rows are written with `skipDuplicates`, `AuditLog` carries no unique
+    // constraint, and the create writes neither `googleSub` nor
+    // `xeroContactId`. The constraint is logged beside the error because the
+    // pino `err` serializer keeps only name/message/stack and drops `meta`.
+    if (isPrismaUniqueConstraintError(err)) {
+      if (
+        isLoginEmailUniqueConflict(err, {
+          canClaimLoginEmail: validatedRows.some((row) => row.canLogin),
+        })
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              "Import failed because one or more login emails already exist. No members were created.",
+          },
+          { status: 409 },
+        );
+      }
+
+      logger.error(
+        { err, constraint: describeUniqueConstraintTarget(err) },
+        "Member import hit an unexpected unique constraint",
+      );
+      return NextResponse.json(
+        {
+          error:
+            "Import failed because one of the imported details is already used by another record. No members were created.",
+        },
+        { status: 409 },
+      );
+    }
+
+    logger.error({ err }, "Failed to import members (transaction rolled back)");
+    return NextResponse.json(
+      { error: "Import failed — no members were created. Please try again." },
+      { status: 500 },
+    );
+  }
+
+  return NextResponse.json(results, { status: 200 });
+}

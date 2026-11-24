@@ -1,0 +1,528 @@
+#!/usr/bin/env -S pnpm exec tsx
+/**
+ * File-size budget ratchet (#2687, rebuilt on the base ref by #2979).
+ *
+ * `pnpm run quality:budget`                    judge the files this change touched
+ * `pnpm run quality:budget --base <ref>`    compare against a different ref
+ * `pnpm run quality:budget --report`        print the whole tree's debt
+ * `pnpm run quality:budget --upstream-ref <ref>`
+ *                                           a deployment fork's sync-down:
+ *                                           trust that upstream commit (#5196)
+ *
+ * `--upstream-ref` is for a deployment fork syncing down from upstream `main`.
+ * Files and functions a sync brings in unchanged from that commit are judged
+ * against the longer of their fork-base and upstream lengths, and allowance
+ * fragments byte-identical to upstream's are not live, so upstream's reviewed
+ * code passes without being re-declared by hand. Only the fork's own changes
+ * are judged as before. The rules live in `scripts/lib/budget-upstream-ref.ts`;
+ * CI passes the option only when the repository variable
+ * `QUALITY_BUDGET_UPSTREAM_REPO` is set (`scripts/ci/run-budget-gate.mjs`).
+ * When the upstream commit is `HEAD` itself, trust is ignored and one line
+ * says so; an upstream ref that cannot be resolved fails.
+ *
+ * The same run also judges FUNCTION length (#4927): the function-length ratchet
+ * in `scripts/lib/function-length-ratchet.ts`, against the same base, with the
+ * same allowance directory. It is a second phase of this command rather than a
+ * command of its own so that the CI step, the epic-sync census and every lane's
+ * pre-push habit run it without anybody wiring it in.
+ *
+ * `--base` is not only a diagnostic. CI passes it on a `push` to `main`, where
+ * the default of `origin/main` IS the commit being tested and would make this
+ * gate vacuous — see the step comment in `.github/workflows/ci.yml`.
+ *
+ * The rule, in one sentence and unchanged: current size debt may stay, but new
+ * debt and debt growth may not appear silently. A file that was not over its
+ * budget may not go over it, and a file that was already over may not grow.
+ * A declared allowance may let an over-budget file grow, but never past its
+ * hard ceiling of three times its budget (#4926).
+ *
+ * WHAT #2979 CHANGED is where "was" comes from. It used to be a checked-in
+ * ledger, `scripts/quality/file-size-baseline.txt`. That file was the problem
+ * rather than the rule: every change that grew a listed file rewrote the same
+ * line, so the next merge re-conflicted it, forever — five of nine lanes on the
+ * 21 Aug 2026 wave touched it, and `.gitattributes` gives it no merge driver.
+ * Worse, resolving one of those conflicts by picking a side shipped a WRONG
+ * ceiling twice, once a ceiling the untouched file already exceeded. The
+ * previous length is now read from the base ref, so there is no line for two
+ * branches to both rewrite, no stored number to drift from the tree, and a
+ * rename is followed rather than guessed at.
+ *
+ * There is deliberately NO UPDATE MODE any more. It existed to record an
+ * accepted increase, and the thing it wrote no longer exists — an accepted
+ * increase is now explained in the pull request body, which is where a reviewer
+ * was meant to be looking anyway. Nothing to regenerate is the point, not an
+ * omission. `--update` still answers, so somebody who types it from muscle
+ * memory gets that explanation instead of an unrecognised-flag shrug.
+ *
+ * Exits 1 on any finding, and also when the base ref cannot be resolved: a gate
+ * that cannot read what it is comparing against must not report a pass it has
+ * not earned. `pnpm run pr:check` already behaves this way for the same reason.
+ *
+ * Reads `git` and the working tree only: no network, no build, no database, no
+ * provider.
+ */
+
+import {
+  CHECK_COMMAND,
+  HARD_CEILING_MULTIPLE,
+  budgetForFile,
+  countLines,
+  describeBudget,
+  isProductionFile,
+  scanRepository,
+  summariseSizeDebt,
+} from "../lib/file-size-budget";
+import {
+  evaluateComputedRatchet,
+  type ComputedFinding,
+} from "../lib/file-size-base";
+import {
+  ALLOWANCE_DIR,
+  readSizeAllowances,
+  type SizeAllowance,
+} from "../lib/file-size-allowances";
+import {
+  FUNCTION_LENGTH_LIMIT,
+  evaluateFunctionLengthRatchet,
+  findLongFunctions,
+} from "../lib/function-length-ratchet";
+import { DEFAULT_BASE_REF } from "../lib/budget-base-ref.mjs";
+import {
+  UPSTREAM_IGNORED_LINE,
+  upstreamTrustFor,
+  type UpstreamTrust,
+} from "../lib/budget-upstream-ref";
+import type { TrustedUpstreamSummary } from "../lib/file-size-base";
+import { isMainModule } from "../lib/is-main-module.mjs";
+
+/** The ref a change is judged against unless told otherwise. */
+export { DEFAULT_BASE_REF };
+
+const SEVERITY_HEADINGS = {
+  unusable: "UNUSABLE — the comparison cannot be trusted",
+  regression: "REGRESSION — new or growing size debt",
+} as const;
+
+/** The fields both ratchets' findings share, which is all rendering reads. */
+type RenderableFinding = Pick<
+  ComputedFinding,
+  "severity" | "file" | "budget" | "previous" | "current" | "problem" | "action"
+>;
+
+export function renderFinding(finding: RenderableFinding): string {
+  const lines: string[] = [`  ${finding.file ?? "(the comparison itself)"}`];
+  lines.push(`      problem:  ${finding.problem}`);
+  if (finding.budget) lines.push(`      budget:   ${finding.budget}`);
+  if (finding.previous) lines.push(`      previous: ${finding.previous}`);
+  if (finding.current) lines.push(`      current:  ${finding.current}`);
+  lines.push(`      action:   ${finding.action}`);
+  return lines.join("\n");
+}
+
+/**
+ * Growth this run let through, printed on SUCCESS as well as on failure.
+ *
+ * An escape hatch nobody can see is the ledger again in another shape. This is
+ * what a reviewer reads to decide whether the reason is good enough, and what
+ * makes an allowance a decision somebody made rather than a green tick.
+ */
+export function renderAppliedAllowances(
+  applied: readonly SizeAllowance[],
+  unit: "file" | "function" = "file",
+): string {
+  if (applied.length === 0) return "";
+  return [
+    "",
+    `ALLOWED GROWTH — ${applied.length} ${unit}(s) grew because this change said so out loud`,
+    "",
+    ...applied.flatMap((allowance) => [
+      `  ${allowance.file}  ->  ${allowance.lines} ${unit === "file" ? "LOC" : "lines"}`,
+      `      declared: ${allowance.source}`,
+      `      reason:   ${allowance.reason}`,
+      "",
+    ]),
+    "  Each entry is one-shot. Once this merges the new length IS the base ref, so",
+    `  the ${unit} needs no allowance next time and the ${ALLOWANCE_DIR}/ file is inert.`,
+    "",
+  ].join("\n");
+}
+
+/**
+ * The one line every run on a change prints, pass or fail (#4926): how far this
+ * change moves the tree-wide debt that `--report` totals. A run of small
+ * declared increases is invisible one at a time; the total `--report` prints
+ * is not. A file moved out of the budgeted scope counts as debt removed, as it
+ * does there, so read the diff before taking a negative figure for a split.
+ */
+export function renderDebtDelta(delta: number | null): string {
+  if (delta === null) {
+    return "Size debt change from this PR: not measured — the base ref could not be resolved\n";
+  }
+  const signed = delta > 0 ? `+${delta}` : String(delta);
+  return `Size debt change from this PR: ${signed} lines\n`;
+}
+
+export function renderReport(findings: readonly RenderableFinding[]): string {
+  const out: string[] = [];
+  for (const severity of ["unusable", "regression"] as const) {
+    const group = findings.filter((finding) => finding.severity === severity);
+    if (group.length === 0) continue;
+    out.push("");
+    out.push(`${SEVERITY_HEADINGS[severity]} (${group.length})`);
+    out.push("");
+    for (const finding of group) {
+      out.push(renderFinding(finding));
+      out.push("");
+    }
+  }
+  return out.join("\n");
+}
+
+/** `--base <ref>` or `--base=<ref>`; falls back to the default. */
+export function baseRefFrom(argv: readonly string[]): string {
+  const inline = argv.find((arg) => arg.startsWith("--base="));
+  if (inline) return inline.slice("--base=".length) || DEFAULT_BASE_REF;
+  const index = argv.indexOf("--base");
+  if (index !== -1) return argv[index + 1] ?? DEFAULT_BASE_REF;
+  return DEFAULT_BASE_REF;
+}
+
+/**
+ * `--upstream-ref <ref>` or `--upstream-ref=<ref>`, or null when not given.
+ * A flag with no value is an error rather than "no upstream": a fork whose CI
+ * lost the value must not quietly judge a sync-down as an ordinary change.
+ */
+export function upstreamRefFrom(
+  argv: readonly string[],
+): { ok: true; ref: string | null } | { ok: false; error: string } {
+  const missing = {
+    ok: false as const,
+    error: "--upstream-ref needs a value: the upstream commit or ref to trust",
+  };
+  const inline = argv.find((arg) => arg.startsWith("--upstream-ref="));
+  if (inline !== undefined) {
+    const ref = inline.slice("--upstream-ref=".length);
+    return ref ? { ok: true, ref } : missing;
+  }
+  const index = argv.indexOf("--upstream-ref");
+  if (index === -1) return { ok: true, ref: null };
+  const ref = argv[index + 1];
+  return ref && !ref.startsWith("--") ? { ok: true, ref } : missing;
+}
+
+/** What a trusted run says it trusted, pass or fail (#5196). */
+function renderTrustedUpstream(
+  summary: TrustedUpstreamSummary | undefined,
+  unit: "file" | "function",
+): string {
+  if (!summary) return "";
+  return (
+    `Trusted upstream ${summary.sha.slice(0, 12)} "${summary.subject}": ` +
+    `${summary.lifted} ${unit}(s) judged against its longer length, ` +
+    `${summary.ignoredFragments} allowance fragment(s) ignored as its own.\n`
+  );
+}
+
+/**
+ * The whole tree's debt, on demand.
+ *
+ * This is what the stored ledger used to give away for free, and it is the one
+ * thing worth keeping from it — a number to quote in `docs/MAINTENANCE.md` and
+ * to watch shrink. It is a REPORT rather than a gate: it never fails on the
+ * debt it finds, and nothing has to be committed to keep it current.
+ */
+export function runReport(root: string): number {
+  const scan = scanRepository(root);
+  if (scan.gitError !== null) {
+    process.stderr.write(
+      `File-size budget report: ${scan.gitError.split("\n")[0]}\n` +
+        "  Run this from the repository root inside a git checkout.\n",
+    );
+    return 1;
+  }
+  const summary = summariseSizeDebt(scan.productionStats);
+  const worst = [...summary.oversized]
+    .sort((a, b) => b.lines - a.lines)
+    .slice(0, 10);
+
+  process.stdout.write(
+    [
+      `File-size budget report — ${summary.oversizedFiles} of ${summary.scannedFiles} ` +
+        `production files are over budget, carrying ${summary.debt} lines of debt.`,
+      ...(summary.scannedFiles === 0
+        ? [
+            "",
+            "  NOTHING WAS SCANNED. This is not a debt-free tree; it is a checkout with",
+            "  no production source in it. Run from the repository root.",
+          ]
+        : []),
+      "",
+      "  Largest ten:",
+      ...worst.map(
+        (file) =>
+          `    ${String(file.lines).padStart(5)}  ${file.file}  (${describeBudget(file)})`,
+      ),
+      "",
+      "  This is a report, not a gate. Nothing is committed to keep it current:",
+      `  ${CHECK_COMMAND} judges only the files a change touches, against the base ref.`,
+      "",
+    ].join("\n"),
+  );
+  return 0;
+}
+
+/** What `--update` used to do, and why typing it is no longer a mistake worth punishing quietly. */
+function explainRemovedUpdateMode(): number {
+  process.stderr.write(
+    [
+      "File-size budget: `--update` no longer exists (#2979).",
+      "",
+      "  It regenerated scripts/quality/file-size-baseline.txt, and that file is gone:",
+      "  a file every change rewrites is a file every merge re-conflicts, and resolving",
+      "  those conflicts by picking a side shipped a wrong ceiling twice.",
+      "",
+      "  An accepted increase is now explained in the pull request body instead, which",
+      "  is where a reviewer was meant to be looking. There is nothing to regenerate.",
+      "",
+      `  ${CHECK_COMMAND} --report   the whole tree's debt, if that is what you wanted`,
+      "",
+    ].join("\n"),
+  );
+  return 1;
+}
+
+/**
+ * A gate that scans nothing reports clean. Say so instead.
+ *
+ * Carried over from the ledger implementation, which floored on exactly this
+ * condition and lost it in the rewrite. Without it a checkout with no `src/`
+ * tree at all — a partial clone, a wrong working directory that still happens
+ * to be inside some git repository, a sparse checkout that excluded the source
+ * — prints "OK, 0 production file(s) changed" and exits 0. Reproduced.
+ *
+ * "Scanned and found nothing wrong" and "scanned nothing" produce the same
+ * empty findings list and must not produce the same message.
+ */
+const EMPTY_SCAN_FINDING: ComputedFinding = {
+  severity: "unusable",
+  kind: "empty-scan",
+  file: null,
+  budget: null,
+  previous: null,
+  current: null,
+  problem:
+    "the scan found no production source files at all, so the comparison proves nothing",
+  action:
+    "run this from the repository root inside a full git checkout; a passing " +
+    "result from an empty scan is not a pass",
+};
+
+export function run(root: string, argv: readonly string[]): number {
+  if (argv.includes("--report")) {
+    return Math.max(runReport(root), runFunctionLengthReport(root));
+  }
+  if (argv.includes("--update")) return explainRemovedUpdateMode();
+  const upstreamRef = upstreamRefFrom(argv);
+  if (!upstreamRef.ok) {
+    process.stderr.write(`File-size budget: ${upstreamRef.error}\n`);
+    return 1;
+  }
+  const baseRef = baseRefFrom(argv);
+  const upstream = upstreamTrustFor(root, baseRef, upstreamRef.ref);
+  // Said once, before both phases, which then run exactly as without trust.
+  if (upstream?.kind === "ignored-head") {
+    process.stdout.write(`${UPSTREAM_IGNORED_LINE}\n`);
+  }
+  const fileSize = runFileSizeRatchet(root, baseRef, upstream);
+  // Run even when the file-size phase failed, so one push shows both answers.
+  // A base that cannot be resolved is reported by both phases, which is noisy
+  // but honest: neither has evidence for a pass.
+  const functionLength = runFunctionLengthRatchet(root, baseRef, upstream);
+  return Math.max(fileSize, functionLength);
+}
+
+function runFileSizeRatchet(
+  root: string,
+  baseRef: string,
+  upstream: UpstreamTrust | undefined,
+): number {
+  // The scan is no longer where the comparison comes from — it is here for the
+  // scope audit, which asks a question about the WHOLE tree rather than about
+  // this change: is there a tracked `src/` file no budget covers? A scope hole
+  // reads exactly like a clean pass, so it is worth one `git ls-files` call.
+  // It is also what the empty-scan floor below is measured from.
+  const scan = scanRepository(root);
+  if (scan.gitError !== null) {
+    process.stderr.write(
+      "File-size budget: could not list tracked files, so nothing was checked.\n" +
+        `  ${scan.gitError.split("\n")[0]}\n` +
+        "  Run this from the repository root inside a git checkout.\n",
+    );
+    return 1;
+  }
+
+  const declared = readSizeAllowances(root);
+  const result = evaluateComputedRatchet({
+    root,
+    baseRef,
+    unclassified: scan.unclassified,
+    isProductionFile,
+    budgetForFile: (file) => {
+      const budget = budgetForFile(file);
+      return { category: budget.category, limit: budget.limit };
+    },
+    countLines,
+    allowances: declared.allowances,
+    allowanceProblems: declared.problems,
+    upstream,
+  });
+
+  const findings =
+    scan.productionStats.length === 0
+      ? [EMPTY_SCAN_FINDING, ...result.findings]
+      : result.findings;
+
+  // Name the COMMIT, not only the ref. The comparison is against the merge base
+  // of the ref and HEAD, which on a stale branch is not where the ref points —
+  // and until now nothing the gate printed said so, in either direction. Same
+  // shape as `scripts/agent-context.ts` prints for the same reason.
+  const against =
+    result.baseSha === null
+      ? `\`${baseRef}\``
+      : `\`${baseRef}\` (merge base \`${result.baseSha.slice(0, 12)}\`)`;
+
+  if (findings.length === 0) {
+    // The tail changes when an allowance was applied, because "none beyond its
+    // previous length" would then be a false summary of a run that deliberately
+    // let one through.
+    const tail =
+      result.allowancesApplied.length === 0
+        ? "none over its budget or beyond its previous length."
+        : `the only growth beyond a previous length is the ` +
+          `${result.allowancesApplied.length} declared below.`;
+    process.stdout.write(
+      `File-size budget ratchet: OK — ${result.checkedFiles} production file(s) changed ` +
+        `since ${against}, ${tail}\n`,
+    );
+    process.stdout.write(renderDebtDelta(result.debtDelta));
+    process.stdout.write(renderTrustedUpstream(result.trustedUpstream, "file"));
+    process.stdout.write(renderAppliedAllowances(result.allowancesApplied));
+    return 0;
+  }
+
+  process.stderr.write(
+    `File-size budget ratchet: FAILED — ${findings.length} finding(s) ` +
+      `against ${against}.\n` +
+      `Judged ${result.checkedFiles} production file(s) changed since that point.\n`,
+  );
+  process.stderr.write(renderDebtDelta(result.debtDelta));
+  process.stderr.write(renderTrustedUpstream(result.trustedUpstream, "file"));
+  process.stderr.write(renderReport(findings));
+  process.stderr.write(renderAppliedAllowances(result.allowancesApplied));
+  process.stderr.write(
+    [
+      "",
+      "The rule: current size debt may stay, but new debt and debt growth may not",
+      'appear silently. See docs/MAINTENANCE.md -> "File-size budget ratchet".',
+      "",
+      "An already-over-budget file that genuinely has to grow says so out loud, in",
+      `${ALLOWANCE_DIR}/<pr-number>-<slug>.md — one file per pull request, so no two`,
+      `branches conflict over it. ${ALLOWANCE_DIR}/README.md is the format and the`,
+      "rules; splitting the file is still the better answer where it is available,",
+      `and the only one past the hard ceiling of ${HARD_CEILING_MULTIPLE} times the budget.`,
+      "",
+      `  ${CHECK_COMMAND}                     re-run this check`,
+      `  ${CHECK_COMMAND} --report         the whole tree's debt, for context`,
+      "",
+    ].join("\n"),
+  );
+  return 1;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Function length (#4927)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The function-length phase: the same rule one level down, against the same
+ * base. Malformed allowance files are not reported again here — the file-size
+ * phase reads the same directory and has already said so.
+ */
+function runFunctionLengthRatchet(
+  root: string,
+  baseRef: string,
+  upstream: UpstreamTrust | undefined,
+): number {
+  const declared = readSizeAllowances(root);
+  const result = evaluateFunctionLengthRatchet({
+    root,
+    baseRef,
+    isProductionFile,
+    allowances: declared.functionAllowances,
+    upstream,
+  });
+  const applied = result.allowancesApplied.map((a) => ({ ...a, file: a.key }));
+  const against =
+    result.baseSha === null
+      ? `\`${baseRef}\``
+      : `\`${baseRef}\` (merge base \`${result.baseSha.slice(0, 12)}\`)`;
+
+  if (result.findings.length === 0) {
+    process.stdout.write(
+      `Function-length ratchet: OK — no function in the ${result.checkedFiles} ` +
+        `production file(s) changed since ${against} crossed ` +
+        `${FUNCTION_LENGTH_LIMIT} lines or grew beyond its previous length` +
+        `${applied.length === 0 ? "" : " except the declared growth below"}.\n`,
+    );
+    process.stdout.write(renderTrustedUpstream(result.trustedUpstream, "function"));
+    process.stdout.write(renderAppliedAllowances(applied, "function"));
+    return 0;
+  }
+
+  process.stderr.write(
+    `Function-length ratchet: FAILED — ${result.findings.length} finding(s) ` +
+      `against ${against}.\n`,
+  );
+  process.stderr.write(renderTrustedUpstream(result.trustedUpstream, "function"));
+  process.stderr.write(renderReport(result.findings));
+  process.stderr.write(renderAppliedAllowances(applied, "function"));
+  process.stderr.write(
+    [
+      "",
+      `The rule: no function may cross ${FUNCTION_LENGTH_LIMIT} lines, and one already`,
+      "over it may not grow. See docs/MAINTENANCE.md -> \"Function-length ratchet\".",
+      "Split along the seams the function already has: each step a named function",
+      "with a typed input and a typed result.",
+      "",
+    ].join("\n"),
+  );
+  return 1;
+}
+
+/** Every over-limit function in the tree, on demand — a report, never a gate. */
+function runFunctionLengthReport(root: string): number {
+  const scan = scanRepository(root);
+  if (scan.gitError !== null) return 1;
+  const long = findLongFunctions(
+    root,
+    scan.productionStats.map((stat) => stat.file),
+  );
+  const debt = long.reduce((sum, fn) => sum + fn.lines - FUNCTION_LENGTH_LIMIT, 0);
+  process.stdout.write(
+    [
+      `Function-length report — ${long.length} function(s) are over ` +
+        `${FUNCTION_LENGTH_LIMIT} lines, carrying ${debt} lines of debt.`,
+      "",
+      "  Longest ten:",
+      ...long
+        .slice(0, 10)
+        .map((fn) => `    ${String(fn.lines).padStart(5)}  ${fn.file}#${fn.name}`),
+      "",
+    ].join("\n"),
+  );
+  return 0;
+}
+
+if (isMainModule(import.meta.url)) {
+  process.exitCode = run(process.cwd(), process.argv.slice(2));
+}

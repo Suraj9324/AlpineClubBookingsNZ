@@ -1,0 +1,601 @@
+"use client";
+
+import { FocusedActionError } from "@/components/focused-action-error";
+import { useActionAttention } from "@/hooks/use-scroll-to-feedback";
+import Link from "next/link";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckCircle2,
+  CircleAlert,
+  CircleDashed,
+  ExternalLink,
+  Loader2,
+  PlayCircle,
+  RefreshCw,
+  RotateCcw,
+  SkipForward,
+} from "lucide-react";
+import { getAdminPage } from "@/lib/admin-hubs";
+import type { AdminHubSection } from "@/components/admin-hub-page";
+import { setupHubCards } from "./hub-cards";
+import { Badge, type BadgeProps } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { useAdminAreaEditAccess } from "@/hooks/use-admin-area-edit-access";
+import {
+  AdminViewOnlySectionBanner,
+  ViewOnlyActionButton,
+} from "@/components/admin/view-only-action";
+import { LodgeCapacityCard } from "@/components/admin/lodge-capacity-card";
+import { isFeatureHrefVisible } from "@/config/feature-routes";
+import type { FeatureFlags } from "@/config/schema";
+import {
+  canOpenAdminPathWithMatrix,
+  type AdminPermissionMatrix,
+} from "@/lib/admin-permissions";
+import { ApiRefusalError, apiErrorMessageFromBody, readApiErrorBody, refusalMessageOr, readApiObjectOrEmpty } from "@/lib/api-error-message";
+import type {
+  ProgressStatus,
+  Provider,
+  ProviderTestResult,
+  SetupProgressState,
+  SetupReadiness,
+  SetupResponse,
+  SetupStatus,
+} from "./setup-types";
+
+const SETUP_COMPLETE_MESSAGE = "Setup has been marked complete.";
+const SETUP_COMPLETE_BANNER_CLASS =
+  "rounded-md border border-success-6 bg-success-3 px-4 py-3 text-sm text-success-11";
+
+function statusVariant(status: SetupStatus): BadgeProps["variant"] {
+  if (status === "complete") return "success";
+  if (status === "blocked") return "destructive";
+  if (status === "warning") return "warning";
+  return "secondary";
+}
+
+function StatusIcon({ status }: { status: SetupStatus }) {
+  if (status === "complete") {
+    return <CheckCircle2 className="h-4 w-4 text-success-11" />;
+  }
+  if (status === "blocked") {
+    return <CircleAlert className="h-4 w-4 text-danger-11" />;
+  }
+  if (status === "warning") {
+    return <CircleAlert className="h-4 w-4 text-warning-11" />;
+  }
+  return <CircleDashed className="h-4 w-4 text-muted-foreground" />;
+}
+
+function progressLabel(progress: ProgressStatus) {
+  if (progress === "completed") return "Acknowledged";
+  if (progress === "skipped") return "Skipped";
+  return null;
+}
+
+/**
+ * Whether a readiness check's Open link is offered: an admin page only when it
+ * would open for this admin (S1 #4796; the cancellation settings are a
+ * membership page on a support page). The check itself stays visible.
+ */
+function canFollowCheckHref(permissionMatrix: AdminPermissionMatrix, href: string) {
+  return !/^\/admin(?:[/?#]|$)/.test(href) || canOpenAdminPathWithMatrix(permissionMatrix, href);
+}
+
+function getVisibleSetupHubCards(
+  cards: AdminHubSection[],
+  features: FeatureFlags,
+  permissionMatrix: AdminPermissionMatrix,
+) {
+  return cards.filter(
+    (card) =>
+      isFeatureHrefVisible(card.href, features) &&
+      // Shown exactly when the card's page would open for this admin.
+      canOpenAdminPathWithMatrix(permissionMatrix, card.href),
+  );
+}
+
+function SetupHubCards({
+  features,
+  permissionMatrix,
+}: {
+  features: FeatureFlags;
+  permissionMatrix: AdminPermissionMatrix;
+}) {
+  const visibleCards = getVisibleSetupHubCards(
+    setupHubCards,
+    features,
+    permissionMatrix,
+  );
+
+  if (visibleCards.length === 0) return null;
+
+  return (
+    <section id="setup-hubs" className="space-y-3">
+      <div>
+        <h2 className="text-xl font-semibold text-foreground">Setup hubs</h2>
+        <p className="text-sm text-muted-foreground">
+          Open the relevant drill-down before editing lower-frequency
+          configuration.
+        </p>
+      </div>
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {visibleCards.map(({ href, title, description, icon: Icon }) => (
+          <Link key={href} href={href} className="group block">
+            <Card className="h-full transition-colors hover:border-brand-gold/70">
+              <CardHeader>
+                <div className="flex items-center gap-2">
+                  <Icon className="h-5 w-5 shrink-0 text-foreground" />
+                  <CardTitle className="text-base">{title}</CardTitle>
+                </div>
+                <CardDescription>{description}</CardDescription>
+              </CardHeader>
+            </Card>
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+export function SetupPageClient({
+  permissionMatrix,
+  features,
+}: {
+  permissionMatrix: AdminPermissionMatrix;
+  features: FeatureFlags;
+}) {
+  const canEdit = useAdminAreaEditAccess("support");
+  const [readiness, setReadiness] = useState<SetupReadiness | null>(null);
+  const [progress, setProgress] = useState<SetupProgressState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setErrorMessage] = useState("");
+  const [errorAttentionKey, setErrorAttentionKey] = useState(0);
+  const [loadError, setLoadError] = useState("");
+  const [finishMessage, setFinishMessage] = useState("");
+  const successRef = useRef<HTMLDivElement>(null);
+  // Only action failures request attention; background loads use loadError.
+  function setError(value: string) {
+    setErrorMessage(value);
+    if (value) setErrorAttentionKey((key) => key + 1);
+  }
+  useActionAttention({
+    error,
+    errorTarget: null, // FocusedActionError owns failure focus.
+    success: finishMessage,
+    successTarget: successRef,
+  });
+  const [savingStep, setSavingStep] = useState<string | null>(null);
+  const [finishing, setFinishing] = useState(false);
+  const [runningProvider, setRunningProvider] = useState<Provider | null>(null);
+  const [providerResults, setProviderResults] = useState<Record<string, ProviderTestResult>>({});
+
+  async function loadSetup() {
+    setLoading(true);
+    setLoadError("");
+
+    try {
+      const response = await fetch("/api/admin/setup", {
+        credentials: "same-origin",
+      });
+      const body = (await readApiObjectOrEmpty(response)) as SetupResponse | { error?: string };
+      if (!response.ok || !("readiness" in body)) {
+        throw new ApiRefusalError(apiErrorMessageFromBody(body, "Failed to load setup readiness"));
+      }
+      setReadiness(body.readiness);
+      setProgress(body.progress);
+      // A reload that finds setup reopened retires this session's finish notice.
+      if (!body.progress.completedAt) setFinishMessage("");
+      return body;
+    } catch (loadFailure) {
+      setLoadError(refusalMessageOr(loadFailure, "Failed to load setup readiness"));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadSetup();
+  }, []);
+
+  // The admin's own Refresh retires the last action's error (it described the
+  // old data); the attention key is untouched, so clearing never takes focus.
+  function refreshSetup() {
+    setErrorMessage("");
+    void loadSetup();
+  }
+
+  const allChecks = useMemo(
+    () => readiness?.categories.flatMap((category) => category.checks) ?? [],
+    [readiness],
+  );
+  const requiredBlockers = allChecks.filter(
+    (check) =>
+      check.required &&
+      check.status === "blocked" &&
+      check.progress !== "skipped",
+  );
+  const completedSteps = allChecks.filter(
+    (check) => check.status === "complete" || check.progress === "completed",
+  ).length;
+  const completionPercent =
+    allChecks.length > 0 ? Math.round((completedSteps / allChecks.length) * 100) : 0;
+  const setupCompleted = Boolean(progress?.completedAt);
+  const overallStatus = setupCompleted ? "complete" : readiness?.status ?? "not_started";
+
+  async function updateProgress(
+    action: "complete" | "skip" | "reopen",
+    stepId: string,
+  ) {
+    setSavingStep(stepId);
+    setError("");
+    setFinishMessage("");
+    try {
+      const response = await fetch("/api/admin/setup/progress", {
+        method: "PATCH",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, stepId }),
+      });
+      const body = await readApiErrorBody(response);
+      if (!response.ok) {
+        throw new ApiRefusalError(apiErrorMessageFromBody(body, "Failed to update setup progress"));
+      }
+      await loadSetup();
+    } catch (saveError) {
+      setError(refusalMessageOr(saveError, "Failed to update setup progress"));
+    } finally {
+      setSavingStep(null);
+    }
+  }
+
+  async function finishSetup() {
+    setFinishing(true);
+    setError("");
+    setFinishMessage("");
+    try {
+      const response = await fetch("/api/admin/setup/progress", {
+        method: "PATCH",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "finish" }),
+      });
+      const body = await readApiErrorBody(response);
+      if (!response.ok) {
+        throw new ApiRefusalError(apiErrorMessageFromBody(body, "Failed to finish setup"));
+      }
+      const updated = await loadSetup();
+      if (updated?.progress.completedAt) {
+        setFinishMessage(SETUP_COMPLETE_MESSAGE);
+      }
+    } catch (finishError) {
+      setError(refusalMessageOr(finishError, "Failed to finish setup"));
+    } finally {
+      setFinishing(false);
+    }
+  }
+
+  async function runProviderTest(provider: Provider) {
+    setRunningProvider(provider);
+    setError("");
+    try {
+      const response = await fetch("/api/admin/setup/provider-test", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider }),
+      });
+      const body = (await readApiObjectOrEmpty(response)) as ProviderTestResult | { error?: string };
+      if (!response.ok || !("ok" in body)) {
+        throw new ApiRefusalError(apiErrorMessageFromBody(body, "Provider test failed"));
+      }
+      setProviderResults((current) => ({
+        ...current,
+        [provider]: body,
+      }));
+      await loadSetup();
+      if (!body.ok) setError(body.message);
+    } catch (providerError) {
+      const message = refusalMessageOr(providerError, "Provider test failed");
+      setError(message);
+      setProviderResults((current) => ({
+        ...current,
+        [provider]: {
+          ok: false,
+          provider,
+          checkedAt: new Date().toISOString(),
+          message,
+        },
+      }));
+    } finally {
+      setRunningProvider(null);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-foreground">
+            {getAdminPage("setup").label}
+          </h1>
+          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+            Finish first-install readiness for club configuration, booking rules,
+            provider connections, and finance mappings.
+          </p>
+          {/* The empty wrapper an editor gets costs no layout; the spacing
+              lives on the inner box. */}
+          <AdminViewOnlySectionBanner canEdit={canEdit} className="mt-3 max-w-3xl" />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" onClick={refreshSetup} disabled={loading}>
+            <RefreshCw className="h-4 w-4" />
+            Refresh
+          </Button>
+          <ViewOnlyActionButton
+            canEdit={canEdit}
+            describeReason={false}
+            onClick={finishSetup}
+            disabled={
+              finishing || setupCompleted || requiredBlockers.length > 0 || !readiness
+            }
+          >
+            {finishing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <CheckCircle2 className="h-4 w-4" />
+            )}
+            {setupCompleted ? "Setup Complete" : "Mark Setup Complete"}
+          </ViewOnlyActionButton>
+        </div>
+      </div>
+
+      <FocusedActionError id="setup-error" error={error} attentionKey={errorAttentionKey} />
+      <div
+        role="alert"
+        aria-atomic="true"
+        className={loadError ? "rounded-md border border-danger-6 bg-danger-3 p-3 text-sm text-danger-11" : "sr-only"}
+      >
+        {loadError}
+      </div>
+      {/* Saved completion is a plain banner; only an explicit finish is announced. */}
+      {setupCompleted && !finishMessage ? (
+        <div className={SETUP_COMPLETE_BANNER_CLASS}>{SETUP_COMPLETE_MESSAGE}</div>
+      ) : null}
+      <div
+        id="setup-success"
+        ref={successRef}
+        role="status"
+        aria-atomic="true"
+        className={finishMessage ? SETUP_COMPLETE_BANNER_CLASS : "sr-only"}
+      >
+        {finishMessage}
+      </div>
+      {loading && !readiness ? (
+        <div className="flex min-h-[320px] items-center justify-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading setup readiness
+        </div>
+      ) : null}
+
+      {readiness ? (
+        <>
+          <div className="grid gap-3 md:grid-cols-4">
+            <div className="rounded-md border bg-card p-4">
+              <div className="flex items-center gap-2">
+                <StatusIcon status={overallStatus} />
+                <p className="text-sm font-medium text-muted-foreground">Overall</p>
+              </div>
+              <p className="mt-2 text-2xl font-semibold capitalize text-foreground">
+                {overallStatus.replace("_", " ")}
+              </p>
+            </div>
+            <div className="rounded-md border bg-card p-4">
+              <p className="text-sm font-medium text-muted-foreground">Progress</p>
+              <p className="mt-2 text-2xl font-semibold text-foreground">
+                {completionPercent}%
+              </p>
+            </div>
+            <div className="rounded-md border bg-card p-4">
+              <p className="text-sm font-medium text-muted-foreground">Blocked</p>
+              <p className="mt-2 text-2xl font-semibold text-foreground">
+                {readiness.summary.blocked}
+              </p>
+            </div>
+            <div className="rounded-md border bg-card p-4">
+              <p className="text-sm font-medium text-muted-foreground">Skipped</p>
+              <p className="mt-2 text-2xl font-semibold text-foreground">
+                {readiness.summary.skipped}
+              </p>
+            </div>
+          </div>
+
+          {requiredBlockers.length > 0 ? (
+            <div className="rounded-md border border-warning-6 bg-warning-3 px-4 py-3 text-sm text-warning-11">
+              Resolve or explicitly skip required blocked steps before marking setup complete.
+            </div>
+          ) : null}
+
+          <SetupHubCards
+            features={features}
+            permissionMatrix={permissionMatrix}
+          />
+
+          {/* The lodge-capacity card remains on the setup page and keeps the
+              #1548 matrix gate because its backing API is lodge-area while
+              /admin/setup itself is support-area. */}
+          {permissionMatrix.lodge !== "none" ? <LodgeCapacityCard /> : null}
+
+          <section id="setup-checks" className="space-y-6">
+            <div>
+              <h2 className="text-xl font-semibold text-foreground">
+                Readiness checks
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Work through the live checks after choosing the matching setup
+                hub.
+              </p>
+            </div>
+            {readiness.categories.map((category) => (
+              <section key={category.id} className="space-y-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <h2 className="text-xl font-semibold text-foreground">
+                      {category.title}
+                    </h2>
+                    <p className="text-sm text-muted-foreground">{category.description}</p>
+                  </div>
+                  <Badge variant={statusVariant(category.status)} className="w-fit capitalize">
+                    {category.status.replace("_", " ")}
+                  </Badge>
+                </div>
+
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {category.checks.map((check) => {
+                    const result = check.action
+                      ? providerResults[check.action.provider]
+                      : null;
+                    const progress = progressLabel(check.progress);
+                    const isSaving = savingStep === check.id;
+                    return (
+                      <Card key={check.id}>
+                        <CardHeader className="space-y-3">
+                          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                            <div className="flex gap-3">
+                              <StatusIcon status={check.status} />
+                              <div>
+                                <CardTitle className="text-base">
+                                  {check.title}
+                                </CardTitle>
+                                <CardDescription>{check.description}</CardDescription>
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <Badge variant={statusVariant(check.status)} className="capitalize">
+                                {check.status.replace("_", " ")}
+                              </Badge>
+                              {check.required ? (
+                                <Badge variant="outline">Required</Badge>
+                              ) : null}
+                              {progress ? (
+                                <Badge variant="secondary">{progress}</Badge>
+                              ) : null}
+                            </div>
+                          </div>
+                        </CardHeader>
+                        <CardContent className="space-y-4">
+                          <p className="text-sm text-muted-foreground">{check.message}</p>
+                          {check.details.length > 0 ? (
+                            <ul className="space-y-1 text-sm text-muted-foreground">
+                              {check.details.map((detail) => (
+                                <li key={detail}>{detail}</li>
+                              ))}
+                            </ul>
+                          ) : null}
+
+                          {result ? (
+                            <div
+                              className={`rounded-md border px-3 py-2 text-sm ${
+                                result.ok
+                                  ? "border-success-6 bg-success-3 text-success-11"
+                                  : "border-danger-6 bg-danger-3 text-danger-11"
+                              }`}
+                            >
+                              {result.message}
+                            </div>
+                          ) : null}
+
+                          <div className="flex flex-wrap gap-2">
+                            {check.href && canFollowCheckHref(permissionMatrix, check.href) ? (
+                              <Button asChild variant="outline" size="sm">
+                                <a href={check.href}>
+                                  <ExternalLink className="h-4 w-4" />
+                                  Open
+                                </a>
+                              </Button>
+                            ) : null}
+                            {check.action ? (
+                              <ViewOnlyActionButton
+                                canEdit={canEdit}
+                                describeReason={false}
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => runProviderTest(check.action!.provider)}
+                                disabled={runningProvider === check.action.provider}
+                              >
+                                {runningProvider === check.action.provider ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <PlayCircle className="h-4 w-4" />
+                                )}
+                                {check.action.label}
+                              </ViewOnlyActionButton>
+                            ) : null}
+                            {check.progress !== "completed" ? (
+                              <ViewOnlyActionButton
+                                canEdit={canEdit}
+                                describeReason={false}
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => updateProgress("complete", check.id)}
+                                disabled={isSaving}
+                              >
+                                {isSaving ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <CheckCircle2 className="h-4 w-4" />
+                                )}
+                                Acknowledge
+                              </ViewOnlyActionButton>
+                            ) : null}
+                            {check.progress !== "skipped" ? (
+                              <ViewOnlyActionButton
+                                canEdit={canEdit}
+                                describeReason={false}
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => updateProgress("skip", check.id)}
+                                disabled={isSaving}
+                              >
+                                <SkipForward className="h-4 w-4" />
+                                Skip
+                              </ViewOnlyActionButton>
+                            ) : null}
+                            {check.progress !== "open" ? (
+                              <ViewOnlyActionButton
+                                canEdit={canEdit}
+                                describeReason={false}
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => updateProgress("reopen", check.id)}
+                                disabled={isSaving}
+                              >
+                                <RotateCcw className="h-4 w-4" />
+                                Reopen
+                              </ViewOnlyActionButton>
+                            ) : null}
+                          </div>
+                        </CardContent>
+                      </Card>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
+          </section>
+        </>
+      ) : null}
+    </div>
+  );
+}

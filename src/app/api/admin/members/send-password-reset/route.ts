@@ -1,0 +1,158 @@
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { parseJsonRequestBody } from "@/lib/api-json";
+import { requireAdmin } from "@/lib/session-guards";
+import { prisma } from "@/lib/prisma";
+import { sendAdminPasswordResetEmail } from "@/lib/email";
+import { logAudit } from "@/lib/audit";
+import logger from "@/lib/logger";
+import { issueActionToken } from "@/lib/action-tokens";
+import {
+  ADMIN_PASSWORD_RESET_EXPIRY_WINDOWS,
+  DEFAULT_ADMIN_PASSWORD_RESET_EXPIRY_WINDOW,
+  getAdminPasswordResetExpiryDate,
+  getAdminPasswordResetExpiryLabel,
+} from "@/lib/password-reset";
+
+const sendPasswordResetSchema = z.object({
+  memberIds: z.array(z.string()).min(1, "At least one member ID is required").max(100),
+  expiryWindow: z.enum(ADMIN_PASSWORD_RESET_EXPIRY_WINDOWS).default(DEFAULT_ADMIN_PASSWORD_RESET_EXPIRY_WINDOW),
+});
+
+// Simple in-memory throttle for bulk sends (>1 member): 1 per 10 minutes per admin
+const bulkThrottle = new Map<string, number>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * POST /api/admin/members/send-password-reset
+ * Send password reset emails to one or more members.
+ */
+export async function POST(req: NextRequest) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return guard.response;
+  const session = guard.session;
+  const jsonBody = await parseJsonRequestBody(req, { error: "Invalid JSON" });
+  if (!jsonBody.ok) return jsonBody.response;
+  const body = jsonBody.body;
+
+  const parsed = sendPasswordResetSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      { status: 422 }
+    );
+  }
+
+  const { memberIds, expiryWindow } = parsed.data;
+  const adminId = session.user.id;
+  const expiryLabel = getAdminPasswordResetExpiryLabel(expiryWindow);
+
+  // Throttle bulk sends (>1 member) to 1 per 10 minutes per admin
+  if (memberIds.length > 1) {
+    const lastBulk = bulkThrottle.get(adminId) ?? 0;
+    const elapsed = Date.now() - lastBulk;
+    const cooldown = 10 * 60 * 1000; // 10 minutes
+    if (elapsed < cooldown) {
+      const retryAfter = Math.ceil((cooldown - elapsed) / 1000);
+      return NextResponse.json(
+        { error: "Bulk password reset rate limited. Try again later." },
+        { status: 429, headers: { "Retry-After": String(retryAfter) } }
+      );
+    }
+    bulkThrottle.set(adminId, Date.now());
+  }
+
+  try {
+    // Fetch only active login-eligible members with an email
+    const members = await prisma.member.findMany({
+      where: {
+        id: { in: memberIds },
+        active: true,
+        canLogin: true,
+      },
+      select: { id: true, email: true, firstName: true, lastName: true },
+    });
+
+    const eligibleIds = new Set(members.map((m) => m.id));
+    const skipped = memberIds.filter((id) => !eligibleIds.has(id)).length;
+
+    // Create tokens and send emails in batches of 10
+    const BATCH_SIZE = 10;
+    let sent = 0;
+
+    for (let i = 0; i < members.length; i += BATCH_SIZE) {
+      if (i > 0) await sleep(1000);
+
+      const batch = members.slice(i, i + BATCH_SIZE);
+
+      await Promise.all(
+        batch.map(async (member) => {
+          try {
+            const { token, tokenHash } = issueActionToken();
+            const expiresAt = getAdminPasswordResetExpiryDate(expiryWindow);
+
+            await prisma.passwordResetToken.deleteMany({
+              where: { memberId: member.id },
+            });
+
+            await prisma.passwordResetToken.create({
+              data: {
+                tokenHash,
+                memberId: member.id,
+                expiresAt,
+              },
+            });
+
+            sendAdminPasswordResetEmail(member.email, token, expiryLabel).catch((err) => {
+              logger.error(
+                { err, to: member.email },
+                "Failed to send admin password reset email"
+              );
+            });
+
+            logAudit({
+              action: "member.password-reset-sent",
+              // `security`, not `communication` (#2581 decision 3): the
+              // affected domain is the CREDENTIAL, not the mailing — this
+              // action hands somebody a way to take over an account. `security`
+              // is read with `support:view` alone, the same gate Admin > Audit
+              // Log already needs for this row, and the correlation projection
+              // returns only action/category/severity/outcome/entityType/
+              // requestId — never `details`, which is where the recipient's
+              // address lives.
+              category: "security",
+              memberId: adminId,
+              targetId: member.id,
+              entityType: "Member",
+              entityId: member.id,
+              details: JSON.stringify({
+                recipientEmail: member.email,
+                recipientName: `${member.firstName} ${member.lastName}`,
+                kind: "reset",
+                expiryLabel,
+              }),
+            });
+
+            sent++;
+          } catch (err) {
+            logger.error(
+              { err, memberId: member.id },
+              "Failed to create password reset token"
+            );
+          }
+        })
+      );
+    }
+
+    return NextResponse.json({ sent, skipped, expiryLabel });
+  } catch (error) {
+    logger.error({ err: error }, "Failed to send password reset emails");
+    return NextResponse.json(
+      { error: "Failed to send password reset emails" },
+      { status: 500 }
+    );
+  }
+}
